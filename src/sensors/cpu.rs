@@ -20,7 +20,10 @@ pub fn util_from_stat_lines(prev: &str, cur: &str) -> Option<f64> {
 
 /// (idle_all, total) jiffies from the first aggregate `cpu ` line of a
 /// /proc/stat snapshot. Fields: user nice system idle iowait irq softirq
-/// steal guest guest_nice; idle_all = idle + iowait, total = sum of all.
+/// steal guest guest_nice; idle_all = idle + iowait, total = sum of the
+/// first 8 fields. guest/guest_nice are excluded from total because the
+/// kernel already folds guest time into user -- counting them again would
+/// double-count (canonical htop/mpstat formula).
 fn parse_aggregate_line(snapshot: &str) -> Option<(u64, u64)> {
     let line = snapshot
         .lines()
@@ -36,7 +39,10 @@ fn parse_aggregate_line(snapshot: &str) -> Option<(u64, u64)> {
         return None;
     }
     let idle_all = fields[3].checked_add(fields[4])?;
-    let total = fields.iter().try_fold(0u64, |acc, &f| acc.checked_add(f))?;
+    let total = fields
+        .iter()
+        .take(8)
+        .try_fold(0u64, |acc, &f| acc.checked_add(f))?;
     Some((idle_all, total))
 }
 
@@ -128,6 +134,18 @@ mod tests {
         // busy = 100/200 = 50%
         let prev = "cpu  1000 0 500 8000 200 0 0 0 0 0";
         let cur = "cpu  1100 0 500 8050 250 0 0 0 0 0";
+        let u = util_from_stat_lines(prev, cur).unwrap();
+        assert!((u - 50.0).abs() < 1e-9, "expected 50%, got {u}");
+    }
+
+    #[test]
+    fn util_ignores_guest_fields() {
+        // Same first-8-field deltas as util_from_known_deltas, but with large
+        // guest/guest_nice deltas (+600, +300). Guest time is already folded
+        // into user by the kernel; if it were summed into total the result
+        // would be 100/1100 idle, not 100/200.
+        let prev = "cpu  1000 0 500 8000 200 0 0 0 300 100";
+        let cur = "cpu  1100 0 500 8050 250 0 0 0 900 400";
         let u = util_from_stat_lines(prev, cur).unwrap();
         assert!((u - 50.0).abs() < 1e-9, "expected 50%, got {u}");
     }

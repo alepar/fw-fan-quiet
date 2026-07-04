@@ -13,6 +13,7 @@ task's commit lands. Human-gated items are marked 👤.
 - [ ] 5. CPU utilization + frequency sensors
 - [ ] 6. NVML sensor wrapper
 - [ ] 7. Sampler thread + event enum
+- [ ] 7b. Telemetry JSONL logger (samples + decisions, for offline controller review)
 - [ ] 8. UI Model + update()
 - [ ] 9. Dashboard view + main wiring 👤 (visual check of live dashboard)
 

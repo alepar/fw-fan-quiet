@@ -226,6 +226,42 @@ fn detects_monotonic_gap() {
 Thread exits when a shared `Arc<AtomicBool>` shutdown flag flips.
 Commit: `feat: 1Hz sampler thread with resume detection`.
 
+### Task 7b: Telemetry JSONL logger
+
+**Files:** Create `src/telemetry.rs`.
+
+Purpose: offline controller-quality review — every sample and every controller decision
+land in an append-only JSONL file loadable into pandas/DuckDB.
+
+```rust
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Record<'a> {
+    Sample(&'a Sample),
+    Decision(&'a DecisionRecord),   // defined in Task 14; stub the variant until then
+    Flag { t_mono: f64, flag: String, active: bool },
+}
+pub struct Telemetry { /* BufWriter<File> */ }
+impl Telemetry {
+    /// path e.g. /var/lib/bazerame-fans/telemetry/run-<unix_ts>.jsonl (dir created);
+    /// CLI-overridable; falls back to ./telemetry-<ts>.jsonl if dir unwritable
+    pub fn open(dir: &Path) -> std::io::Result<Self>;
+    pub fn log(&mut self, r: &Record) ;   // serialize + \n; flush every 10 records or 5 s
+}
+```
+Failure to open/write telemetry must never crash sampling — log a tracing warning once
+and drop records. Tests: roundtrip (open in tempdir, log 3 records incl. a Sample,
+read file back, each line parses as JSON with correct `kind`); unwritable dir → open
+falls back / errors without panic. Wire into main (Task 9): sampler samples are logged
+by the main loop on receipt. Controller decisions wired in Task 14+.
+Commit: `feat: JSONL telemetry log for offline controller analysis`.
+
+**Downstream requirements this creates:** Task 14 defines `DecisionRecord` (mode,
+setpoints commanded, why: demand scores, contour budget, trim offset, PI internals,
+flags) and logs one per control step; Tasks 25/26/27 extend it as allocator/trim/RLS
+land. Task 22 logs calibration points as they're recorded. Acceptance for M4/M5
+includes reviewing a session's telemetry offline.
+
 ### Task 8: UI Model + update()
 
 **Files:** Create `src/model.rs`.
@@ -372,6 +408,11 @@ pub struct ControlStatus {
     pub flags: Vec<StatusFlag>,        // e.g. LimitNotSticking, Resumed
 }
 ```
+Also define `DecisionRecord` (serializable; consumed by Task 7b telemetry): t_mono, mode,
+commanded cpu_w / gpu_max_mhz, and a `why` payload (later tasks extend it: demand scores,
+contour budget, trim offset, PI internals). Controller logs one Decision per control
+action and a Flag record on every status-flag transition.
+
 Controller loop (`select!` on samples/commands/10 s reassert tick):
 - Manual commands → actuators; every status change → `Event::Status` to UI.
 - Reassert tick: reapply current CPU limit (defends against PPD/tuned clobbers).

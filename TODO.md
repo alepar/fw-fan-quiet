@@ -6,7 +6,7 @@ Rules: one task at a time, in a subagent, TDD, commit per task, tick the box whe
 task's commit lands. Human-gated items are marked 👤.
 
 ## Milestone 1 — Monitor (read-only dashboard)
-- [ ] 1. Project scaffold (cargo + deps)
+- [x] 1. Project scaffold (cargo + deps)
 - [ ] 2. Core types + ring buffer
 - [ ] 3. RAPL power sensor (wraparound-safe)
 - [ ] 4. hwmon sensors (fans, Tctl, amdgpu)

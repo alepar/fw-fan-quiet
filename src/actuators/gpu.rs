@@ -9,21 +9,16 @@
 use nvml_wrapper::Nvml;
 use nvml_wrapper::enums::device::GpuLockedClocksSetting;
 
-// TODO(task-14): set_max_clock/applied + clamp consts go live with the controller.
-#[allow(dead_code)]
 /// Hardware clock floor on this RTX 5070 Laptop (min supported graphics
 /// clock); used as the lock's min so idle clocks stay free to drop.
 const MIN_LOCK_MHZ: u32 = 210;
-#[allow(dead_code)] // TODO(task-14)
 /// Design §3 GPU perf floor default: never command a ceiling below this.
 const MIN_MAX_CLOCK_MHZ: u32 = 1000;
-#[allow(dead_code)] // TODO(task-14)
 /// Max supported graphics clock on this RTX 5070 Laptop.
 const MAX_MAX_CLOCK_MHZ: u32 = 3090;
 
 const DEVICE_INDEX: u32 = 0;
 
-#[allow(dead_code)] // TODO(task-14): called by the controller.
 /// Clamp a commanded max clock to [1000, 3090] MHz. The driver snaps to its
 /// ~7.5 MHz bins on its own; we don't need to.
 pub fn clamp_gpu_clock(mhz: u32) -> u32 {
@@ -54,7 +49,6 @@ impl GpuActuator {
         })
     }
 
-    #[allow(dead_code)] // TODO(task-14): called by the controller.
     /// Lock graphics clocks to `(210, clamp_gpu_clock(mhz))` and remember the
     /// applied value on success. NVML errors (e.g. no root) propagate.
     pub fn set_max_clock(&mut self, mhz: u32) -> color_eyre::Result<()> {
@@ -77,7 +71,6 @@ impl GpuActuator {
         Ok(())
     }
 
-    #[allow(dead_code)] // TODO(task-14): read by the controller/UI.
     /// Last successfully applied max clock, if a lock is active.
     pub fn applied(&self) -> Option<u32> {
         self.applied_mhz

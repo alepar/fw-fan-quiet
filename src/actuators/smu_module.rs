@@ -48,13 +48,21 @@ impl SmuModule {
         })
     }
 
-    /// A module we "unloaded", so `restore` will reload it. Guard tests use
-    /// this to observe the restore sequence without a sysfs fixture.
-    #[cfg(test)]
-    pub(crate) fn unloaded_for_test() -> Self {
+    /// A module handle that behaves as if we unloaded ryzen_smu, so
+    /// `restore` WILL reload it. `FinalRestore` uses this to rebuild the
+    /// reload obligation on the panic path (from main's recorded
+    /// `smu_was_unloaded`); guard/controller tests use it to observe the
+    /// restore sequence without a sysfs fixture.
+    pub fn assume_unloaded() -> Self {
         Self {
             unloaded_by_us: true,
         }
+    }
+
+    /// True iff `restore` will reload the module (we unloaded it). Main
+    /// records this at startup for `FinalRestore`.
+    pub fn unloaded_by_us(&self) -> bool {
+        self.unloaded_by_us
     }
 
     /// `modprobe ryzen_smu` ONLY if we unloaded it; idempotent (second call

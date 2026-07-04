@@ -1,6 +1,7 @@
 //! TEA-style UI model: single source of UI state, mutated only in update().
 
-use crate::event::{ControlStatus, Event};
+use crate::control::ControlStatus;
+use crate::event::Event;
 use crate::ring::Ring;
 use crate::types::Sample;
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
@@ -8,7 +9,8 @@ use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 /// Ring capacity: 5 minutes of history at 1 Hz.
 pub const RING_CAP: usize = 300;
 
-/// Display-only fan target (RPM) until the controller lands (Task 14).
+/// Display-only fan target (RPM); Task 15 wires it to the controller's
+/// echoed `status.fan_target_rpm`.
 const DEFAULT_FAN_TARGET_RPM: f64 = 3000.0;
 
 pub struct Model {
@@ -197,10 +199,17 @@ mod tests {
 
     #[test]
     fn status_event_stored() {
-        // ControlStatus is an empty placeholder; just verify the event is
-        // handled without panicking and the assignment compiles.
+        use crate::control::controller::{Mode, StatusFlag};
         let mut m = Model::new();
-        m.update(Event::Status(ControlStatus::default()));
+        let cs = ControlStatus {
+            mode: Mode::Manual,
+            cpu_limit_w: Some(20.0),
+            gpu_max_mhz: Some(1500),
+            fan_target_rpm: 2500.0,
+            flags: vec![StatusFlag::Resumed],
+        };
+        m.update(Event::Status(cs.clone()));
+        assert_eq!(m.status, cs);
     }
 
     #[test]

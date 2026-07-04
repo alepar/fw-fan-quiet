@@ -23,14 +23,26 @@ const MAX_NAME_ATTEMPTS: u32 = 10;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Record<'a> {
     Sample(&'a Sample),
-    // TODO(task-14): logged by the controller (resume/sensor-lost flags).
+    // TODO(task-28): per-flag transition records (sensor-lost etc.); flags
+    // currently ride along inside Decision lines.
     #[allow(dead_code)]
     Flag {
         t_mono: f64,
         flag: String,
         active: bool,
     },
-    // TODO(task-14): Decision variant for controller decisions.
+    /// One controller decision: emitted by the controller thread whenever a
+    /// status change or reassert happens, with a short `cause` string
+    /// ("command:set_cpu_w", "reassert", "stickiness", "resume", "release").
+    Decision {
+        t_mono: f64,
+        mode: String,
+        cpu_limit_w: Option<f64>,
+        gpu_max_mhz: Option<u32>,
+        fan_target_rpm: f64,
+        cause: String,
+        flags: Vec<String>,
+    },
 }
 
 /// First line of every file: anchors the monotonic axis to wall clock and
@@ -184,6 +196,18 @@ impl Telemetry {
     }
 }
 
+/// Poison-tolerant lock for the telemetry sink shared by main (samples) and
+/// the controller thread (decisions): if the other thread panicked while
+/// holding the lock, keep logging instead of cascading the panic. Callers
+/// keep lock scopes one-call tiny.
+pub fn lock(
+    shared: &std::sync::Mutex<Option<Telemetry>>,
+) -> std::sync::MutexGuard<'_, Option<Telemetry>> {
+    shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Opens under `preferred_dir`, falling back to `fallback_dir` if that fails
 /// (production passes "."); `None` only if both fail (telemetry disabled).
 pub fn open_with_fallback(preferred_dir: &Path, fallback_dir: &Path) -> Option<Telemetry> {
@@ -239,14 +263,23 @@ mod tests {
             flag: "resumed".into(),
             active: true,
         });
+        t.log(&Record::Decision {
+            t_mono: 4.0,
+            mode: "manual".into(),
+            cpu_limit_w: Some(20.0),
+            gpu_max_mhz: None,
+            fan_target_rpm: 3000.0,
+            cause: "command:set_cpu_w".into(),
+            flags: vec!["resumed".into()],
+        });
         t.flush();
 
         let contents = fs::read_to_string(t.path()).unwrap();
         let lines: Vec<&str> = contents.lines().collect();
         assert_eq!(
             lines.len(),
-            4,
-            "run_start header + 3 records, got: {contents:?}"
+            5,
+            "run_start header + 4 records, got: {contents:?}"
         );
 
         let start: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
@@ -274,6 +307,19 @@ mod tests {
         assert!(
             flag["t_wall"].as_f64().unwrap() > 1.5e9,
             "flag lines carry a top-level wall-clock stamp"
+        );
+        let decision: serde_json::Value = serde_json::from_str(lines[4]).unwrap();
+        assert_eq!(decision["kind"], "decision");
+        assert_eq!(decision["t_mono"], 4.0);
+        assert_eq!(decision["mode"], "manual");
+        assert_eq!(decision["cpu_limit_w"], 20.0);
+        assert_eq!(decision["gpu_max_mhz"], serde_json::Value::Null);
+        assert_eq!(decision["fan_target_rpm"], 3000.0);
+        assert_eq!(decision["cause"], "command:set_cpu_w");
+        assert_eq!(decision["flags"][0], "resumed");
+        assert!(
+            decision["t_wall"].as_f64().unwrap() > 1.5e9,
+            "decision lines carry a top-level wall-clock stamp"
         );
 
         fs::remove_dir_all(&dir).unwrap();

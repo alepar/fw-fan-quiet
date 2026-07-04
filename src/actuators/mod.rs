@@ -1,5 +1,5 @@
-//! Actuators: command runner seam + hardware knobs. Consumed by the
-//! controller thread (Task 14) and RestoreGuard.
+//! Actuators: command runner seam + hardware knobs. Owned by the controller
+//! thread via RestoreGuard; FinalRestore rebuilds fresh ones on the panic path.
 
 pub mod cmd;
 pub mod cpu;

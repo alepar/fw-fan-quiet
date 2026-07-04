@@ -10,23 +10,22 @@ use std::time::Duration;
 
 use super::cmd::Runner;
 
-// TODO(task-14): set_sustained_mw + its consts/fields go live with the controller.
-#[allow(dead_code)]
+/// Production platform-profile sysfs node (main and FinalRestore build
+/// their actuators against it).
+pub const PLATFORM_PROFILE_PATH: &str = "/sys/firmware/acpi/platform_profile";
+
 /// Absolute safety floor (design §5): below ~10 W risks UI stalls and
 /// resume instability.
 const MIN_SUSTAINED_MW: u32 = 10_000;
-#[allow(dead_code)] // TODO(task-14)
 /// HX 370 cTDP ceiling.
 const MAX_SUSTAINED_MW: u32 = 54_000;
 /// Stock burst ceiling (verified on-machine invocation shape).
 const DEFAULT_FAST_LIMIT_MW: u32 = 53_000;
 
 pub struct CpuActuator<R: Runner> {
-    #[allow(dead_code)] // TODO(task-14): read by set_sustained_mw only
     runner: R,
     /// Stock burst ceiling left untouched so short spikes stay fast
     /// (design §3). Pub so config (Task 21) can set it.
-    #[allow(dead_code)] // TODO(task-14): read by set_sustained_mw only
     pub fast_limit_mw: u32,
     /// Production: /sys/firmware/acpi/platform_profile.
     profile_path: PathBuf,
@@ -45,7 +44,6 @@ impl<R: Runner> CpuActuator<R> {
         }
     }
 
-    #[allow(dead_code)] // TODO(task-14): called by the controller.
     /// Clamp `mw` to [10_000, 54_000] and command it as the sustained limit:
     /// `ryzenadj --stapm-limit=<mw> --slow-limit=<mw> --fast-limit=<fast>`.
     /// Returns the clamped value actually commanded; Err on spawn failure or

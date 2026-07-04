@@ -2,6 +2,7 @@
 //! and logging. Milestone 1: live read-only monitoring dashboard.
 
 mod actuators;
+mod control;
 mod event;
 mod logging;
 mod model;
@@ -12,8 +13,8 @@ mod types;
 mod ui;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::Parser;
@@ -21,10 +22,12 @@ use color_eyre::Result;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 
 use actuators::cmd::RealRunner;
-use actuators::cpu::CpuActuator;
+use actuators::cpu::{CpuActuator, PLATFORM_PROFILE_PATH};
 use actuators::gpu::GpuActuator;
-use actuators::guard::RestoreGuard;
+use actuators::guard::{FinalRestore, RestoreGuard};
 use actuators::smu_module::SmuModule;
+use control::Command;
+use control::controller::{self, Controller};
 use event::Event;
 use model::Model;
 use sensors::sampler::Sampler;
@@ -68,15 +71,19 @@ fn main() -> Result<()> {
 
     let _log_guard = logging::init(&args.log_dir);
 
-    let mut telemetry = telemetry::open_with_fallback(&args.telemetry_dir, Path::new("."));
+    let telemetry = telemetry::open_with_fallback(&args.telemetry_dir, Path::new("."));
     match &telemetry {
         Some(t) => tracing::info!("telemetry log: {}", t.path().display()),
         None => tracing::warn!("telemetry disabled: no writable directory"),
     }
+    // Shared with the controller thread: main logs samples, the controller
+    // logs decisions. Lock scopes stay one-call tiny on both sides.
+    let telemetry = Arc::new(Mutex::new(telemetry));
 
     // SIGINT/SIGTERM/SIGHUP set term_flag; the event loop treats it like 'q',
-    // so the process leaves through the normal return path and the guard
-    // drops on main's stack. SIGHUP matters: closing the terminal window (or
+    // so the process leaves through the normal return path where the
+    // controller is told to Quit and restores hardware before main returns.
+    // SIGHUP matters: closing the terminal window (or
     // the pty master dying) would otherwise kill us without running drops.
     // Registered BEFORE any hardware is touched below: a signal arriving
     // mid-construction only sets the flag instead of terminating us without
@@ -96,10 +103,10 @@ fn main() -> Result<()> {
             None
         }
     };
-    let cpu = CpuActuator::new(
-        RealRunner,
-        PathBuf::from("/sys/firmware/acpi/platform_profile"),
-    );
+    // Recorded BEFORE the smu handle moves into the guard: FinalRestore needs
+    // it to rebuild the reload obligation on the panic path.
+    let smu_was_unloaded = smu.as_ref().is_some_and(SmuModule::unloaded_by_us);
+    let cpu = CpuActuator::new(RealRunner, PathBuf::from(PLATFORM_PROFILE_PATH));
     let gpu = match GpuActuator::new() {
         Ok(gpu) => Some(gpu),
         Err(e) => {
@@ -107,37 +114,57 @@ fn main() -> Result<()> {
             None
         }
     };
-    // LOAD-BEARING: the guard lives on MAIN's stack, declared after _log_guard
-    // (so its Drop still gets logged) and before everything else it must
-    // outlive. A panic anywhere below unwinds through here and restores
-    // hardware; a panic in another thread cannot run this drop, which is why
-    // actuation stays reachable from main.
-    // TODO(task-14): controller will borrow/own actuators; guard stays on
-    // main's stack as the final safety net; coordination TBD in task 14.
+    // Actuator ownership, two layers (resolves the Task-13 ownership TODO):
+    // the WORKING actuators live in `guard`, which moves into the controller
+    // thread below — the single place hardware writes happen. On clean
+    // shutdown (Command::Quit or channel disconnect) the controller restores
+    // and flips `restored`; main joins it. `_final_restore` stays LOAD-BEARING
+    // on MAIN's stack for the paths where the controller never gets there
+    // (e.g. a main-thread panic kills other threads without running their
+    // drops, but unwinds its own stack): its Drop sees `restored == false`,
+    // builds fresh short-lived actuators and reruns the same best-effort
+    // restore. Restores are idempotent, so a double restore is harmless.
+    // Declared after _log_guard so its Drop still gets logged.
+    let restored = Arc::new(AtomicBool::new(false));
+    let _final_restore = FinalRestore::new(Arc::clone(&restored), smu_was_unloaded);
     let mut guard = RestoreGuard::new(RealRunner, Some(cpu), gpu, smu);
     // Belt-and-suspenders against a previous SIGKILL'd run leaving locks set.
     guard.startup_reset();
 
     let (ui_tx, ui_rx) = unbounded::<Event>();
+    let (ctl_sample_tx, ctl_sample_rx) = unbounded::<Event>();
+    let (cmd_tx, cmd_rx) = unbounded::<Command>();
     let shutdown = Arc::new(AtomicBool::new(false));
-    // Controller joins as a second subscriber in Task 14.
-    let sampler = Sampler::new_system().spawn(vec![ui_tx.clone()], Arc::clone(&shutdown));
+    let sampler =
+        Sampler::new_system().spawn(vec![ui_tx.clone(), ctl_sample_tx], Arc::clone(&shutdown));
+    let ctl = controller::spawn(
+        Controller::new(guard),
+        ctl_sample_rx,
+        cmd_rx,
+        ui_tx.clone(),
+        Arc::clone(&telemetry),
+        Arc::clone(&restored),
+    );
 
     // try_init() returns Err instead of panicking when there is no usable
     // tty (e.g. stdin redirected). It installs a terminal-restoring panic
     // hook, which install_tty_safe_panic_hook() below replaces with a
     // dead-tty-safe equivalent.
     // ORDER (shutdown, normal path): 'q' or SIGINT/SIGTERM/SIGHUP stops the
-    // event loop -> terminal restore -> sampler shutdown+join, telemetry
-    // flush -> guard drops (GPU release -> CPU restore -> ryzen_smu reload)
-    // -> _log_guard drops last so every restore step is still logged.
+    // event loop -> terminal restore -> Command::Quit + controller join FIRST
+    // (controller runs GPU release -> CPU restore -> ryzen_smu reload, then
+    // flips `restored`) -> telemetry flush, sampler join -> _final_restore
+    // drops as a no-op (restored is true) -> _log_guard drops last so every
+    // restore step is still logged.
     // ORDER (panic path): the tty-safe panic hook restores the terminal
-    // first, then main's unwind runs the same drops in the same order.
+    // first, then main's unwind drops cmd_tx/ui_rx (the controller sees the
+    // disconnect and restores from its thread) and _final_restore's Drop
+    // covers the race where the process exits before the controller does.
     // Terminal::drop can never run on ANY path (normal or unwind): it is
     // wrapped in ManuallyDrop below, because on a dead tty its show_cursor()
     // fails and it eprintln!s the error, which PANICS (dead stderr) - during
-    // unwind that is a double panic -> SIGABRT before the guard can restore
-    // hardware (observed on-machine as SIGABRT via coredumpctl).
+    // unwind that is a double panic -> SIGABRT before any hardware restore
+    // can run (observed on-machine as SIGABRT via coredumpctl).
     let init_result = ratatui::try_init();
     let result = match init_result {
         Ok(terminal) => {
@@ -149,7 +176,7 @@ fn main() -> Result<()> {
             let mut terminal = std::mem::ManuallyDrop::new(terminal);
             install_tty_safe_panic_hook();
             spawn_input_thread(ui_tx);
-            let result = run(&mut terminal, &ui_rx, telemetry.as_mut(), &term_flag);
+            let result = run(&mut terminal, &ui_rx, &telemetry, &term_flag);
             // try_restore, NOT restore(): restore() reports failure via
             // eprintln!, which itself panics when stderr is a dead tty (e.g.
             // the terminal hung up). Verified on-machine via pty-hangup repro.
@@ -165,7 +192,17 @@ fn main() -> Result<()> {
     };
 
     shutdown.store(true, Ordering::Relaxed);
-    if let Some(t) = telemetry.as_mut() {
+    // Controller FIRST: Quit makes it restore hardware; joining before any
+    // other teardown guarantees stock state is back even if a later step
+    // hangs. A send failure means the controller already exited (it restores
+    // on channel disconnect too) — the join below still reaps it.
+    if cmd_tx.send(Command::Quit).is_err() {
+        tracing::warn!("controller already gone at shutdown");
+    }
+    if ctl.join().is_err() {
+        tracing::error!("controller thread panicked");
+    }
+    if let Some(t) = telemetry::lock(&telemetry).as_mut() {
         t.flush();
     }
     if sampler.join().is_err() {
@@ -185,7 +222,7 @@ fn main() -> Result<()> {
 fn run(
     terminal: &mut ratatui::DefaultTerminal,
     rx: &Receiver<Event>,
-    mut telemetry: Option<&mut Telemetry>,
+    telemetry: &Mutex<Option<Telemetry>>,
     term_flag: &AtomicBool,
 ) -> Result<()> {
     let mut model = Model::new();
@@ -202,8 +239,10 @@ fn run(
                 // model before spending a draw on it.
                 let mut next = Some(first);
                 while let Some(ev) = next {
-                    if let (Event::Sample(s), Some(t)) = (&ev, telemetry.as_deref_mut()) {
-                        t.log(&Record::Sample(s));
+                    if let Event::Sample(s) = &ev {
+                        if let Some(t) = telemetry::lock(telemetry).as_mut() {
+                            t.log(&Record::Sample(s));
+                        }
                     }
                     model.update(ev);
                     next = rx.try_recv().ok();

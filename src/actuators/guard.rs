@@ -1,14 +1,28 @@
-//! RestoreGuard: RAII hardware restore on every exit path (design doc §5).
+//! Hardware restore on every exit path (design doc §5), in two layers:
 //!
-//! Owned by MAIN's stack (not the controller thread): a panicking main kills
-//! other threads without running their drops, but unwinds its own stack, so
-//! the guard's Drop runs on normal return, on `?`-propagation and on panic.
+//! - [`RestoreGuard`] owns the working actuators and moves INTO the
+//!   controller thread (the only place hardware writes happen). On clean
+//!   shutdown (Command::Quit or command-channel disconnect) the controller
+//!   runs `restore_all` itself, flips the shared `restored` flag, and main
+//!   joins it before exiting.
+//! - [`FinalRestore`] sits on MAIN's stack as the safety net for the paths
+//!   where the controller thread never gets to restore: a panicking main
+//!   kills other threads without running their drops, but unwinds its own
+//!   stack. Its Drop checks `restored`; if the controller didn't get there,
+//!   it rebuilds fresh short-lived actuators and runs the same best-effort
+//!   restore sequence. Restores are idempotent, so the race where both
+//!   layers restore is harmless.
+//!
 //! Signals (SIGINT/SIGTERM/SIGHUP) are funneled into the normal return path
 //! by main's `term_flag`; SIGKILL cannot be caught — `startup_reset` on the
 //! *next* run covers that hole.
 
-use super::cmd::Runner;
-use super::cpu::CpuActuator;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use super::cmd::{RealRunner, Runner};
+use super::cpu::{CpuActuator, PLATFORM_PROFILE_PATH};
 use super::gpu::GpuActuator;
 use super::smu_module::SmuModule;
 
@@ -91,6 +105,73 @@ impl<R: Runner> Drop for RestoreGuard<R> {
     }
 }
 
+/// Main-stack safety net for the panic path (see module doc). Holds no
+/// actuators — the working ones live in the controller thread — and only
+/// constructs fresh short-lived ones in Drop if the controller never
+/// restored (`restored` still false).
+pub struct FinalRestore {
+    /// Flipped by the controller thread after its `restore_all` ran.
+    restored: Arc<AtomicBool>,
+    /// Whether startup unloaded ryzen_smu (so the fresh restore must reload it).
+    smu_was_unloaded: bool,
+    /// Test seam: when set, Drop records that the fresh-actuator restore
+    /// WOULD have run instead of touching real hardware/NVML.
+    #[cfg(test)]
+    probe: Option<Arc<AtomicBool>>,
+}
+
+impl FinalRestore {
+    pub fn new(restored: Arc<AtomicBool>, smu_was_unloaded: bool) -> Self {
+        Self {
+            restored,
+            smu_was_unloaded,
+            #[cfg(test)]
+            probe: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_probe(
+        restored: Arc<AtomicBool>,
+        smu_was_unloaded: bool,
+        probe: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            restored,
+            smu_was_unloaded,
+            probe: Some(probe),
+        }
+    }
+}
+
+impl Drop for FinalRestore {
+    fn drop(&mut self) {
+        if self.restored.load(Ordering::SeqCst) {
+            tracing::debug!("final restore: controller already restored, nothing to do");
+            return;
+        }
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.store(true, Ordering::SeqCst);
+            return;
+        }
+        tracing::warn!(
+            "final restore: controller never restored (panic path?); \
+             restoring with fresh actuators"
+        );
+        let cpu = CpuActuator::new(RealRunner, PathBuf::from(PLATFORM_PROFILE_PATH));
+        let gpu = match GpuActuator::new() {
+            Ok(gpu) => Some(gpu),
+            Err(e) => {
+                tracing::warn!("final restore: GPU actuator unavailable: {e}");
+                None
+            }
+        };
+        let smu = self.smu_was_unloaded.then(SmuModule::assume_unloaded);
+        RestoreGuard::new(RealRunner, Some(cpu), gpu, smu).restore_all();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,7 +212,7 @@ mod tests {
             &runner,
             Some(cpu_actuator(&runner, path.clone())),
             None, // GPU needs NVML hardware; untestable here
-            Some(SmuModule::unloaded_for_test()),
+            Some(SmuModule::assume_unloaded()),
         );
 
         guard.restore_all();
@@ -158,12 +239,8 @@ mod tests {
         let runner = FakeRunner::new();
         // CPU restore fails: the profile file does not exist.
         let cpu = cpu_actuator(&runner, PathBuf::from("/nonexistent/platform_profile"));
-        let mut guard = RestoreGuard::new(
-            &runner,
-            Some(cpu),
-            None,
-            Some(SmuModule::unloaded_for_test()),
-        );
+        let mut guard =
+            RestoreGuard::new(&runner, Some(cpu), None, Some(SmuModule::assume_unloaded()));
 
         guard.restore_all();
 
@@ -179,11 +256,41 @@ mod tests {
                 &runner,
                 None,
                 None,
-                Some(SmuModule::unloaded_for_test()),
+                Some(SmuModule::assume_unloaded()),
             );
         } // dropped here
 
         assert_eq!(modprobe_reload_calls(&runner), 1);
+    }
+
+    #[test]
+    fn final_restore_is_noop_when_controller_already_restored() {
+        let restored = Arc::new(AtomicBool::new(true));
+        let probe = Arc::new(AtomicBool::new(false));
+        drop(FinalRestore::with_probe(
+            Arc::clone(&restored),
+            true,
+            Arc::clone(&probe),
+        ));
+        assert!(
+            !probe.load(Ordering::SeqCst),
+            "restored=true must short-circuit before any actuator construction"
+        );
+    }
+
+    #[test]
+    fn final_restore_fires_when_controller_never_restored() {
+        let restored = Arc::new(AtomicBool::new(false));
+        let probe = Arc::new(AtomicBool::new(false));
+        drop(FinalRestore::with_probe(
+            Arc::clone(&restored),
+            false,
+            Arc::clone(&probe),
+        ));
+        assert!(
+            probe.load(Ordering::SeqCst),
+            "restored=false must reach the fresh-actuator restore path"
+        );
     }
 
     #[test]
@@ -194,7 +301,7 @@ mod tests {
             &runner,
             Some(cpu_actuator(&runner, path.clone())),
             None,
-            Some(SmuModule::unloaded_for_test()),
+            Some(SmuModule::assume_unloaded()),
         );
 
         guard.startup_reset();

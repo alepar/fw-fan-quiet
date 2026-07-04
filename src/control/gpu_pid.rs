@@ -129,9 +129,11 @@ impl GpuPid {
                 last.saturating_add(RATE_LIMIT_MHZ),
             );
             saturated |= limited != clock;
-            // Between `clock` and `last`, both within [floor, ceiling], so
-            // the rate limit cannot push us back out of the clamp range.
-            clock = limited;
+            // `last` may predate a floor RAISE, in which case the rate limit
+            // could hold us below the new floor for a few steps — floors win
+            // over rate limits project-wide (allocator does the same), so
+            // re-clamp to the floor last.
+            clock = limited.max(gpu_floor_mhz);
         }
 
         self.saturated = saturated;
@@ -167,6 +169,26 @@ mod tests {
     use crate::calib::lut_sweep::SWEEP_CLOCKS;
 
     const FLOOR: u32 = 1000;
+
+    #[test]
+    fn raised_floor_wins_over_rate_limit() {
+        // Converge low, then raise the floor far above: the very next output
+        // must sit AT the new floor, not ramp up at 105 MHz/step.
+        let lut = exact_lut();
+        let mut pid = GpuPid::new();
+        pid.set_target_w(35.0); // ~1375 MHz on the plant
+        let mut clock = 1500;
+        for _ in 0..20 {
+            if let Some(c) = pid.update(plant(clock), &lut, FLOOR) {
+                clock = c;
+            }
+        }
+        assert!(clock < 1500, "premise: converged below 1500");
+        let out = pid
+            .update(plant(clock), &lut, 2500)
+            .expect("floor raise forces a clock change");
+        assert_eq!(out, 2500, "floor must win over the rate limit");
+    }
 
     /// Simulated plant: watts drawn at a locked clock. 1500 MHz → 40 W,
     /// 2800 MHz → 92 W. Electrical response is sub-second, so at the 1 Hz

@@ -314,6 +314,7 @@ mod tests {
             cpu_limit_w: Some(20.0),
             gpu_max_mhz: Some(1500),
             fan_target_rpm: 2500.0,
+            trim_rpm: 0.0,
             flags: vec![StatusFlag::Resumed],
             calib: None,
         };
@@ -500,6 +501,7 @@ mod tests {
             cpu_limit_w: Some(20.0),
             gpu_max_mhz: Some(1500),
             fan_target_rpm: 2500.0,
+            trim_rpm: 0.0,
             flags: vec![],
             calib: None,
         }));

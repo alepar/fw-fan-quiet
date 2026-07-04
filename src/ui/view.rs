@@ -89,6 +89,14 @@ fn header_line(model: &Model) -> Line<'static> {
             model.fan_target_rpm
         )),
     ];
+    // Ambient trim (Auto mode): informational, so dim — the loud version of
+    // this signal is the TargetUnreachable flag below.
+    if model.status.trim_rpm != 0.0 {
+        spans.push(Span::styled(
+            format!(" | trim {:+.0}rpm", model.status.trim_rpm),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
     for flag in &model.status.flags {
         spans.push(Span::raw(" | "));
         spans.push(match flag {
@@ -100,6 +108,13 @@ fn header_line(model: &Model) -> Line<'static> {
             StatusFlag::NotCalibrated => Span::styled(
                 "NOT CALIBRATED (press k to calibrate)",
                 Style::default().fg(Color::Yellow),
+            ),
+            // No parenthetical hint: with the trim indicator also shown the
+            // header would overflow a 120-col terminal ("check intake/
+            // ambient" lives in the flag's doc + design notes).
+            StatusFlag::TargetUnreachable => Span::styled(
+                "TARGET UNREACHABLE",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
         });
     }
@@ -423,6 +438,7 @@ mod tests {
             cpu_limit_w: Some(20.0),
             gpu_max_mhz: Some(1500),
             fan_target_rpm: 2500.0,
+            trim_rpm: 0.0,
             flags: vec![StatusFlag::LimitNotSticking, StatusFlag::Resumed],
             calib: None,
         }));
@@ -460,6 +476,7 @@ mod tests {
             cpu_limit_w: Some(20.0),
             gpu_max_mhz: None,
             fan_target_rpm: 3000.0,
+            trim_rpm: 0.0,
             flags: vec![StatusFlag::LimitNotSticking],
             calib: None,
         }));
@@ -501,6 +518,7 @@ mod tests {
             cpu_limit_w: Some(17.0),
             gpu_max_mhz: Some(1653),
             fan_target_rpm: 3000.0,
+            trim_rpm: 0.0,
             flags: vec![],
             calib: None,
         }));
@@ -518,6 +536,77 @@ mod tests {
         );
     }
 
+    // --- Task 26: trim + TargetUnreachable in the header ---
+
+    #[test]
+    fn header_shows_trim_dim_when_nonzero() {
+        use crate::control::ControlStatus;
+        use crate::control::controller::Mode;
+        let mut m = Model::new();
+        m.update(Event::Status(ControlStatus {
+            mode: Mode::Auto,
+            cpu_limit_w: Some(17.0),
+            gpu_max_mhz: Some(1653),
+            fan_target_rpm: 3000.0,
+            trim_rpm: 123.0,
+            flags: vec![],
+            calib: None,
+        }));
+        let terminal = draw(&m);
+        let header = row_text(&terminal, 0);
+        assert!(header.contains("trim +123rpm"), "header was: {header:?}");
+        let x = header.find("trim +123rpm").unwrap() as u16;
+        let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
+        assert_eq!(cell.fg, Color::DarkGray, "trim must render dim");
+
+        // Negative trim shows its sign too.
+        m.update(Event::Status(ControlStatus {
+            mode: Mode::Auto,
+            cpu_limit_w: Some(17.0),
+            gpu_max_mhz: Some(1653),
+            fan_target_rpm: 3000.0,
+            trim_rpm: -17.0,
+            flags: vec![],
+            calib: None,
+        }));
+        let header = row_text(&draw(&m), 0);
+        assert!(header.contains("trim -17rpm"), "header was: {header:?}");
+    }
+
+    #[test]
+    fn header_hides_trim_when_zero() {
+        // Default status has trim 0: no trim clutter in the header.
+        let header = row_text(&draw(&Model::new()), 0);
+        assert!(!header.contains("trim"), "header was: {header:?}");
+    }
+
+    #[test]
+    fn target_unreachable_flag_is_red_bold() {
+        use crate::control::ControlStatus;
+        use crate::control::controller::{Mode, StatusFlag};
+        use ratatui::style::Modifier;
+        let mut m = Model::new();
+        m.update(Event::Status(ControlStatus {
+            mode: Mode::Auto,
+            cpu_limit_w: Some(15.0),
+            gpu_max_mhz: Some(1200),
+            fan_target_rpm: 3000.0,
+            trim_rpm: 400.0,
+            flags: vec![StatusFlag::TargetUnreachable],
+            calib: None,
+        }));
+        let terminal = draw(&m);
+        let header = row_text(&terminal, 0);
+        let x = header
+            .find("TARGET UNREACHABLE")
+            .expect("flag text present") as u16;
+        // The saturated trim shows alongside (the flag means "pinned at max").
+        assert!(header.contains("trim +400rpm"), "header was: {header:?}");
+        let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
+        assert_eq!(cell.fg, Color::Red);
+        assert!(cell.modifier.contains(Modifier::BOLD));
+    }
+
     #[test]
     fn not_calibrated_flag_renders_yellow_hint() {
         use crate::control::ControlStatus;
@@ -528,6 +617,7 @@ mod tests {
             cpu_limit_w: None,
             gpu_max_mhz: None,
             fan_target_rpm: 3000.0,
+            trim_rpm: 0.0,
             flags: vec![StatusFlag::NotCalibrated],
             calib: None,
         }));
@@ -565,6 +655,7 @@ mod tests {
             cpu_limit_w: Some(30.0),
             gpu_max_mhz: Some(1950),
             fan_target_rpm: 3000.0,
+            trim_rpm: 0.0,
             flags: vec![],
             calib: Some(CalibProgressLite {
                 phase: "matrix".into(),
@@ -616,6 +707,7 @@ mod tests {
             cpu_limit_w: None,
             gpu_max_mhz: None,
             fan_target_rpm: 3000.0,
+            trim_rpm: 0.0,
             flags: vec![],
             calib: Some(CalibProgressLite {
                 phase: "aborted".into(),
@@ -642,6 +734,7 @@ mod tests {
             cpu_limit_w: Some(20.0),
             gpu_max_mhz: Some(1500),
             fan_target_rpm: 3000.0,
+            trim_rpm: 0.0,
             flags: vec![],
             calib: None,
         }));
@@ -656,6 +749,7 @@ mod tests {
             cpu_limit_w: Some(54.0),
             gpu_max_mhz: Some(3090),
             fan_target_rpm: 3000.0,
+            trim_rpm: 0.0,
             flags: vec![],
             calib: None,
         }));

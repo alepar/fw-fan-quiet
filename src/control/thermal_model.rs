@@ -52,9 +52,6 @@ impl std::fmt::Display for FitError {
 
 impl std::error::Error for FitError {}
 
-// TODO(task-26/27): the trim/RLS loops consume `rls_update`; dead until then
-// (the allocator consumes `gpu_watts_on_contour` since Task 25).
-#[allow(dead_code)]
 impl ThermalModel {
     /// Batch least squares via SVD over the 4-column design matrix
     /// `[pc, pg, pc*pg, 1]`.
@@ -108,6 +105,8 @@ impl ThermalModel {
             .fold(0.0, |acc, r| acc.max(r.abs()))
     }
 
+    // TODO(task-27): the RLS loop consumes `rls_update`; dead until then.
+    #[allow(dead_code)]
     /// RLS update with forgetting factor `lambda` (design: 0.99). Initializes
     /// covariance `P = I·1e4` on first use (or after load). Rejects (returns
     /// false, no state change) any update that would make `a` or `b` negative

@@ -1,0 +1,219 @@
+//! Bounded ambient trim integrator (design doc §3; research 03 §6 "bounded
+//! integrator authority — the key safeguard").
+//!
+//! Slowest tier of the control cascade: integrates (measured − predicted)
+//! fan RPM at the current operating point into an offset added to the
+//! thermal model's `c` (via `gpu_watts_on_contour`'s trim argument), so
+//! ambient/airflow/dust drift is absorbed without refitting the model.
+//! Positive offset ⇒ the model under-predicted (real fans run higher than
+//! predicted at this power) ⇒ the contour shifts DOWN and commands fewer
+//! watts.
+//!
+//! The safety contract (research 03 §6): the offset saturates at
+//! [`MAX_TRIM_AUTHORITY_RPM`], so a wrong model / blocked intake can cut the
+//! budget by a bounded amount only — and the allocator's floors clamp even
+//! that (floors > trim, project-wide invariant). Once the +max is pinned the
+//! controller surfaces `StatusFlag::TargetUnreachable` instead of silently
+//! collapsing performance.
+
+/// Integration cadence, seconds (design §3: "every 20 s, minutes-scale time
+/// constant"). Gated on `t_mono` like the controller's reassert; must stay
+/// far slower than the 30–90 s fan settling divided by the gain — see
+/// [`KI_TRIM`].
+pub const TRIM_PERIOD_S: f64 = 20.0;
+
+/// Integrator gain, dimensionless (RPM offset per RPM of error, per update).
+/// With the 20 s cadence the effective time constant is TRIM_PERIOD_S /
+/// KI_TRIM = 400 s ≈ 7 minutes — "minutes-scale", per design §3, so the
+/// integrator can never fight the 30–90 s thermal lag and hunt.
+pub const KI_TRIM: f64 = 0.05;
+
+/// Hard bound on the offset, RPM (research 03 §6: cap the *total* cumulative
+/// correction). 400 RPM ≈ 25% of the typical 1500–3000 RPM operating band,
+/// which — through the model's fan-per-watt slopes — corresponds to the
+/// design's "total correction ≤ 25% budget reduction" (e.g. at b ≈ 15 RPM/W
+/// a 400 RPM trim is a ~27 W GPU cut out of the ~100 W envelope).
+pub const MAX_TRIM_AUTHORITY_RPM: f64 = 400.0;
+
+/// Bounded trim integrator state. Owned by the controller's Auto-mode loop
+/// state, so it drops (resets) on Auto exit and starts fresh on re-entry;
+/// it deliberately survives fan-target changes (ambient didn't change).
+#[derive(Debug, Clone, Default)]
+pub struct Trim {
+    /// Cumulative offset added to the model's `c`, clamped to
+    /// ±[`MAX_TRIM_AUTHORITY_RPM`].
+    offset_rpm: f64,
+    /// `t_mono` of the last cadence-consuming update; None until the first.
+    last_update_t: Option<f64>,
+}
+
+impl Trim {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Current offset (RPM), to pass as `gpu_watts_on_contour`'s trim arg.
+    pub fn offset_rpm(&self) -> f64 {
+        self.offset_rpm
+    }
+
+    /// One gated integration step; returns true iff the offset changed.
+    ///
+    /// The CALLER owns the steadiness verdict: it must only call this when
+    /// the fan window is steady (`calib::steady::is_steady`) and the sample
+    /// is fan-valid — never integrate on transients or lost sensors.
+    ///
+    /// Cadence: the FIRST steady call integrates immediately (the caller's
+    /// gate already guarantees 20 steady samples behind it, so the error is
+    /// trustworthy) and pins the baseline; subsequent calls integrate only
+    /// once [`TRIM_PERIOD_S`] has elapsed since the last consuming call.
+    /// A due call with zero error still advances the baseline (steady +
+    /// zero error is a *measurement*, not a skip — retrying it at 1 Hz
+    /// would just burn cycles).
+    ///
+    /// Anti-windup: plain clamp to ±[`MAX_TRIM_AUTHORITY_RPM`]. There is no
+    /// hidden state to wind past the bound (the offset IS the state), so
+    /// back-calculation buys nothing at this 20 s cadence — an error sign
+    /// flip walks back from the clamp on the very next update.
+    pub fn update(&mut self, t_mono: f64, measured_rpm: f64, predicted_rpm: f64) -> bool {
+        if let Some(last) = self.last_update_t
+            && t_mono - last < TRIM_PERIOD_S
+        {
+            return false;
+        }
+        // Defensive: a non-finite reading must neither poison the offset
+        // nor consume the cadence slot (callers already gate validity).
+        if !measured_rpm.is_finite() || !predicted_rpm.is_finite() {
+            return false;
+        }
+        self.last_update_t = Some(t_mono);
+        let next = (self.offset_rpm + KI_TRIM * (measured_rpm - predicted_rpm))
+            .clamp(-MAX_TRIM_AUTHORITY_RPM, MAX_TRIM_AUTHORITY_RPM);
+        let changed = next != self.offset_rpm;
+        self.offset_rpm = next;
+        changed
+    }
+
+    /// Back to zero offset and no baseline. The controller resets by
+    /// dropping its whole Auto loop state instead; kept as the explicit API
+    /// for callers that hold on to a Trim.
+    #[allow(dead_code)]
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_starts_at_zero() {
+        assert_eq!(Trim::new().offset_rpm(), 0.0);
+    }
+
+    #[test]
+    fn first_steady_call_integrates_immediately() {
+        let mut t = Trim::new();
+        // The caller's steadiness gate is the trust source: the first call
+        // may integrate right away (documented decision).
+        assert!(t.update(100.0, 2100.0, 2000.0));
+        assert!((t.offset_rpm() - KI_TRIM * 100.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn integrates_at_20s_cadence_only() {
+        let mut t = Trim::new();
+        assert!(t.update(0.0, 2100.0, 2000.0)); // baseline + first step
+        let after_first = t.offset_rpm();
+        // Anything under 20 s since the last consuming call: no update.
+        assert!(!t.update(10.0, 2100.0, 2000.0));
+        assert!(!t.update(19.9, 2100.0, 2000.0));
+        assert_eq!(t.offset_rpm(), after_first);
+        // 20 s elapsed: integrates again.
+        assert!(t.update(20.0, 2100.0, 2000.0));
+        assert!((t.offset_rpm() - 2.0 * KI_TRIM * 100.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn zero_error_advances_the_baseline_without_change() {
+        let mut t = Trim::new();
+        assert!(t.update(0.0, 2100.0, 2000.0));
+        // Due update with zero error: no change reported...
+        assert!(!t.update(20.0, 2000.0, 2000.0));
+        // ...but it consumed the cadence slot: 10 s later is still gated.
+        assert!(!t.update(30.0, 2100.0, 2000.0));
+        assert!(t.update(40.0, 2100.0, 2000.0));
+    }
+
+    #[test]
+    fn sign_measured_above_predicted_is_positive() {
+        // Model under-predicts (real fans louder) → positive offset →
+        // contour commands FEWER watts (the contour subtracts the trim).
+        let mut t = Trim::new();
+        t.update(0.0, 2300.0, 2000.0);
+        assert!(t.offset_rpm() > 0.0);
+        let mut t = Trim::new();
+        t.update(0.0, 1700.0, 2000.0);
+        assert!(t.offset_rpm() < 0.0);
+    }
+
+    #[test]
+    fn sustained_error_walks_to_cap_and_stops() {
+        let mut t = Trim::new();
+        // +300 RPM error = +15 RPM per update: reaches +400 in 27 updates.
+        for i in 0..40 {
+            t.update(f64::from(i) * 20.0, 2300.0, 2000.0);
+            assert!(t.offset_rpm() <= MAX_TRIM_AUTHORITY_RPM);
+        }
+        assert_eq!(t.offset_rpm(), MAX_TRIM_AUTHORITY_RPM);
+        // Pinned: further same-sign updates change nothing (returns false).
+        assert!(!t.update(1000.0, 2300.0, 2000.0));
+        assert_eq!(t.offset_rpm(), MAX_TRIM_AUTHORITY_RPM);
+    }
+
+    #[test]
+    fn no_windup_past_the_clamp_sign_flip_walks_back_immediately() {
+        let mut t = Trim::new();
+        // Slam into the +400 clamp with huge errors for a long time.
+        for i in 0..50 {
+            t.update(f64::from(i) * 20.0, 9000.0, 2000.0);
+        }
+        assert_eq!(t.offset_rpm(), MAX_TRIM_AUTHORITY_RPM);
+        // First opposite-sign update moves off the clamp by exactly one
+        // step — no hidden wound-up state to burn off first.
+        assert!(t.update(2000.0, 1900.0, 2000.0));
+        assert!((t.offset_rpm() - (MAX_TRIM_AUTHORITY_RPM - KI_TRIM * 100.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn clamps_at_negative_max_too() {
+        let mut t = Trim::new();
+        for i in 0..50 {
+            t.update(f64::from(i) * 20.0, 2000.0, 9000.0);
+        }
+        assert_eq!(t.offset_rpm(), -MAX_TRIM_AUTHORITY_RPM);
+    }
+
+    #[test]
+    fn non_finite_inputs_are_ignored_and_do_not_consume_the_slot() {
+        let mut t = Trim::new();
+        assert!(!t.update(0.0, f64::NAN, 2000.0));
+        assert!(!t.update(1.0, 2100.0, f64::INFINITY));
+        assert_eq!(t.offset_rpm(), 0.0);
+        // The garbage calls did not pin a baseline: a clean first call
+        // still integrates immediately.
+        assert!(t.update(2.0, 2100.0, 2000.0));
+    }
+
+    #[test]
+    fn reset_clears_offset_and_baseline() {
+        let mut t = Trim::new();
+        t.update(0.0, 2300.0, 2000.0);
+        assert_ne!(t.offset_rpm(), 0.0);
+        t.reset();
+        assert_eq!(t.offset_rpm(), 0.0);
+        // Baseline gone too: the next call integrates immediately.
+        assert!(t.update(1.0, 2100.0, 2000.0));
+    }
+}

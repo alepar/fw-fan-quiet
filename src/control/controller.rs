@@ -22,11 +22,13 @@ use crate::actuators::cmd::Runner;
 use crate::actuators::guard::RestoreGuard;
 use crate::calib::burner::Burner;
 use crate::calib::runner::{CalibRunner, RunnerEffect};
+use crate::calib::steady::{STEADY_N, STEADY_RPM_TOLERANCE, is_steady};
 use crate::config::Config;
 use crate::control::allocator::{self, AllocInput, Allocator};
 use crate::control::gpu_pid::GpuPid;
 use crate::control::lut::ClockWattsLut;
 use crate::control::thermal_model::ThermalModel;
+use crate::control::trim::{MAX_TRIM_AUTHORITY_RPM, Trim};
 use crate::event::Event;
 use crate::state::PersistedState;
 use crate::telemetry::{self, Record, Telemetry};
@@ -49,6 +51,13 @@ const STICKINESS_MARGIN_W: f64 = 5.0;
 const STICKINESS_SAMPLES: u8 = 3;
 /// How long the `Resumed` flag stays visible after a suspend/resume.
 const RESUMED_FLAG_S: f64 = 30.0;
+/// Cap on the Auto-mode fan-RPM window feeding the trim integrator's
+/// steadiness gate (`is_steady` needs STEADY_N=20; a little slack beyond
+/// that is harmless).
+const FAN_WINDOW_CAP: usize = 30;
+/// `TargetUnreachable` clears once the trim offset drops below this fraction
+/// of its +max — hysteresis so the flag doesn't flicker at the bound.
+const TRIM_CLEAR_FRACTION: f64 = 0.9;
 /// Fan target clamp range (RPM); the Auto-mode allocator consumes the
 /// target live via `status.fan_target_rpm`.
 const FAN_TARGET_MIN_RPM: f64 = 1000.0;
@@ -119,6 +128,13 @@ pub enum StatusFlag {
     /// Auto mode was requested without a calibrated model + LUT. Cleared on
     /// a successful Auto entry or when a calibration lands its fit.
     NotCalibrated,
+    /// The trim integrator is pinned at its +max authority: the model
+    /// persistently under-predicts and even the maximum budget cut cannot
+    /// reach the fan target — fans above target, check intake/ambient
+    /// (research 03 §6: surface a status when the floor is hit instead of
+    /// silently collapsing performance). Clears once the offset drops below
+    /// [`TRIM_CLEAR_FRACTION`] of max.
+    TargetUnreachable,
 }
 
 impl StatusFlag {
@@ -128,6 +144,7 @@ impl StatusFlag {
             StatusFlag::LimitNotSticking => "limit_not_sticking",
             StatusFlag::Resumed => "resumed",
             StatusFlag::NotCalibrated => "not_calibrated",
+            StatusFlag::TargetUnreachable => "target_unreachable",
         }
     }
 }
@@ -143,6 +160,9 @@ pub struct ControlStatus {
     pub gpu_max_mhz: Option<u32>,
     /// Stored fan target (RPM); the Auto-mode allocator consumes it live.
     pub fan_target_rpm: f64,
+    /// Current trim offset (RPM); nonzero only in Auto mode. Positive =
+    /// model under-predicts = budget cut (shown dim in the UI header).
+    pub trim_rpm: f64,
     /// Currently active flags.
     pub flags: Vec<StatusFlag>,
     /// Calibration wizard progress; Some exactly while Calibrating.
@@ -158,6 +178,7 @@ impl Default for ControlStatus {
             cpu_limit_w: None,
             gpu_max_mhz: None,
             fan_target_rpm: DEFAULT_FAN_TARGET_RPM,
+            trim_rpm: 0.0,
             flags: Vec::new(),
             calib: None,
         }
@@ -209,6 +230,14 @@ struct AutoState {
     last_alloc: Option<f64>,
     /// Current PI watts target (allocator output); demand input next step.
     gpu_target_w: Option<f64>,
+    /// Bounded ambient trim integrator (Task 26). Lives here so it resets
+    /// on Auto exit (fresh on re-entry) but survives fan-target changes
+    /// (ambient didn't change).
+    trim: Trim,
+    /// Fan-RPM window feeding the trim steadiness gate; fan-invalid samples
+    /// land as NaN (the charts/steady.rs convention), so `is_steady` rejects
+    /// any tail spanning a sensor outage — never integrate across one.
+    fan_window: std::collections::VecDeque<f64>,
 }
 
 impl AutoState {
@@ -218,6 +247,8 @@ impl AutoState {
             allocator: Allocator::new(),
             last_alloc: None,
             gpu_target_w: None,
+            trim: Trim::new(),
+            fan_window: std::collections::VecDeque::new(),
         }
     }
 }
@@ -634,6 +665,18 @@ impl<R: Runner> Controller<R> {
         let model = self.model.as_ref().expect("checked above");
         let lut = self.lut.as_ref().expect("checked above");
 
+        // Trim steadiness window: fan-invalid samples land as NaN (the
+        // steady.rs convention) so the 20-sample steady tail can never span
+        // a sensor outage — an outage restarts the settling clock.
+        if auto.fan_window.len() >= FAN_WINDOW_CAP {
+            auto.fan_window.pop_front();
+        }
+        auto.fan_window.push_back(if s.fan_valid {
+            s.max_fan_rpm()
+        } else {
+            f64::NAN
+        });
+
         // Allocator step, every ALLOC_PERIOD_S (first sample after entry
         // included: last_alloc starts None).
         if auto
@@ -648,8 +691,12 @@ impl<R: Runner> Controller<R> {
                 self.status.gpu_max_mhz,
             );
             let target_rpm = self.status.fan_target_rpm;
-            // TODO(task-26): the trim integrator's offset replaces the 0.0.
-            let contour = |pc: f64| model.gpu_watts_on_contour(target_rpm, 0.0, pc);
+            // Positive trim shifts the contour down (fewer watts): the model
+            // under-predicted, so the real machine needs a smaller budget to
+            // hit the target. Floors still win — the allocator/PI clamps
+            // bound the trim's effect (design invariant: floors > trim).
+            let trim_rpm = auto.trim.offset_rpm();
+            let contour = |pc: f64| model.gpu_watts_on_contour(target_rpm, trim_rpm, pc);
             let (cpu_w, gpu_w) = auto.allocator.step(&AllocInput {
                 contour: &contour,
                 demand,
@@ -726,6 +773,44 @@ impl<R: Runner> Controller<R> {
                     }
                 },
             }
+        }
+
+        // Trim integrator, last (after allocator + PI, so it sees this
+        // sample's allocation): every TRIM_PERIOD_S, and ONLY when the fan
+        // window is steady and the sample fan-valid — never integrate on
+        // transients or lost sensors (design invariant; non-steady/invalid
+        // samples freeze the trim exactly like they freeze the allocator).
+        // predicted = model at the CURRENT operating point (applied CPU
+        // allocation, PI watts target); measured−predicted is the ambient/
+        // airflow drift the model doesn't know about.
+        if s.fan_valid
+            && is_steady(
+                auto.fan_window.make_contiguous(),
+                STEADY_N,
+                STEADY_RPM_TOLERANCE,
+            )
+            && let (Some(cpu_w), Some(gpu_w)) = (self.status.cpu_limit_w, auto.gpu_target_w)
+        {
+            let predicted = model.predict(cpu_w, gpu_w);
+            if auto.trim.update(s.t_mono, s.max_fan_rpm(), predicted) {
+                self.status.trim_rpm = auto.trim.offset_rpm();
+                cause.get_or_insert("auto:trim");
+            }
+        }
+
+        // Saturated at +max: even the maximum budget cut cannot reach the
+        // target — surface it instead of silently losing performance
+        // (research 03 §6). Hysteresis: clears below 90% of max. The cause
+        // is claimed only on an actual flag TRANSITION, so a later stage's
+        // status change in the same sample can't get mislabeled "auto:trim".
+        let offset = auto.trim.offset_rpm();
+        let flagged = self.status.flags.contains(&StatusFlag::TargetUnreachable);
+        if offset >= MAX_TRIM_AUTHORITY_RPM && !flagged {
+            self.add_flag(StatusFlag::TargetUnreachable);
+            cause.get_or_insert("auto:trim");
+        } else if offset < TRIM_CLEAR_FRACTION * MAX_TRIM_AUTHORITY_RPM && flagged {
+            self.remove_flag(StatusFlag::TargetUnreachable);
+            cause.get_or_insert("auto:trim");
         }
     }
 
@@ -899,6 +984,10 @@ impl<R: Runner> Controller<R> {
         self.status.cpu_limit_w = None;
         self.status.gpu_max_mhz = None;
         self.status.mode = Mode::Monitor;
+        // Trim state lives in AutoState (dropped by every Auto exit path
+        // before reaching here); mirror the reset into the visible status.
+        self.status.trim_rpm = 0.0;
+        self.remove_flag(StatusFlag::TargetUnreachable);
         self.remove_flag(StatusFlag::LimitNotSticking);
         self.stick_violations = 0;
         self.last_reassert = None;
@@ -1093,6 +1182,10 @@ fn apply_effects<R: Runner>(
             alloc_gpu_w: auto_alloc.map(|a| a.3),
             // The allocator's gpu_w IS the PI target (set_target_w).
             pi_target_w: auto_alloc.map(|a| a.3),
+            // Every Auto-mode decision carries the current trim (offline
+            // analysis wants the trim context on allocate lines too);
+            // non-auto lines skip it to stay lean.
+            trim_rpm: (status.mode == Mode::Auto).then_some(status.trim_rpm),
         };
         if let Some(t) = telemetry::lock(telemetry).as_mut() {
             t.log(&record);
@@ -2519,6 +2612,256 @@ mod tests {
         ctl.on_sample(&busy_at(1.0));
         assert_eq!(gpu_sets(&gpu_calls), vec![1500, 1605]);
         assert_eq!(ctl.status().gpu_max_mhz, Some(1605));
+    }
+
+    // --- Task 26: trim integrator ---
+
+    use crate::control::trim::MAX_TRIM_AUTHORITY_RPM;
+
+    /// `busy_at` with a chosen fan reading (the trim window watches the fan).
+    fn busy_fan_at(t: f64, fan_rpm: f64) -> Sample {
+        Sample {
+            fan1_rpm: fan_rpm,
+            ..busy_at(t)
+        }
+    }
+
+    fn has_status_cause(effects: &[Effect], want: &str) -> bool {
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::StatusChanged { cause } if *cause == want))
+    }
+
+    #[test]
+    fn steady_auto_samples_move_trim_toward_model_error() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu_calls) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+
+        // 19 steady samples (t=0..=18): window not yet 20 long — no trim.
+        for t in 0..19 {
+            ctl.on_sample(&busy_at(f64::from(t)));
+            assert_eq!(ctl.status().trim_rpm, 0.0, "trim moved early at t={t}");
+        }
+
+        // 20th steady sample: first trim update. Allocation is (23, 38)
+        // (four +2 steps from the conservative start), so the model
+        // predicts 25*23 + 15*38 + 0.1*23*38 + 800 = 2032.4 RPM; measured
+        // 1700 → error -332.4 → trim = -16.62 (model OVER-predicts here,
+        // so the offset goes negative = more budget).
+        let effects = ctl.on_sample(&busy_at(19.0));
+        assert!(has_status_cause(&effects, "auto:trim"), "got {effects:?}");
+        let trim = ctl.status().trim_rpm;
+        assert!((trim - (-16.62)).abs() < 0.01, "trim = {trim}");
+    }
+
+    #[test]
+    fn non_steady_window_freezes_trim() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu_calls) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+
+        // Fan bouncing 1500/1700: spread 200 > the 100 RPM tolerance, so
+        // the window is never steady — the trim must never integrate on a
+        // transient, no matter how long it lasts.
+        for t in 0..=45 {
+            let rpm = if t % 2 == 0 { 1500.0 } else { 1700.0 };
+            ctl.on_sample(&busy_fan_at(f64::from(t), rpm));
+        }
+        assert_eq!(ctl.status().trim_rpm, 0.0);
+    }
+
+    #[test]
+    fn fan_invalid_freezes_trim_and_restarts_the_settling_clock() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu_calls) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+
+        // 18 valid steady samples, then an 8 s fan outage, then valid again:
+        // the outage lands as NaN in the window, so the 20-sample steady
+        // tail restarts — no update may span the gap (a lost sensor must
+        // freeze the trim exactly like it freezes the allocator).
+        for t in 0..18 {
+            ctl.on_sample(&busy_at(f64::from(t)));
+        }
+        for t in 18..26 {
+            let s = Sample {
+                fan_valid: false,
+                ..busy_at(f64::from(t))
+            };
+            ctl.on_sample(&s);
+            assert_eq!(ctl.status().trim_rpm, 0.0, "trim moved on invalid fan");
+        }
+        for t in 26..45 {
+            ctl.on_sample(&busy_at(f64::from(t)));
+            assert_eq!(ctl.status().trim_rpm, 0.0, "tail spans the outage at t={t}");
+        }
+        // 20 clean samples after the outage (t=26..=45): integrates again.
+        ctl.on_sample(&busy_at(45.0));
+        assert_ne!(ctl.status().trim_rpm, 0.0);
+    }
+
+    #[test]
+    fn under_prediction_saturates_trim_flags_unreachable_and_cuts_allocation() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu_calls) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+
+        // Measured fan pinned AT the 3000 RPM target while the model claims
+        // this allocation should be much quieter: the model persistently
+        // under-predicts (blocked intake / hot ambient). The trim must walk
+        // up, saturate at +400 exactly, flag TargetUnreachable — and the
+        // positive trim must shift the contour down so the allocator
+        // commands fewer GPU watts (the end-to-end sign check).
+        let mut peak_gpu: f64 = 0.0;
+        let mut last_gpu: f64 = 0.0;
+        for t in 0..=900 {
+            let effects = ctl.on_sample(&busy_fan_at(f64::from(t), 3000.0));
+            if let Some((_, gpu_w)) = alloc_of(&effects) {
+                peak_gpu = peak_gpu.max(gpu_w);
+                last_gpu = gpu_w;
+            }
+        }
+        assert_eq!(ctl.status().trim_rpm, MAX_TRIM_AUTHORITY_RPM);
+        assert!(
+            ctl.status().flags.contains(&StatusFlag::TargetUnreachable),
+            "saturated +max must surface TargetUnreachable"
+        );
+        // Untrimmed the optimum sits near (54, 41.7); with the full 400 RPM
+        // cut the contour yields (850-400)/20.4 ≈ 22 GPU W.
+        assert!(peak_gpu > 35.0, "peak gpu alloc = {peak_gpu}");
+        assert!(
+            last_gpu < peak_gpu - 5.0 && last_gpu < 30.0,
+            "positive trim must cut the GPU allocation: peak {peak_gpu}, last {last_gpu}"
+        );
+
+        // Recovery (blanket removed): fans drop well below target, the
+        // error flips sign, one update walks the trim off the clamp to
+        // 320 < 360 (90% of max) and the flag clears.
+        for t in 901..=930 {
+            ctl.on_sample(&busy_fan_at(f64::from(t), 1000.0));
+        }
+        assert!(
+            ctl.status().trim_rpm < TRIM_CLEAR_FRACTION * MAX_TRIM_AUTHORITY_RPM,
+            "trim = {}",
+            ctl.status().trim_rpm
+        );
+        assert!(
+            !ctl.status().flags.contains(&StatusFlag::TargetUnreachable),
+            "flag must clear below 90% of max"
+        );
+    }
+
+    #[test]
+    fn auto_exit_resets_trim() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu_calls) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        for t in 0..=19 {
+            ctl.on_sample(&busy_at(f64::from(t)));
+        }
+        assert_ne!(ctl.status().trim_rpm, 0.0, "premise: trim accumulated");
+
+        // SetAuto(false) resets (AutoState drops whole; status mirrors it).
+        ctl.on_command(Command::SetAuto(false));
+        assert_eq!(ctl.status().trim_rpm, 0.0);
+
+        // Re-entry starts fresh and needs a fresh 20-sample steady window.
+        ctl.on_command(Command::SetAuto(true));
+        for t in 100..119 {
+            ctl.on_sample(&busy_at(f64::from(t)));
+            assert_eq!(ctl.status().trim_rpm, 0.0, "stale trim after re-entry");
+        }
+        ctl.on_sample(&busy_at(119.0));
+        assert_ne!(ctl.status().trim_rpm, 0.0);
+
+        // ReleaseAll is the other Auto exit: resets too.
+        ctl.on_command(Command::ReleaseAll);
+        assert_eq!(ctl.status().trim_rpm, 0.0);
+        assert_eq!(ctl.status().mode, Mode::Monitor);
+    }
+
+    #[test]
+    fn fan_target_change_keeps_trim() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu_calls) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        for t in 0..=19 {
+            ctl.on_sample(&busy_at(f64::from(t)));
+        }
+        let trim = ctl.status().trim_rpm;
+        assert_ne!(trim, 0.0, "premise: trim accumulated");
+
+        // Retargeting the fan goal does NOT reset the trim: the ambient
+        // (what the trim measures) didn't change with the user's target.
+        ctl.on_command(Command::SetFanTarget(2500.0));
+        assert_eq!(ctl.status().trim_rpm, trim);
+        assert_eq!(ctl.status().mode, Mode::Auto);
+    }
+
+    #[test]
+    fn trim_decisions_reach_telemetry_with_offset() {
+        let runner = FakeRunner::new();
+        let dir = std::env::temp_dir().join(format!(
+            "bazerame-controller-test-{}-trim-telemetry",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let (mut ctl, _gpu_calls) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+
+        let (ui_tx, _ui_rx) = crossbeam_channel::unbounded();
+        let telemetry = Arc::new(Mutex::new(Some(Telemetry::open(&dir).unwrap())));
+        for t in 0..19 {
+            ctl.on_sample(&busy_at(f64::from(t)));
+        }
+        // t=19: the trim update; t=20: an allocator step using the trim.
+        let effects = ctl.on_sample(&busy_at(19.0));
+        apply_effects(&effects, &ctl, 19.0, &ui_tx, &telemetry);
+        let effects = ctl.on_sample(&busy_at(20.0));
+        apply_effects(&effects, &ctl, 20.0, &ui_tx, &telemetry);
+        // Auto exit: a non-Auto decision afterwards must skip trim_rpm.
+        let effects = ctl.on_command(Command::SetAuto(false));
+        apply_effects(&effects, &ctl, 21.0, &ui_tx, &telemetry);
+        let path = {
+            let mut guard = telemetry::lock(&telemetry);
+            let t = guard.as_mut().unwrap();
+            t.flush();
+            t.path().to_path_buf()
+        };
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let decisions: Vec<serde_json::Value> = contents
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|v: &serde_json::Value| v["kind"] == "decision")
+            .collect();
+
+        let trim_line = decisions
+            .iter()
+            .find(|d| d["cause"] == "auto:trim")
+            .unwrap_or_else(|| panic!("no auto:trim decision in {contents}"));
+        let offset = trim_line["trim_rpm"].as_f64().expect("trim_rpm present");
+        assert!((offset - (-16.62)).abs() < 0.01, "trim_rpm = {offset}");
+
+        // The allocate line right after carries the current trim too.
+        let alloc_line = decisions
+            .iter()
+            .find(|d| d["cause"] == "auto:allocate" && d["t_mono"] == 20.0)
+            .unwrap_or_else(|| panic!("no t=20 allocate decision in {contents}"));
+        assert_eq!(alloc_line["trim_rpm"], trim_line["trim_rpm"]);
+
+        // Non-Auto decisions stay lean: no trim_rpm key.
+        let off_line = decisions
+            .iter()
+            .find(|d| d["cause"] == "auto:off")
+            .unwrap_or_else(|| panic!("no auto:off decision in {contents}"));
+        assert!(
+            off_line.get("trim_rpm").is_none(),
+            "trim_rpm must be skipped outside Auto: {off_line}"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

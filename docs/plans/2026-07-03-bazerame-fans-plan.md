@@ -214,7 +214,17 @@ pub enum Event {
 }
 ```
 Sampler: owns all sensor structs; loop `{ read all → Sample; send to ui_tx and ctl_tx;
-sleep to next 1 s boundary }`. Resume detection: pure function tested first:
+sleep to next 1 s boundary }`.
+
+Sensor validity (review finding from Task 4): hwmon getters and RaplReader return
+`Option` — 0.0 is a legitimate fan/temp reading, so `None` (sensor lost) must stay
+distinguishable. `Sample` gains `fan_valid: bool` and `cpu_temp_valid: bool`
+(+ `cpu_pkg_w` stays f64 with 0.0 flatten — RAPL None on first sample is normal).
+Sampler flattens `None` → 0.0 for the numeric fields but sets validity flags.
+Downstream contract (Tasks 14/26/27/28): trim integrator and RLS updates require
+`fan_valid`; the thermal watchdog treats 10 consecutive invalid `cpu_temp` samples as
+"assume hot" → release caps + `SensorLost` flag. A lost sensor must never be able to
+raise power. Resume detection: pure function tested first:
 ```rust
 #[test]
 fn detects_monotonic_gap() {

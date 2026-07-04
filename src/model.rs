@@ -347,6 +347,15 @@ mod tests {
     }
 
     #[test]
+    fn shift_c_first_press_seeds_then_steps_up() {
+        let mut m = Model::new();
+        assert_eq!(
+            m.update(Event::Input(shift_key('C'))),
+            vec![Command::SetCpuW(42.0)] // 40 seed + 2
+        );
+    }
+
+    #[test]
     fn cpu_clamps_at_bounds_and_stays_idempotent() {
         let mut m = Model::new();
         // Up from the 38 W seed: 8 steps hit the 54 W ceiling.

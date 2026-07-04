@@ -419,6 +419,16 @@ mod tests {
     fn commanded_limit_lines_render_without_panic() {
         use crate::control::ControlStatus;
         use crate::control::controller::Mode;
+        // Limits set with EMPTY rings (Status before first Sample) must not panic.
+        let mut m = Model::new();
+        m.update(Event::Status(ControlStatus {
+            mode: Mode::Manual,
+            cpu_limit_w: Some(20.0),
+            gpu_max_mhz: Some(1500),
+            fan_target_rpm: 3000.0,
+            flags: vec![],
+        }));
+        draw(&m);
         // Some limits + data in the rings...
         let mut m = Model::new();
         for i in 0..50 {

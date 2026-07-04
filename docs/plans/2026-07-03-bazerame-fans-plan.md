@@ -617,6 +617,13 @@ Commit: `feat: bounded ambient trim integrator`.
 
 ### Task 27: Online RLS + trust monitor
 
+**Review finding to honor (Task 20 math review, quantified):** RLS covariance winds up
+at a constant operating point (unexcited directions grow ×(1/λ)/step; diag(P) hits 2.3e8
+after ~1k same-point updates, after which one ±20 RPM noisy sample at a new point jumps
+`e` by ~25%). Gate rls_update on operating-point movement (e.g. skip unless
+|Δpc| + |Δpg| since last accepted update > 2 W) AND cap the covariance trace
+(e.g. if trace(P) > 1e6, rescale P to trace 1e5). Test both gates.
+
 **Files:** Modify `src/control/thermal_model.rs`; create `src/control/trust.rs`.
 
 Wire `rls_update` (λ=0.99) into controller on steady samples in Auto mode. Trust monitor:

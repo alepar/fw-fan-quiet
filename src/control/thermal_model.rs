@@ -128,6 +128,11 @@ impl ThermalModel {
             return false;
         }
         (self.a, self.b, self.e, self.c) = (theta[0], theta[1], theta[2], theta[3]);
+        // TODO(task-27): covariance windup — at a constant operating point the
+        // unexcited directions grow ×(1/λ) per step (measured: diag(P) 1e4 →
+        // 2.3e8 after 1k same-point updates; one noisy sample then jumps `e`
+        // by ~25%). Task 27 must gate updates on operating-point movement
+        // (excitation) or cap the covariance trace before wiring this at 1 Hz.
         self.p = Some((p - k * (x.transpose() * p)) / lambda);
         true
     }
@@ -229,6 +234,27 @@ mod tests {
     fn too_few_points_err() {
         let pts = &exact_points()[..3];
         assert_eq!(ThermalModel::fit_batch(pts), Err(FitError::TooFewPoints));
+    }
+
+    #[test]
+    fn degenerate_collinear_points_err() {
+        // Distinct but collinear (pg = 2·pc): rank-deficient without being
+        // duplicates — pins the rank test against regressing to a
+        // duplicate-only check.
+        let pts: Vec<CalibPoint> = (1..=8)
+            .map(|i| {
+                let pc = f64::from(i) * 5.0;
+                CalibPoint {
+                    cpu_w: pc,
+                    gpu_w: 2.0 * pc,
+                    rpm: 800.0 + 30.0 * pc,
+                }
+            })
+            .collect();
+        assert!(matches!(
+            ThermalModel::fit_batch(&pts),
+            Err(FitError::Degenerate)
+        ));
     }
 
     #[test]

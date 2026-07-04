@@ -32,7 +32,7 @@ task's commit lands. Human-gated items are marked 👤.
 - [x] 19. Clock→watts LUT sweep
 - [x] 20. Thermal model fit + RLS
 - [x] 21. Config + state persistence
-- [ ] 22. Calibration runner + UI wizard 👤 (real ~30-min calibration run)
+- [x] 22. Calibration runner + UI wizard 👤 (real ~30-min calibration run still pending)
 
 ## Milestone 4 — Closed loop
 - [ ] 23. Demand estimator + allocator

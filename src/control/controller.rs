@@ -188,7 +188,8 @@ pub struct Controller<R: Runner> {
     #[allow(dead_code)]
     model: Option<ThermalModel>,
     /// GPU clock→watts LUT, same lifecycle as `model`.
-    /// TODO(task-24): consumed by the GPU watts→clock PI; unread until then.
+    /// TODO(task-25): fed to the GPU watts→clock PI (`gpu_pid`) once the
+    /// Auto-mode loop is wired up; unread until then.
     #[allow(dead_code)]
     lut: Option<ClockWattsLut>,
 }

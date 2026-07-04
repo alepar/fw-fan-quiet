@@ -5,6 +5,7 @@
 
 pub mod allocator;
 pub mod controller;
+pub mod gpu_pid;
 pub mod lut;
 pub mod thermal_model;
 

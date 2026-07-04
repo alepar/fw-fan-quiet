@@ -15,8 +15,6 @@ pub struct ClockWattsLut {
     points: Vec<(u32, f64)>,
 }
 
-// TODO(task-24): the PI loop is the runtime consumer; dead until then.
-#[allow(dead_code)]
 impl ClockWattsLut {
     pub fn new() -> Self {
         Self { points: Vec::new() }
@@ -31,10 +29,14 @@ impl ClockWattsLut {
         }
     }
 
+    // TODO(task-25): len/is_empty/watts_for_clock feed the Auto-mode UI
+    // (calibration summary + predicted watts); test-only until then.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.points.len()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.points.is_empty()
     }
@@ -82,6 +84,7 @@ impl ClockWattsLut {
 
     /// Forward lookup for telemetry/UI: interpolated watts at `mhz`, clamped
     /// to the LUT's clock range at both ends. None if the LUT is empty.
+    #[allow(dead_code)]
     pub fn watts_for_clock(&self, mhz: u32) -> Option<f64> {
         let &(lo_mhz, lo_w) = self.points.first()?;
         let &(hi_mhz, hi_w) = self.points.last()?;

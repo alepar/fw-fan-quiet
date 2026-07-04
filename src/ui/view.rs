@@ -127,11 +127,11 @@ fn header_line(model: &Model) -> Line<'static> {
             // stays released until the user acknowledges (first actuating
             // press re-arms without executing; the second acts normally).
             StatusFlag::ThermalEmergency => Span::styled(
-                "THERMAL EMERGENCY (press a or c/g to acknowledge)",
+                "THERMAL EMERGENCY (press a, c/g or k to acknowledge)",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
             StatusFlag::SensorLost => Span::styled(
-                "SENSOR LOST (press a or c/g to acknowledge)",
+                "SENSOR LOST (press a, c/g or k to acknowledge)",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
         });
@@ -524,7 +524,7 @@ mod tests {
         let terminal = draw(&m);
         let header = row_text(&terminal, 0);
         let x = header
-            .find("THERMAL EMERGENCY (press a or c/g to acknowledge)")
+            .find("THERMAL EMERGENCY (press a, c/g or k to acknowledge)")
             .expect("flag text present") as u16;
         let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
         assert_eq!(cell.fg, Color::Red);
@@ -549,7 +549,7 @@ mod tests {
         let terminal = draw(&m);
         let header = row_text(&terminal, 0);
         let x = header
-            .find("SENSOR LOST (press a or c/g to acknowledge)")
+            .find("SENSOR LOST (press a, c/g or k to acknowledge)")
             .expect("flag text present") as u16;
         let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
         assert_eq!(cell.fg, Color::Red);

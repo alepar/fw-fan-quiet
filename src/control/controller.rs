@@ -632,7 +632,11 @@ impl<R: Runner> Controller<R> {
         match self.watchdog.observe(s) {
             Trip::None => {}
             trip if self.anything_commanded() => return self.emergency_release(trip),
-            _ => self.watchdog.rearm(),
+            trip => {
+                // Diagnostically interesting even with nothing to release.
+                tracing::warn!("watchdog tripped ({trip:?}) in idle Monitor; re-arming");
+                self.watchdog.rearm();
+            }
         }
         if self.status.mode == Mode::Calibrating {
             return self.on_calib_sample(s);

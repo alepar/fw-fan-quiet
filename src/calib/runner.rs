@@ -239,9 +239,12 @@ impl CalibRunner {
         self.gpu_block = false;
         self.note = "aborted".into();
         vec![
+            // Heat source off FIRST: during a thermal-emergency abort the
+            // burner must not keep spinning through the (subprocess-slow)
+            // CPU release.
+            RunnerEffect::StopBurner,
             RunnerEffect::ReleaseCpu,
             RunnerEffect::ReleaseGpu,
-            RunnerEffect::StopBurner,
         ]
     }
 
@@ -872,9 +875,10 @@ mod tests {
         assert_eq!(
             effects,
             vec![
+                // Heat source off first (thermal-emergency ordering).
+                RunnerEffect::StopBurner,
                 RunnerEffect::ReleaseCpu,
                 RunnerEffect::ReleaseGpu,
-                RunnerEffect::StopBurner,
             ]
         );
         assert_eq!(*runner.phase(), Phase::Aborted);

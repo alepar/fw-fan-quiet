@@ -10,7 +10,7 @@ task's commit lands. Human-gated items are marked 👤.
 - [x] 2. Core types + ring buffer
 - [x] 3. RAPL power sensor (wraparound-safe)
 - [x] 4. hwmon sensors (fans, Tctl, amdgpu)
-- [ ] 5. CPU utilization + frequency sensors
+- [x] 5. CPU utilization + frequency sensors
 - [ ] 6. NVML sensor wrapper
 - [ ] 7. Sampler thread + event enum
 - [ ] 7b. Telemetry JSONL logger (samples + decisions, for offline controller review)

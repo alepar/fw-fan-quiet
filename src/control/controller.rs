@@ -22,6 +22,9 @@ use crate::actuators::cmd::Runner;
 use crate::actuators::guard::RestoreGuard;
 use crate::calib::burner::Burner;
 use crate::calib::runner::{CalibRunner, RunnerEffect};
+use crate::config::Config;
+use crate::control::allocator::{self, AllocInput, Allocator};
+use crate::control::gpu_pid::GpuPid;
 use crate::control::lut::ClockWattsLut;
 use crate::control::thermal_model::ThermalModel;
 use crate::event::Event;
@@ -36,6 +39,9 @@ pub use crate::calib::runner::CalibProgress as CalibProgressLite;
 /// Reapply active limits at least this often (defends against PPD/tuned
 /// clobbering the ryzenadj limits behind our back; design §3).
 const REASSERT_PERIOD_S: f64 = 10.0;
+/// Auto-mode allocator cadence (design §3: retarget the contour split every
+/// 5 s; the GPU PI runs every sample in between).
+const ALLOC_PERIOD_S: f64 = 5.0;
 /// A sample must exceed the CPU limit by this margin to count as a
 /// stickiness violation (RAPL vs STAPM accounting slack).
 const STICKINESS_MARGIN_W: f64 = 5.0;
@@ -60,8 +66,12 @@ pub enum Command {
     SetGpuMaxClock(u32),
     /// Back to Monitor mode: restore stock limits but keep running.
     ReleaseAll,
-    /// Stored + echoed in status; the control loop uses it in M4.
+    /// Fan target (RPM): stored, echoed in status, persisted to config on
+    /// change, and consumed live by the Auto-mode allocator.
     SetFanTarget(f64),
+    /// Enter/leave the closed-loop Auto mode. Explicit bool (not a toggle) so
+    /// a queued duplicate keypress can never flip the mode back unnoticed.
+    SetAuto(bool),
     /// Begin guided calibration (honored in Monitor mode only).
     StartCalibration,
     /// Abort a running calibration (release everything, back to Monitor).
@@ -70,7 +80,7 @@ pub enum Command {
     Quit,
 }
 
-/// Controller mode. Auto comes later. TODO(task-25): Auto.
+/// Controller mode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
     #[default]
@@ -79,6 +89,11 @@ pub enum Mode {
     /// The calibration runner owns actuation; manual commands and the
     /// reassert/stickiness machinery are suspended.
     Calibrating,
+    /// The closed loop owns actuation (allocator + GPU PI); manual setters
+    /// are rejected, but the reassert/stickiness/resume machinery stays
+    /// ACTIVE (it keys off `status.cpu_limit_w`/`gpu_max_mhz`, which hold
+    /// the current auto allocation).
+    Auto,
 }
 
 impl Mode {
@@ -88,6 +103,7 @@ impl Mode {
             Mode::Monitor => "monitor",
             Mode::Manual => "manual",
             Mode::Calibrating => "calibrating",
+            Mode::Auto => "auto",
         }
     }
 }
@@ -99,6 +115,9 @@ pub enum StatusFlag {
     LimitNotSticking,
     /// A suspend/resume was detected recently (cleared after 30 s).
     Resumed,
+    /// Auto mode was requested without a calibrated model + LUT. Cleared on
+    /// a successful Auto entry or when a calibration lands its fit.
+    NotCalibrated,
 }
 
 impl StatusFlag {
@@ -107,6 +126,7 @@ impl StatusFlag {
         match self {
             StatusFlag::LimitNotSticking => "limit_not_sticking",
             StatusFlag::Resumed => "resumed",
+            StatusFlag::NotCalibrated => "not_calibrated",
         }
     }
 }
@@ -161,8 +181,44 @@ pub enum Effect {
     /// the user-visible status is unchanged (e.g. a repeated calibration
     /// NeedsGpuLoad nag — offline analysis needs the full nag history).
     Noted { cause: &'static str },
+    /// One Auto-mode allocator step ran (every 5 s): the WHY behind the
+    /// resulting limits, mirrored into the Decision record's demand/alloc
+    /// fields (cause "auto:allocate"). `gpu_w` is both the allocation and
+    /// the PI's new watts target.
+    AutoAllocated {
+        demand_cpu: f64,
+        demand_gpu: f64,
+        cpu_w: f64,
+        gpu_w: f64,
+    },
     /// Hardware restored; the thread shell must exit its loop.
     Quit,
+}
+
+/// Auto-mode loop state; Some exactly while `Mode::Auto`. Dropped whole on
+/// exit, so re-entry always starts from a fresh PI (integrator cleared) and
+/// a fresh allocator (conservative start) — the `reset()`s the design asks
+/// for happen by construction.
+struct AutoState {
+    /// GPU watts→clock inner PI (1 Hz).
+    pid: GpuPid,
+    /// Contour allocator (every ALLOC_PERIOD_S).
+    allocator: Allocator,
+    /// t_mono of the last allocator step; None → step on the next sample.
+    last_alloc: Option<f64>,
+    /// Current PI watts target (allocator output); demand input next step.
+    gpu_target_w: Option<f64>,
+}
+
+impl AutoState {
+    fn new() -> Self {
+        Self {
+            pid: GpuPid::new(),
+            allocator: Allocator::new(),
+            last_alloc: None,
+            gpu_target_w: None,
+        }
+    }
 }
 
 /// Testable controller core. Owns the actuators through `RestoreGuard`, so
@@ -183,22 +239,43 @@ pub struct Controller<R: Runner> {
     /// Where `RunnerEffect::SaveState` persists to (`--state-file`).
     state_path: PathBuf,
     /// Fitted thermal model: loaded from the state file at construction,
-    /// replaced by a fresh calibration.
-    /// TODO(task-25): wired to the auto-mode allocator loop; unread until then.
-    #[allow(dead_code)]
+    /// replaced by a fresh calibration; inverted to the target-RPM contour
+    /// by the Auto-mode allocator.
     model: Option<ThermalModel>,
-    /// GPU clock→watts LUT, same lifecycle as `model`.
-    /// TODO(task-25): fed to the GPU watts→clock PI (`gpu_pid`) once the
-    /// Auto-mode loop is wired up; unread until then.
-    #[allow(dead_code)]
+    /// GPU clock→watts LUT, same lifecycle as `model`; the GPU PI's
+    /// feedforward.
     lut: Option<ClockWattsLut>,
+    /// User config (fan target, floors, fast limit). Mutated + saved when
+    /// the fan target changes.
+    config: Config,
+    /// Where `config` persists to (`--config`).
+    config_path: PathBuf,
+    /// Auto-mode loop state; Some exactly while `Mode::Auto`.
+    auto: Option<AutoState>,
 }
 
 impl<R: Runner> Controller<R> {
-    pub fn new(guard: RestoreGuard<R>, persisted: PersistedState, state_path: PathBuf) -> Self {
+    pub fn new(
+        mut guard: RestoreGuard<R>,
+        persisted: PersistedState,
+        state_path: PathBuf,
+        config: Config,
+        config_path: PathBuf,
+    ) -> Self {
+        // Config owns the burst ceiling; the actuator default only covers a
+        // hypothetical config-less construction.
+        if let Some(cpu) = guard.cpu.as_mut() {
+            cpu.fast_limit_mw = config.fast_limit_mw;
+        }
+        let status = ControlStatus {
+            fan_target_rpm: config
+                .fan_target_rpm
+                .clamp(FAN_TARGET_MIN_RPM, FAN_TARGET_MAX_RPM),
+            ..ControlStatus::default()
+        };
         Self {
             guard,
-            status: ControlStatus::default(),
+            status,
             stick_violations: 0,
             resumed_until: None,
             last_reassert: None,
@@ -207,6 +284,9 @@ impl<R: Runner> Controller<R> {
             state_path,
             model: persisted.model,
             lut: persisted.lut,
+            config,
+            config_path,
+            auto: None,
         }
     }
 
@@ -225,16 +305,28 @@ impl<R: Runner> Controller<R> {
     /// Actuator failures are warned and leave the status untouched — the UI
     /// keeps showing what is actually applied, never what merely was asked.
     pub fn on_command(&mut self, c: Command) -> Vec<Effect> {
-        // While calibrating the runner owns actuation: manual setters and
-        // release are rejected outright (Esc/AbortCalibration is the way to
-        // take control back).
+        // While calibrating the runner owns actuation: manual setters,
+        // release and Auto entry are rejected outright (Esc/AbortCalibration
+        // is the way to take control back).
         if self.status.mode == Mode::Calibrating
             && matches!(
                 c,
-                Command::SetCpuW(_) | Command::SetGpuMaxClock(_) | Command::ReleaseAll
+                Command::SetCpuW(_)
+                    | Command::SetGpuMaxClock(_)
+                    | Command::ReleaseAll
+                    | Command::SetAuto(_)
             )
         {
             tracing::warn!("manual command rejected while calibrating: {c:?}");
+            return Vec::new();
+        }
+        // While in Auto the closed loop owns actuation: manual setters are
+        // rejected (SetFanTarget stays allowed — it retargets the contour
+        // live; ReleaseAll/SetAuto(false) are the ways out).
+        if self.status.mode == Mode::Auto
+            && matches!(c, Command::SetCpuW(_) | Command::SetGpuMaxClock(_))
+        {
+            tracing::warn!("manual command rejected while in auto mode: {c:?}");
             return Vec::new();
         }
         let before = self.status.clone();
@@ -274,31 +366,79 @@ impl<R: Runner> Controller<R> {
                 "command:set_gpu_max_clock"
             }
             Command::ReleaseAll => {
-                // NOT guard.restore_all(): the smu module must stay unloaded
-                // and the actuators stay owned — the session keeps running.
-                if let Some(gpu) = self.guard.gpu.as_mut() {
-                    match gpu.release() {
-                        Ok(()) => tracing::info!("released GPU clock locks"),
-                        Err(e) => tracing::warn!("release: GPU clock release failed: {e}"),
-                    }
-                }
-                if let Some(cpu) = self.guard.cpu.as_ref() {
-                    if let Err(e) = cpu.restore_stock() {
-                        tracing::warn!("release: CPU stock restore failed: {e}");
-                    }
-                }
-                self.status.cpu_limit_w = None;
-                self.status.gpu_max_mhz = None;
-                self.status.mode = Mode::Monitor;
-                self.remove_flag(StatusFlag::LimitNotSticking);
-                self.stick_violations = 0;
-                self.last_reassert = None;
+                // Exiting Auto too: the loop state drops whole, so a later
+                // re-entry starts from a fresh PI + conservative allocator.
+                self.auto = None;
+                self.release_to_stock();
                 effects.push(Effect::Released);
                 "release"
             }
             Command::SetFanTarget(rpm) => {
-                self.status.fan_target_rpm = rpm.clamp(FAN_TARGET_MIN_RPM, FAN_TARGET_MAX_RPM);
+                let clamped = rpm.clamp(FAN_TARGET_MIN_RPM, FAN_TARGET_MAX_RPM);
+                if clamped != self.status.fan_target_rpm {
+                    self.status.fan_target_rpm = clamped;
+                    // The Auto allocator reads status.fan_target_rpm on its
+                    // next step: no extra wiring needed for a live retarget.
+                    // Persist on CHANGE only (a held key repeats the same
+                    // clamped value at the bounds — never spam the disk);
+                    // save failure is warned, the in-session target applies.
+                    self.config.fan_target_rpm = clamped;
+                    if let Err(e) = self.config.save(&self.config_path) {
+                        tracing::warn!(
+                            "config save to {} failed (fan target still active): {e}",
+                            self.config_path.display()
+                        );
+                    }
+                }
                 "command:set_fan_target"
+            }
+            Command::SetAuto(true) => {
+                if self.status.mode == Mode::Auto {
+                    tracing::warn!("SetAuto(true) ignored: already in auto mode");
+                    "auto:on"
+                } else if self.model.is_none() || self.lut.is_none() {
+                    tracing::warn!(
+                        "auto mode requires a calibrated model + LUT; run a calibration (k) first"
+                    );
+                    self.add_flag(StatusFlag::NotCalibrated);
+                    "auto:not_calibrated"
+                } else {
+                    self.remove_flag(StatusFlag::NotCalibrated);
+                    let mut auto = AutoState::new();
+                    match self.guard.gpu.as_ref() {
+                        // Carried-over review decision: with a GPU lock
+                        // applied right now (e.g. entering from Manual),
+                        // seed the PI's rate-limit reference from it so the
+                        // first PI command cannot jump >105 MHz from what is
+                        // in force. With no lock applied (stock), the PI's
+                        // documented first-jump-to-feedforward is safe — it
+                        // only moves DOWNWARD from the stock 3090 MHz.
+                        Some(gpu) => {
+                            if let Some(applied) = gpu.applied() {
+                                auto.pid.seed_last_clock(applied);
+                            }
+                        }
+                        None => tracing::warn!(
+                            "no GPU actuator this run: auto mode will shape the CPU only"
+                        ),
+                    }
+                    self.auto = Some(auto);
+                    self.status.mode = Mode::Auto;
+                    // Any manual limits stay in force for <1 s: the first
+                    // sample runs the allocator, which starts from its
+                    // conservative start and replaces them.
+                    "auto:on"
+                }
+            }
+            Command::SetAuto(false) => {
+                if self.status.mode == Mode::Auto {
+                    self.auto = None; // fresh PI/allocator on re-entry
+                    self.release_to_stock();
+                    effects.push(Effect::Released);
+                } else {
+                    tracing::warn!("SetAuto(false) ignored: not in auto mode");
+                }
+                "auto:off"
             }
             Command::StartCalibration => {
                 if self.status.mode != Mode::Monitor {
@@ -380,6 +520,16 @@ impl<R: Runner> Controller<R> {
             cause.get_or_insert("resume");
         }
 
+        // Auto loop (allocator + GPU PI) BEFORE the stickiness/reassert
+        // machinery, so the watchdogs below see the freshly commanded
+        // allocation. Unlike Calibrating, those watchdogs stay ACTIVE in
+        // Auto: they key off status.cpu_limit_w/gpu_max_mhz, which hold the
+        // current auto allocation — reassert reapplies it, stickiness
+        // watches it, resume (above) restores it.
+        if self.status.mode == Mode::Auto {
+            self.on_auto_sample(s, &mut effects, &mut cause);
+        }
+
         // Stickiness watchdog: RAPL says the commanded limit is not holding.
         // cpu_pkg_w == 0.0 is RAPL warmup/invalid — neither a violation nor
         // evidence of compliance, so it leaves the streak untouched.
@@ -446,6 +596,120 @@ impl<R: Runner> Controller<R> {
             });
         }
         effects
+    }
+
+    /// One Auto-mode control step, driven off the 1 Hz samples (t_mono-based
+    /// like the reassert): every [`ALLOC_PERIOD_S`] an allocator step
+    /// retargets both devices on the fan-target contour; every sample the
+    /// GPU watts→clock PI trims the locked clock toward its watts target.
+    ///
+    /// Sensor-loss semantics: the PI is driven by the GPU WATTS sensor, not
+    /// the fan — a lost fan sensor freezes the allocator (inside
+    /// `Allocator::step`, which then never raises power past the floor) but
+    /// the PI keeps holding the last watts target off `gpu_w`; a lost GPU
+    /// watts sensor holds the PI (skip) while the allocator keeps running.
+    fn on_auto_sample(
+        &mut self,
+        s: &Sample,
+        effects: &mut Vec<Effect>,
+        cause: &mut Option<&'static str>,
+    ) {
+        // Defensive: Auto without its state/model cannot control anything —
+        // fail toward stock (every failure path degrades to louder fans or
+        // stock behavior, design §5). Unreachable in practice: entry
+        // requires model+LUT and they are only ever replaced, never cleared.
+        if self.auto.is_none() || self.model.is_none() || self.lut.is_none() {
+            tracing::warn!("auto mode lost its state/model; releasing to Monitor");
+            self.auto = None;
+            self.release_to_stock();
+            effects.push(Effect::Released);
+            cause.get_or_insert("auto:degraded");
+            return;
+        }
+        let auto = self.auto.as_mut().expect("checked above");
+        let model = self.model.as_ref().expect("checked above");
+        let lut = self.lut.as_ref().expect("checked above");
+
+        // Allocator step, every ALLOC_PERIOD_S (first sample after entry
+        // included: last_alloc starts None).
+        if auto
+            .last_alloc
+            .is_none_or(|last| s.t_mono - last >= ALLOC_PERIOD_S)
+        {
+            auto.last_alloc = Some(s.t_mono);
+            let demand = allocator::demand(
+                s,
+                self.status.cpu_limit_w,
+                auto.gpu_target_w,
+                self.status.gpu_max_mhz,
+            );
+            let target_rpm = self.status.fan_target_rpm;
+            // TODO(task-26): the trim integrator's offset replaces the 0.0.
+            let contour = |pc: f64| model.gpu_watts_on_contour(target_rpm, 0.0, pc);
+            let (cpu_w, gpu_w) = auto.allocator.step(&AllocInput {
+                contour: &contour,
+                demand,
+                floors: (self.config.cpu_floor_w, self.config.gpu_floor_mhz),
+                measured_fan_rpm: s.max_fan_rpm(),
+                fan_target_rpm: target_rpm,
+                fan_valid: s.fan_valid,
+            });
+            // Bumpless retarget: the PI keeps its trim + rate reference.
+            auto.pid.set_target_w(gpu_w);
+            auto.gpu_target_w = Some(gpu_w);
+            // Command the CPU only when the allocation moved: a held/frozen
+            // allocation (deadband, lost fan) must not re-command at 5 s
+            // cadence — the 10 s reassert already defends the applied value.
+            if self.status.cpu_limit_w != Some(cpu_w) {
+                match self.guard.cpu.as_ref() {
+                    None => {
+                        tracing::warn!("auto: no CPU actuator; allocation {cpu_w} W not applied");
+                    }
+                    Some(cpu) => match cpu.set_sustained_mw((cpu_w * 1000.0).round() as u32) {
+                        Ok(clamped_mw) => {
+                            let clamped_w = f64::from(clamped_mw) / 1000.0;
+                            self.status.cpu_limit_w = Some(clamped_w);
+                            effects.push(Effect::CpuSet(clamped_w));
+                        }
+                        Err(e) => {
+                            tracing::warn!("auto: CPU allocation ({cpu_w} W) failed: {e}");
+                        }
+                    },
+                }
+            }
+            effects.push(Effect::AutoAllocated {
+                demand_cpu: demand.cpu_starved,
+                demand_gpu: demand.gpu_starved,
+                cpu_w,
+                gpu_w,
+            });
+            cause.get_or_insert("auto:allocate");
+        }
+
+        // GPU PI, every sample. Invalid NVML watts → skip (the PI holds; it
+        // must never chase a phantom reading). update() returning None is
+        // the in-deadband hold — no command, no Decision (1 Hz spam guard).
+        if s.gpu_w_valid
+            && let Some(clock) = auto.pid.update(s.gpu_w, lut, self.config.gpu_floor_mhz)
+        {
+            match self.guard.gpu.as_mut() {
+                // Warned once at Auto entry, not here (1 Hz spam).
+                None => {}
+                Some(gpu) => match gpu.set_max_clock(clock) {
+                    Ok(()) => {
+                        let applied = gpu.applied();
+                        // Same clock re-commanded (e.g. pinned at the floor)
+                        // changes nothing user-visible: no status, no record.
+                        if applied != self.status.gpu_max_mhz {
+                            self.status.gpu_max_mhz = applied;
+                            effects.push(Effect::GpuSet(applied.unwrap_or(clock)));
+                            cause.get_or_insert("auto:gpu_clock");
+                        }
+                    }
+                    Err(e) => tracing::warn!("auto: GPU clock ({clock} MHz) failed: {e}"),
+                },
+            }
+        }
     }
 
     /// One calibrating-mode sample: feed the runner, execute its effects,
@@ -569,6 +833,10 @@ impl<R: Runner> Controller<R> {
                 RunnerEffect::SaveState(state) => {
                     self.model = state.model.clone();
                     self.lut = state.lut.clone();
+                    if self.model.is_some() && self.lut.is_some() {
+                        // A landed fit satisfies the Auto-entry requirement.
+                        self.remove_flag(StatusFlag::NotCalibrated);
+                    }
                     match state.save(&self.state_path) {
                         Ok(()) => {
                             tracing::info!("calib: state saved to {}", self.state_path.display());
@@ -594,6 +862,29 @@ impl<R: Runner> Controller<R> {
             self.end_calibration();
         }
         cause
+    }
+
+    /// Back to Monitor with stock limits, actuators kept (the session goes
+    /// on). NOT `guard.restore_all()`: the smu module must stay unloaded.
+    /// Shared by ReleaseAll and the Auto-mode exit.
+    fn release_to_stock(&mut self) {
+        if let Some(gpu) = self.guard.gpu.as_mut() {
+            match gpu.release() {
+                Ok(()) => tracing::info!("released GPU clock locks"),
+                Err(e) => tracing::warn!("release: GPU clock release failed: {e}"),
+            }
+        }
+        if let Some(cpu) = self.guard.cpu.as_ref() {
+            if let Err(e) = cpu.restore_stock() {
+                tracing::warn!("release: CPU stock restore failed: {e}");
+            }
+        }
+        self.status.cpu_limit_w = None;
+        self.status.gpu_max_mhz = None;
+        self.status.mode = Mode::Monitor;
+        self.remove_flag(StatusFlag::LimitNotSticking);
+        self.stick_violations = 0;
+        self.last_reassert = None;
     }
 
     /// Mirror the runner's progress into status (None once it's gone).
@@ -666,6 +957,10 @@ pub fn spawn<R: Runner + Send + 'static>(
         .spawn(move || {
             let mut controller = controller;
             let mut sample_rx = sample_rx;
+            // Initial status push: the config-seeded fan target must show in
+            // the UI before the first change-driven Status event (the model's
+            // built-in default only matches a default config).
+            let _ = ui_tx.send(Event::Status(controller.status().clone()));
             // t_mono of the latest sample, stamped into command-driven
             // Decision records (0.0 before the first sample).
             let mut t_mono = 0.0_f64;
@@ -732,6 +1027,9 @@ fn apply_effects<R: Runner>(
     let mut quit = false;
     let mut status_changed = false;
     let mut cause: Option<&'static str> = None;
+    // (demand_cpu, demand_gpu, alloc_cpu_w, alloc_gpu_w) from an Auto-mode
+    // allocator step in this batch; the WHY behind an "auto:allocate" record.
+    let mut auto_alloc: Option<(f64, f64, f64, f64)> = None;
     for effect in effects {
         match effect {
             Effect::Reasserted { cause: c } | Effect::Noted { cause: c } => {
@@ -740,6 +1038,15 @@ fn apply_effects<R: Runner>(
             Effect::StatusChanged { cause: c } => {
                 status_changed = true;
                 cause.get_or_insert(c);
+            }
+            Effect::AutoAllocated {
+                demand_cpu,
+                demand_gpu,
+                cpu_w,
+                gpu_w,
+            } => {
+                auto_alloc = Some((*demand_cpu, *demand_gpu, *cpu_w, *gpu_w));
+                cause.get_or_insert("auto:allocate");
             }
             Effect::Quit => quit = true,
             Effect::CpuSet(_) | Effect::GpuSet(_) | Effect::Released => {}
@@ -763,6 +1070,12 @@ fn apply_effects<R: Runner>(
                 .iter()
                 .map(|f| f.as_str().to_string())
                 .collect(),
+            demand_cpu: auto_alloc.map(|a| a.0),
+            demand_gpu: auto_alloc.map(|a| a.1),
+            alloc_cpu_w: auto_alloc.map(|a| a.2),
+            alloc_gpu_w: auto_alloc.map(|a| a.3),
+            // The allocator's gpu_w IS the PI target (set_target_w).
+            pi_target_w: auto_alloc.map(|a| a.3),
         };
         if let Some(t) = telemetry::lock(telemetry).as_mut() {
             t.log(&record);
@@ -799,8 +1112,9 @@ mod tests {
         cpu
     }
 
-    /// Controller over a FakeRunner-backed CPU actuator (no GPU: NVML needs
-    /// hardware) and an smu module "we unloaded" (so Quit's reload shows up).
+    /// Controller over a FakeRunner-backed CPU actuator (no GPU — Auto tests
+    /// pass a FakeGpu explicitly) and an smu module "we unloaded" (so Quit's
+    /// reload shows up).
     fn controller(runner: &FakeRunner, profile_path: PathBuf) -> Controller<&FakeRunner> {
         Controller::new(
             RestoreGuard::new(
@@ -811,6 +1125,8 @@ mod tests {
             ),
             PersistedState::default(),
             PathBuf::from("/nonexistent/state.json"),
+            Config::default(),
+            PathBuf::from("/nonexistent/config.toml"),
         )
     }
 
@@ -912,6 +1228,8 @@ mod tests {
             RestoreGuard::new(&runner, None, None, None),
             PersistedState::default(),
             PathBuf::from("/nonexistent/state.json"),
+            Config::default(),
+            PathBuf::from("/nonexistent/config.toml"),
         );
 
         let effects = ctl.on_command(Command::SetCpuW(20.0));
@@ -1202,6 +1520,8 @@ mod tests {
             guard,
             PersistedState::default(),
             PathBuf::from("/nonexistent/state.json"),
+            Config::default(),
+            PathBuf::from("/nonexistent/config.toml"),
         );
 
         let (ui_tx, ui_rx) = crossbeam_channel::unbounded();
@@ -1218,6 +1538,15 @@ mod tests {
             Arc::clone(&restored),
         );
 
+        // The shell pushes one initial Status at startup (so a config-seeded
+        // fan target shows before any change); the command's echo follows.
+        match ui_rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(Event::Status(st)) => {
+                assert_eq!(st.cpu_limit_w, None, "initial status precedes commands");
+                assert_eq!(st.mode, Mode::Monitor);
+            }
+            other => panic!("expected the initial Event::Status, got {other:?}"),
+        }
         cmd_tx.send(Command::SetCpuW(20.0)).unwrap();
         match ui_rx.recv_timeout(Duration::from_secs(3)) {
             Ok(Event::Status(st)) => {
@@ -1350,6 +1679,7 @@ mod tests {
             Command::SetCpuW(20.0),
             Command::SetGpuMaxClock(1500),
             Command::ReleaseAll,
+            Command::SetAuto(true),
         ] {
             let effects = ctl.on_command(cmd);
             assert!(effects.is_empty(), "{cmd:?} must be rejected: {effects:?}");
@@ -1508,7 +1838,13 @@ mod tests {
             None,
             Some(SmuModule::assume_unloaded()),
         );
-        let mut ctl = Controller::new(guard, PersistedState::default(), state_path.clone());
+        let mut ctl = Controller::new(
+            guard,
+            PersistedState::default(),
+            state_path.clone(),
+            Config::default(),
+            PathBuf::from("/nonexistent/config.toml"),
+        );
         assert!(ctl.model.is_none() && ctl.lut.is_none());
 
         ctl.on_command(Command::StartCalibration);
@@ -1539,6 +1875,536 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    // --- Task 25: auto mode ---
+
+    use crate::actuators::gpu::test_support::{FakeGpu, GpuCall};
+    use crate::control::thermal_model::CalibPoint;
+
+    /// Truth surface `rpm = 25·pc + 15·pg + 0.1·pc·pg + 800` (the same one
+    /// the thermal_model tests use), fit into a model.
+    fn fitted_model() -> ThermalModel {
+        let pts: Vec<CalibPoint> = [
+            (5.0, 0.0),
+            (45.0, 0.0),
+            (5.0, 100.0),
+            (45.0, 100.0),
+            (20.0, 40.0),
+        ]
+        .iter()
+        .map(|&(pc, pg)| CalibPoint {
+            cpu_w: pc,
+            gpu_w: pg,
+            rpm: 25.0 * pc + 15.0 * pg + 0.1 * pc * pg + 800.0,
+        })
+        .collect();
+        ThermalModel::fit_batch(&pts).unwrap()
+    }
+
+    /// 3-point LUT: 30 W @ 1200, 60 W @ 2000, 100 W @ 2800 MHz.
+    fn lut3() -> ClockWattsLut {
+        let mut lut = ClockWattsLut::new();
+        lut.insert(1200, 30.0);
+        lut.insert(2000, 60.0);
+        lut.insert(2800, 100.0);
+        lut
+    }
+
+    fn calibrated() -> PersistedState {
+        PersistedState {
+            model: Some(fitted_model()),
+            lut: Some(lut3()),
+            calibrated_at: None,
+        }
+    }
+
+    /// Calibrated controller with a CPU actuator AND a FakeGpu; also returns
+    /// the GPU call-log handle.
+    fn auto_controller(
+        runner: &FakeRunner,
+        profile_path: PathBuf,
+        config: Config,
+    ) -> (Controller<&FakeRunner>, Arc<Mutex<Vec<GpuCall>>>) {
+        let gpu = FakeGpu::new();
+        let gpu_calls = gpu.calls();
+        let ctl = Controller::new(
+            RestoreGuard::new(
+                runner,
+                Some(cpu_actuator(runner, profile_path)),
+                Some(Box::new(gpu)),
+                None,
+            ),
+            calibrated(),
+            PathBuf::from("/nonexistent/state.json"),
+            config,
+            PathBuf::from("/nonexistent/config.toml"),
+        );
+        (ctl, gpu_calls)
+    }
+
+    fn auto_controller_no_profile(
+        runner: &FakeRunner,
+    ) -> (Controller<&FakeRunner>, Arc<Mutex<Vec<GpuCall>>>) {
+        auto_controller(
+            runner,
+            PathBuf::from("/nonexistent/platform_profile"),
+            Config::default(),
+        )
+    }
+
+    /// A gaming-ish sample: both devices busy, fan well below the 3000 RPM
+    /// target, GPU drawing 10 W (far under any target: the PI must raise the
+    /// clock). `cpu_pkg_w` stays 0 (RAPL-warmup semantics) so the stickiness
+    /// watchdog stays quiet and CPU demand falls back to utilization.
+    fn busy_at(t: f64) -> Sample {
+        Sample {
+            t_mono: t,
+            cpu_util_pct: 100.0,
+            gpu_util_pct: 100.0,
+            gpu_w: 10.0,
+            gpu_w_valid: true,
+            fan1_rpm: 1700.0,
+            fan_valid: true,
+            ..Sample::default()
+        }
+    }
+
+    fn gpu_sets(calls: &Mutex<Vec<GpuCall>>) -> Vec<u32> {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|c| match c {
+                GpuCall::Set(mhz) => Some(*mhz),
+                GpuCall::Release => None,
+            })
+            .collect()
+    }
+
+    fn alloc_of(effects: &[Effect]) -> Option<(f64, f64)> {
+        effects.iter().find_map(|e| match e {
+            Effect::AutoAllocated { cpu_w, gpu_w, .. } => Some((*cpu_w, *gpu_w)),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn auto_entry_without_model_flags_not_calibrated() {
+        let runner = FakeRunner::new();
+        let mut ctl = controller_no_profile(&runner); // uncalibrated
+
+        let effects = ctl.on_command(Command::SetAuto(true));
+        assert_eq!(ctl.status().mode, Mode::Monitor, "must stay in Monitor");
+        assert!(ctl.status().flags.contains(&StatusFlag::NotCalibrated));
+        assert_eq!(status_changes(&effects), 1);
+        assert!(ctl.auto.is_none());
+        assert!(runner.calls().is_empty(), "no actuation on a refused entry");
+
+        // Samples keep flowing through the plain Monitor path.
+        assert!(ctl.on_sample(&busy_at(0.0)).is_empty());
+        assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn auto_entry_allocates_cpu_and_drives_gpu_pi() {
+        let runner = FakeRunner::new();
+        let (mut ctl, gpu_calls) = auto_controller_no_profile(&runner);
+
+        let effects = ctl.on_command(Command::SetAuto(true));
+        assert_eq!(ctl.status().mode, Mode::Auto);
+        assert_eq!(status_changes(&effects), 1);
+        assert!(!ctl.status().flags.contains(&StatusFlag::NotCalibrated));
+        assert!(
+            ryzenadj_calls(&runner).is_empty(),
+            "entry itself must not actuate; the first sample does"
+        );
+
+        // First sample: the allocator steps from the conservative (15, 30)
+        // start toward the both-starved optimum, up-rate-limited to
+        // (17, 32) → ryzenadj 17 W + PI target 32 W. The PI (measured 10 W)
+        // commands FF(32 W) = 1253 MHz + the clamped +400 MHz correction.
+        let effects = ctl.on_sample(&busy_at(0.0));
+        assert_eq!(alloc_of(&effects), Some((17.0, 32.0)));
+        assert_eq!(ryzenadj_calls(&runner), vec![expected_args(17_000)]);
+        assert_eq!(ctl.status().cpu_limit_w, Some(17.0));
+        assert!(effects.contains(&Effect::CpuSet(17.0)), "got {effects:?}");
+        assert_eq!(gpu_sets(&gpu_calls), vec![1653]);
+        assert_eq!(ctl.status().gpu_max_mhz, Some(1653));
+        assert!(effects.contains(&Effect::GpuSet(1653)), "got {effects:?}");
+        assert_eq!(status_changes(&effects), 1);
+    }
+
+    #[test]
+    fn allocator_runs_every_5s_not_every_sample() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu_calls) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+
+        let mut alloc_times = Vec::new();
+        for t in [0.0, 1.0, 2.0, 3.0, 4.0, 4.9, 5.0, 6.0, 9.9] {
+            let effects = ctl.on_sample(&busy_at(t));
+            if alloc_of(&effects).is_some() {
+                alloc_times.push(t);
+            }
+        }
+        assert_eq!(
+            alloc_times,
+            vec![0.0, 5.0],
+            "allocator must act on entry and every 5 s, not per sample"
+        );
+        // Each acting step changed the allocation → exactly one ryzenadj
+        // command per step.
+        assert_eq!(ryzenadj_calls(&runner).len(), 2);
+    }
+
+    #[test]
+    fn fan_target_change_shifts_next_allocation() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu_calls) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        ctl.on_sample(&busy_at(0.0)); // (17, 32)
+        let effects = ctl.on_sample(&busy_at(5.0));
+        assert_eq!(alloc_of(&effects), Some((19.0, 34.0)), "premise");
+
+        // Live retarget: 1000 RPM turns the measured 1700 RPM into a 700 RPM
+        // overshoot on a collapsed contour — ups forbidden, hard cuts.
+        ctl.on_command(Command::SetFanTarget(1000.0));
+        let effects = ctl.on_sample(&busy_at(10.0));
+        assert_eq!(
+            alloc_of(&effects),
+            Some((19.0, 18.0)),
+            "next step must consume the new target (gpu cut at the overshoot rate)"
+        );
+    }
+
+    #[test]
+    fn config_floor_honored_with_zero_demand() {
+        let runner = FakeRunner::new();
+        let config = Config {
+            cpu_floor_w: 20.0,
+            ..Config::default()
+        };
+        let (mut ctl, _gpu_calls) = auto_controller(
+            &runner,
+            PathBuf::from("/nonexistent/platform_profile"),
+            config,
+        );
+        ctl.on_command(Command::SetAuto(true));
+
+        // Fully idle machine, fan already sitting at the target.
+        let idle_at = |t: f64| Sample {
+            t_mono: t,
+            gpu_w: 10.0,
+            gpu_w_valid: true,
+            fan1_rpm: 3000.0,
+            fan_valid: true,
+            ..Sample::default()
+        };
+        for t in [0.0, 5.0, 10.0, 15.0] {
+            let effects = ctl.on_sample(&idle_at(t));
+            if let Some((cpu_w, _)) = alloc_of(&effects) {
+                assert!(cpu_w >= 20.0, "allocation {cpu_w} W fell below the floor");
+            }
+        }
+        assert_eq!(ctl.status().cpu_limit_w, Some(20.0));
+        // Every ryzenadj command (allocations AND reasserts) honored it.
+        for args in ryzenadj_calls(&runner) {
+            let mw: u32 = args[0]
+                .strip_prefix("--stapm-limit=")
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(mw >= 20_000, "commanded {mw} mW below the 20 W floor");
+        }
+    }
+
+    #[test]
+    fn manual_and_calibration_commands_rejected_in_auto() {
+        let runner = FakeRunner::new();
+        let (mut ctl, gpu_calls) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        ctl.on_sample(&busy_at(0.0));
+        let cpu_calls_before = ryzenadj_calls(&runner).len();
+        let gpu_calls_before = gpu_sets(&gpu_calls).len();
+
+        for cmd in [Command::SetCpuW(40.0), Command::SetGpuMaxClock(3000)] {
+            let effects = ctl.on_command(cmd);
+            assert!(effects.is_empty(), "{cmd:?} must be rejected: {effects:?}");
+        }
+        let effects = ctl.on_command(Command::StartCalibration);
+        assert!(effects.is_empty(), "got {effects:?}");
+        assert_eq!(ctl.status().mode, Mode::Auto);
+        assert!(ctl.status().calib.is_none());
+        assert_eq!(ryzenadj_calls(&runner).len(), cpu_calls_before);
+        assert_eq!(gpu_sets(&gpu_calls).len(), gpu_calls_before);
+
+        // SetFanTarget stays allowed: it retargets the contour live.
+        ctl.on_command(Command::SetFanTarget(2500.0));
+        assert_eq!(ctl.status().fan_target_rpm, 2500.0);
+        assert_eq!(ctl.status().mode, Mode::Auto);
+    }
+
+    #[test]
+    fn set_auto_false_releases_to_stock_and_resets_loop_state() {
+        let runner = FakeRunner::new();
+        let (dir, path) = profile_fixture("auto-exit");
+        let (mut ctl, gpu_calls) = auto_controller(&runner, path.clone(), Config::default());
+        ctl.on_command(Command::SetAuto(true));
+        ctl.on_sample(&busy_at(0.0));
+        assert!(ctl.status().cpu_limit_w.is_some(), "premise: limits active");
+
+        let effects = ctl.on_command(Command::SetAuto(false));
+        assert!(effects.contains(&Effect::Released), "got {effects:?}");
+        assert_eq!(status_changes(&effects), 1);
+        assert_eq!(ctl.status().mode, Mode::Monitor);
+        assert_eq!(ctl.status().cpu_limit_w, None);
+        assert_eq!(ctl.status().gpu_max_mhz, None);
+        assert!(ctl.auto.is_none());
+        // GPU locks released + CPU stock restored (profile toggled back);
+        // the smu module stays untouched — the session keeps running.
+        assert_eq!(gpu_calls.lock().unwrap().last(), Some(&GpuCall::Release));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "balanced");
+        assert_eq!(modprobe_reload_calls(&runner), 0);
+
+        // Re-entry starts FRESH: conservative allocator start and a clean PI
+        // (rate reference cleared with the released lock).
+        ctl.on_command(Command::SetAuto(true));
+        let effects = ctl.on_sample(&busy_at(100.0));
+        assert_eq!(alloc_of(&effects), Some((17.0, 32.0)));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reassert_stays_active_in_auto() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu_calls) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        ctl.on_sample(&busy_at(0.0)); // alloc 17 W; reassert baseline t=0
+        assert_eq!(ryzenadj_calls(&runner).len(), 1);
+
+        // 10.1 s later: the allocator retargets (19 W) AND the periodic
+        // reassert fires, re-commanding the fresh auto allocation.
+        let effects = ctl.on_sample(&busy_at(10.1));
+        assert!(has_reassert(&effects, "reassert"), "got {effects:?}");
+        assert_eq!(
+            ryzenadj_calls(&runner),
+            vec![
+                expected_args(17_000),
+                expected_args(19_000),
+                expected_args(19_000)
+            ],
+            "reassert must reapply the CURRENT auto allocation"
+        );
+    }
+
+    #[test]
+    fn fan_invalid_freezes_allocator_but_pi_keeps_working() {
+        let runner = FakeRunner::new();
+        let (mut ctl, gpu_calls) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+
+        let invalid_fan_at = |t: f64| Sample {
+            fan_valid: false,
+            ..busy_at(t)
+        };
+        // First step: frozen at the conservative start — a lost fan sensor
+        // must never raise power. The one initial command applies it.
+        let effects = ctl.on_sample(&invalid_fan_at(0.0));
+        assert_eq!(alloc_of(&effects), Some((15.0, 30.0)));
+        assert_eq!(ryzenadj_calls(&runner), vec![expected_args(15_000)]);
+
+        // Later allocator steps stay frozen: no new CPU command...
+        let effects = ctl.on_sample(&invalid_fan_at(5.0));
+        assert_eq!(alloc_of(&effects), Some((15.0, 30.0)));
+        assert_eq!(
+            ryzenadj_calls(&runner).len(),
+            1,
+            "frozen: no 5 s re-command"
+        );
+
+        // ...besides the 10 s reassert, which keeps defending what is applied.
+        let effects = ctl.on_sample(&invalid_fan_at(10.1));
+        assert!(has_reassert(&effects, "reassert"), "got {effects:?}");
+        assert_eq!(ryzenadj_calls(&runner).len(), 2);
+        assert_eq!(ctl.status().cpu_limit_w, Some(15.0));
+
+        // The PI runs off the GPU WATTS sensor, not the fan: it kept driving
+        // the clock toward the 30 W target the whole time.
+        assert!(
+            !gpu_sets(&gpu_calls).is_empty(),
+            "PI must keep working off gpu_w while the fan is lost"
+        );
+        assert_eq!(ctl.status().gpu_max_mhz, Some(1600)); // FF(30)=1200 + 400
+    }
+
+    #[test]
+    fn gpu_pi_seeded_from_applied_lock_at_entry() {
+        let runner = FakeRunner::new();
+        let (mut ctl, gpu_calls) = auto_controller_no_profile(&runner);
+        // A manual lock is in force when Auto starts.
+        ctl.on_command(Command::SetGpuMaxClock(1500));
+        assert_eq!(ctl.status().gpu_max_mhz, Some(1500), "premise");
+        ctl.on_command(Command::SetAuto(true));
+
+        ctl.on_sample(&busy_at(0.0));
+        let sets = gpu_sets(&gpu_calls);
+        assert_eq!(sets[0], 1500, "the manual lock");
+        let first_pi = sets[1];
+        assert!(
+            first_pi.abs_diff(1500) <= 105,
+            "first PI command ({first_pi} MHz) jumped >105 MHz from the applied 1500"
+        );
+        // Concretely: rate-limited toward the 1653 MHz desired clock.
+        assert_eq!(first_pi, 1605);
+    }
+
+    #[test]
+    fn set_fan_target_persists_config_on_change_only() {
+        let runner = FakeRunner::new();
+        let dir = std::env::temp_dir().join(format!(
+            "bazerame-controller-test-{}-fan-persist",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        let mut ctl: Controller<&FakeRunner> = Controller::new(
+            RestoreGuard::new(&runner, None, None, None),
+            PersistedState::default(),
+            PathBuf::from("/nonexistent/state.json"),
+            Config::default(),
+            config_path.clone(),
+        );
+
+        ctl.on_command(Command::SetFanTarget(2500.0));
+        assert_eq!(Config::load(&config_path).fan_target_rpm, 2500.0);
+
+        // Unchanged target (e.g. a key held at the clamp bound): no re-save.
+        fs::remove_file(&config_path).unwrap();
+        ctl.on_command(Command::SetFanTarget(2500.0));
+        assert!(
+            !config_path.exists(),
+            "an unchanged target must not spam config saves"
+        );
+
+        // A real change saves again, preserving the other fields.
+        ctl.on_command(Command::SetFanTarget(2000.0));
+        let saved = Config::load(&config_path);
+        assert_eq!(saved.fan_target_rpm, 2000.0);
+        assert_eq!(saved.cpu_floor_w, Config::default().cpu_floor_w);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn config_fast_limit_reaches_ryzenadj() {
+        let runner = FakeRunner::new();
+        let config = Config {
+            fast_limit_mw: 60_000,
+            ..Config::default()
+        };
+        let mut ctl: Controller<&FakeRunner> = Controller::new(
+            RestoreGuard::new(
+                &runner,
+                Some(cpu_actuator(
+                    &runner,
+                    PathBuf::from("/nonexistent/platform_profile"),
+                )),
+                None,
+                None,
+            ),
+            PersistedState::default(),
+            PathBuf::from("/nonexistent/state.json"),
+            config,
+            PathBuf::from("/nonexistent/config.toml"),
+        );
+        ctl.on_command(Command::SetCpuW(20.0));
+        assert_eq!(
+            ryzenadj_calls(&runner),
+            vec![vec![
+                "--stapm-limit=20000".to_string(),
+                "--slow-limit=20000".to_string(),
+                "--fast-limit=60000".to_string(),
+            ]]
+        );
+    }
+
+    #[test]
+    fn config_seeds_status_fan_target() {
+        let runner = FakeRunner::new();
+        let config = Config {
+            fan_target_rpm: 2200.0,
+            ..Config::default()
+        };
+        let ctl: Controller<&FakeRunner> = Controller::new(
+            RestoreGuard::new(&runner, None, None, None),
+            PersistedState::default(),
+            PathBuf::from("/nonexistent/state.json"),
+            config,
+            PathBuf::from("/nonexistent/config.toml"),
+        );
+        assert_eq!(ctl.status().fan_target_rpm, 2200.0);
+    }
+
+    #[test]
+    fn auto_allocate_decision_carries_demand_fields() {
+        let runner = FakeRunner::new();
+        let dir = std::env::temp_dir().join(format!(
+            "bazerame-controller-test-{}-auto-telemetry",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let (mut ctl, _gpu_calls) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        let effects = ctl.on_sample(&busy_at(0.0));
+
+        let (ui_tx, _ui_rx) = crossbeam_channel::unbounded();
+        let telemetry = Arc::new(Mutex::new(Some(Telemetry::open(&dir).unwrap())));
+        apply_effects(&effects, &ctl, 0.0, &ui_tx, &telemetry);
+        // A non-auto decision afterwards: its line must skip the auto fields.
+        apply_effects(
+            &[Effect::StatusChanged { cause: "release" }],
+            &ctl,
+            1.0,
+            &ui_tx,
+            &telemetry,
+        );
+        let path = {
+            let mut guard = telemetry::lock(&telemetry);
+            let t = guard.as_mut().unwrap();
+            t.flush();
+            t.path().to_path_buf()
+        };
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let decisions: Vec<serde_json::Value> = contents
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|v: &serde_json::Value| v["kind"] == "decision")
+            .collect();
+        assert_eq!(decisions.len(), 2, "got: {contents}");
+
+        let auto = &decisions[0];
+        assert_eq!(auto["cause"], "auto:allocate");
+        assert_eq!(auto["mode"], "auto");
+        assert_eq!(auto["demand_cpu"], 1.0);
+        assert_eq!(auto["demand_gpu"], 1.0);
+        assert_eq!(auto["alloc_cpu_w"], 17.0);
+        assert_eq!(auto["alloc_gpu_w"], 32.0);
+        assert_eq!(auto["pi_target_w"], 32.0);
+        assert_eq!(auto["cpu_limit_w"], 17.0);
+
+        let plain = &decisions[1];
+        assert_eq!(plain["cause"], "release");
+        for key in ["demand_cpu", "demand_gpu", "alloc_cpu_w", "alloc_gpu_w"] {
+            assert!(
+                plain.get(key).is_none(),
+                "{key} must be absent on non-auto decisions: {plain}"
+            );
+        }
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn persisted_state_seeds_controller_model_and_lut() {
         let runner = FakeRunner::new();
@@ -1553,6 +2419,8 @@ mod tests {
             RestoreGuard::new(&runner, None, None, None),
             persisted,
             PathBuf::from("/nonexistent/state.json"),
+            Config::default(),
+            PathBuf::from("/nonexistent/config.toml"),
         );
         assert_eq!(ctl.lut, Some(lut));
         assert!(ctl.model.is_none());

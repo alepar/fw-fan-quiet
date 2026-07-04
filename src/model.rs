@@ -41,7 +41,8 @@ pub struct Model {
     pub status: ControlStatus,
     /// false => main loop exits.
     pub running: bool,
-    /// Display-only until M4; kept in sync with the controller via commands.
+    /// Fan target shown in the header/fan chart; kept in sync with the
+    /// controller via commands + echoed Status (the Auto loop consumes it).
     pub fan_target_rpm: f64,
     /// Locally tracked CPU setpoint (W): what the next c/C press steps from.
     /// None until the first press or Status sync; re-seeds after 'p'.
@@ -155,8 +156,8 @@ impl Model {
                     -FAN_STEP_RPM
                 };
                 let v = (self.fan_target_rpm + step).clamp(FAN_MIN_RPM, FAN_MAX_RPM);
-                // Updated locally too: display-only until M4, but the command
-                // keeps the controller's status in sync.
+                // Updated locally too for an instant redraw; the command keeps
+                // the controller (and the Auto contour target) in sync.
                 self.fan_target_rpm = v;
                 vec![Command::SetFanTarget(v)]
             }
@@ -166,6 +167,16 @@ impl Model {
                 self.cpu_setpoint_w = None;
                 self.gpu_setpoint_mhz = None;
                 vec![Command::ReleaseAll]
+            }
+            'a' => {
+                // Auto toggle, driven off the controller's echoed mode (the
+                // truth): blocked while a calibration runs (the runner owns
+                // actuation; the controller would reject it anyway).
+                match self.status.mode {
+                    Mode::Calibrating => Vec::new(),
+                    Mode::Auto => vec![Command::SetAuto(false)],
+                    Mode::Monitor | Mode::Manual => vec![Command::SetAuto(true)],
+                }
             }
             'k' => {
                 // Calibration only starts from Monitor: a manual session (or
@@ -547,6 +558,43 @@ mod tests {
         m.update(Event::Status(status_in(Mode::Calibrating)));
         assert_eq!(m.update(esc()), vec![Command::AbortCalibration]);
         assert!(m.running, "Esc aborts calibration, never quits the app");
+    }
+
+    // --- Task 25: auto-mode key ---
+
+    #[test]
+    fn a_key_enters_auto_from_monitor_and_manual() {
+        // Default (Monitor) status: a emits SetAuto(true).
+        let mut m = Model::new();
+        assert_eq!(
+            m.update(Event::Input(key('a'))),
+            vec![Command::SetAuto(true)]
+        );
+
+        // Manual mode too: entering Auto replaces the manual limits.
+        let mut m = Model::new();
+        m.update(Event::Status(status_in(Mode::Manual)));
+        assert_eq!(
+            m.update(Event::Input(key('a'))),
+            vec![Command::SetAuto(true)]
+        );
+    }
+
+    #[test]
+    fn a_key_exits_auto_when_in_auto() {
+        let mut m = Model::new();
+        m.update(Event::Status(status_in(Mode::Auto)));
+        assert_eq!(
+            m.update(Event::Input(key('a'))),
+            vec![Command::SetAuto(false)]
+        );
+    }
+
+    #[test]
+    fn a_key_blocked_while_calibrating() {
+        let mut m = Model::new();
+        m.update(Event::Status(status_in(Mode::Calibrating)));
+        assert_eq!(m.update(Event::Input(key('a'))), vec![]);
     }
 
     #[test]

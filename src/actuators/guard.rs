@@ -28,18 +28,19 @@ use std::time::Duration;
 
 use super::cmd::{RealRunner, Runner};
 use super::cpu::{CpuActuator, PLATFORM_PROFILE_PATH};
-use super::gpu::GpuActuator;
+use super::gpu::{BoxedGpu, GpuActuator};
 use super::smu_module::SmuModule;
 
 /// Owns the hardware-restore responsibility. Every field is an Option:
 /// `None` if construction failed at startup (degraded run) or already
-/// restored (after `restore_all`).
+/// restored (after `restore_all`). The GPU is held through the boxed
+/// `gpu::GpuClockCtl` seam so controller tests can substitute a fake.
 pub struct RestoreGuard<R: Runner> {
     /// Used for the ryzen_smu reload; `CpuActuator` owns its own runner
     /// (both are `RealRunner`, a ZST, in production).
     runner: R,
     pub cpu: Option<CpuActuator<R>>,
-    pub gpu: Option<GpuActuator>,
+    pub gpu: Option<BoxedGpu>,
     pub smu: Option<SmuModule>,
 }
 
@@ -47,7 +48,7 @@ impl<R: Runner> RestoreGuard<R> {
     pub fn new(
         runner: R,
         cpu: Option<CpuActuator<R>>,
-        gpu: Option<GpuActuator>,
+        gpu: Option<BoxedGpu>,
         smu: Option<SmuModule>,
     ) -> Self {
         Self {
@@ -182,8 +183,8 @@ impl Drop for FinalRestore {
              restoring with fresh actuators"
         );
         let cpu = CpuActuator::new(RealRunner, PathBuf::from(PLATFORM_PROFILE_PATH));
-        let gpu = match GpuActuator::new() {
-            Ok(gpu) => Some(gpu),
+        let gpu: Option<BoxedGpu> = match GpuActuator::new() {
+            Ok(gpu) => Some(Box::new(gpu)),
             Err(e) => {
                 tracing::warn!("final restore: GPU actuator unavailable: {e}");
                 None

@@ -30,9 +30,6 @@
 //! GPU gets crushed on a gaming machine), and the whole allocation thrashes
 //! end-to-end whenever trim shifts the contour slope.
 
-// TODO(task-25): consumed by the auto-mode controller loop; dead until then.
-#![allow(dead_code)]
-
 use crate::types::Sample;
 
 /// Grid resolution of the contour search over cpu_w.
@@ -229,8 +226,11 @@ impl Allocator {
         out
     }
 
-    /// Forget history (on mode exit): the next step starts from the
-    /// conservative point again.
+    /// Forget history: the next step starts from the conservative point
+    /// again. The Auto controller exits by dropping its whole loop state —
+    /// equivalent to (and covered by the same tests as) this reset; kept as
+    /// the explicit API for callers that hold on to an Allocator.
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.last = None;
     }

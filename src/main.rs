@@ -27,7 +27,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 
 use actuators::cmd::RealRunner;
 use actuators::cpu::{CpuActuator, PLATFORM_PROFILE_PATH};
-use actuators::gpu::GpuActuator;
+use actuators::gpu::{BoxedGpu, GpuActuator};
 use actuators::guard::{FinalRestore, RestoreGuard};
 use actuators::smu_module::SmuModule;
 use control::Command;
@@ -100,8 +100,9 @@ fn main() -> Result<()> {
     let _log_guard = logging::init(&args.log_dir);
 
     // Loaded at startup so config/state problems surface in the log from day
-    // one. TODO(task-25): wire config fan_target/floors into the controller.
-    let _config = config::Config::load(&args.config);
+    // one; the controller consumes the fan target, floors and fast limit
+    // (and saves the fan target back on change).
+    let config = config::Config::load(&args.config);
     // Persisted calibration (model + LUT) seeds the controller; a fresh
     // calibration run overwrites the file through the same path.
     let persisted = state::PersistedState::load(&args.state_file);
@@ -142,8 +143,8 @@ fn main() -> Result<()> {
     // it to rebuild the reload obligation on the panic path.
     let smu_was_unloaded = smu.as_ref().is_some_and(SmuModule::unloaded_by_us);
     let cpu = CpuActuator::new(RealRunner, PathBuf::from(PLATFORM_PROFILE_PATH));
-    let gpu = match GpuActuator::new() {
-        Ok(gpu) => Some(gpu),
+    let gpu: Option<BoxedGpu> = match GpuActuator::new() {
+        Ok(gpu) => Some(Box::new(gpu)),
         Err(e) => {
             tracing::warn!("GPU actuator unavailable (no clock control this run): {e}");
             None
@@ -175,7 +176,7 @@ fn main() -> Result<()> {
     let sampler =
         Sampler::new_system().spawn(vec![ui_tx.clone(), ctl_sample_tx], Arc::clone(&shutdown));
     let ctl = controller::spawn(
-        Controller::new(guard, persisted, args.state_file),
+        Controller::new(guard, persisted, args.state_file, config, args.config),
         ctl_sample_rx,
         cmd_rx,
         ui_tx.clone(),

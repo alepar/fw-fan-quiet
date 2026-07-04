@@ -33,7 +33,11 @@ pub enum Record<'a> {
     },
     /// One controller decision: emitted by the controller thread whenever a
     /// status change or reassert happens, with a short `cause` string
-    /// ("command:set_cpu_w", "reassert", "stickiness", "resume", "release").
+    /// ("command:set_cpu_w", "reassert", "stickiness", "resume", "release",
+    /// "auto:allocate", "auto:gpu_clock", ...). The `demand_*`/`alloc_*`/
+    /// `pi_target_w` fields carry the WHY of an Auto-mode allocator step
+    /// (cause "auto:allocate"); they are None — and skipped on the wire to
+    /// keep lines lean — for every other decision.
     Decision {
         t_mono: f64,
         mode: String,
@@ -42,6 +46,16 @@ pub enum Record<'a> {
         fan_target_rpm: f64,
         cause: String,
         flags: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        demand_cpu: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        demand_gpu: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        alloc_cpu_w: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        alloc_gpu_w: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pi_target_w: Option<f64>,
     },
 }
 
@@ -271,6 +285,11 @@ mod tests {
             fan_target_rpm: 3000.0,
             cause: "command:set_cpu_w".into(),
             flags: vec!["resumed".into()],
+            demand_cpu: None,
+            demand_gpu: None,
+            alloc_cpu_w: None,
+            alloc_gpu_w: None,
+            pi_target_w: None,
         });
         t.flush();
 
@@ -317,6 +336,19 @@ mod tests {
         assert_eq!(decision["fan_target_rpm"], 3000.0);
         assert_eq!(decision["cause"], "command:set_cpu_w");
         assert_eq!(decision["flags"][0], "resumed");
+        // None auto fields are skipped entirely: non-auto lines stay lean.
+        for key in [
+            "demand_cpu",
+            "demand_gpu",
+            "alloc_cpu_w",
+            "alloc_gpu_w",
+            "pi_target_w",
+        ] {
+            assert!(
+                decision.get(key).is_none(),
+                "{key} must be skipped when None: {decision}"
+            );
+        }
         assert!(
             decision["t_wall"].as_f64().unwrap() > 1.5e9,
             "decision lines carry a top-level wall-clock stamp"

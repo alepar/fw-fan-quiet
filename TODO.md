@@ -37,7 +37,7 @@ task's commit lands. Human-gated items are marked 👤.
 ## Milestone 4 — Closed loop
 - [x] 23. Demand estimator + allocator
 - [x] 24. GPU watts→clock inner PI
-- [ ] 25. Auto mode wiring + UI 👤 (real gaming session validation)
+- [x] 25. Auto mode wiring + UI 👤 (real gaming session validation still pending — needs a calibration run first)
 
 ## Milestone 5 — Adaptive & hardening
 - [ ] 26. Bounded trim integrator

@@ -25,6 +25,25 @@ pub fn clamp_gpu_clock(mhz: u32) -> u32 {
     mhz.clamp(MIN_MAX_CLOCK_MHZ, MAX_MAX_CLOCK_MHZ)
 }
 
+/// Actuation seam for the GPU clock lock (Task 25): the real [`GpuActuator`]
+/// talks NVML, which needs hardware and root — untestable in unit tests. The
+/// controller reaches the GPU only through this trait (boxed in
+/// `RestoreGuard`), so tests substitute `test_support::FakeGpu` and can
+/// observe the Auto-mode PI's clock commands. `Send` supertrait: the guard
+/// moves into the controller thread.
+pub trait GpuClockCtl: Send {
+    /// Lock graphics clocks to `(210, clamp_gpu_clock(mhz))` and remember the
+    /// applied value on success.
+    fn set_max_clock(&mut self, mhz: u32) -> color_eyre::Result<()>;
+    /// Reset GPU locked clocks to default and clear applied state.
+    fn release(&mut self) -> color_eyre::Result<()>;
+    /// Last successfully applied max clock, if a lock is active.
+    fn applied(&self) -> Option<u32>;
+}
+
+/// The trait-object form everything stores (`RestoreGuard`, constructors).
+pub type BoxedGpu = Box<dyn GpuClockCtl>;
+
 /// Applies max-clock locks to device 0 via NVML. Construction fails if the
 /// NVIDIA driver is absent or no device is present.
 pub struct GpuActuator {
@@ -48,10 +67,12 @@ impl GpuActuator {
             applied_mhz: None,
         })
     }
+}
 
+impl GpuClockCtl for GpuActuator {
     /// Lock graphics clocks to `(210, clamp_gpu_clock(mhz))` and remember the
     /// applied value on success. NVML errors (e.g. no root) propagate.
-    pub fn set_max_clock(&mut self, mhz: u32) -> color_eyre::Result<()> {
+    fn set_max_clock(&mut self, mhz: u32) -> color_eyre::Result<()> {
         let max_clock_mhz = clamp_gpu_clock(mhz);
         let mut device = self.nvml.device_by_index(DEVICE_INDEX)?;
         device.set_gpu_locked_clocks(GpuLockedClocksSetting::Numeric {
@@ -64,7 +85,7 @@ impl GpuActuator {
 
     /// Reset GPU locked clocks to default and clear applied state. Errors
     /// propagate; exit-path callers warn instead of propagating.
-    pub fn release(&mut self) -> color_eyre::Result<()> {
+    fn release(&mut self) -> color_eyre::Result<()> {
         let mut device = self.nvml.device_by_index(DEVICE_INDEX)?;
         device.reset_gpu_locked_clocks()?;
         self.applied_mhz = None;
@@ -72,8 +93,63 @@ impl GpuActuator {
     }
 
     /// Last successfully applied max clock, if a lock is active.
-    pub fn applied(&self) -> Option<u32> {
+    fn applied(&self) -> Option<u32> {
         self.applied_mhz
+    }
+}
+
+/// Shared test double for controller/guard tests (cfg(test) makes it
+/// crate-visible in test builds only).
+#[cfg(test)]
+pub mod test_support {
+    use super::{GpuClockCtl, clamp_gpu_clock};
+    use std::sync::{Arc, Mutex};
+
+    /// One recorded call on the fake (Set carries the CLAMPED clock, mirroring
+    /// what the real actuator would apply).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum GpuCall {
+        Set(u32),
+        Release,
+    }
+
+    /// Recording stand-in for `GpuActuator`. The call log is behind an `Arc`
+    /// so tests keep a handle after the fake moves into the controller's
+    /// `RestoreGuard`.
+    #[derive(Default)]
+    pub struct FakeGpu {
+        applied: Option<u32>,
+        calls: Arc<Mutex<Vec<GpuCall>>>,
+    }
+
+    impl FakeGpu {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Shared handle to the call log (clone it before boxing the fake).
+        pub fn calls(&self) -> Arc<Mutex<Vec<GpuCall>>> {
+            Arc::clone(&self.calls)
+        }
+    }
+
+    impl GpuClockCtl for FakeGpu {
+        fn set_max_clock(&mut self, mhz: u32) -> color_eyre::Result<()> {
+            let clamped = clamp_gpu_clock(mhz);
+            self.applied = Some(clamped);
+            self.calls.lock().unwrap().push(GpuCall::Set(clamped));
+            Ok(())
+        }
+
+        fn release(&mut self) -> color_eyre::Result<()> {
+            self.applied = None;
+            self.calls.lock().unwrap().push(GpuCall::Release);
+            Ok(())
+        }
+
+        fn applied(&self) -> Option<u32> {
+            self.applied
+        }
     }
 }
 

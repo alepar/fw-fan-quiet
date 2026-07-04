@@ -62,9 +62,6 @@ pub struct GpuPid {
     frozen_i: f64,
 }
 
-// TODO(task-25): constructed and driven by the Auto-mode controller loop;
-// dead until then.
-#[allow(dead_code)]
 impl GpuPid {
     pub fn new() -> Self {
         Self {
@@ -73,6 +70,17 @@ impl GpuPid {
             saturated: false,
             frozen_i: 0.0,
         }
+    }
+
+    /// Seed the rate-limit reference (Auto-mode entry, review decision): when
+    /// a GPU clock lock is already applied, the first PI command must stay
+    /// within ±105 MHz of what is in force — without a seed the documented
+    /// first-output jump straight to the feedforward could yank an applied
+    /// lock arbitrarily far in one step. With no lock applied (stock), the
+    /// caller skips the seed and the first-jump contract is safe: it only
+    /// ever moves DOWNWARD from the stock 3090 MHz ceiling.
+    pub fn seed_last_clock(&mut self, mhz: u32) {
+        self.last_clock = Some(mhz);
     }
 
     /// Update the watts setpoint (allocator, every 5 s). Bumpless: resets
@@ -152,8 +160,12 @@ impl GpuPid {
         Some(clock)
     }
 
-    /// Clear all state (mode exit): integrator, saturation freeze and the
-    /// rate-limit reference. Keeps the setpoint (re-entry re-targets anyway).
+    /// Clear all state: integrator, saturation freeze and the rate-limit
+    /// reference. Keeps the setpoint (re-entry re-targets anyway). The Auto
+    /// controller exits by dropping its whole loop state — equivalent to
+    /// this reset; kept as the explicit API for callers that hold on to a
+    /// GpuPid.
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.pid = make_pid(self.pid.setpoint);
         self.last_clock = None;
@@ -180,6 +192,18 @@ mod tests {
     use crate::calib::lut_sweep::SWEEP_CLOCKS;
 
     const FLOOR: u32 = 1000;
+
+    #[test]
+    fn seeded_rate_reference_limits_first_output() {
+        let lut = exact_lut();
+        let mut pid = GpuPid::new();
+        pid.set_target_w(60.0);
+        pid.seed_last_clock(1500);
+        // Unseeded, this exact stimulus jumps straight to 2400 (see the reset
+        // test); seeded from an applied 1500 MHz lock it must stay within one
+        // rate-limit step of it.
+        assert_eq!(pid.update(40.0, &lut, FLOOR), Some(1605));
+    }
 
     #[test]
     fn raised_floor_wins_over_rate_limit() {

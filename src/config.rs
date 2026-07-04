@@ -34,9 +34,6 @@ impl Default for Config {
     }
 }
 
-// TODO(task-25): the controller/allocator consume fan_target_rpm and the
-// floors; save() gains a caller when config becomes editable from the UI.
-#[allow(dead_code)]
 impl Config {
     /// Load from `path`. Missing file → defaults (info log); unreadable or
     /// unparseable file → defaults + warning. NEVER crashes on bad config.

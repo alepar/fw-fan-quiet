@@ -8,7 +8,7 @@ use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Axis, Block, Chart, Dataset, Gauge, GraphType, Paragraph};
 
-use crate::control::controller::{CalibProgressLite, StatusFlag};
+use crate::control::controller::{CalibProgressLite, Mode, StatusFlag};
 use crate::model::{Model, RING_CAP};
 use crate::ring::Ring;
 
@@ -50,8 +50,8 @@ pub fn view(model: &Model, frame: &mut Frame) {
     let keybar = if model.status.calib.is_some() {
         " q quit  Esc abort calibration"
     } else {
-        " q quit  c/C cpu\u{2213}2W  g/G gpu\u{2213}105MHz  t/T fan\u{2213}250  p release  \
-         k calibrate"
+        " q quit  a auto  c/C cpu\u{2213}2W  g/G gpu\u{2213}105MHz  t/T fan\u{2213}250  \
+         p release  k calibrate"
     };
     frame.render_widget(
         Paragraph::new(keybar).style(Style::default().fg(Color::DarkGray)),
@@ -70,11 +70,25 @@ fn header_line(model: &Model) -> Line<'static> {
         Some(mhz) => format!("gpu\u{2264}{mhz}MHz"),
         None => "gpu \u{2013}".into(),
     };
-    let mut spans = vec![Span::raw(format!(
-        " bazerame-fans | {} | fan target {:.0} rpm | {cpu} | {gpu}",
-        model.status.mode.as_str(),
-        model.fan_target_rpm
-    ))];
+    // Auto is the mode the whole app exists for: style it loud so a glance
+    // tells whether the closed loop is driving.
+    let mode_span = match model.status.mode {
+        Mode::Auto => Span::styled(
+            "auto",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        mode => Span::raw(mode.as_str()),
+    };
+    let mut spans = vec![
+        Span::raw(" bazerame-fans | "),
+        mode_span,
+        Span::raw(format!(
+            " | fan target {:.0} rpm | {cpu} | {gpu}",
+            model.fan_target_rpm
+        )),
+    ];
     for flag in &model.status.flags {
         spans.push(Span::raw(" | "));
         spans.push(match flag {
@@ -83,6 +97,10 @@ fn header_line(model: &Model) -> Line<'static> {
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
             StatusFlag::Resumed => Span::styled("resumed", Style::default().fg(Color::Yellow)),
+            StatusFlag::NotCalibrated => Span::styled(
+                "NOT CALIBRATED (press k to calibrate)",
+                Style::default().fg(Color::Yellow),
+            ),
         });
     }
     if let Some(s) = &model.latest {
@@ -459,6 +477,7 @@ mod tests {
         let footer = row_text(&terminal, 39);
         for hint in [
             "q quit",
+            "a auto",
             "c/C cpu\u{2213}2W",
             "g/G gpu\u{2213}105MHz",
             "t/T fan\u{2213}250",
@@ -468,6 +487,59 @@ mod tests {
             assert!(footer.contains(hint), "footer was: {footer:?}");
         }
         assert!(!footer.contains("Esc abort"), "footer was: {footer:?}");
+    }
+
+    // --- Task 25: auto mode in the header ---
+
+    #[test]
+    fn auto_mode_renders_green_bold() {
+        use crate::control::ControlStatus;
+        use crate::control::controller::Mode;
+        let mut m = Model::new();
+        m.update(Event::Status(ControlStatus {
+            mode: Mode::Auto,
+            cpu_limit_w: Some(17.0),
+            gpu_max_mhz: Some(1653),
+            fan_target_rpm: 3000.0,
+            flags: vec![],
+            calib: None,
+        }));
+        let terminal = draw(&m);
+        let header = row_text(&terminal, 0);
+        let x = header.find("auto").expect("mode text present") as u16;
+        let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
+        assert_eq!(cell.fg, Color::Green);
+        assert!(cell.modifier.contains(Modifier::BOLD));
+        // Allocation shows through the existing limit fields.
+        assert!(header.contains("cpu\u{2264}17W"), "header was: {header:?}");
+        assert!(
+            header.contains("gpu\u{2264}1653MHz"),
+            "header was: {header:?}"
+        );
+    }
+
+    #[test]
+    fn not_calibrated_flag_renders_yellow_hint() {
+        use crate::control::ControlStatus;
+        use crate::control::controller::{Mode, StatusFlag};
+        let mut m = Model::new();
+        m.update(Event::Status(ControlStatus {
+            mode: Mode::Monitor,
+            cpu_limit_w: None,
+            gpu_max_mhz: None,
+            fan_target_rpm: 3000.0,
+            flags: vec![StatusFlag::NotCalibrated],
+            calib: None,
+        }));
+        let terminal = draw(&m);
+        let header = row_text(&terminal, 0);
+        let x = header.find("NOT CALIBRATED").expect("hint present") as u16;
+        assert!(
+            header.contains("press k to calibrate"),
+            "header was: {header:?}"
+        );
+        let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
+        assert_eq!(cell.fg, Color::Yellow);
     }
 
     // --- Task 22: calibration wizard panel ---

@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use crate::actuators::cmd::RealRunner;
 use crate::actuators::cpu::{CpuActuator, PLATFORM_PROFILE_PATH};
-use crate::actuators::gpu::GpuActuator;
+use crate::actuators::gpu::{BoxedGpu, GpuActuator};
 use crate::actuators::guard::RestoreGuard;
 use crate::actuators::smu_module::SmuModule;
 use crate::calib::burner::Burner;
@@ -95,7 +95,8 @@ pub fn run() -> i32 {
         Ok(_) => Ok("cpu + gpu constructed (NVML device 0 present)".to_string()),
         Err(e) => Err(format!("GPU actuator init failed: {e}")),
     };
-    let mut guard = RestoreGuard::new(RealRunner, Some(cpu), gpu_result.ok(), smu);
+    let gpu: Option<BoxedGpu> = gpu_result.ok().map(|g| Box::new(g) as BoxedGpu);
+    let mut guard = RestoreGuard::new(RealRunner, Some(cpu), gpu, smu);
     guard.startup_reset();
     check(
         "actuators",

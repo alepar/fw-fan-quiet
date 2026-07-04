@@ -1,6 +1,7 @@
 //! Entry point: wires sampler -> channel -> TEA model -> view, plus telemetry
 //! and logging. Milestone 1: live read-only monitoring dashboard.
 
+mod actuators;
 mod event;
 mod logging;
 mod model;

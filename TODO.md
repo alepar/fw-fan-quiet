@@ -40,7 +40,7 @@ task's commit lands. Human-gated items are marked 👤.
 - [x] 25. Auto mode wiring + UI 👤 (real gaming session validation still pending — needs a calibration run first)
 
 ## Milestone 5 — Adaptive & hardening
-- [ ] 26. Bounded trim integrator
+- [x] 26. Bounded trim integrator
 - [ ] 27. Online RLS + trust monitor
 - [ ] 28. Watchdogs + emergency release
 - [ ] 29. Resume hardening + polish + README 👤 (acceptance + abuse tests)

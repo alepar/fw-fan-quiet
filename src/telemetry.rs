@@ -40,7 +40,7 @@ pub enum Record<'a> {
 struct RunStart {
     kind: &'static str,
     t_mono: f64,
-    t_wall_unix: f64,
+    t_wall: f64,
     schema_version: u32,
 }
 
@@ -96,11 +96,11 @@ impl Telemetry {
                         kind: "run_start",
                         // Telemetry opens at process start -- the same moment
                         // the sampler pins its t_mono epoch -- so pairing 0.0
-                        // with t_wall_unix anchors the monotonic axis to wall
+                        // with t_wall anchors the monotonic axis to wall
                         // clock within startup milliseconds. Per-record
                         // t_wall makes any residual skew a non-issue.
                         t_mono: 0.0,
-                        t_wall_unix: wall,
+                        t_wall: wall,
                         schema_version: SCHEMA_VERSION,
                     });
                     return Ok(t);
@@ -254,8 +254,8 @@ mod tests {
         assert_eq!(start["kind"], "run_start");
         assert!(start["t_mono"].is_number());
         assert!(
-            start["t_wall_unix"].as_f64().unwrap() > 1.5e9,
-            "t_wall_unix must be real unix seconds"
+            start["t_wall"].as_f64().unwrap() > 1.5e9,
+            "t_wall must be real unix seconds"
         );
         assert_eq!(start["schema_version"], 1);
 

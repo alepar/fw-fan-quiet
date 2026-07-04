@@ -1,6 +1,6 @@
 //! TEA-style UI model: single source of UI state, mutated only in update().
 
-use crate::control::ControlStatus;
+use crate::control::{Command, ControlStatus};
 // Shared with the controller so display default and echoed status agree.
 use crate::control::controller::DEFAULT_FAN_TARGET_RPM;
 use crate::event::Event;
@@ -10,6 +10,23 @@ use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 
 /// Ring capacity: 5 minutes of history at 1 Hz.
 pub const RING_CAP: usize = 300;
+
+// Manual-mode key steps/seeds/clamps (plan §M2). Local clamps mirror the
+// controller's own clamps; the controller's echoed Status stays the truth.
+const CPU_STEP_W: f64 = 2.0;
+/// Framework Balanced sustained limit: the first press steps from stock.
+const CPU_SEED_W: f64 = 40.0;
+const CPU_MIN_W: f64 = 10.0;
+const CPU_MAX_W: f64 = 54.0;
+/// ~14 driver bins per press.
+const GPU_STEP_MHZ: u32 = 105;
+/// Stock GPU max boost clock.
+const GPU_SEED_MHZ: u32 = 3090;
+const GPU_MIN_MHZ: u32 = 1000;
+const GPU_MAX_MHZ: u32 = 3090;
+const FAN_STEP_RPM: f64 = 250.0;
+const FAN_MIN_RPM: f64 = 1000.0;
+const FAN_MAX_RPM: f64 = 7000.0;
 
 pub struct Model {
     pub max_fan: Ring,
@@ -24,8 +41,13 @@ pub struct Model {
     pub status: ControlStatus,
     /// false => main loop exits.
     pub running: bool,
-    /// Display-only for now.
+    /// Display-only until M4; kept in sync with the controller via commands.
     pub fan_target_rpm: f64,
+    /// Locally tracked CPU setpoint (W): what the next c/C press steps from.
+    /// None until the first press or Status sync; re-seeds after 'p'.
+    cpu_setpoint_w: Option<f64>,
+    /// Locally tracked GPU max-clock setpoint (MHz); same lifecycle.
+    gpu_setpoint_mhz: Option<u32>,
 }
 
 impl Model {
@@ -41,11 +63,14 @@ impl Model {
             status: ControlStatus::default(),
             running: true,
             fan_target_rpm: DEFAULT_FAN_TARGET_RPM,
+            cpu_setpoint_w: None,
+            gpu_setpoint_mhz: None,
         }
     }
 
-    /// The ONLY place UI state changes (TEA update).
-    pub fn update(&mut self, ev: Event) {
+    /// The ONLY place UI state changes (TEA update). Returned commands are
+    /// forwarded to the controller by the main loop.
+    pub fn update(&mut self, ev: Event) -> Vec<Command> {
         match ev {
             Event::Sample(s) => {
                 // Invalid readings become NaN in the rings: the view filters
@@ -66,19 +91,77 @@ impl Model {
                 // Kitty-protocol terminals also deliver Repeat/Release events;
                 // only act on presses.
                 if key.kind != KeyEventKind::Press {
-                    return;
+                    return Vec::new();
                 }
                 match (key.code, key.modifiers) {
+                    // No command: main's shutdown sequence sends Quit itself.
                     (KeyCode::Char('q'), KeyModifiers::NONE) => self.running = false,
-                    // Belt and suspenders; signal handling comes later.
+                    // Belt and suspenders next to the signal handler.
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.running = false,
-                    // TODO(task-15): manual-mode keys (m, arrows, ...).
+                    // Shifted letters arrive as uppercase Char + SHIFT.
+                    (KeyCode::Char(ch), m)
+                        if m == KeyModifiers::NONE || m == KeyModifiers::SHIFT =>
+                    {
+                        return self.on_manual_key(ch);
+                    }
                     _ => {}
                 }
             }
-            Event::Status(cs) => self.status = cs,
+            Event::Status(cs) => {
+                // The controller's clamped truth wins over local tracking
+                // (it echoes what we sent, so this cannot fight local edits).
+                self.cpu_setpoint_w = cs.cpu_limit_w;
+                self.gpu_setpoint_mhz = cs.gpu_max_mhz;
+                self.fan_target_rpm = cs.fan_target_rpm;
+                self.status = cs;
+            }
             // Render cadence is driven by the main loop; nothing to do here.
             Event::Tick => {}
+        }
+        Vec::new()
+    }
+
+    /// Manual-mode keymap: lowercase steps down, uppercase steps up.
+    fn on_manual_key(&mut self, ch: char) -> Vec<Command> {
+        match ch {
+            'c' | 'C' => {
+                let step = if ch == 'C' { CPU_STEP_W } else { -CPU_STEP_W };
+                let v =
+                    (self.cpu_setpoint_w.unwrap_or(CPU_SEED_W) + step).clamp(CPU_MIN_W, CPU_MAX_W);
+                self.cpu_setpoint_w = Some(v);
+                vec![Command::SetCpuW(v)]
+            }
+            'g' | 'G' => {
+                let cur = self.gpu_setpoint_mhz.unwrap_or(GPU_SEED_MHZ);
+                let stepped = if ch == 'G' {
+                    cur.saturating_add(GPU_STEP_MHZ)
+                } else {
+                    cur.saturating_sub(GPU_STEP_MHZ)
+                };
+                let v = stepped.clamp(GPU_MIN_MHZ, GPU_MAX_MHZ);
+                self.gpu_setpoint_mhz = Some(v);
+                vec![Command::SetGpuMaxClock(v)]
+            }
+            't' | 'T' => {
+                let step = if ch == 'T' {
+                    FAN_STEP_RPM
+                } else {
+                    -FAN_STEP_RPM
+                };
+                let v = (self.fan_target_rpm + step).clamp(FAN_MIN_RPM, FAN_MAX_RPM);
+                // Updated locally too: display-only until M4, but the command
+                // keeps the controller's status in sync.
+                self.fan_target_rpm = v;
+                vec![Command::SetFanTarget(v)]
+            }
+            'p' => {
+                // Pause: back to Monitor mode with stock limits, app keeps
+                // running. Cleared setpoints make the next press re-seed.
+                self.cpu_setpoint_w = None;
+                self.gpu_setpoint_mhz = None;
+                vec![Command::ReleaseAll]
+            }
+            _ => Vec::new(),
         }
     }
 }
@@ -86,6 +169,7 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::Command;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn key(c: char) -> KeyEvent {
@@ -225,9 +309,184 @@ mod tests {
     #[test]
     fn tick_is_noop() {
         let mut m = Model::new();
-        m.update(Event::Tick);
+        let cmds = m.update(Event::Tick);
+        assert!(cmds.is_empty());
         assert!(m.running);
         assert!(m.latest.is_none());
         assert_eq!(m.max_fan.len(), 0);
+    }
+
+    // --- Task 15: manual-mode keys ---
+
+    fn shift_key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT)
+    }
+
+    #[test]
+    fn c_key_seeds_and_steps_cpu() {
+        let mut m = Model::new();
+        // First press seeds from 40 W (Framework Balanced sustained) - 2 W.
+        assert_eq!(
+            m.update(Event::Input(key('c'))),
+            vec![Command::SetCpuW(38.0)]
+        );
+        assert_eq!(
+            m.update(Event::Input(key('c'))),
+            vec![Command::SetCpuW(36.0)]
+        );
+    }
+
+    #[test]
+    fn shift_c_steps_up() {
+        let mut m = Model::new();
+        m.update(Event::Input(key('c'))); // seed -> 38
+        assert_eq!(
+            m.update(Event::Input(shift_key('C'))),
+            vec![Command::SetCpuW(40.0)]
+        );
+    }
+
+    #[test]
+    fn cpu_clamps_at_bounds_and_stays_idempotent() {
+        let mut m = Model::new();
+        // Up from the 38 W seed: 8 steps hit the 54 W ceiling.
+        m.update(Event::Input(key('c')));
+        for _ in 0..7 {
+            m.update(Event::Input(shift_key('C')));
+        }
+        assert_eq!(
+            m.update(Event::Input(shift_key('C'))),
+            vec![Command::SetCpuW(54.0)]
+        );
+        // At the bound: repeated presses still emit the bound value.
+        assert_eq!(
+            m.update(Event::Input(shift_key('C'))),
+            vec![Command::SetCpuW(54.0)]
+        );
+        // All the way down: clamps at the 10 W floor and stays there.
+        for _ in 0..21 {
+            m.update(Event::Input(key('c')));
+        }
+        assert_eq!(
+            m.update(Event::Input(key('c'))),
+            vec![Command::SetCpuW(10.0)]
+        );
+        assert_eq!(
+            m.update(Event::Input(key('c'))),
+            vec![Command::SetCpuW(10.0)]
+        );
+    }
+
+    #[test]
+    fn g_key_seeds_and_steps_gpu() {
+        let mut m = Model::new();
+        // First press seeds from the 3090 MHz stock max - 105 MHz.
+        assert_eq!(
+            m.update(Event::Input(key('g'))),
+            vec![Command::SetGpuMaxClock(2985)]
+        );
+        // 2985 - 19*105 = 990 < 1000: clamps at the floor and stays there.
+        for _ in 0..18 {
+            m.update(Event::Input(key('g')));
+        }
+        assert_eq!(
+            m.update(Event::Input(key('g'))),
+            vec![Command::SetGpuMaxClock(1000)]
+        );
+        assert_eq!(
+            m.update(Event::Input(key('g'))),
+            vec![Command::SetGpuMaxClock(1000)]
+        );
+    }
+
+    #[test]
+    fn shift_g_steps_up_and_clamps_at_stock_max() {
+        let mut m = Model::new();
+        m.update(Event::Input(key('g'))); // seed -> 2985
+        assert_eq!(
+            m.update(Event::Input(shift_key('G'))),
+            vec![Command::SetGpuMaxClock(3090)]
+        );
+        assert_eq!(
+            m.update(Event::Input(shift_key('G'))),
+            vec![Command::SetGpuMaxClock(3090)]
+        );
+    }
+
+    #[test]
+    fn t_keys_adjust_fan_target() {
+        let mut m = Model::new();
+        // Default 3000 - 250.
+        assert_eq!(
+            m.update(Event::Input(key('t'))),
+            vec![Command::SetFanTarget(2750.0)]
+        );
+        assert_eq!(m.fan_target_rpm, 2750.0);
+        assert_eq!(
+            m.update(Event::Input(shift_key('T'))),
+            vec![Command::SetFanTarget(3000.0)]
+        );
+        // Clamp at the 1000 RPM floor.
+        for _ in 0..8 {
+            m.update(Event::Input(key('t')));
+        }
+        assert_eq!(
+            m.update(Event::Input(key('t'))),
+            vec![Command::SetFanTarget(1000.0)]
+        );
+        assert_eq!(m.fan_target_rpm, 1000.0);
+    }
+
+    #[test]
+    fn p_releases_and_clears() {
+        let mut m = Model::new();
+        m.update(Event::Input(key('c')));
+        m.update(Event::Input(key('g')));
+        assert_eq!(m.update(Event::Input(key('p'))), vec![Command::ReleaseAll]);
+        // Local setpoints cleared: the next presses re-seed from scratch.
+        assert_eq!(
+            m.update(Event::Input(key('c'))),
+            vec![Command::SetCpuW(38.0)]
+        );
+        assert_eq!(
+            m.update(Event::Input(key('g'))),
+            vec![Command::SetGpuMaxClock(2985)]
+        );
+    }
+
+    #[test]
+    fn status_syncs_local_setpoints() {
+        use crate::control::controller::Mode;
+        let mut m = Model::new();
+        m.update(Event::Input(key('c'))); // local 38
+        let cmds = m.update(Event::Status(ControlStatus {
+            mode: Mode::Manual,
+            cpu_limit_w: Some(20.0),
+            gpu_max_mhz: Some(1500),
+            fan_target_rpm: 2500.0,
+            flags: vec![],
+        }));
+        assert!(cmds.is_empty());
+        // The controller's clamped truth wins: next steps start from it.
+        assert_eq!(
+            m.update(Event::Input(key('c'))),
+            vec![Command::SetCpuW(18.0)]
+        );
+        assert_eq!(
+            m.update(Event::Input(key('g'))),
+            vec![Command::SetGpuMaxClock(1395)]
+        );
+        assert_eq!(m.fan_target_rpm, 2500.0);
+    }
+
+    #[test]
+    fn q_emits_no_commands() {
+        let mut m = Model::new();
+        let cmds = m.update(Event::Input(key('q')));
+        assert!(
+            cmds.is_empty(),
+            "Quit is sent by main's shutdown, not update()"
+        );
+        assert!(!m.running);
     }
 }

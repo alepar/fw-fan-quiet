@@ -183,7 +183,7 @@ fn main() -> Result<()> {
             let mut terminal = std::mem::ManuallyDrop::new(terminal);
             install_tty_safe_panic_hook();
             spawn_input_thread(ui_tx);
-            let result = run(&mut terminal, &ui_rx, &telemetry, &term_flag);
+            let result = run(&mut terminal, &ui_rx, &cmd_tx, &telemetry, &term_flag);
             // Hardware restore BEFORE any terminal I/O (see ORDER above).
             shutdown.store(true, Ordering::Relaxed);
             quit_and_join_controller(cmd_tx, ctl);
@@ -233,12 +233,14 @@ fn quit_and_join_controller(cmd_tx: Sender<Command>, ctl: std::thread::JoinHandl
 }
 
 /// Event loop: draw, then wait (bounded) for the next event and fold it into
-/// the model. Every sample is also mirrored to the telemetry log. A raised
-/// `term_flag` (SIGINT/SIGTERM/SIGHUP) is treated exactly like 'q': the loop
-/// ends and shutdown proceeds through the normal return path.
+/// the model; commands the update returns (manual-mode keys) are forwarded to
+/// the controller. Every sample is also mirrored to the telemetry log. A
+/// raised `term_flag` (SIGINT/SIGTERM/SIGHUP) is treated exactly like 'q':
+/// the loop ends and shutdown proceeds through the normal return path.
 fn run(
     terminal: &mut ratatui::DefaultTerminal,
     rx: &Receiver<Event>,
+    cmd_tx: &Sender<Command>,
     telemetry: &Mutex<Option<Telemetry>>,
     term_flag: &AtomicBool,
 ) -> Result<()> {
@@ -255,13 +257,21 @@ fn run(
                 // Coalesce bursts: fold everything already queued into the
                 // model before spending a draw on it.
                 let mut next = Some(first);
-                while let Some(ev) = next {
+                'events: while let Some(ev) = next {
                     if let Event::Sample(s) = &ev {
                         if let Some(t) = telemetry::lock(telemetry).as_mut() {
                             t.log(&Record::Sample(s));
                         }
                     }
-                    model.update(ev);
+                    for c in model.update(ev) {
+                        if cmd_tx.send(c).is_err() {
+                            // Controller died: shut down cleanly (warn once;
+                            // dropping the queued events is fine mid-exit).
+                            tracing::warn!("controller command channel closed, shutting down");
+                            model.running = false;
+                            break 'events;
+                        }
+                    }
                     next = rx.try_recv().ok();
                 }
             }

@@ -3,10 +3,12 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Axis, Block, Chart, Dataset, GraphType, Paragraph};
 
+use crate::control::controller::StatusFlag;
 use crate::model::{Model, RING_CAP};
 use crate::ring::Ring;
 
@@ -41,17 +43,40 @@ pub fn view(model: &Model, frame: &mut Frame) {
     render_clock(model, frame, clock_area);
 
     frame.render_widget(
-        Paragraph::new(" q quit").style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(
+            " q quit  c/C cpu\u{2213}2W  g/G gpu\u{2213}105MHz  t/T fan\u{2213}250  p release",
+        )
+        .style(Style::default().fg(Color::DarkGray)),
         footer,
     );
 }
 
-/// App name, fan target, and validity warnings for the latest sample.
-fn header_line(model: &Model) -> String {
-    let mut line = format!(
-        " bazerame-fans | fan target {:.0} rpm",
+/// App name, mode, fan target, commanded limits, active flags and validity
+/// warnings for the latest sample. Flags carry their own (loud) styling.
+fn header_line(model: &Model) -> Line<'static> {
+    let cpu = match model.status.cpu_limit_w {
+        Some(w) => format!("cpu\u{2264}{w:.0}W"),
+        None => "cpu \u{2013}".into(),
+    };
+    let gpu = match model.status.gpu_max_mhz {
+        Some(mhz) => format!("gpu\u{2264}{mhz}MHz"),
+        None => "gpu \u{2013}".into(),
+    };
+    let mut spans = vec![Span::raw(format!(
+        " bazerame-fans | {} | fan target {:.0} rpm | {cpu} | {gpu}",
+        model.status.mode.as_str(),
         model.fan_target_rpm
-    );
+    ))];
+    for flag in &model.status.flags {
+        spans.push(Span::raw(" | "));
+        spans.push(match flag {
+            StatusFlag::LimitNotSticking => Span::styled(
+                "LIMIT-SLIP!",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            StatusFlag::Resumed => Span::styled("resumed", Style::default().fg(Color::Yellow)),
+        });
+    }
     if let Some(s) = &model.latest {
         let mut warnings = Vec::new();
         if !s.fan_valid {
@@ -64,11 +89,13 @@ fn header_line(model: &Model) -> String {
             warnings.push("GPU?");
         }
         if !warnings.is_empty() {
-            line.push_str(" | sensors lost: ");
-            line.push_str(&warnings.join(" "));
+            spans.push(Span::styled(
+                format!(" | sensors lost: {}", warnings.join(" ")),
+                Style::default().fg(Color::Red),
+            ));
         }
     }
-    line
+    Line::from(spans)
 }
 
 /// Ring -> chart points split into contiguous valid runs, X = sample index.
@@ -149,12 +176,15 @@ fn render_chart(
     frame.render_widget(chart, area);
 }
 
+/// Two-point horizontal guide line at `y` spanning the full X range (fan
+/// target and commanded-limit overlays).
+fn hline(y: f64) -> [(f64, f64); 2] {
+    [(0.0, y), (RING_CAP as f64, y)]
+}
+
 fn render_fans(model: &Model, frame: &mut Frame, area: Rect) {
     let fan_segs = segments(&model.max_fan);
-    let target_pts = [
-        (0.0, model.fan_target_rpm),
-        (RING_CAP as f64, model.fan_target_rpm),
-    ];
+    let target_pts = hline(model.fan_target_rpm);
     let title = match &model.latest {
         Some(s) => format!("fans {:.0}/{:.0} rpm", s.fan1_rpm, s.fan2_rpm),
         None => "fans (rpm)".into(),
@@ -167,11 +197,17 @@ fn render_fans(model: &Model, frame: &mut Frame, area: Rect) {
 fn render_watts(model: &Model, frame: &mut Frame, area: Rect) {
     let cpu_segs = segments(&model.cpu_w);
     let gpu_segs = segments(&model.gpu_w);
+    // Commanded CPU limit overlay (same pattern as the fan target line).
+    let limit_pts = model.status.cpu_limit_w.map(hline);
     let title = match &model.latest {
         Some(s) => format!("watts | cpu {:.1} W gpu {:.1} W", s.cpu_pkg_w, s.gpu_w),
         None => "watts".into(),
     };
-    let mut datasets = series("cpu", Color::Yellow, &cpu_segs);
+    let mut datasets = Vec::new();
+    if let Some(pts) = &limit_pts {
+        datasets.push(line_dataset(Color::DarkGray, pts).name("cpu limit"));
+    }
+    datasets.extend(series("cpu", Color::Yellow, &cpu_segs));
     datasets.extend(series("gpu", Color::Green, &gpu_segs));
     render_chart(frame, area, title, datasets, WATT_BOUNDS);
 }
@@ -193,17 +229,18 @@ fn render_temps(model: &Model, frame: &mut Frame, area: Rect) {
 
 fn render_clock(model: &Model, frame: &mut Frame, area: Rect) {
     let segs = segments(&model.gpu_mhz);
+    // Commanded GPU max-clock overlay.
+    let limit_pts = model.status.gpu_max_mhz.map(|mhz| hline(f64::from(mhz)));
     let title = match &model.latest {
         Some(s) => format!("gpu clock {:.0} MHz", s.gpu_sm_mhz),
         None => "gpu clock (MHz)".into(),
     };
-    render_chart(
-        frame,
-        area,
-        title,
-        series("sm", Color::Blue, &segs),
-        MHZ_BOUNDS,
-    );
+    let mut datasets = Vec::new();
+    if let Some(pts) = &limit_pts {
+        datasets.push(line_dataset(Color::DarkGray, pts).name("max"));
+    }
+    datasets.extend(series("sm", Color::Blue, &segs));
+    render_chart(frame, area, title, datasets, MHZ_BOUNDS);
 }
 
 #[cfg(test)]
@@ -305,6 +342,99 @@ mod tests {
         let mut ring = Ring::new(4);
         ring.push(f64::NAN);
         assert!(segments(&ring).is_empty());
+    }
+
+    #[test]
+    fn header_shows_mode_limits_and_flags() {
+        use crate::control::ControlStatus;
+        use crate::control::controller::{Mode, StatusFlag};
+        let mut m = Model::new();
+        m.update(Event::Status(ControlStatus {
+            mode: Mode::Manual,
+            cpu_limit_w: Some(20.0),
+            gpu_max_mhz: Some(1500),
+            fan_target_rpm: 2500.0,
+            flags: vec![StatusFlag::LimitNotSticking, StatusFlag::Resumed],
+        }));
+        let terminal = draw(&m);
+        let header = row_text(&terminal, 0);
+        assert!(header.contains("manual"), "header was: {header:?}");
+        assert!(header.contains("cpu\u{2264}20W"), "header was: {header:?}");
+        assert!(
+            header.contains("gpu\u{2264}1500MHz"),
+            "header was: {header:?}"
+        );
+        assert!(header.contains("LIMIT-SLIP!"), "header was: {header:?}");
+        assert!(header.contains("resumed"), "header was: {header:?}");
+        assert!(header.contains("2500"), "header was: {header:?}");
+    }
+
+    #[test]
+    fn header_shows_monitor_mode_and_dashes_without_limits() {
+        let terminal = draw(&Model::new());
+        let header = row_text(&terminal, 0);
+        assert!(header.contains("monitor"), "header was: {header:?}");
+        assert!(header.contains("cpu \u{2013}"), "header was: {header:?}");
+        assert!(header.contains("gpu \u{2013}"), "header was: {header:?}");
+        assert!(!header.contains("LIMIT-SLIP!"), "header was: {header:?}");
+    }
+
+    #[test]
+    fn limit_slip_flag_is_red_bold() {
+        use crate::control::ControlStatus;
+        use crate::control::controller::{Mode, StatusFlag};
+        use ratatui::style::Modifier;
+        let mut m = Model::new();
+        m.update(Event::Status(ControlStatus {
+            mode: Mode::Manual,
+            cpu_limit_w: Some(20.0),
+            gpu_max_mhz: None,
+            fan_target_rpm: 3000.0,
+            flags: vec![StatusFlag::LimitNotSticking],
+        }));
+        let terminal = draw(&m);
+        let header = row_text(&terminal, 0);
+        let x = header.find("LIMIT-SLIP!").expect("flag text present") as u16;
+        let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
+        assert_eq!(cell.fg, Color::Red);
+        assert!(cell.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn keybar_lists_manual_key_hints() {
+        let terminal = draw(&Model::new());
+        let footer = row_text(&terminal, 39);
+        for hint in [
+            "q quit",
+            "c/C cpu\u{2213}2W",
+            "g/G gpu\u{2213}105MHz",
+            "t/T fan\u{2213}250",
+            "p release",
+        ] {
+            assert!(footer.contains(hint), "footer was: {footer:?}");
+        }
+    }
+
+    #[test]
+    fn commanded_limit_lines_render_without_panic() {
+        use crate::control::ControlStatus;
+        use crate::control::controller::Mode;
+        // Some limits + data in the rings...
+        let mut m = Model::new();
+        for i in 0..50 {
+            m.update(Event::Sample(valid_sample(f64::from(i) * 30.0)));
+        }
+        m.update(Event::Status(ControlStatus {
+            mode: Mode::Manual,
+            cpu_limit_w: Some(54.0),
+            gpu_max_mhz: Some(3090),
+            fan_target_rpm: 3000.0,
+            flags: vec![],
+        }));
+        draw(&m);
+        // ...and back to None mid-session (release).
+        m.update(Event::Status(ControlStatus::default()));
+        draw(&m);
     }
 
     #[test]

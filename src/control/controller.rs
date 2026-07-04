@@ -40,21 +40,17 @@ const FAN_TARGET_MAX_RPM: f64 = 7000.0;
 /// echoed status and the displayed default can never diverge.
 pub const DEFAULT_FAN_TARGET_RPM: f64 = 3000.0;
 
-/// UI -> controller commands. Main sends only `Quit` today; the rest are
-/// wired to keys in Task 15.
+/// UI -> controller commands: the manual-mode keys emit the setters and
+/// `ReleaseAll`; `Quit` comes from main's shutdown sequence only.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Command {
     /// Sustained CPU package watts (converted to mW and clamped inside).
-    #[allow(dead_code)] // TODO(task-15): sent by the manual-mode UI.
     SetCpuW(f64),
     /// GPU max clock in MHz (clamped inside).
-    #[allow(dead_code)] // TODO(task-15): sent by the manual-mode UI.
     SetGpuMaxClock(u32),
     /// Back to Monitor mode: restore stock limits but keep running.
-    #[allow(dead_code)] // TODO(task-15): sent by the manual-mode UI.
     ReleaseAll,
     /// Stored + echoed in status; the control loop uses it in M4.
-    #[allow(dead_code)] // TODO(task-15): sent by the manual-mode UI.
     SetFanTarget(f64),
     /// Restore hardware and exit the controller thread.
     Quit,
@@ -270,9 +266,13 @@ impl<R: Runner> Controller<R> {
 
         // Resume: firmware may have forgotten our limits across the suspend.
         if s.resumed {
-            if self.reassert_actuators().is_some() {
+            if let Some(all_ok) = self.reassert_actuators() {
                 self.last_reassert = Some(s.t_mono);
-                effects.push(Effect::Reasserted { cause: "resume" });
+                // Telemetry honesty (as in the periodic path): a failed
+                // attempt must not count as a phantom reassert.
+                effects.push(Effect::Reasserted {
+                    cause: if all_ok { "resume" } else { "resume_failed" },
+                });
             }
             self.add_flag(StatusFlag::Resumed);
             self.resumed_until = Some(s.t_mono + RESUMED_FLAG_S);
@@ -299,10 +299,14 @@ impl<R: Runner> Controller<R> {
                              ({STICKINESS_SAMPLES} consecutive samples); reasserting",
                             s.cpu_pkg_w
                         );
-                        if self.reassert_actuators().is_some() {
+                        if let Some(all_ok) = self.reassert_actuators() {
                             self.last_reassert = Some(s.t_mono);
                             effects.push(Effect::Reasserted {
-                                cause: "stickiness",
+                                cause: if all_ok {
+                                    "stickiness"
+                                } else {
+                                    "stickiness_failed"
+                                },
                             });
                         }
                         self.add_flag(StatusFlag::LimitNotSticking);
@@ -840,6 +844,47 @@ mod tests {
         let effects = ctl.on_sample(&sample_at(231.0));
         assert!(!ctl.status().flags.contains(&StatusFlag::Resumed));
         assert_eq!(status_changes(&effects), 1);
+    }
+
+    #[test]
+    fn failed_resume_reassert_reports_resume_failed() {
+        let runner = FakeRunner::new();
+        let mut ctl = controller_no_profile(&runner);
+        ctl.on_command(Command::SetCpuW(20.0));
+
+        // The next ryzenadj invocation (the resume reassert) fails.
+        runner.push_result(Ok(output_with_code(1)));
+        let resumed = Sample {
+            t_mono: 200.0,
+            resumed: true,
+            ..Sample::default()
+        };
+        let effects = ctl.on_sample(&resumed);
+        assert!(
+            has_reassert(&effects, "resume_failed"),
+            "a failed attempt must not count as a phantom resume reassert, got {effects:?}"
+        );
+        assert!(!has_reassert(&effects, "resume"), "got {effects:?}");
+        // The Resumed flag is about the suspend, not the reassert: still set.
+        assert!(ctl.status().flags.contains(&StatusFlag::Resumed));
+    }
+
+    #[test]
+    fn failed_stickiness_reassert_reports_stickiness_failed() {
+        let runner = FakeRunner::new();
+        let mut ctl = controller_no_profile(&runner);
+        ctl.on_command(Command::SetCpuW(20.0));
+
+        ctl.on_sample(&sample_with_power(1.0, 26.0));
+        ctl.on_sample(&sample_with_power(2.0, 26.0));
+        // The third violation triggers the reassert, which fails.
+        runner.push_result(Ok(output_with_code(1)));
+        let effects = ctl.on_sample(&sample_with_power(3.0, 26.0));
+        assert!(
+            has_reassert(&effects, "stickiness_failed"),
+            "a failed attempt must not count as a phantom stickiness reassert, got {effects:?}"
+        );
+        assert!(ctl.status().flags.contains(&StatusFlag::LimitNotSticking));
     }
 
     #[test]

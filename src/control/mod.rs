@@ -5,5 +5,5 @@
 
 pub mod controller;
 
-// Mode/StatusFlag join this re-export when the UI consumes them (Task 15).
+// Mode/StatusFlag are reached via `controller::` where needed (view/tests).
 pub use controller::{Command, ControlStatus};

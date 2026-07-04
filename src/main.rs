@@ -74,6 +74,18 @@ fn main() -> Result<()> {
         None => tracing::warn!("telemetry disabled: no writable directory"),
     }
 
+    // SIGINT/SIGTERM/SIGHUP set term_flag; the event loop treats it like 'q',
+    // so the process leaves through the normal return path and the guard
+    // drops on main's stack. SIGHUP matters: closing the terminal window (or
+    // the pty master dying) would otherwise kill us without running drops.
+    // Registered BEFORE any hardware is touched below: a signal arriving
+    // mid-construction only sets the flag instead of terminating us without
+    // drops. SIGKILL cannot be caught - startup_reset below covers it.
+    let term_flag = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&term_flag))?;
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&term_flag))?;
+    signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&term_flag))?;
+
     // Actuators + restore guard, BEFORE ratatui init so a failed terminal
     // init still restores hardware. ensure_unloaded failure is only warned:
     // CPU actuation will then fail visibly later, monitoring still works.
@@ -106,16 +118,6 @@ fn main() -> Result<()> {
     // Belt-and-suspenders against a previous SIGKILL'd run leaving locks set.
     guard.startup_reset();
 
-    // SIGINT/SIGTERM/SIGHUP set term_flag; the event loop treats it like 'q',
-    // so the process leaves through the normal return path and the guard
-    // drops on main's stack. SIGHUP matters: closing the terminal window (or
-    // the pty master dying) would otherwise kill us without running drops.
-    // SIGKILL cannot be caught - startup_reset above covers it.
-    let term_flag = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&term_flag))?;
-    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&term_flag))?;
-    signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&term_flag))?;
-
     let (ui_tx, ui_rx) = unbounded::<Event>();
     let shutdown = Arc::new(AtomicBool::new(false));
     // Controller joins as a second subscriber in Task 14.
@@ -131,9 +133,20 @@ fn main() -> Result<()> {
     // -> _log_guard drops last so every restore step is still logged.
     // ORDER (panic path): the tty-safe panic hook restores the terminal
     // first, then main's unwind runs the same drops in the same order.
+    // Terminal::drop can never run on ANY path (normal or unwind): it is
+    // wrapped in ManuallyDrop below, because on a dead tty its show_cursor()
+    // fails and it eprintln!s the error, which PANICS (dead stderr) - during
+    // unwind that is a double panic -> SIGABRT before the guard can restore
+    // hardware (observed on-machine as SIGABRT via coredumpctl).
     let init_result = ratatui::try_init();
     let result = match init_result {
-        Ok(mut terminal) => {
+        Ok(terminal) => {
+            // ManuallyDrop, immediately: if run() panics, unwinding would
+            // otherwise drop `terminal` (hidden_cursor is true after the
+            // first draw) and abort as described above. DerefMut keeps the
+            // &mut terminal calls below working; the handful of leaked
+            // buffer bytes are reclaimed at process exit.
+            let mut terminal = std::mem::ManuallyDrop::new(terminal);
             install_tty_safe_panic_hook();
             spawn_input_thread(ui_tx);
             let result = run(&mut terminal, &ui_rx, telemetry.as_mut(), &term_flag);
@@ -143,14 +156,9 @@ fn main() -> Result<()> {
             if let Err(e) = ratatui::try_restore() {
                 tracing::warn!("terminal restore failed (harmless if the tty is gone): {e}");
             }
-            // Skip Terminal's Drop: on a dead tty its show_cursor() fails and
-            // it eprintln!s the error, which PANICS (dead stderr) and aborts
-            // the process before the guard below can restore hardware
-            // (observed as SIGABRT on-machine). We already restored the
-            // screen above; try to show the cursor, then leak the handful of
-            // buffer bytes - the process is exiting anyway.
+            // Best-effort replacement for the cursor restore Terminal::drop
+            // would have done.
             let _ = terminal.show_cursor();
-            std::mem::forget(terminal);
             result
         }
         Err(e) => Err(color_eyre::eyre::eyre!(e).wrap_err("cannot initialize terminal UI")),

@@ -3,4 +3,5 @@
 
 pub mod cmd;
 pub mod cpu;
+pub mod gpu;
 pub mod smu_module;

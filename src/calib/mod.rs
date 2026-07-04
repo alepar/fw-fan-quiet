@@ -4,4 +4,5 @@
 
 pub mod burner;
 pub mod lut_sweep;
+pub mod runner;
 pub mod steady;

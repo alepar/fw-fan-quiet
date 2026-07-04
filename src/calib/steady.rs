@@ -5,13 +5,9 @@
 
 /// Samples the tail window must span before we call it steady. At the 1 Hz
 /// sampling rate this is 20 seconds of settling time.
-// TODO(task-22): consumed by the calibration matrix runner; dead until then.
-#[allow(dead_code)]
 pub const STEADY_N: usize = 20;
 
 /// Max-min spread (RPM) the tail window may have and still count as steady.
-// TODO(task-22): consumed by the calibration matrix runner; dead until then.
-#[allow(dead_code)]
 pub const STEADY_RPM_TOLERANCE: f64 = 100.0;
 
 /// Window is steady when it has >= `n` samples and the max-min spread of the

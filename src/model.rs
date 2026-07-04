@@ -2,7 +2,7 @@
 
 use crate::control::{Command, ControlStatus};
 // Shared with the controller so display default and echoed status agree.
-use crate::control::controller::DEFAULT_FAN_TARGET_RPM;
+use crate::control::controller::{DEFAULT_FAN_TARGET_RPM, Mode};
 use crate::event::Event;
 use crate::ring::Ring;
 use crate::types::Sample;
@@ -98,6 +98,12 @@ impl Model {
                     (KeyCode::Char('q'), KeyModifiers::NONE) => self.running = false,
                     // Belt and suspenders next to the signal handler.
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.running = false,
+                    // Esc only means something while a calibration runs.
+                    (KeyCode::Esc, KeyModifiers::NONE) => {
+                        if self.status.mode == Mode::Calibrating {
+                            return vec![Command::AbortCalibration];
+                        }
+                    }
                     // Shifted letters arrive as uppercase Char + SHIFT.
                     (KeyCode::Char(ch), m)
                         if m == KeyModifiers::NONE || m == KeyModifiers::SHIFT =>
@@ -160,6 +166,15 @@ impl Model {
                 self.cpu_setpoint_w = None;
                 self.gpu_setpoint_mhz = None;
                 vec![Command::ReleaseAll]
+            }
+            'k' => {
+                // Calibration only starts from Monitor: a manual session (or
+                // a running calibration) must not be silently clobbered.
+                if self.status.mode == Mode::Monitor {
+                    vec![Command::StartCalibration]
+                } else {
+                    Vec::new()
+                }
             }
             _ => Vec::new(),
         }
@@ -289,6 +304,7 @@ mod tests {
             gpu_max_mhz: Some(1500),
             fan_target_rpm: 2500.0,
             flags: vec![StatusFlag::Resumed],
+            calib: None,
         };
         m.update(Event::Status(cs.clone()));
         assert_eq!(m.status, cs);
@@ -474,6 +490,7 @@ mod tests {
             gpu_max_mhz: Some(1500),
             fan_target_rpm: 2500.0,
             flags: vec![],
+            calib: None,
         }));
         assert!(cmds.is_empty());
         // The controller's clamped truth wins: next steps start from it.
@@ -486,6 +503,50 @@ mod tests {
             vec![Command::SetGpuMaxClock(1395)]
         );
         assert_eq!(m.fan_target_rpm, 2500.0);
+    }
+
+    // --- Task 22: calibration keys ---
+
+    /// A ControlStatus in the given mode (rest default).
+    fn status_in(mode: Mode) -> ControlStatus {
+        ControlStatus {
+            mode,
+            ..ControlStatus::default()
+        }
+    }
+
+    #[test]
+    fn k_starts_calibration_only_in_monitor_mode() {
+        // Default status is Monitor: k emits StartCalibration.
+        let mut m = Model::new();
+        assert_eq!(
+            m.update(Event::Input(key('k'))),
+            vec![Command::StartCalibration]
+        );
+
+        // Manual and Calibrating modes: k is ignored.
+        for mode in [Mode::Manual, Mode::Calibrating] {
+            let mut m = Model::new();
+            m.update(Event::Status(status_in(mode)));
+            assert_eq!(m.update(Event::Input(key('k'))), vec![], "mode {mode:?}");
+        }
+    }
+
+    #[test]
+    fn esc_aborts_only_while_calibrating() {
+        let esc = || Event::Input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        // Monitor/Manual: Esc does nothing.
+        for mode in [Mode::Monitor, Mode::Manual] {
+            let mut m = Model::new();
+            m.update(Event::Status(status_in(mode)));
+            assert_eq!(m.update(esc()), vec![], "mode {mode:?}");
+            assert!(m.running);
+        }
+        // Calibrating: Esc aborts.
+        let mut m = Model::new();
+        m.update(Event::Status(status_in(Mode::Calibrating)));
+        assert_eq!(m.update(esc()), vec![Command::AbortCalibration]);
+        assert!(m.running, "Esc aborts calibration, never quits the app");
     }
 
     #[test]

@@ -18,8 +18,6 @@ use crate::types::Sample;
 /// Clocks to sweep, descending from near-max to the low end: 10 steps about
 /// 210 MHz apart. Descending order keeps the GPU load saturating from the
 /// start (the top clock is where an unpinned GPU is most obvious).
-// TODO(task-22): consumed by the calibration runner; dead until then.
-#[allow(dead_code)]
 pub const SWEEP_CLOCKS: [u32; 10] = [3090, 2880, 2670, 2460, 2250, 2040, 1830, 1620, 1410, 1200];
 
 /// Tail-window length for GPU power settling. GPU power responds to a clock
@@ -54,8 +52,6 @@ const WATTS_WINDOW_CAP: usize = 60;
 
 /// Where the sweep is for the current clock step (exposed for UI progress).
 #[derive(Debug, Clone, PartialEq, Eq)]
-// TODO(task-22): consumed by the calibration runner; dead until then.
-#[allow(dead_code)]
 pub enum SweepState {
     /// Waiting for the GPU to be loaded and locked at `clock`.
     WaitPinned { clock: u32 },
@@ -68,8 +64,6 @@ pub enum SweepState {
 /// What one `start`/`on_sample` call did — mapped to actuation/UI by the
 /// runner shell (Task 22), asserted on directly in tests.
 #[derive(Debug, Clone, PartialEq)]
-// TODO(task-22): consumed by the calibration runner; dead until then.
-#[allow(dead_code)]
 pub enum SweepEffect {
     /// Lock the GPU SM clock at this many MHz.
     CommandClock(u32),
@@ -83,8 +77,6 @@ pub enum SweepEffect {
 
 /// The sweep state machine. Drive it with `start()` once, then `on_sample`
 /// for every 1 Hz sample.
-// TODO(task-22): consumed by the calibration runner; dead until then.
-#[allow(dead_code)]
 pub struct LutSweep {
     /// Index into `SWEEP_CLOCKS` of the point being measured (== completed
     /// points; equals `SWEEP_CLOCKS.len()` when Done).
@@ -97,8 +89,6 @@ pub struct LutSweep {
     lut: ClockWattsLut,
 }
 
-// TODO(task-22): consumed by the calibration runner; dead until then.
-#[allow(dead_code)]
 impl LutSweep {
     /// Positioned at the first clock; emits nothing until `start()`.
     pub fn new() -> Self {

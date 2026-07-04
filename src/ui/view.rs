@@ -6,9 +6,9 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Axis, Block, Chart, Dataset, GraphType, Paragraph};
+use ratatui::widgets::{Axis, Block, Chart, Dataset, Gauge, GraphType, Paragraph};
 
-use crate::control::controller::StatusFlag;
+use crate::control::controller::{CalibProgressLite, StatusFlag};
 use crate::model::{Model, RING_CAP};
 use crate::ring::Ring;
 
@@ -40,13 +40,21 @@ pub fn view(model: &Model, frame: &mut Frame) {
     render_fans(model, frame, fans_area);
     render_watts(model, frame, watts_area);
     render_temps(model, frame, temps_area);
-    render_clock(model, frame, clock_area);
+    // The calibration wizard borrows the bottom-right slot (the GPU clock is
+    // the least interesting chart mid-calibration); other charts stay live.
+    match &model.status.calib {
+        Some(progress) => render_calib_wizard(progress, frame, clock_area),
+        None => render_clock(model, frame, clock_area),
+    }
 
+    let keybar = if model.status.calib.is_some() {
+        " q quit  Esc abort calibration"
+    } else {
+        " q quit  c/C cpu\u{2213}2W  g/G gpu\u{2213}105MHz  t/T fan\u{2213}250  p release  \
+         k calibrate"
+    };
     frame.render_widget(
-        Paragraph::new(
-            " q quit  c/C cpu\u{2213}2W  g/G gpu\u{2213}105MHz  t/T fan\u{2213}250  p release",
-        )
-        .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(keybar).style(Style::default().fg(Color::DarkGray)),
         footer,
     );
 }
@@ -227,6 +235,49 @@ fn render_temps(model: &Model, frame: &mut Frame, area: Rect) {
     render_chart(frame, area, title, datasets, TEMP_BOUNDS);
 }
 
+/// Calibration wizard panel: phase, step gauge, load prompt, note, abort
+/// hint. Rendered instead of the GPU clock chart while calibrating.
+fn render_calib_wizard(progress: &CalibProgressLite, frame: &mut Frame, area: Rect) {
+    let block = Block::bordered().title(format!("calibration \u{2014} {}", progress.phase));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [gauge_area, load_area, note_area, hint_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    let ratio = if progress.total == 0 {
+        0.0
+    } else {
+        (progress.step as f64 / progress.total as f64).clamp(0.0, 1.0)
+    };
+    frame.render_widget(
+        Gauge::default()
+            .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
+            .ratio(ratio)
+            .label(format!("step {}/{}", progress.step, progress.total)),
+        gauge_area,
+    );
+    if progress.needs_load {
+        frame.render_widget(
+            Paragraph::new("\u{25b6} START A GPU-HEAVY LOAD (game/benchmark)").style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            load_area,
+        );
+    }
+    frame.render_widget(Paragraph::new(progress.note.clone()), note_area);
+    frame.render_widget(
+        Paragraph::new("Esc abort").style(Style::default().fg(Color::DarkGray)),
+        hint_area,
+    );
+}
+
 fn render_clock(model: &Model, frame: &mut Frame, area: Rect) {
     let segs = segments(&model.gpu_mhz);
     // Commanded GPU max-clock overlay.
@@ -355,6 +406,7 @@ mod tests {
             gpu_max_mhz: Some(1500),
             fan_target_rpm: 2500.0,
             flags: vec![StatusFlag::LimitNotSticking, StatusFlag::Resumed],
+            calib: None,
         }));
         let terminal = draw(&m);
         let header = row_text(&terminal, 0);
@@ -391,6 +443,7 @@ mod tests {
             gpu_max_mhz: None,
             fan_target_rpm: 3000.0,
             flags: vec![StatusFlag::LimitNotSticking],
+            calib: None,
         }));
         let terminal = draw(&m);
         let header = row_text(&terminal, 0);
@@ -410,9 +463,100 @@ mod tests {
             "g/G gpu\u{2213}105MHz",
             "t/T fan\u{2213}250",
             "p release",
+            "k calibrate",
         ] {
             assert!(footer.contains(hint), "footer was: {footer:?}");
         }
+        assert!(!footer.contains("Esc abort"), "footer was: {footer:?}");
+    }
+
+    // --- Task 22: calibration wizard panel ---
+
+    /// All buffer rows joined with newlines (wizard text spans several rows).
+    fn all_text(terminal: &Terminal<TestBackend>) -> String {
+        (0..40)
+            .map(|y| row_text(terminal, y))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn calibrating_model(needs_load: bool) -> Model {
+        use crate::control::ControlStatus;
+        use crate::control::controller::{CalibProgressLite, Mode};
+        let mut m = Model::new();
+        // Live data in the rings: the other three charts keep rendering.
+        for i in 0..50 {
+            m.update(Event::Sample(valid_sample(f64::from(i) * 30.0)));
+        }
+        m.update(Event::Status(ControlStatus {
+            mode: Mode::Calibrating,
+            cpu_limit_w: Some(30.0),
+            gpu_max_mhz: Some(1950),
+            fan_target_rpm: 3000.0,
+            flags: vec![],
+            calib: Some(CalibProgressLite {
+                phase: "matrix".into(),
+                step: 4,
+                total: 11,
+                needs_load,
+                note: "matrix point 5/11: cpu 5 W, gpu 35 W".into(),
+            }),
+        }));
+        m
+    }
+
+    #[test]
+    fn wizard_panel_renders_with_needs_load_prompt() {
+        let terminal = draw(&calibrating_model(true));
+        let text = all_text(&terminal);
+        assert!(text.contains("calibration \u{2014} matrix"), "text: {text}");
+        assert!(text.contains("step 4/11"), "text: {text}");
+        assert!(
+            text.contains("START A GPU-HEAVY LOAD"),
+            "needs_load prompt missing: {text}"
+        );
+        assert!(text.contains("matrix point 5/11"), "text: {text}");
+        assert!(text.contains("Esc abort"), "text: {text}");
+        // Header reflects the mode; keybar switched to the abort hint.
+        assert!(row_text(&terminal, 0).contains("calibrating"));
+        assert!(row_text(&terminal, 39).contains("Esc abort"));
+        assert!(!row_text(&terminal, 39).contains("k calibrate"));
+    }
+
+    #[test]
+    fn wizard_panel_without_needs_load_hides_prompt() {
+        let terminal = draw(&calibrating_model(false));
+        let text = all_text(&terminal);
+        assert!(text.contains("calibration \u{2014} matrix"), "text: {text}");
+        assert!(
+            !text.contains("START A GPU-HEAVY LOAD"),
+            "prompt must be hidden: {text}"
+        );
+    }
+
+    #[test]
+    fn wizard_panel_survives_tiny_areas_and_zero_total() {
+        use crate::control::ControlStatus;
+        use crate::control::controller::{CalibProgressLite, Mode};
+        let mut m = Model::new();
+        m.update(Event::Status(ControlStatus {
+            mode: Mode::Calibrating,
+            cpu_limit_w: None,
+            gpu_max_mhz: None,
+            fan_target_rpm: 3000.0,
+            flags: vec![],
+            calib: Some(CalibProgressLite {
+                phase: "aborted".into(),
+                step: 0,
+                total: 0,
+                needs_load: true,
+                note: String::new(),
+            }),
+        }));
+        // Tiny terminal: every wizard sub-area degenerates; must not panic.
+        let mut terminal = Terminal::new(TestBackend::new(20, 6)).unwrap();
+        terminal.draw(|f| view(&m, f)).unwrap();
+        draw(&m); // and the normal size with total == 0 (gauge ratio 0)
     }
 
     #[test]
@@ -427,6 +571,7 @@ mod tests {
             gpu_max_mhz: Some(1500),
             fan_target_rpm: 3000.0,
             flags: vec![],
+            calib: None,
         }));
         draw(&m);
         // Some limits + data in the rings...
@@ -440,6 +585,7 @@ mod tests {
             gpu_max_mhz: Some(3090),
             fan_target_rpm: 3000.0,
             flags: vec![],
+            calib: None,
         }));
         draw(&m);
         // ...and back to None mid-session (release).

@@ -22,9 +22,6 @@ pub struct PersistedState {
     pub calibrated_at: Option<String>,
 }
 
-// TODO(task-22): the calibration runner saves here after a successful fit;
-// TODO(task-25): startup loads it into the controller.
-#[allow(dead_code)]
 impl PersistedState {
     /// Load from `path`. Missing file → default (info log); unreadable or
     /// corrupt JSON → default + warning. NEVER crashes on bad state.

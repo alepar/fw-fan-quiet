@@ -11,6 +11,7 @@
 //! unit-testable with `FakeRunner` and hand-fed samples. The shell only maps
 //! effects to channel sends and telemetry records.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -19,9 +20,18 @@ use crossbeam_channel::{Receiver, Sender, never, select};
 
 use crate::actuators::cmd::Runner;
 use crate::actuators::guard::RestoreGuard;
+use crate::calib::burner::Burner;
+use crate::calib::runner::{CalibRunner, RunnerEffect};
+use crate::control::lut::ClockWattsLut;
+use crate::control::thermal_model::ThermalModel;
 use crate::event::Event;
+use crate::state::PersistedState;
 use crate::telemetry::{self, Record, Telemetry};
 use crate::types::Sample;
+
+/// UI-facing calibration progress, re-exported so the view/model layers name
+/// it without reaching into `calib::`.
+pub use crate::calib::runner::CalibProgress as CalibProgressLite;
 
 /// Reapply active limits at least this often (defends against PPD/tuned
 /// clobbering the ryzenadj limits behind our back; design §3).
@@ -52,17 +62,23 @@ pub enum Command {
     ReleaseAll,
     /// Stored + echoed in status; the control loop uses it in M4.
     SetFanTarget(f64),
+    /// Begin guided calibration (honored in Monitor mode only).
+    StartCalibration,
+    /// Abort a running calibration (release everything, back to Monitor).
+    AbortCalibration,
     /// Restore hardware and exit the controller thread.
     Quit,
 }
 
-/// Controller mode. Auto/Calibrating come later.
-/// TODO(task-22): Calibrating. TODO(task-25): Auto.
+/// Controller mode. Auto comes later. TODO(task-25): Auto.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
     #[default]
     Monitor,
     Manual,
+    /// The calibration runner owns actuation; manual commands and the
+    /// reassert/stickiness machinery are suspended.
+    Calibrating,
 }
 
 impl Mode {
@@ -71,6 +87,7 @@ impl Mode {
         match self {
             Mode::Monitor => "monitor",
             Mode::Manual => "manual",
+            Mode::Calibrating => "calibrating",
         }
     }
 }
@@ -107,6 +124,8 @@ pub struct ControlStatus {
     pub fan_target_rpm: f64,
     /// Currently active flags.
     pub flags: Vec<StatusFlag>,
+    /// Calibration wizard progress; Some exactly while Calibrating.
+    pub calib: Option<CalibProgressLite>,
 }
 
 /// Hand-written (not derived) so `fan_target_rpm` starts at the real default
@@ -119,6 +138,7 @@ impl Default for ControlStatus {
             gpu_max_mhz: None,
             fan_target_rpm: DEFAULT_FAN_TARGET_RPM,
             flags: Vec::new(),
+            calib: None,
         }
     }
 }
@@ -152,16 +172,36 @@ pub struct Controller<R: Runner> {
     resumed_until: Option<f64>,
     /// `t_mono` of the last (re)assert, None until the first post-command sample.
     last_reassert: Option<f64>,
+    /// Running calibration session; Some exactly while `Mode::Calibrating`.
+    calib: Option<CalibRunner>,
+    /// CPU burner owned on the runner's behalf (StartBurner/StopBurner).
+    burner: Option<Burner>,
+    /// Where `RunnerEffect::SaveState` persists to (`--state-file`).
+    state_path: PathBuf,
+    /// Fitted thermal model: loaded from the state file at construction,
+    /// replaced by a fresh calibration.
+    /// TODO(task-23/25): consumed by the auto-mode allocator; unread until then.
+    #[allow(dead_code)]
+    model: Option<ThermalModel>,
+    /// GPU clock→watts LUT, same lifecycle as `model`.
+    /// TODO(task-24): consumed by the GPU watts→clock PI; unread until then.
+    #[allow(dead_code)]
+    lut: Option<ClockWattsLut>,
 }
 
 impl<R: Runner> Controller<R> {
-    pub fn new(guard: RestoreGuard<R>) -> Self {
+    pub fn new(guard: RestoreGuard<R>, persisted: PersistedState, state_path: PathBuf) -> Self {
         Self {
             guard,
             status: ControlStatus::default(),
             stick_violations: 0,
             resumed_until: None,
             last_reassert: None,
+            calib: None,
+            burner: None,
+            state_path,
+            model: persisted.model,
+            lut: persisted.lut,
         }
     }
 
@@ -180,6 +220,18 @@ impl<R: Runner> Controller<R> {
     /// Actuator failures are warned and leave the status untouched — the UI
     /// keeps showing what is actually applied, never what merely was asked.
     pub fn on_command(&mut self, c: Command) -> Vec<Effect> {
+        // While calibrating the runner owns actuation: manual setters and
+        // release are rejected outright (Esc/AbortCalibration is the way to
+        // take control back).
+        if self.status.mode == Mode::Calibrating
+            && matches!(
+                c,
+                Command::SetCpuW(_) | Command::SetGpuMaxClock(_) | Command::ReleaseAll
+            )
+        {
+            tracing::warn!("manual command rejected while calibrating: {c:?}");
+            return Vec::new();
+        }
         let before = self.status.clone();
         let mut effects = Vec::new();
         let cause = match c {
@@ -243,7 +295,40 @@ impl<R: Runner> Controller<R> {
                 self.status.fan_target_rpm = rpm.clamp(FAN_TARGET_MIN_RPM, FAN_TARGET_MAX_RPM);
                 "command:set_fan_target"
             }
+            Command::StartCalibration => {
+                if self.status.mode != Mode::Monitor {
+                    tracing::warn!(
+                        "StartCalibration ignored: mode is {}, not monitor",
+                        self.status.mode.as_str()
+                    );
+                } else {
+                    let mut runner = CalibRunner::new();
+                    let runner_effects = runner.start();
+                    self.calib = Some(runner);
+                    self.status.mode = Mode::Calibrating;
+                    self.apply_calib_effects(runner_effects);
+                    self.sync_calib_status();
+                }
+                "calib:start"
+            }
+            Command::AbortCalibration => {
+                match self.calib.take() {
+                    None => tracing::warn!("AbortCalibration ignored: no calibration running"),
+                    Some(mut runner) => {
+                        self.apply_calib_effects(runner.abort());
+                        self.end_calibration();
+                    }
+                }
+                "calib:aborted"
+            }
             Command::Quit => {
+                // Abort a running calibration FIRST: burner threads stopped
+                // and calibration limits released before the guard's full
+                // restore (which reloads ryzen_smu last).
+                if let Some(mut runner) = self.calib.take() {
+                    self.apply_calib_effects(runner.abort());
+                    self.end_calibration();
+                }
                 self.guard.restore_all();
                 effects.push(Effect::Quit);
                 return effects;
@@ -256,8 +341,15 @@ impl<R: Runner> Controller<R> {
     }
 
     /// Consume one 1 Hz sample: resume handling, stickiness watchdog and the
-    /// periodic reassert (all t_mono-driven); returns what happened.
+    /// periodic reassert (all t_mono-driven); returns what happened. While
+    /// Calibrating, all of that is SUSPENDED — the sample goes to the
+    /// calibration runner, which owns actuation (the stickiness watchdog
+    /// would fight the runner's deliberate low limits, and the runner
+    /// re-commands each point itself).
     pub fn on_sample(&mut self, s: &Sample) -> Vec<Effect> {
+        if self.status.mode == Mode::Calibrating {
+            return self.on_calib_sample(s);
+        }
         let before = self.status.clone();
         let mut effects = Vec::new();
         // First status-affecting stage wins the Decision `cause`; the record
@@ -349,6 +441,165 @@ impl<R: Runner> Controller<R> {
             });
         }
         effects
+    }
+
+    /// One calibrating-mode sample: feed the runner, execute its effects,
+    /// refresh the wizard progress in status.
+    fn on_calib_sample(&mut self, s: &Sample) -> Vec<Effect> {
+        let before = self.status.clone();
+        let runner_effects = match self.calib.as_mut() {
+            Some(runner) => runner.on_sample(s),
+            None => {
+                // Defensive: mode says Calibrating but no runner; recover.
+                tracing::warn!("Calibrating mode without a runner; returning to Monitor");
+                self.end_calibration();
+                Vec::new()
+            }
+        };
+        let cause = self.apply_calib_effects(runner_effects);
+        self.sync_calib_status();
+        let mut effects = Vec::new();
+        if self.status != before {
+            effects.push(Effect::StatusChanged {
+                cause: cause.unwrap_or("calib:progress"),
+            });
+        }
+        effects
+    }
+
+    /// Execute one batch of runner effects against the guard's actuators,
+    /// the burner and the state file. Actuator failures are warned — the
+    /// runner records MEASURED watts, so a missed command skews one point
+    /// instead of breaking the machine. Returns the most significant
+    /// telemetry cause the batch produced.
+    fn apply_calib_effects(&mut self, effects: Vec<RunnerEffect>) -> Option<&'static str> {
+        /// Higher wins when a batch carries several notable events (the
+        /// final batch is releases + PointRecorded + Fitted + Finished).
+        fn rank(cause: &str) -> u8 {
+            match cause {
+                "calib:failed" => 5,
+                "calib:fitted" => 4,
+                "calib:finished" => 3,
+                "calib:point_recorded" => 2,
+                _ => 1,
+            }
+        }
+        fn raise(cur: &mut Option<&'static str>, c: &'static str) {
+            if cur.is_none_or(|old| rank(c) > rank(old)) {
+                *cur = Some(c);
+            }
+        }
+        let mut cause: Option<&'static str> = None;
+        let mut ended = false;
+        for effect in effects {
+            match effect {
+                RunnerEffect::SetCpuW(w) => match self.guard.cpu.as_ref() {
+                    None => tracing::warn!("calib: no CPU actuator; SetCpuW({w}) skipped"),
+                    Some(cpu) => match cpu.set_sustained_mw((w * 1000.0).round() as u32) {
+                        Ok(clamped_mw) => {
+                            self.status.cpu_limit_w = Some(f64::from(clamped_mw) / 1000.0);
+                        }
+                        Err(e) => tracing::warn!("calib: SetCpuW({w}) failed: {e}"),
+                    },
+                },
+                RunnerEffect::SetGpuMaxClock(mhz) => match self.guard.gpu.as_mut() {
+                    None => tracing::warn!("calib: no GPU actuator; SetGpuMaxClock({mhz}) skipped"),
+                    Some(gpu) => match gpu.set_max_clock(mhz) {
+                        Ok(()) => self.status.gpu_max_mhz = gpu.applied(),
+                        Err(e) => tracing::warn!("calib: SetGpuMaxClock({mhz}) failed: {e}"),
+                    },
+                },
+                RunnerEffect::ReleaseCpu => {
+                    if let Some(cpu) = self.guard.cpu.as_ref() {
+                        if let Err(e) = cpu.restore_stock() {
+                            tracing::warn!("calib: CPU stock restore failed: {e}");
+                        }
+                    }
+                    self.status.cpu_limit_w = None;
+                }
+                RunnerEffect::ReleaseGpu => {
+                    if let Some(gpu) = self.guard.gpu.as_mut() {
+                        if let Err(e) = gpu.release() {
+                            tracing::warn!("calib: GPU clock release failed: {e}");
+                        }
+                    }
+                    self.status.gpu_max_mhz = None;
+                }
+                RunnerEffect::StartBurner(n) => {
+                    // Replace any running burner: the runner re-commands the
+                    // CPU side on every point entry.
+                    if let Some(old) = self.burner.take() {
+                        old.stop();
+                    }
+                    self.burner = Some(Burner::start(n));
+                }
+                RunnerEffect::StopBurner => {
+                    if let Some(burner) = self.burner.take() {
+                        burner.stop();
+                    }
+                }
+                RunnerEffect::NeedsGpuLoad => raise(&mut cause, "calib:needs_load"),
+                RunnerEffect::PointRecorded { phase, idx, detail } => {
+                    tracing::info!("calib: {phase} point {idx} recorded: {detail}");
+                    raise(&mut cause, "calib:point_recorded");
+                }
+                RunnerEffect::Fitted {
+                    a,
+                    b,
+                    e,
+                    c,
+                    max_residual,
+                } => {
+                    tracing::info!(
+                        "calib: fitted a={a:.2} b={b:.2} e={e:.3} c={c:.0} \
+                         (max residual {max_residual:.0} RPM)"
+                    );
+                    raise(&mut cause, "calib:fitted");
+                }
+                RunnerEffect::SaveState(state) => {
+                    self.model = state.model.clone();
+                    self.lut = state.lut.clone();
+                    match state.save(&self.state_path) {
+                        Ok(()) => {
+                            tracing::info!("calib: state saved to {}", self.state_path.display());
+                        }
+                        Err(e) => tracing::warn!(
+                            "calib: state save to {} failed: {e}",
+                            self.state_path.display()
+                        ),
+                    }
+                }
+                RunnerEffect::Failed(msg) => {
+                    tracing::warn!("calibration failed: {msg}");
+                    raise(&mut cause, "calib:failed");
+                    ended = true;
+                }
+                RunnerEffect::Finished => {
+                    raise(&mut cause, "calib:finished");
+                    ended = true;
+                }
+            }
+        }
+        if ended {
+            self.end_calibration();
+        }
+        cause
+    }
+
+    /// Mirror the runner's progress into status (None once it's gone).
+    fn sync_calib_status(&mut self) {
+        self.status.calib = self.calib.as_ref().map(CalibRunner::progress);
+    }
+
+    /// Back to Monitor: drop the runner, stop the burner (defensive — the
+    /// runner's own StopBurner normally already ran), clear the wizard.
+    fn end_calibration(&mut self) {
+        if let Some(burner) = self.burner.take() {
+            burner.stop();
+        }
+        self.calib = None;
+        self.status.mode = Mode::Monitor;
+        self.status.calib = None;
     }
 
     /// Reapply whatever limits are currently commanded (same values). Errors
@@ -541,12 +792,16 @@ mod tests {
     /// Controller over a FakeRunner-backed CPU actuator (no GPU: NVML needs
     /// hardware) and an smu module "we unloaded" (so Quit's reload shows up).
     fn controller(runner: &FakeRunner, profile_path: PathBuf) -> Controller<&FakeRunner> {
-        Controller::new(RestoreGuard::new(
-            runner,
-            Some(cpu_actuator(runner, profile_path)),
-            None,
-            Some(SmuModule::assume_unloaded()),
-        ))
+        Controller::new(
+            RestoreGuard::new(
+                runner,
+                Some(cpu_actuator(runner, profile_path)),
+                None,
+                Some(SmuModule::assume_unloaded()),
+            ),
+            PersistedState::default(),
+            PathBuf::from("/nonexistent/state.json"),
+        )
     }
 
     /// No profile file needed: tests that never touch restore_stock.
@@ -643,8 +898,11 @@ mod tests {
     #[test]
     fn set_cpu_w_without_actuator_is_a_warned_noop() {
         let runner = FakeRunner::new();
-        let mut ctl: Controller<&FakeRunner> =
-            Controller::new(RestoreGuard::new(&runner, None, None, None));
+        let mut ctl: Controller<&FakeRunner> = Controller::new(
+            RestoreGuard::new(&runner, None, None, None),
+            PersistedState::default(),
+            PathBuf::from("/nonexistent/state.json"),
+        );
 
         let effects = ctl.on_command(Command::SetCpuW(20.0));
         assert!(effects.is_empty(), "got {effects:?}");
@@ -930,7 +1188,11 @@ mod tests {
         let mut cpu = CpuActuator::new(FakeRunner::new(), path);
         cpu.toggle_delay = Duration::from_millis(1);
         let guard = RestoreGuard::new(FakeRunner::new(), Some(cpu), None, None);
-        let controller = Controller::new(guard);
+        let controller = Controller::new(
+            guard,
+            PersistedState::default(),
+            PathBuf::from("/nonexistent/state.json"),
+        );
 
         let (ui_tx, ui_rx) = crossbeam_channel::unbounded();
         let (_sample_tx, sample_rx) = crossbeam_channel::unbounded::<Event>();
@@ -969,5 +1231,271 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- Task 22: calibration integration ---
+
+    use crate::calib::runner::MATRIX_POINTS;
+
+    /// Sweep-phase sample: GPU pinned at `clock` drawing clock/30 watts.
+    fn sweep_pinned(clock: u32) -> Sample {
+        Sample {
+            gpu_util_pct: 99.0,
+            gpu_sm_mhz: f64::from(clock),
+            gpu_w: f64::from(clock) / 30.0,
+            gpu_w_valid: true,
+            gpu_mhz_valid: true,
+            fan1_rpm: 3000.0,
+            fan_valid: true,
+            ..Sample::default()
+        }
+    }
+
+    /// The sample a well-behaved system produces on matrix point `idx`
+    /// (measured CPU 2 W under the commanded limit; fans from a synthetic
+    /// affine surface so every point settles).
+    fn matrix_point_sample(idx: usize) -> Sample {
+        let (cpu_t, gpu_t) = MATRIX_POINTS[idx];
+        let cpu = if cpu_t > 5.0 { cpu_t - 2.0 } else { 4.0 };
+        let (gpu, util) = if gpu_t > 0.0 {
+            (gpu_t, 97.0)
+        } else {
+            (10.0, 3.0)
+        };
+        Sample {
+            cpu_pkg_w: cpu,
+            gpu_w: gpu,
+            gpu_w_valid: true,
+            gpu_util_pct: util,
+            gpu_mhz_valid: true,
+            fan1_rpm: 25.0 * cpu + 15.0 * gpu + 0.1 * cpu * gpu + 800.0,
+            fan_valid: true,
+            ..Sample::default()
+        }
+    }
+
+    /// Drive the whole LUT sweep through the controller with pinned samples.
+    fn drive_sweep(ctl: &mut Controller<&FakeRunner>) {
+        use crate::calib::lut_sweep::SWEEP_CLOCKS;
+        for (i, &clock) in SWEEP_CLOCKS.iter().enumerate() {
+            for _ in 0..60 {
+                ctl.on_sample(&sweep_pinned(clock));
+                let calib = ctl.status().calib.as_ref().expect("calibrating");
+                if calib.phase != "lut sweep" || calib.step > i {
+                    break;
+                }
+            }
+        }
+        let calib = ctl.status().calib.as_ref().expect("calibrating");
+        assert_eq!(calib.phase, "matrix", "sweep must finish: {calib:?}");
+    }
+
+    /// Drive matrix point `idx` to its recording through the controller.
+    fn drive_matrix_point(ctl: &mut Controller<&FakeRunner>, idx: usize) {
+        for _ in 0..300 {
+            ctl.on_sample(&matrix_point_sample(idx));
+            match ctl.status().calib.as_ref() {
+                None => return, // calibration finished after the last point
+                Some(calib) if calib.step > idx => return,
+                Some(_) => {}
+            }
+        }
+        panic!("matrix point {idx} never recorded through the controller");
+    }
+
+    #[test]
+    fn start_calibration_only_from_monitor() {
+        let runner = FakeRunner::new();
+        let mut ctl = controller_no_profile(&runner);
+
+        // From Manual mode: warned no-op, status untouched.
+        ctl.on_command(Command::SetCpuW(20.0));
+        let effects = ctl.on_command(Command::StartCalibration);
+        assert!(effects.is_empty(), "got {effects:?}");
+        assert_eq!(ctl.status().mode, Mode::Manual);
+        assert!(ctl.status().calib.is_none());
+        assert!(ctl.calib.is_none());
+
+        // Back to Monitor: calibration starts (LUT sweep phase).
+        ctl.on_command(Command::ReleaseAll);
+        let effects = ctl.on_command(Command::StartCalibration);
+        assert_eq!(status_changes(&effects), 1);
+        assert_eq!(ctl.status().mode, Mode::Calibrating);
+        let calib = ctl.status().calib.as_ref().expect("wizard progress set");
+        assert_eq!(calib.phase, "lut sweep");
+        assert_eq!(calib.total, 10);
+        // The sweep's first clock lock was attempted (no GPU actuator in
+        // tests: warned no-op, gpu_max_mhz stays None).
+        assert_eq!(ctl.status().gpu_max_mhz, None);
+    }
+
+    #[test]
+    fn manual_commands_rejected_while_calibrating() {
+        let runner = FakeRunner::new();
+        let mut ctl = controller_no_profile(&runner);
+        ctl.on_command(Command::StartCalibration);
+        let calls_before = runner.calls().len();
+
+        for cmd in [
+            Command::SetCpuW(20.0),
+            Command::SetGpuMaxClock(1500),
+            Command::ReleaseAll,
+        ] {
+            let effects = ctl.on_command(cmd);
+            assert!(effects.is_empty(), "{cmd:?} must be rejected: {effects:?}");
+        }
+        assert_eq!(runner.calls().len(), calls_before, "no actuation happened");
+        assert_eq!(ctl.status().mode, Mode::Calibrating);
+
+        // Fan target is not actuation: still accepted while calibrating.
+        ctl.on_command(Command::SetFanTarget(2500.0));
+        assert_eq!(ctl.status().fan_target_rpm, 2500.0);
+    }
+
+    #[test]
+    fn calibration_effects_drive_actuators_and_burner() {
+        let runner = FakeRunner::new();
+        let (dir, path) = profile_fixture("calib-actuators");
+        let mut ctl = controller(&runner, path);
+        ctl.on_command(Command::StartCalibration);
+        drive_sweep(&mut ctl);
+        // Point 0 (idle/idle): no burner, no ryzenadj set.
+        assert!(ctl.burner.is_none());
+        assert!(ryzenadj_calls(&runner).is_empty());
+        drive_matrix_point(&mut ctl, 0);
+
+        // Point 1 (15 W): ryzenadj commanded with the matrix wattage and the
+        // burner is running.
+        assert_eq!(ryzenadj_calls(&runner), vec![expected_args(15_000)]);
+        assert!(ctl.burner.is_some(), "burner must run for a loaded point");
+        assert_eq!(ctl.status().cpu_limit_w, Some(15.0));
+        drive_matrix_point(&mut ctl, 1);
+
+        // Point 2 (30 W): re-commanded.
+        assert_eq!(
+            ryzenadj_calls(&runner),
+            vec![expected_args(15_000), expected_args(30_000)]
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn abort_calibration_releases_and_returns_to_monitor() {
+        let runner = FakeRunner::new();
+        let (dir, path) = profile_fixture("calib-abort");
+        let mut ctl = controller(&runner, path.clone());
+        ctl.on_command(Command::StartCalibration);
+        drive_sweep(&mut ctl);
+        drive_matrix_point(&mut ctl, 0);
+        drive_matrix_point(&mut ctl, 1); // burner + 30 W limit now active
+        assert!(ctl.burner.is_some());
+
+        let effects = ctl.on_command(Command::AbortCalibration);
+        assert_eq!(status_changes(&effects), 1);
+        assert_eq!(ctl.status().mode, Mode::Monitor);
+        assert!(ctl.status().calib.is_none());
+        assert_eq!(ctl.status().cpu_limit_w, None);
+        assert!(ctl.calib.is_none());
+        assert!(ctl.burner.is_none(), "abort must stop the burner");
+        // Release toggled the profile back; smu stays untouched (session on).
+        assert_eq!(fs::read_to_string(&path).unwrap(), "balanced");
+        assert_eq!(modprobe_reload_calls(&runner), 0);
+
+        // Manual mode works again after the abort.
+        ctl.on_command(Command::SetCpuW(20.0));
+        assert_eq!(ctl.status().mode, Mode::Manual);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn quit_during_calibration_aborts_then_restores() {
+        let runner = FakeRunner::new();
+        let (dir, path) = profile_fixture("calib-quit");
+        let mut ctl = controller(&runner, path.clone());
+        ctl.on_command(Command::StartCalibration);
+        drive_sweep(&mut ctl);
+        drive_matrix_point(&mut ctl, 0);
+        drive_matrix_point(&mut ctl, 1); // burner + limit active
+
+        let effects = ctl.on_command(Command::Quit);
+        assert_eq!(effects, vec![Effect::Quit]);
+        assert!(ctl.burner.is_none(), "quit must stop the burner");
+        assert!(ctl.calib.is_none());
+        // Profile restored and ryzen_smu reloaded exactly once — and the
+        // reload is the LAST runner call, i.e. the calibration release
+        // (profile toggle) happened before the guard's final restore.
+        assert_eq!(fs::read_to_string(&path).unwrap(), "balanced");
+        assert_eq!(modprobe_reload_calls(&runner), 1);
+        let calls = runner.calls();
+        assert_eq!(
+            calls.last().map(|(prog, _)| prog.as_str()),
+            Some("modprobe"),
+            "smu reload must come last: {calls:?}"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn full_calibration_persists_state_and_keeps_model() {
+        let runner = FakeRunner::new();
+        let (dir, profile) = profile_fixture("calib-full");
+        let state_path = dir.join("state.json");
+        let guard = RestoreGuard::new(
+            &runner,
+            Some(cpu_actuator(&runner, profile)),
+            None,
+            Some(SmuModule::assume_unloaded()),
+        );
+        let mut ctl = Controller::new(guard, PersistedState::default(), state_path.clone());
+        assert!(ctl.model.is_none() && ctl.lut.is_none());
+
+        ctl.on_command(Command::StartCalibration);
+        drive_sweep(&mut ctl);
+        for idx in 0..MATRIX_POINTS.len() {
+            drive_matrix_point(&mut ctl, idx);
+        }
+
+        // Finished: back to Monitor, wizard gone, everything released.
+        assert_eq!(ctl.status().mode, Mode::Monitor);
+        assert!(ctl.status().calib.is_none());
+        assert!(ctl.burner.is_none());
+        assert_eq!(ctl.status().cpu_limit_w, None);
+
+        // The state file exists, parses and carries the fitted model + LUT;
+        // the controller kept them for M4.
+        let saved = PersistedState::load(&state_path);
+        let model = saved.model.expect("model persisted");
+        assert!((model.a - 25.0).abs() < 0.05 * 25.0, "a = {}", model.a);
+        assert_eq!(saved.lut.expect("lut persisted").len(), 10);
+        saved
+            .calibrated_at
+            .expect("calibrated_at set")
+            .parse::<u64>()
+            .expect("unix seconds");
+        assert!(ctl.model.is_some() && ctl.lut.is_some());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn persisted_state_seeds_controller_model_and_lut() {
+        let runner = FakeRunner::new();
+        let mut lut = ClockWattsLut::new();
+        lut.insert(2000, 60.0);
+        let persisted = PersistedState {
+            model: None,
+            lut: Some(lut.clone()),
+            calibrated_at: None,
+        };
+        let ctl: Controller<&FakeRunner> = Controller::new(
+            RestoreGuard::new(&runner, None, None, None),
+            persisted,
+            PathBuf::from("/nonexistent/state.json"),
+        );
+        assert_eq!(ctl.lut, Some(lut));
+        assert!(ctl.model.is_none());
     }
 }

@@ -52,8 +52,8 @@ impl std::fmt::Display for FitError {
 
 impl std::error::Error for FitError {}
 
-// TODO(task-22/23/26/27): calibration runner, allocator and trim/RLS loops are
-// the consumers; dead until then.
+// TODO(task-23/26/27): allocator and trim/RLS loops consume the rest
+// (contour inversion, RLS); dead until then.
 #[allow(dead_code)]
 impl ThermalModel {
     /// Batch least squares via SVD over the 4-column design matrix

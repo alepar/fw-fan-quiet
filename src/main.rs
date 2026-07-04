@@ -100,10 +100,11 @@ fn main() -> Result<()> {
     let _log_guard = logging::init(&args.log_dir);
 
     // Loaded at startup so config/state problems surface in the log from day
-    // one. TODO(task-25): wire config fan_target/floors into the controller;
-    // TODO(task-22): calibration fills and saves the persisted state.
+    // one. TODO(task-25): wire config fan_target/floors into the controller.
     let _config = config::Config::load(&args.config);
-    let _persisted = state::PersistedState::load(&args.state_file);
+    // Persisted calibration (model + LUT) seeds the controller; a fresh
+    // calibration run overwrites the file through the same path.
+    let persisted = state::PersistedState::load(&args.state_file);
 
     let telemetry = telemetry::open_with_fallback(&args.telemetry_dir, Path::new("."));
     match &telemetry {
@@ -174,7 +175,7 @@ fn main() -> Result<()> {
     let sampler =
         Sampler::new_system().spawn(vec![ui_tx.clone(), ctl_sample_tx], Arc::clone(&shutdown));
     let ctl = controller::spawn(
-        Controller::new(guard),
+        Controller::new(guard, persisted, args.state_file),
         ctl_sample_rx,
         cmd_rx,
         ui_tx.clone(),

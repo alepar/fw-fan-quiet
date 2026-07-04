@@ -1,4 +1,5 @@
 mod event;
+mod model;
 mod ring;
 mod sensors;
 mod telemetry;

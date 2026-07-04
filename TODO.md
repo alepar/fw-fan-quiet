@@ -24,10 +24,10 @@ task's commit lands. Human-gated items are marked 👤.
 - [x] 13. Restore guard + startup reset
 - [x] 14. Controller thread + ControlStatus
 - [x] 15. Manual-mode UI
-- [ ] 16. Selftest subcommand + M2 hardware verification
+- [x] 16. Selftest subcommand + M2 hardware verification
 
 ## Milestone 3 — Calibration
-- [ ] 17. CPU burner
+- [x] 17. CPU burner (implemented with task 16; selftest uses it)
 - [ ] 18. Steady-state detector
 - [ ] 19. Clock→watts LUT sweep
 - [ ] 20. Thermal model fit + RLS

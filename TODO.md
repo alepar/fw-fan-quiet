@@ -18,7 +18,7 @@ task's commit lands. Human-gated items are marked 👤.
 - [x] 9. Dashboard view + main wiring 👤 (visual check of live dashboard)
 
 ## Milestone 2 — Manual actuation + safety
-- [ ] 10. Command runner trait + ryzen_smu module handling
+- [x] 10. Command runner trait + ryzen_smu module handling
 - [ ] 11. CPU actuator (ryzenadj) + stock restore
 - [ ] 12. GPU actuator (NVML clock locks)
 - [ ] 13. Restore guard + startup reset

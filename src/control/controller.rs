@@ -22,7 +22,7 @@ use crate::actuators::cmd::Runner;
 use crate::actuators::guard::RestoreGuard;
 use crate::calib::burner::Burner;
 use crate::calib::runner::{CalibRunner, RunnerEffect};
-use crate::calib::steady::{STEADY_N, STEADY_RPM_TOLERANCE, is_steady};
+use crate::calib::steady::{STEADY_N, STEADY_RPM_TOLERANCE, is_steady, tail_mean};
 use crate::config::Config;
 use crate::control::allocator::{self, AllocInput, Allocator};
 use crate::control::gpu_pid::GpuPid;
@@ -548,6 +548,12 @@ impl<R: Runner> Controller<R> {
             }
             self.add_flag(StatusFlag::Resumed);
             self.resumed_until = Some(s.t_mono + RESUMED_FLAG_S);
+            // The pre-suspend fan window is thermally stale (the machine
+            // cooled while asleep) — clear it so the trim integrator can't
+            // fire on a 20-sample tail spanning the suspend (review finding).
+            if let Some(auto) = &mut self.auto {
+                auto.fan_window.clear();
+            }
             cause.get_or_insert("resume");
         } else if self.resumed_until.is_some_and(|until| s.t_mono >= until) {
             self.remove_flag(StatusFlag::Resumed);
@@ -792,7 +798,12 @@ impl<R: Runner> Controller<R> {
             && let (Some(cpu_w), Some(gpu_w)) = (self.status.cpu_limit_w, auto.gpu_target_w)
         {
             let predicted = model.predict(cpu_w, gpu_w);
-            if auto.trim.update(s.t_mono, s.max_fan_rpm(), predicted) {
+            // Integrate the steady tail's mean, not the single latest sample:
+            // the ±100 RPM steadiness tolerance would otherwise leak ±5 RPM of
+            // per-update noise into the trim (review nit).
+            let measured = tail_mean(auto.fan_window.make_contiguous(), STEADY_N)
+                .unwrap_or_else(|| s.max_fan_rpm());
+            if auto.trim.update(s.t_mono, measured, predicted) {
                 self.status.trim_rpm = auto.trim.offset_rpm();
                 cause.get_or_insert("auto:trim");
             }

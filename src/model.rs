@@ -57,8 +57,9 @@ impl Model {
                 self.gpu_w.push(nan_unless(s.gpu_w_valid, s.gpu_w));
                 self.cpu_temp
                     .push(nan_unless(s.cpu_temp_valid, s.cpu_temp_c));
-                self.gpu_temp.push(s.gpu_temp_c);
-                self.gpu_mhz.push(s.gpu_sm_mhz);
+                self.gpu_temp
+                    .push(nan_unless(s.gpu_temp_valid, s.gpu_temp_c));
+                self.gpu_mhz.push(nan_unless(s.gpu_mhz_valid, s.gpu_sm_mhz));
                 self.latest = Some(s);
             }
             Event::Input(key) => {
@@ -109,14 +110,20 @@ mod tests {
             fan1_rpm: 2000.0,
             cpu_temp_c: 55.0,
             gpu_w: 20.0,
+            gpu_temp_c: 45.0,
+            gpu_sm_mhz: 1500.0,
             fan_valid: false,
             cpu_temp_valid: false,
             gpu_w_valid: false,
+            gpu_temp_valid: false,
+            gpu_mhz_valid: false,
             ..Default::default()
         }));
         assert!(m.max_fan.last().unwrap().is_nan());
         assert!(m.cpu_temp.last().unwrap().is_nan());
         assert!(m.gpu_w.last().unwrap().is_nan());
+        assert!(m.gpu_temp.last().unwrap().is_nan());
+        assert!(m.gpu_mhz.last().unwrap().is_nan());
     }
 
     #[test]

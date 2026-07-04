@@ -19,6 +19,21 @@ use crate::types::Sample;
 /// Target sampling cadence.
 const SAMPLE_PERIOD: Duration = Duration::from_secs(1);
 
+/// The inter-sample sleep checks the shutdown flag at least this often, so
+/// quitting never waits out a full sample period.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(250);
+
+/// Sleeps `total` in slices of at most [`SHUTDOWN_POLL`], returning early
+/// once `shutdown` flips.
+fn sleep_unless_shutdown(total: Duration, shutdown: &AtomicBool) {
+    let mut remaining = total;
+    while !remaining.is_zero() && !shutdown.load(Ordering::Relaxed) {
+        let slice = remaining.min(SHUTDOWN_POLL);
+        std::thread::sleep(slice);
+        remaining -= slice;
+    }
+}
+
 /// Monotonic gap larger than this between consecutive samples means the
 /// machine slept (normal cadence is ~1 s).
 const RESUME_GAP_S: f64 = 5.0;
@@ -123,7 +138,9 @@ impl Sampler {
             gpu_w: gpu.power_w.unwrap_or(0.0),
             gpu_w_valid: gpu.power_w.is_some(),
             gpu_temp_c: gpu.temp_c.unwrap_or(0.0),
+            gpu_temp_valid: gpu.temp_c.is_some(),
             gpu_sm_mhz: gpu.sm_mhz.unwrap_or(0.0),
+            gpu_mhz_valid: gpu.sm_mhz.is_some(),
             gpu_util_pct: gpu.util_pct.unwrap_or(0.0),
             cpu_util_pct: self.cpu_util.read_util_pct().unwrap_or(0.0),
             cpu_avg_mhz: cpu::avg_freq_mhz(&self.cpufreq_base).unwrap_or(0.0),
@@ -155,9 +172,9 @@ impl Sampler {
                         }
                     }
                     // Land iterations on a ~1 s cadence: sleep whatever the
-                    // sensor reads left of the period.
+                    // sensor reads left of the period, waking early on shutdown.
                     if let Some(remainder) = SAMPLE_PERIOD.checked_sub(iter_start.elapsed()) {
-                        std::thread::sleep(remainder);
+                        sleep_unless_shutdown(remainder, &shutdown);
                     }
                 }
                 tracing::debug!("sampler: shutdown flag set, exiting");
@@ -234,6 +251,8 @@ mod tests {
         assert!(s.cpu_temp_valid);
         assert_eq!(s.cpu_temp_c, 49.375);
         assert!(!s.gpu_w_valid, "no NVML sensor => gpu_w invalid");
+        assert!(!s.gpu_temp_valid, "no NVML sensor => gpu_temp invalid");
+        assert!(!s.gpu_mhz_valid, "no NVML sensor => gpu_mhz invalid");
         assert_eq!(s.gpu_w, 0.0);
         assert_eq!(s.cpu_pkg_w, 0.0, "no RAPL => flattened to 0.0");
         assert!(
@@ -292,8 +311,10 @@ mod tests {
         let flipped_at = Instant::now();
         handle.join().expect("sampler thread should not panic");
         assert!(
-            flipped_at.elapsed() < Duration::from_secs(3),
-            "thread must exit promptly after shutdown"
+            flipped_at.elapsed() < Duration::from_millis(500),
+            "thread must exit promptly after shutdown (took {:?}); the \
+             inter-sample sleep must poll the flag, not sleep a full period",
+            flipped_at.elapsed()
         );
 
         fs::remove_dir_all(&root).unwrap();

@@ -71,24 +71,49 @@ fn header_line(model: &Model) -> String {
     line
 }
 
-/// Ring -> chart points, X = sample index. NaN (invalid reading) points are
-/// dropped: the index still advances, so a lost sensor shows as a gap
-/// (braille markers can misrender NaN, so filtering is the safe route).
-fn points(ring: &Ring) -> Vec<(f64, f64)> {
-    ring.iter()
-        .enumerate()
-        .filter(|(_, v)| !v.is_nan())
-        .map(|(i, v)| (i as f64, *v))
-        .collect()
+/// Ring -> chart points split into contiguous valid runs, X = sample index.
+/// NaN (invalid reading) ends the current run: rendering each run as its own
+/// dataset keeps outages as visible gaps (a `GraphType::Line` dataset would
+/// otherwise draw a bridge between the points flanking the NaN run), and the
+/// index still advances so the gap has real width.
+fn segments(ring: &Ring) -> Vec<Vec<(f64, f64)>> {
+    let mut runs = Vec::new();
+    let mut current: Vec<(f64, f64)> = Vec::new();
+    for (i, v) in ring.iter().enumerate() {
+        if v.is_nan() {
+            if !current.is_empty() {
+                runs.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push((i as f64, *v));
+        }
+    }
+    if !current.is_empty() {
+        runs.push(current);
+    }
+    runs
 }
 
-fn series<'a>(name: &'a str, color: Color, data: &'a [(f64, f64)]) -> Dataset<'a> {
+fn line_dataset(color: Color, data: &[(f64, f64)]) -> Dataset<'_> {
     Dataset::default()
-        .name(name)
         .marker(Marker::Braille)
         .graph_type(GraphType::Line)
         .style(Style::default().fg(color))
         .data(data)
+}
+
+/// One Dataset per contiguous valid segment, so sensor outages render as
+/// real gaps (a single dataset would draw a line bridging the missing run).
+/// Only the first segment carries the legend name.
+fn series<'a>(name: &'a str, color: Color, segments: &'a [Vec<(f64, f64)>]) -> Vec<Dataset<'a>> {
+    segments
+        .iter()
+        .enumerate()
+        .map(|(i, seg)| {
+            let ds = line_dataset(color, seg);
+            if i == 0 { ds.name(name) } else { ds }
+        })
+        .collect()
 }
 
 fn render_chart(
@@ -125,7 +150,7 @@ fn render_chart(
 }
 
 fn render_fans(model: &Model, frame: &mut Frame, area: Rect) {
-    let fan_pts = points(&model.max_fan);
+    let fan_segs = segments(&model.max_fan);
     let target_pts = [
         (0.0, model.fan_target_rpm),
         (RING_CAP as f64, model.fan_target_rpm),
@@ -134,40 +159,26 @@ fn render_fans(model: &Model, frame: &mut Frame, area: Rect) {
         Some(s) => format!("fans {:.0}/{:.0} rpm", s.fan1_rpm, s.fan2_rpm),
         None => "fans (rpm)".into(),
     };
-    render_chart(
-        frame,
-        area,
-        title,
-        vec![
-            series("target", Color::DarkGray, &target_pts),
-            series("max fan", Color::Cyan, &fan_pts),
-        ],
-        FAN_BOUNDS,
-    );
+    let mut datasets = vec![line_dataset(Color::DarkGray, &target_pts).name("target")];
+    datasets.extend(series("max fan", Color::Cyan, &fan_segs));
+    render_chart(frame, area, title, datasets, FAN_BOUNDS);
 }
 
 fn render_watts(model: &Model, frame: &mut Frame, area: Rect) {
-    let cpu_pts = points(&model.cpu_w);
-    let gpu_pts = points(&model.gpu_w);
+    let cpu_segs = segments(&model.cpu_w);
+    let gpu_segs = segments(&model.gpu_w);
     let title = match &model.latest {
         Some(s) => format!("watts | cpu {:.1} W gpu {:.1} W", s.cpu_pkg_w, s.gpu_w),
         None => "watts".into(),
     };
-    render_chart(
-        frame,
-        area,
-        title,
-        vec![
-            series("cpu", Color::Yellow, &cpu_pts),
-            series("gpu", Color::Green, &gpu_pts),
-        ],
-        WATT_BOUNDS,
-    );
+    let mut datasets = series("cpu", Color::Yellow, &cpu_segs);
+    datasets.extend(series("gpu", Color::Green, &gpu_segs));
+    render_chart(frame, area, title, datasets, WATT_BOUNDS);
 }
 
 fn render_temps(model: &Model, frame: &mut Frame, area: Rect) {
-    let cpu_pts = points(&model.cpu_temp);
-    let gpu_pts = points(&model.gpu_temp);
+    let cpu_segs = segments(&model.cpu_temp);
+    let gpu_segs = segments(&model.gpu_temp);
     let title = match &model.latest {
         Some(s) => format!(
             "temps | cpu {:.1}\u{b0}C gpu {:.1}\u{b0}C",
@@ -175,20 +186,13 @@ fn render_temps(model: &Model, frame: &mut Frame, area: Rect) {
         ),
         None => "temps".into(),
     };
-    render_chart(
-        frame,
-        area,
-        title,
-        vec![
-            series("cpu", Color::Red, &cpu_pts),
-            series("gpu", Color::Magenta, &gpu_pts),
-        ],
-        TEMP_BOUNDS,
-    );
+    let mut datasets = series("cpu", Color::Red, &cpu_segs);
+    datasets.extend(series("gpu", Color::Magenta, &gpu_segs));
+    render_chart(frame, area, title, datasets, TEMP_BOUNDS);
 }
 
 fn render_clock(model: &Model, frame: &mut Frame, area: Rect) {
-    let pts = points(&model.gpu_mhz);
+    let segs = segments(&model.gpu_mhz);
     let title = match &model.latest {
         Some(s) => format!("gpu clock {:.0} MHz", s.gpu_sm_mhz),
         None => "gpu clock (MHz)".into(),
@@ -197,7 +201,7 @@ fn render_clock(model: &Model, frame: &mut Frame, area: Rect) {
         frame,
         area,
         title,
-        vec![series("sm", Color::Blue, &pts)],
+        series("sm", Color::Blue, &segs),
         MHZ_BOUNDS,
     );
 }
@@ -228,6 +232,8 @@ mod tests {
             fan_valid: true,
             cpu_temp_valid: true,
             gpu_w_valid: true,
+            gpu_temp_valid: true,
+            gpu_mhz_valid: true,
             ..Default::default()
         }
     }
@@ -270,6 +276,35 @@ mod tests {
         let terminal = draw(&m);
         let header = row_text(&terminal, 0);
         assert!(!header.contains('?'), "header was: {header:?}");
+    }
+
+    #[test]
+    fn segments_split_on_nan_runs() {
+        let mut ring = Ring::new(8);
+        for v in [1.0, f64::NAN, f64::NAN, 2.0, 3.0] {
+            ring.push(v);
+        }
+        assert_eq!(
+            segments(&ring),
+            vec![vec![(0.0, 1.0)], vec![(3.0, 2.0), (4.0, 3.0)]],
+            "a NaN run must split the series so the chart shows a gap, not a bridge"
+        );
+    }
+
+    #[test]
+    fn segments_of_all_valid_ring_is_one_run() {
+        let mut ring = Ring::new(4);
+        ring.push(1.0);
+        ring.push(2.0);
+        assert_eq!(segments(&ring), vec![vec![(0.0, 1.0), (1.0, 2.0)]]);
+    }
+
+    #[test]
+    fn segments_of_empty_or_all_nan_ring_is_empty() {
+        assert!(segments(&Ring::new(4)).is_empty());
+        let mut ring = Ring::new(4);
+        ring.push(f64::NAN);
+        assert!(segments(&ring).is_empty());
     }
 
     #[test]

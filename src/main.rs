@@ -29,7 +29,9 @@ use ui::view::view;
 /// sensor we cannot live without (actuators later are root-only too).
 const RAPL_ENERGY_PATH: &str = "/sys/class/powercap/intel-rapl:0/energy_uj";
 
-/// Redraw at least this often even when no events arrive.
+/// Redraw at least this often even when no events arrive. Load-bearing: the
+/// input thread drops Resize events, so this timeout is what guarantees a
+/// prompt redraw at the new size after a terminal resize.
 const RECV_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Parser)]
@@ -49,13 +51,16 @@ struct Args {
 fn main() -> Result<()> {
     color_eyre::install()?;
     let args = Args::parse();
-    let _log_guard = logging::init(&args.log_dir);
 
+    // Root check before logging::init: a non-root run should print the hint
+    // and exit without leaving a stray fallback log file in the cwd.
     if let Err(e) = std::fs::File::open(RAPL_ENERGY_PATH) {
         eprintln!("bazerame-fans needs root for RAPL/actuators - run: sudo ./bazerame-fans");
         eprintln!("(cannot open {RAPL_ENERGY_PATH} for read: {e})");
         std::process::exit(1);
     }
+
+    let _log_guard = logging::init(&args.log_dir);
 
     let mut telemetry = telemetry::open_with_fallback(&args.telemetry_dir, Path::new("."));
     match &telemetry {
@@ -90,9 +95,10 @@ fn main() -> Result<()> {
     if sampler.join().is_err() {
         tracing::error!("sampler thread panicked");
     }
-    // The input thread stays blocked in crossterm::event::read() with no
-    // portable way to interrupt it, so it is deliberately left detached;
-    // process exit reclaims it (its send fails once ui_rx is dropped anyway).
+    // The input thread stays blocked in crossterm::event::read(). A
+    // poll(100ms)+shutdown-flag loop would let it exit cleanly, but detaching
+    // is a deliberate simplicity choice: it owns nothing needing cleanup,
+    // its send fails once ui_rx drops, and process exit reclaims it.
     result
 }
 
@@ -107,11 +113,17 @@ fn run(
     while model.running {
         terminal.draw(|f| view(&model, f))?;
         match rx.recv_timeout(RECV_TIMEOUT) {
-            Ok(ev) => {
-                if let (Event::Sample(s), Some(t)) = (&ev, telemetry.as_deref_mut()) {
-                    t.log(&Record::Sample(s));
+            Ok(first) => {
+                // Coalesce bursts: fold everything already queued into the
+                // model before spending a draw on it.
+                let mut next = Some(first);
+                while let Some(ev) = next {
+                    if let (Event::Sample(s), Some(t)) = (&ev, telemetry.as_deref_mut()) {
+                        t.log(&Record::Sample(s));
+                    }
+                    model.update(ev);
+                    next = rx.try_recv().ok();
                 }
-                model.update(ev);
             }
             // Timeout is the redraw tick: loop around and draw again.
             Err(RecvTimeoutError::Timeout) => {}

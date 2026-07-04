@@ -23,6 +23,8 @@ pub struct Sample {
     pub fan_valid: bool,      // hwmon fan_rpms() returned Some
     pub cpu_temp_valid: bool, // hwmon cpu_temp_c() returned Some
     pub gpu_w_valid: bool,    // NVML power reading returned Some
+    pub gpu_temp_valid: bool, // NVML temperature reading returned Some
+    pub gpu_mhz_valid: bool,  // NVML SM clock reading returned Some
 }
 
 impl Sample {

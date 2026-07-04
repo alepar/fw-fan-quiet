@@ -3,3 +3,4 @@ pub mod cpu;
 pub mod gpu;
 pub mod hwmon;
 pub mod rapl;
+pub mod sampler;

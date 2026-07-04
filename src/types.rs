@@ -16,6 +16,14 @@ pub struct Sample {
     pub cpu_util_pct: f64,
     pub cpu_avg_mhz: f64,
     pub resumed: bool, // monotonic jump detected since last sample
+
+    // Validity flags: 0.0 is a legitimate reading (e.g. fans stopped), so the
+    // sampler flattens None -> 0.0 for the numeric fields but records sensor
+    // presence here. "Sensor lost" stays distinguishable from a real zero --
+    // the controller must never raise power off a phantom reading.
+    pub fan_valid: bool,      // hwmon fan_rpms() returned Some
+    pub cpu_temp_valid: bool, // hwmon cpu_temp_c() returned Some
+    pub gpu_w_valid: bool,    // NVML power reading returned Some
 }
 
 impl Sample {

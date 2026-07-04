@@ -1,3 +1,4 @@
+mod event;
 mod ring;
 mod sensors;
 mod types;

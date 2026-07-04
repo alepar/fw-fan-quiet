@@ -111,10 +111,8 @@ mod tests {
 
     /// Unique-per-test fixture root; caller removes it when done.
     fn fixture_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "bazerame-hwmon-test-{}-{name}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("bazerame-hwmon-test-{}-{name}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -179,7 +177,12 @@ mod tests {
         // Chip present but fan2_input unreadable: the pair is None, not a
         // fabricated (rpm, 0.0) that would look like a stopped fan.
         let root = fixture_dir("missing-fan-file");
-        add_chip(&root, "hwmon0", "framework_laptop", &[("fan1_input", "1467")]);
+        add_chip(
+            &root,
+            "hwmon0",
+            "framework_laptop",
+            &[("fan1_input", "1467")],
+        );
 
         let hwmon = Hwmon::discover(&root);
         assert_eq!(hwmon.fan_rpms(), None);

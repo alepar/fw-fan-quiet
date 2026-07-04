@@ -55,7 +55,12 @@ impl RaplReader {
         let cur_uj = read_u64(&self.energy_path)?;
         let now = Instant::now();
         let watts = self.prev.map(|(prev_uj, prev_t)| {
-            watts_from_counters(prev_uj, cur_uj, self.max_range_uj, (now - prev_t).as_secs_f64())
+            watts_from_counters(
+                prev_uj,
+                cur_uj,
+                self.max_range_uj,
+                (now - prev_t).as_secs_f64(),
+            )
         });
         self.prev = Some((cur_uj, now));
         // Plausibility clamp: counter resets (suspend/resume, driver reload),
@@ -78,7 +83,10 @@ mod tests {
     #[test]
     fn watts_from_energy_delta() {
         // 10 J in 2 s = 5 W
-        assert_eq!(watts_from_counters(1_000_000, 11_000_000, MAX_RANGE, 2.0), 5.0);
+        assert_eq!(
+            watts_from_counters(1_000_000, 11_000_000, MAX_RANGE, 2.0),
+            5.0
+        );
     }
 
     #[test]
@@ -102,10 +110,8 @@ mod tests {
     }
 
     fn fixture_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "bazerame-rapl-test-{}-{name}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("bazerame-rapl-test-{}-{name}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -154,7 +160,9 @@ mod tests {
         // State must still have advanced: a subsequent sane delta yields Some.
         fs::write(dir.join("energy_uj"), "100000002000000\n").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
-        let watts = reader.read_watts().expect("sane delta after spike should yield watts");
+        let watts = reader
+            .read_watts()
+            .expect("sane delta after spike should yield watts");
         assert!(
             watts > 0.0 && watts <= 20.0,
             "expected plausible watts in (0, 20], got {watts}"

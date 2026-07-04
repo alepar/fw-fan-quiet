@@ -1,0 +1,21 @@
+[package]
+name = "bazerame-fans"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+crossbeam-channel = "0.5"
+nvml-wrapper = "0.12"
+pid = "2"
+nalgebra = "0.33"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tracing-appender = "0.2"
+signal-hook = "0.3"
+clap = { version = "4", features = ["derive"] }
+color-eyre = "0.6"

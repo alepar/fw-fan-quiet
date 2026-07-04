@@ -78,6 +78,9 @@ impl<R: Runner> CpuActuator<R> {
         } else {
             "low-power"
         };
+        // Crash window between the two writes is benign: firmware reasserts
+        // stock limits on *any* profile change, so dying here leaves stock
+        // power limits with only the user's profile preference lost.
         std::fs::write(&self.profile_path, intermediate)?;
         std::thread::sleep(self.toggle_delay);
         std::fs::write(&self.profile_path, original)?;
@@ -119,9 +122,10 @@ mod tests {
     fn set_clamps_high() {
         let cpu = actuator(FakeRunner::new());
         assert_eq!(cpu.set_sustained_mw(90_000).unwrap(), 54_000);
-        let calls = cpu.runner.calls();
-        assert_eq!(calls.len(), 1);
-        assert!(calls[0].1.contains(&"--stapm-limit=54000".to_string()));
+        assert_eq!(
+            cpu.runner.calls(),
+            vec![("ryzenadj".to_string(), expected_args(54_000))]
+        );
     }
 
     #[test]

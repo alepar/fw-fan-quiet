@@ -5,6 +5,7 @@
 
 pub mod controller;
 pub mod lut;
+pub mod thermal_model;
 
 // Mode/StatusFlag are reached via `controller::` where needed (view/tests).
 pub use controller::{Command, ControlStatus};

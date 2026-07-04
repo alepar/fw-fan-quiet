@@ -1,5 +1,4 @@
 // 1 Hz sensor snapshot shared by all threads (consumed from later tasks).
-#![allow(dead_code)]
 
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct Sample {

@@ -1,9 +1,6 @@
 //! CPU utilization (from `/proc/stat` deltas) and average core frequency
 //! (mean of `cpu*/cpufreq/scaling_cur_freq`) sensors.
 
-// Consumed by the sampler thread in Task 7.
-#![allow(dead_code)]
-
 use std::fs;
 use std::path::{Path, PathBuf};
 

@@ -6,9 +6,6 @@
 //! individually tolerant: a failed NVML call logs at debug and yields `None`
 //! -- a driver hiccup must never kill sampling.
 
-// Consumed by the sampler thread in Task 7.
-#![allow(dead_code)]
-
 use nvml_wrapper::Nvml;
 use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};
 

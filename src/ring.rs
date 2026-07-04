@@ -1,5 +1,4 @@
 // Fixed-capacity history buffer backing the UI's scrolling charts (used from task 6).
-#![allow(dead_code)]
 
 use std::collections::VecDeque;
 
@@ -24,6 +23,9 @@ impl Ring {
         self.buf.push_back(v);
     }
 
+    // Prod code reads rings via iter() (the view) and latest values via
+    // Model::latest; last()/len() serve tests and future consumers.
+    #[allow(dead_code)]
     pub fn last(&self) -> Option<f64> {
         self.buf.back().copied()
     }
@@ -32,6 +34,7 @@ impl Ring {
         self.buf.iter()
     }
 
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.buf.len()
     }

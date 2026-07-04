@@ -5,9 +5,6 @@
 //! yield `None` -- sensor absence must never crash the sampler, and a lost
 //! sensor stays distinguishable from a legitimate zero reading (e.g. 0 RPM).
 
-// Consumed by the sampler thread in Task 7.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -45,6 +42,8 @@ impl Hwmon {
     }
 
     /// True if a chip with this name was discovered.
+    // TODO(task-16): selftest reports which chips are present.
+    #[allow(dead_code)]
     pub fn has_chip(&self, name: &str) -> bool {
         self.chips.contains_key(name)
     }

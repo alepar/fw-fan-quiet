@@ -1,9 +1,6 @@
 //! Cross-thread event enum: everything the UI and controller threads receive
 //! arrives as one of these over crossbeam channels.
 
-// Consumed once the UI (Task 8) and controller (Task 14) threads land.
-#![allow(dead_code)]
-
 use crate::types::Sample;
 
 /// Controller status placeholder.
@@ -20,7 +17,11 @@ pub enum Event {
     /// Keyboard input from the input thread.
     Input(crossterm::event::KeyEvent),
     /// Controller status update.
+    // TODO(task-14): constructed by the controller thread.
+    #[allow(dead_code)]
     Status(ControlStatus),
-    /// Periodic redraw tick.
+    /// Periodic redraw tick. Nothing constructs it yet: the main loop's
+    /// recv timeout currently plays this role.
+    #[allow(dead_code)]
     Tick,
 }

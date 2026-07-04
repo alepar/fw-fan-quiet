@@ -2,9 +2,6 @@
 //! into a dense [`Sample`] (None -> 0.0 + validity flags), and fans each
 //! sample out to every subscriber channel from a dedicated thread.
 
-// Consumed by main wiring in Task 9.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

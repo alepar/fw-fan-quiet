@@ -2,9 +2,6 @@
 //! every 1 Hz [`Sample`] (and, from Task 14, every controller decision)
 //! becomes one JSON line loadable into pandas/DuckDB.
 
-// Consumed by main wiring in Task 9.
-#![allow(dead_code)]
-
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -26,6 +23,8 @@ const MAX_NAME_ATTEMPTS: u32 = 10;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Record<'a> {
     Sample(&'a Sample),
+    // TODO(task-14): logged by the controller (resume/sensor-lost flags).
+    #[allow(dead_code)]
     Flag {
         t_mono: f64,
         flag: String,

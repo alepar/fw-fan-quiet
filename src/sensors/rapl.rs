@@ -3,9 +3,6 @@
 //! Reads the monotonically increasing `energy_uj` counter (wraps at
 //! `max_energy_range_uj`) and derives watts from the wrap-aware delta.
 
-// Consumed by the sampler thread in Task 7.
-#![allow(dead_code)]
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;

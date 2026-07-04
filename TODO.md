@@ -42,5 +42,5 @@ task's commit lands. Human-gated items are marked 👤.
 ## Milestone 5 — Adaptive & hardening
 - [x] 26. Bounded trim integrator
 - [x] 27. Online RLS + trust monitor
-- [ ] 28. Watchdogs + emergency release
+- [x] 28. Watchdogs + emergency release
 - [ ] 29. Resume hardening + polish + README 👤 (acceptance + abuse tests)

@@ -827,10 +827,14 @@ impl<R: Runner> Controller<R> {
         //
         // Separation of concerns: the trim absorbs offset drift FAST (hard-
         // bounded at ±400 RPM) while RLS reshapes the a/b/e/c surface only
-        // under excitation — at a constant operating point `rls_update`'s
+        // under excitation — at a CONSTANT operating point `rls_update`'s
         // excitation gate rejects everything and ONLY the trim moves, so the
         // two cannot fight over the same steady-state error (the intended
-        // split: trim = offset, RLS = shape).
+        // split: trim = offset, RLS = shape). Under excitation both DO
+        // integrate the same offset; the overlap is accepted: RLS absorbs
+        // it into the surface, and the trim's leftover (bounded ≤ 400 RPM)
+        // simply freezes with the near-zero residual until an error sign
+        // flip walks it back.
         //
         // predicted = the PRE-update model at the CURRENT operating point
         // (applied CPU allocation, PI watts target): the residual measures
@@ -3071,6 +3075,68 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn positive_trim_cuts_the_commanded_gpu_allocation_end_to_end() {
+        // The decisive sign check for the trim→contour wiring: a POSITIVE
+        // trim must yield FEWER commanded GPU watts than the untrimmed
+        // contour would (under-prediction → smaller budget). Kills both
+        // sign mutants in the allocator's contour closure: `trim_rpm → 0.0`
+        // (allocation lands on the untrimmed contour) and `trim_rpm →
+        // -trim_rpm` (positive feedback: MORE budget, above the untrimmed
+        // contour).
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu_calls) = pinned_op_controller(&runner);
+        ctl.on_command(Command::SetAuto(true));
+
+        // Build exactly +100 RPM of trim at the frozen (54, 0) point, with
+        // the model staying bit-for-bit calibrated (RLS excitation-frozen,
+        // as pinned by persistent_residual_…): clean baseline, then a +400
+        // step → five 20 s trim updates of +20 (t = 59..139), well before
+        // the t=427 distrust onset.
+        for t in 0..40 {
+            ctl.on_sample(&busy_fan_at(f64::from(t), PINNED_PREDICT_RPM));
+        }
+        for t in 40..=139 {
+            ctl.on_sample(&busy_fan_at(f64::from(t), PINNED_PREDICT_RPM + 400.0));
+        }
+        let trim = ctl.status().trim_rpm;
+        assert!((trim - 100.0).abs() < 1e-6, "premise: trim = {trim}");
+
+        // Now raise the target to 4000 RPM so the contour at pc=54 is
+        // INTERIOR (neither zero-clamped nor at GPU_MAX), and feed a fan
+        // sawtooth (2400/2650, spread 250 > the 100 RPM steadiness
+        // tolerance, always valid): the whole adaptation tier freezes (no
+        // steady window → no RLS, no trim movement, no trust evidence)
+        // while the allocator keeps walking the GPU allocation up toward
+        // the TRIMMED contour — isolating exactly the trim term.
+        ctl.on_command(Command::SetFanTarget(4000.0));
+        let mut last_gpu = None;
+        for t in 140..=400 {
+            let fan = if t % 2 == 0 { 2400.0 } else { 2650.0 };
+            if let Some((_, gpu_w)) = alloc_of(&ctl.on_sample(&busy_fan_at(f64::from(t), fan))) {
+                last_gpu = Some(gpu_w);
+            }
+        }
+        let gpu_w = last_gpu.expect("allocator ran");
+        assert_eq!(ctl.status().trim_rpm, trim, "trim frozen while unsteady");
+
+        // The model is still calibrated, so both contours are exact:
+        // untrimmed (4000 − 800 − 25·54)/20.4 ≈ 90.7 W, trimmed ≈ 85.8 W.
+        let m = ctl.model.as_ref().unwrap();
+        let untrimmed = m.gpu_watts_on_contour(4000.0, 0.0, 54.0).unwrap();
+        let trimmed = m.gpu_watts_on_contour(4000.0, trim, 54.0).unwrap();
+        assert!((untrimmed - 90.7).abs() < 0.1, "untrimmed = {untrimmed}");
+        assert!(
+            (gpu_w - trimmed).abs() < 2.5,
+            "allocation must settle on the TRIMMED contour: {gpu_w} vs {trimmed}"
+        );
+        assert!(
+            gpu_w < untrimmed - 2.0,
+            "positive trim must CUT the allocation below the untrimmed \
+             contour: {gpu_w} vs {untrimmed}"
+        );
     }
 
     // --- Task 27: online RLS + trust monitor ---

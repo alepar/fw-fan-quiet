@@ -9,6 +9,7 @@ pub mod gpu_pid;
 pub mod lut;
 pub mod thermal_model;
 pub mod trim;
+pub mod trust;
 
 // Mode/StatusFlag are reached via `controller::` where needed (view/tests).
 pub use controller::{Command, ControlStatus};

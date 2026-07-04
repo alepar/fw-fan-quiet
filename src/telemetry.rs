@@ -19,6 +19,11 @@ const FLUSH_MAX_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_NAME_ATTEMPTS: u32 = 10;
 
 /// One JSONL line. Internally tagged so each line carries a `kind` field.
+// Records are built one at a time on the stack and passed by reference
+// straight into `log()` — never stored or collected — so the Decision
+// variant's size (it grew a tail of Option fields) costs nothing; boxing
+// would only complicate every construction site.
+#[allow(clippy::large_enum_variant)]
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Record<'a> {
@@ -60,6 +65,18 @@ pub enum Record<'a> {
         /// (cause "auto:trim" marks the updates), None otherwise.
         #[serde(skip_serializing_if = "Option::is_none")]
         trim_rpm: Option<f64>,
+        /// Thermal-model parameters, carried ONLY on the periodic Auto-mode
+        /// "auto:model_snapshot" decisions (every 60 s): per-line params
+        /// would be too heavy, one snapshot a minute keeps the online-RLS
+        /// trajectory reviewable offline. None (skipped) everywhere else.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model_a: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model_b: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model_e: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model_c: Option<f64>,
     },
 }
 
@@ -295,6 +312,10 @@ mod tests {
             alloc_gpu_w: None,
             pi_target_w: None,
             trim_rpm: None,
+            model_a: None,
+            model_b: None,
+            model_e: None,
+            model_c: None,
         });
         t.flush();
 
@@ -349,6 +370,10 @@ mod tests {
             "alloc_gpu_w",
             "pi_target_w",
             "trim_rpm",
+            "model_a",
+            "model_b",
+            "model_e",
+            "model_c",
         ] {
             assert!(
                 decision.get(key).is_none(),

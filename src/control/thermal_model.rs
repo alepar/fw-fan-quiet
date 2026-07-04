@@ -7,6 +7,21 @@
 
 use nalgebra::{DMatrix, DVector, Matrix4, Vector4};
 
+/// Excitation gate (Task 27 windup finding, quantified in the plan review):
+/// an RLS update is accepted only if the operating point moved by more than
+/// this (`|Δpc| + |Δpg|`, watts) since the last ACCEPTED update. At a
+/// constant operating point the update carries no new information, yet the
+/// covariance grows ×(1/λ) per step in the unexcited directions — measured:
+/// diag(P) 1e4 → 2.3e8 after ~1k same-point updates, after which one ±20 RPM
+/// noisy sample at a new point jumped `e` by ~25%.
+pub const RLS_EXCITATION_MIN_W: f64 = 2.0;
+/// Covariance trace cap: after an accepted update, if trace(P) exceeds this…
+pub const RLS_TRACE_CAP: f64 = 1e6;
+/// …P is rescaled to this trace. Belt to the excitation gate's suspenders: a
+/// slowly drifting operating point can keep passing the gate while still
+/// leaving directions unexcited, so the trace must stay bounded regardless.
+pub const RLS_TRACE_RESCALE_TO: f64 = 1e5;
+
 /// Fitted model parameters plus (transient) RLS covariance.
 ///
 /// The covariance `p` is deliberately not persisted: after a load it is
@@ -21,6 +36,11 @@ pub struct ThermalModel {
     /// RLS covariance; rebuilt on load (first `rls_update` after deserialize).
     #[serde(skip)]
     p: Option<Matrix4<f64>>,
+    /// Operating point `(pc, pg)` of the last ACCEPTED RLS update — the
+    /// excitation gate's reference. Like `p`, transient online-adaptation
+    /// bookkeeping: not serialized, so gating restarts fresh after a load.
+    #[serde(skip)]
+    last_rls_point: Option<(f64, f64)>,
 }
 
 /// One steady-state calibration measurement.
@@ -84,6 +104,7 @@ impl ThermalModel {
             e: theta[2],
             c: theta[3],
             p: None,
+            last_rls_point: None,
         })
     }
 
@@ -105,13 +126,26 @@ impl ThermalModel {
             .fold(0.0, |acc, r| acc.max(r.abs()))
     }
 
-    // TODO(task-27): the RLS loop consumes `rls_update`; dead until then.
-    #[allow(dead_code)]
     /// RLS update with forgetting factor `lambda` (design: 0.99). Initializes
-    /// covariance `P = I·1e4` on first use (or after load). Rejects (returns
-    /// false, no state change) any update that would make `a` or `b` negative
-    /// — physics: more power can never mean less fan.
+    /// covariance `P = I·1e4` on first use (or after load). Returns false
+    /// (no state change whatsoever) when the update is rejected by any gate:
+    ///
+    /// - Excitation gate: the operating point must have moved by more than
+    ///   [`RLS_EXCITATION_MIN_W`] (`|Δpc| + |Δpg|`) since the last ACCEPTED
+    ///   update — same-point updates carry no information and only wind up
+    ///   the covariance (the Task-27 review finding).
+    /// - Slope-sanity gate: any update that would make `a` or `b` negative —
+    ///   physics: more power can never mean less fan.
+    ///
+    /// After an accepted update, trace(P) is capped: above [`RLS_TRACE_CAP`]
+    /// it is rescaled to [`RLS_TRACE_RESCALE_TO`], bounding how hard a noisy
+    /// sample can yank the parameters no matter what the update history was.
     pub fn rls_update(&mut self, pc: f64, pg: f64, rpm: f64, lambda: f64) -> bool {
+        if let Some((last_pc, last_pg)) = self.last_rls_point
+            && (pc - last_pc).abs() + (pg - last_pg).abs() <= RLS_EXCITATION_MIN_W
+        {
+            return false;
+        }
         let p = self.p.unwrap_or_else(|| Matrix4::identity() * 1e4);
         let x = Vector4::new(pc, pg, pc * pg, 1.0);
         // Textbook RLS with forgetting (research doc 03 §2):
@@ -127,12 +161,13 @@ impl ThermalModel {
             return false;
         }
         (self.a, self.b, self.e, self.c) = (theta[0], theta[1], theta[2], theta[3]);
-        // TODO(task-27): covariance windup — at a constant operating point the
-        // unexcited directions grow ×(1/λ) per step (measured: diag(P) 1e4 →
-        // 2.3e8 after 1k same-point updates; one noisy sample then jumps `e`
-        // by ~25%). Task 27 must gate updates on operating-point movement
-        // (excitation) or cap the covariance trace before wiring this at 1 Hz.
-        self.p = Some((p - k * (x.transpose() * p)) / lambda);
+        self.last_rls_point = Some((pc, pg));
+        let mut p_next = (p - k * (x.transpose() * p)) / lambda;
+        let trace = p_next.trace();
+        if trace > RLS_TRACE_CAP {
+            p_next *= RLS_TRACE_RESCALE_TO / trace;
+        }
+        self.p = Some(p_next);
         true
     }
 
@@ -352,6 +387,7 @@ mod tests {
             e: 0.0,
             c: C,
             p: None,
+            last_rls_point: None,
         };
         assert_eq!(flat.gpu_watts_on_contour(3000.0, 0.0, 10.0), None);
     }
@@ -367,16 +403,111 @@ mod tests {
         assert_eq!(back.b, m.b);
         assert_eq!(back.e, m.e);
         assert_eq!(back.c, m.c);
-        // Covariance was skipped: `back` equals `m` with p cleared, not `m`.
+        // Covariance + excitation bookkeeping were skipped: `back` equals
+        // `m` with both cleared, not `m`.
         assert_eq!(
             back,
             ThermalModel {
                 p: None,
+                last_rls_point: None,
                 ..m.clone()
             }
         );
         assert_ne!(back, m);
-        // And RLS still works after deserialize (P re-initialized).
-        assert!(back.rls_update(30.0, 65.0, truth_rpm(30.0, 65.0) + 10.0, 0.99));
+        // And RLS still works after deserialize (P re-initialized, excitation
+        // gating fresh: even the SAME operating point is accepted again).
+        assert!(back.rls_update(20.0, 40.0, truth_rpm(20.0, 40.0) + 10.0, 0.99));
+    }
+
+    // --- Task 27: windup gates ---
+
+    #[test]
+    fn excitation_gate_rejects_same_point_updates() {
+        let mut m = exact_model();
+        let mut seed = 0x1234_5678_u64;
+        // (a) 1000 same-point updates: only the first is accepted; the rest
+        // change NOTHING (params or covariance), so P cannot wind up.
+        assert!(m.rls_update(30.0, 65.0, truth_rpm(30.0, 65.0), 0.99));
+        let after_first = m.clone();
+        for _ in 0..999 {
+            let rpm = truth_rpm(30.0, 65.0) + lcg_noise(&mut seed);
+            assert!(!m.rls_update(30.0, 65.0, rpm, 0.99));
+        }
+        assert_eq!(m, after_first, "rejected updates must leave no trace");
+        let trace = m.p.expect("covariance live").trace();
+        assert!(
+            trace <= 4e4,
+            "same-point trace must stay at/below the fresh prior, got {trace:e}"
+        );
+    }
+
+    #[test]
+    fn excitation_gate_threshold_is_2w_of_combined_movement() {
+        let mut m = exact_model();
+        assert!(m.rls_update(30.0, 65.0, truth_rpm(30.0, 65.0), 0.99));
+        // |Δpc| + |Δpg| = 2.0: not strictly greater — rejected.
+        assert!(!m.rls_update(31.0, 66.0, truth_rpm(31.0, 66.0), 0.99));
+        // 2.2 W of combined movement: accepted…
+        assert!(m.rls_update(31.0, 66.2, truth_rpm(31.0, 66.2), 0.99));
+        // …and the reference is the last ACCEPTED point (31, 66.2), so the
+        // original point is now far enough away again.
+        assert!(m.rls_update(30.0, 65.0, truth_rpm(30.0, 65.0), 0.99));
+    }
+
+    #[test]
+    fn covariance_trace_capped_under_alternating_excitation() {
+        // (b) Two alternating far-apart points keep the excitation gate open
+        // but leave two of the four regressor directions unexcited: without
+        // the cap their covariance grows ×(1/λ) per step and the trace passes
+        // 1e6 within ~460 updates. With the cap it must stay bounded after
+        // EVERY update.
+        let mut m = exact_model();
+        let mut max_trace: f64 = 0.0;
+        for i in 0..500 {
+            let (pc, pg) = if i % 2 == 0 {
+                (5.0, 0.0)
+            } else {
+                (45.0, 100.0)
+            };
+            assert!(m.rls_update(pc, pg, truth_rpm(pc, pg), 0.99), "i={i}");
+            let trace = m.p.expect("covariance live").trace();
+            assert!(trace <= RLS_TRACE_CAP, "trace {trace:e} after update {i}");
+            max_trace = max_trace.max(trace);
+        }
+        // The windup pressure was real (the run pushed well past the rescale
+        // target) — i.e. the cap was doing work, not idling.
+        assert!(
+            max_trace > 5.0 * RLS_TRACE_RESCALE_TO,
+            "expected windup pressure, max trace {max_trace:e}"
+        );
+    }
+
+    #[test]
+    fn gated_rls_shrugs_off_noisy_sample_after_same_point_soak() {
+        // (c) The plan's quantified scenario: ~1k same-point updates used to
+        // blow diag(P) up to 2.3e8, after which ONE ±20 RPM noisy sample at a
+        // new point jumped `e` by ~25%. With the gates the soak is inert and
+        // the noisy sample moves `e` by well under 5%.
+        //
+        // One full-rank pass over the calibration matrix first: a session
+        // that has seen varied operating points has a settled covariance
+        // (a completely fresh P = I·1e4 prior is legitimately "uncertain" —
+        // one sample may move `e` by >10% no matter what the soak does; the
+        // finding is about the SOAK not being allowed to re-inflate P).
+        let mut m = exact_model();
+        for &(pc, pg) in &POINTS {
+            assert!(m.rls_update(pc, pg, truth_rpm(pc, pg), 0.99));
+        }
+        for _ in 0..1000 {
+            m.rls_update(30.0, 65.0, truth_rpm(30.0, 65.0), 0.99);
+        }
+        let e_before = m.e;
+        assert!(m.rls_update(45.0, 100.0, truth_rpm(45.0, 100.0) + 20.0, 0.99));
+        let moved = (m.e - e_before).abs();
+        assert!(
+            moved < 0.05 * E,
+            "e moved {moved:e} (>{:e}) on one noisy sample — windup not tamed",
+            0.05 * E
+        );
     }
 }

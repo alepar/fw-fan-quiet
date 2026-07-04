@@ -75,7 +75,28 @@ impl Trim {
     /// hidden state to wind past the bound (the offset IS the state), so
     /// back-calculation buys nothing at this 20 s cadence — an error sign
     /// flip walks back from the clamp on the very next update.
+    ///
+    /// Production code goes through [`update_scaled`](Self::update_scaled)
+    /// (the controller always passes an explicit gain scale); this plain
+    /// form is kept as the canonical unscaled API and test baseline.
+    #[allow(dead_code)]
     pub fn update(&mut self, t_mono: f64, measured_rpm: f64, predicted_rpm: f64) -> bool {
+        self.update_scaled(t_mono, measured_rpm, predicted_rpm, 1.0)
+    }
+
+    /// [`update`](Self::update) with the gain scaled by `ki_scale` for THIS
+    /// step: the effective gain is `KI_TRIM · ki_scale`. The controller
+    /// passes 0.5 while the trust monitor reports `ModelDistrust` (Task 27)
+    /// — keep correcting the acoustics, but gently, since the residual
+    /// evidence is suspect. Cadence, clamping and validity handling are
+    /// identical to `update`.
+    pub fn update_scaled(
+        &mut self,
+        t_mono: f64,
+        measured_rpm: f64,
+        predicted_rpm: f64,
+        ki_scale: f64,
+    ) -> bool {
         if let Some(last) = self.last_update_t
             && t_mono - last < TRIM_PERIOD_S
         {
@@ -87,7 +108,7 @@ impl Trim {
             return false;
         }
         self.last_update_t = Some(t_mono);
-        let next = (self.offset_rpm + KI_TRIM * (measured_rpm - predicted_rpm))
+        let next = (self.offset_rpm + KI_TRIM * ki_scale * (measured_rpm - predicted_rpm))
             .clamp(-MAX_TRIM_AUTHORITY_RPM, MAX_TRIM_AUTHORITY_RPM);
         let changed = next != self.offset_rpm;
         self.offset_rpm = next;
@@ -204,6 +225,23 @@ mod tests {
         // The garbage calls did not pin a baseline: a clean first call
         // still integrates immediately.
         assert!(t.update(2.0, 2100.0, 2000.0));
+    }
+
+    #[test]
+    fn update_scaled_scales_the_gain_per_step() {
+        // Same error, ki_scale 0.5 → exactly half the movement (the Task-27
+        // distrust behavior), and the cadence slot is consumed as usual.
+        let mut full = Trim::new();
+        let mut half = Trim::new();
+        assert!(full.update_scaled(0.0, 2100.0, 2000.0, 1.0));
+        assert!(half.update_scaled(0.0, 2100.0, 2000.0, 0.5));
+        assert!((full.offset_rpm() - KI_TRIM * 100.0).abs() < 1e-12);
+        assert!((half.offset_rpm() - 0.5 * KI_TRIM * 100.0).abs() < 1e-12);
+        assert!(!half.update_scaled(10.0, 2100.0, 2000.0, 0.5), "cadence");
+        // update() is the ki_scale = 1.0 case.
+        let mut plain = Trim::new();
+        assert!(plain.update(0.0, 2100.0, 2000.0));
+        assert_eq!(plain.offset_rpm(), full.offset_rpm());
     }
 
     #[test]

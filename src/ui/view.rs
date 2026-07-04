@@ -116,6 +116,13 @@ fn header_line(model: &Model) -> Line<'static> {
                 "TARGET UNREACHABLE",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
+            // The model's predictions have been persistently wrong for 5+
+            // minutes: RLS frozen, trim at half gain (recalibrate if this
+            // persists — the hint lives in the flag's doc, not the header).
+            StatusFlag::ModelDistrust => Span::styled(
+                "MODEL DISTRUST",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
         });
     }
     if let Some(s) = &model.latest {
@@ -602,6 +609,31 @@ mod tests {
             .expect("flag text present") as u16;
         // The saturated trim shows alongside (the flag means "pinned at max").
         assert!(header.contains("trim +400rpm"), "header was: {header:?}");
+        let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
+        assert_eq!(cell.fg, Color::Red);
+        assert!(cell.modifier.contains(Modifier::BOLD));
+    }
+
+    // --- Task 27: ModelDistrust in the header ---
+
+    #[test]
+    fn model_distrust_flag_is_red_bold() {
+        use crate::control::ControlStatus;
+        use crate::control::controller::{Mode, StatusFlag};
+        use ratatui::style::Modifier;
+        let mut m = Model::new();
+        m.update(Event::Status(ControlStatus {
+            mode: Mode::Auto,
+            cpu_limit_w: Some(17.0),
+            gpu_max_mhz: Some(1653),
+            fan_target_rpm: 3000.0,
+            trim_rpm: 200.0,
+            flags: vec![StatusFlag::ModelDistrust],
+            calib: None,
+        }));
+        let terminal = draw(&m);
+        let header = row_text(&terminal, 0);
+        let x = header.find("MODEL DISTRUST").expect("flag text present") as u16;
         let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
         assert_eq!(cell.fg, Color::Red);
         assert!(cell.modifier.contains(Modifier::BOLD));

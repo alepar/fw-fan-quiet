@@ -2,6 +2,9 @@
 name = "bazerame-fans"
 version = "0.1.0"
 edition = "2024"
+# >= 1.87: Linux Instant is CLOCK_BOOTTIME-backed (advances during suspend),
+# which resume detection (sensors::sampler::is_resume_gap) depends on.
+rust-version = "1.87"
 
 [dependencies]
 ratatui = "0.30"

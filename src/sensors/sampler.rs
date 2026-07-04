@@ -40,6 +40,8 @@ pub struct Sampler {
     gpu: Option<GpuSensor>,
     cpufreq_base: PathBuf,
     /// Epoch for `t_mono` (set at construction, i.e. process start).
+    /// Linux `Instant` is CLOCK_BOOTTIME-backed since Rust 1.87 (pinned in
+    /// Cargo.toml): it advances during suspend, which `is_resume_gap` needs.
     epoch: Instant,
     /// `t_mono` of the previous `sample()` call, for resume detection.
     prev_t: Option<f64>,
@@ -147,7 +149,11 @@ impl Sampler {
                     let sample = self.sample();
                     for tx in &txs {
                         if tx.send(Event::Sample(sample)).is_err() {
-                            tracing::debug!("sampler: receiver gone, exiting");
+                            if shutdown.load(Ordering::Relaxed) {
+                                tracing::debug!("sampler: receiver gone during shutdown, exiting");
+                            } else {
+                                tracing::warn!("sampler: receiver died unexpectedly, exiting");
+                            }
                             return;
                         }
                     }

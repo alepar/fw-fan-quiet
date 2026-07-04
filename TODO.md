@@ -15,7 +15,7 @@ task's commit lands. Human-gated items are marked 👤.
 - [x] 7. Sampler thread + event enum
 - [x] 7b. Telemetry JSONL logger (samples + decisions, for offline controller review)
 - [x] 8. UI Model + update()
-- [ ] 9. Dashboard view + main wiring 👤 (visual check of live dashboard)
+- [x] 9. Dashboard view + main wiring 👤 (visual check of live dashboard)
 
 ## Milestone 2 — Manual actuation + safety
 - [ ] 10. Command runner trait + ryzen_smu module handling

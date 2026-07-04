@@ -40,12 +40,25 @@ impl Burner {
     /// Flips the stop flag and joins every thread. Prompt by construction:
     /// each loop iteration checks the flag.
     pub fn stop(self) {
+        // Drop does the actual work; consuming self here just makes the
+        // "stopped burners cannot be reused" contract explicit at the API.
+    }
+
+    fn shutdown(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        for t in self.threads {
+        for t in self.threads.drain(..) {
             if t.join().is_err() {
                 tracing::error!("burner thread panicked");
             }
         }
+    }
+}
+
+/// Defense-in-depth: a Burner dropped without `stop()` (or unwound past by a
+/// panic) must not leave spin threads competing with restore work.
+impl Drop for Burner {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -71,5 +84,19 @@ mod tests {
     #[test]
     fn zero_threads_is_noop() {
         Burner::start(0).stop(); // must not panic or hang
+    }
+
+    #[test]
+    fn drop_without_stop_joins_threads() {
+        let t = Instant::now();
+        {
+            let _burner = Burner::start(2);
+            std::thread::sleep(Duration::from_millis(50));
+        } // dropped here without stop()
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "drop took {:?}, expected < 1 s",
+            t.elapsed()
+        );
     }
 }

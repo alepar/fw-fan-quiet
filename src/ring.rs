@@ -10,6 +10,7 @@ pub struct Ring {
 
 impl Ring {
     pub fn new(cap: usize) -> Self {
+        debug_assert!(cap > 0, "Ring capacity must be > 0");
         Self {
             buf: VecDeque::with_capacity(cap),
             cap,
@@ -17,7 +18,7 @@ impl Ring {
     }
 
     pub fn push(&mut self, v: f64) {
-        if self.buf.len() == self.cap {
+        if self.buf.len() >= self.cap {
             self.buf.pop_front();
         }
         self.buf.push_back(v);
@@ -48,6 +49,14 @@ mod tests {
         }
         assert_eq!(r.iter().copied().collect::<Vec<_>>(), vec![2.0, 3.0, 4.0]);
         assert_eq!(r.last(), Some(4.0));
+    }
+
+    #[test]
+    fn ring_keeps_all_when_under_capacity() {
+        let mut r = Ring::new(3);
+        r.push(1.0);
+        r.push(2.0);
+        assert_eq!(r.iter().copied().collect::<Vec<_>>(), vec![1.0, 2.0]);
     }
 
     #[test]

@@ -2,4 +2,5 @@
 //! controller thread (Task 14) and RestoreGuard (Task 13).
 
 pub mod cmd;
+pub mod cpu;
 pub mod smu_module;

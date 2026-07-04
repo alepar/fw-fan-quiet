@@ -5,9 +5,12 @@
 //! per-device starvation scores.
 //!
 //! Safety invariants (these outrank optimality):
-//! - The CPU floor wins over everything, including rate limits.
-//! - A lost fan sensor must never raise power: fan invalid → freeze at the
-//!   last commanded point (or the conservative start).
+//! - The CPU floor wins over everything: rate limits, deadband holds and the
+//!   freeze paths included — a floor raised while frozen still lifts cpu_w.
+//!   This is the one deliberate exception to "never raise power without fan
+//!   feedback": the performance floor outranks the acoustic goal (design §3).
+//! - A lost fan sensor must never raise power beyond that floor: fan invalid
+//!   → freeze at the last commanded point (or the conservative start).
 //! - Asymmetric rate limits: power rises slowly (creeping up on the noise
 //!   ceiling is never urgent) but falls fast — and *twice* as fast on RPM
 //!   overshoot, because the acoustic contract is already broken and every
@@ -18,6 +21,14 @@
 //! floor is a *clock* floor (MHz) and lives in the watts→clock PI's clamp
 //! (Task 24) — the allocator's gpu_w output is a setpoint for that loop, so
 //! clamping watts here would just fight the clock clamp there.
+//!
+//! The utility is concave (√ of normalized power per device): each device
+//! sees diminishing returns, so a both-starved split lands at an interior,
+//! roughly demand-proportional point on the contour. A linear utility is
+//! bang-bang here: on a near-linear contour the per-watt weights differ by
+//! a hair, so ALL marginal watts go to whichever end wins by epsilon (the
+//! GPU gets crushed on a gaming machine), and the whole allocation thrashes
+//! end-to-end whenever trim shifts the contour slope.
 
 // TODO(task-25): consumed by the auto-mode controller loop; dead until then.
 #![allow(dead_code)]
@@ -82,18 +93,21 @@ pub fn demand(
     gpu_max_mhz: Option<u32>,
 ) -> Demand {
     let cpu_starved = match cpu_limit_w {
-        Some(limit) if limit > 0.0 && s.cpu_pkg_w > 0.0 => {
+        Some(limit)
+            if limit.is_finite() && limit > 0.0 && s.cpu_pkg_w.is_finite() && s.cpu_pkg_w > 0.0 =>
+        {
             if limit - s.cpu_pkg_w <= CPU_PINNED_MARGIN_W {
                 1.0
             } else {
                 (s.cpu_pkg_w / limit).min(1.0)
             }
         }
-        _ => (s.cpu_util_pct / 100.0).clamp(0.0, 1.0),
+        _ => util_frac(s.cpu_util_pct),
     };
 
     let gpu_pinned = gpu_max_mhz.is_some_and(|max| {
         s.gpu_mhz_valid
+            && s.gpu_sm_mhz.is_finite()
             && f64::from(max) - s.gpu_sm_mhz <= GPU_PINNED_MARGIN_MHZ
             && s.gpu_util_pct > GPU_PINNED_UTIL_PCT
     });
@@ -101,14 +115,26 @@ pub fn demand(
         1.0
     } else {
         match gpu_target_w {
-            Some(t) if t > 0.0 && s.gpu_w_valid => (s.gpu_w / t).clamp(0.0, 1.0),
-            _ => (s.gpu_util_pct / 100.0).clamp(0.0, 1.0),
+            Some(t) if t.is_finite() && t > 0.0 && s.gpu_w_valid && s.gpu_w.is_finite() => {
+                (s.gpu_w / t).clamp(0.0, 1.0)
+            }
+            _ => util_frac(s.gpu_util_pct),
         }
     };
 
     Demand {
         cpu_starved,
         gpu_starved,
+    }
+}
+
+/// `pct/100` clamped to 0..=1; non-finite (garbage sensor math) → 0 — never
+/// raise power off a reading that is not a number.
+fn util_frac(pct: f64) -> f64 {
+    if pct.is_finite() {
+        (pct / 100.0).clamp(0.0, 1.0)
+    } else {
+        0.0
     }
 }
 
@@ -142,28 +168,42 @@ impl Allocator {
     }
 
     /// One allocation step (called every 5 s in Auto mode). Policy:
-    /// 1. Fan invalid → freeze: return the last commanded point (conservative
-    ///    start on the first call). A lost fan sensor must never raise power.
-    /// 2. Grid-search pc over [cpu_floor, CPU_MAX_W] in GRID_STEP_W steps;
-    ///    candidates (pc, contour(pc)) with pg clamped to [0, GPU_MAX_W],
-    ///    pc skipped where the contour is degenerate (None). No candidates →
-    ///    freeze as in 1.
-    /// 3. Score = cpu_starved·pc/CPU_MAX_W + gpu_starved·pg/GPU_MAX_W, ties
-    ///    broken toward GPU (gaming default).
-    /// 4. Deadband: RPM within ±DEADBAND_RPM of target AND the candidate
-    ///    within DEADBAND_W of the last point on both axes → hold.
-    /// 5. Rate limits vs the last commanded point: up ≤ UP_RATE_W, down ≤
-    ///    DOWN_RATE_W. RPM overshoot (measured > target + DEADBAND_RPM) →
-    ///    ups forbidden, down ≤ OVERSHOOT_DOWN_RATE_W.
-    /// 6. cpu_w is clamped to ≥ cpu_floor last — floors win over everything.
+    /// 1. The held point is lifted to the CPU floor before anything else, so
+    ///    every path below (freeze, hold, rate-limited move) honors a raised
+    ///    floor — floors win over everything (see module docs).
+    /// 2. Fan invalid → freeze: return the (floored) last commanded point
+    ///    (conservative start on the first call). A lost fan sensor must
+    ///    never raise power beyond the floor.
+    /// 3. Grid-search pc over [cpu_floor rounded up to the grid, CPU_MAX_W]
+    ///    in GRID_STEP_W steps; candidates (pc, contour(pc)) with pg clamped
+    ///    to [0, GPU_MAX_W], pc skipped where the contour is degenerate
+    ///    (None). No candidates → freeze as in 2.
+    /// 4. Score = cpu_starved·√(pc/CPU_MAX_W) + gpu_starved·√(pg/GPU_MAX_W)
+    ///    — concave, so both-starved splits land interior instead of
+    ///    bang-bang (see module docs). Ties broken toward GPU (gaming
+    ///    default).
+    /// 5. Deadband: RPM within ±DEADBAND_RPM of target AND the candidate
+    ///    within DEADBAND_W of the held point on both axes → hold.
+    /// 6. Rate limits vs the held point: up ≤ UP_RATE_W, down ≤ DOWN_RATE_W.
+    ///    RPM overshoot (measured > target + DEADBAND_RPM) → ups forbidden,
+    ///    down ≤ OVERSHOOT_DOWN_RATE_W.
     pub fn step(&mut self, inp: &AllocInput) -> (f64, f64) {
-        let prev = self.last.unwrap_or(CONSERVATIVE_START);
+        debug_assert!(
+            (0.0..=CPU_MAX_W).contains(&inp.floors.0),
+            "cpu floor {} outside [0, {CPU_MAX_W}]",
+            inp.floors.0
+        );
+        let cpu_floor = inp.floors.0.clamp(0.0, CPU_MAX_W);
+        // Floors win over everything, freeze/hold paths included: lift the
+        // held point to the floor first. The one deliberate power raise
+        // without fan feedback — performance floor outranks the acoustic goal.
+        let held = self.last.unwrap_or(CONSERVATIVE_START);
+        let prev = (held.0.max(cpu_floor), held.1);
         self.last = Some(prev);
         if !inp.fan_valid {
             return prev;
         }
 
-        let cpu_floor = inp.floors.0;
         let Some((cand_pc, cand_pg)) = best_candidate(inp.contour, inp.demand, cpu_floor) else {
             return prev; // degenerate contour everywhere → freeze
         };
@@ -205,11 +245,17 @@ fn best_candidate(
     cpu_floor: f64,
 ) -> Option<(f64, f64)> {
     let mut best: Option<((f64, f64), f64)> = None;
-    let mut pc = cpu_floor;
+    // Start at the floor rounded UP onto the 0.5 W grid: keeps the scan
+    // aligned so CPU_MAX_W itself stays reachable for non-multiple floors.
+    // The floor value itself is still enforced by the caller's clamps.
+    let mut pc = (cpu_floor / GRID_STEP_W).ceil() * GRID_STEP_W;
     while pc <= CPU_MAX_W {
         if let Some(pg_raw) = contour(pc) {
             let pg = pg_raw.clamp(0.0, GPU_MAX_W);
-            let score = d.cpu_starved * (pc / CPU_MAX_W) + d.gpu_starved * (pg / GPU_MAX_W);
+            // Concave (√) utility: diminishing returns per device → interior,
+            // demand-proportional optima instead of bang-bang (module docs).
+            let score =
+                d.cpu_starved * (pc / CPU_MAX_W).sqrt() + d.gpu_starved * (pg / GPU_MAX_W).sqrt();
             if best.is_none_or(|(_, s)| score > s) {
                 best = Some(((pc, pg), score));
             }
@@ -241,7 +287,7 @@ mod tests {
             }
             let Some(pg) = contour(pc) else { continue };
             let pg = pg.clamp(0.0, 100.0);
-            let score = d.cpu_starved * pc / 54.0 + d.gpu_starved * pg / 100.0;
+            let score = d.cpu_starved * (pc / 54.0).sqrt() + d.gpu_starved * (pg / 100.0).sqrt();
             if score > best_score {
                 best_score = score;
                 best = (pc, pg);
@@ -315,6 +361,14 @@ mod tests {
     fn both_starved_converges_to_grid_utility_max() {
         let c = contour_for(3000.0);
         let expected = brute_force_best(&c, D_BOTH);
+        // Concave utility → interior optimum: neither device is crushed to an
+        // end of the contour when both are fully starved (the linear utility
+        // was bang-bang: all watts to the CPU end here).
+        assert!(expected.0 < 50.0, "cpu end-pinned: {expected:?}");
+        assert!(
+            expected.1 > 20.0 && expected.1 < 100.0,
+            "gpu crushed or clamp-pinned: {expected:?}"
+        );
         let mut a = Allocator::new();
         let i = inp(&c, D_BOTH, 1700.0, 2000.0);
         let mut out = CONSERVATIVE_START;
@@ -454,9 +508,53 @@ mod tests {
         let mut i = inp(&c, D_BOTH, 1700.0, 2000.0);
         i.floors = (20.0, 1000);
         // From the conservative start (15 W) the up-rate limit alone would
-        // allow only 17 W; the floor overrides it immediately.
+        // allow only 17 W: the floor lifts the held point to 20 W first,
+        // then the normal up rate applies on top of it.
+        let (cpu, _) = a.step(&i);
+        assert!(cpu >= 20.0, "floor violated: cpu_w = {cpu}");
+        assert!((cpu - 22.0).abs() < 1e-9, "cpu_w = {cpu}");
+    }
+
+    #[test]
+    fn raised_floor_wins_during_overshoot() {
+        let c = contour_for(3000.0);
+        let mut a = Allocator::new();
+        for _ in 0..40 {
+            a.step(&inp(&c, D_GPU_ONLY, 1700.0, 2000.0)); // settles at (15, 100)
+        }
+        // The floor rises to 20 W while the fan overshoots by 300 RPM: ups
+        // are forbidden, but the floor still wins — exactly 20 W, no more.
+        let mut i = inp(&c, D_GPU_ONLY, 2300.0, 2000.0);
+        i.floors = (20.0, 1000);
         let (cpu, _) = a.step(&i);
         assert!((cpu - 20.0).abs() < 1e-9, "cpu_w = {cpu}");
+    }
+
+    #[test]
+    fn raised_floor_wins_while_frozen() {
+        let c = contour_for(3000.0);
+        let mut a = Allocator::new();
+        let mut i = inp(&c, D_BOTH, 1700.0, 2000.0);
+        i.fan_valid = false;
+        i.floors = (20.0, 1000);
+        // Frozen (invalid fan): the floor still lifts cpu_w — nothing else moves.
+        assert_eq!(a.step(&i), (20.0, CONSERVATIVE_START.1));
+        // Degenerate contour freeze: same rule.
+        let none = |_pc: f64| None;
+        i.fan_valid = true;
+        i.contour = &none;
+        assert_eq!(a.step(&i), (20.0, CONSERVATIVE_START.1));
+    }
+
+    #[test]
+    fn raised_floor_wins_on_deadband_hold() {
+        // Candidate within DEADBAND_W and RPM in band → hold, but the held
+        // point itself is lifted to the raised floor.
+        let flat = |_pc: f64| Some(30.5);
+        let mut a = Allocator::new();
+        let mut i = inp(&flat, D_GPU_ONLY, 2000.0, 2000.0);
+        i.floors = (20.0, 1000);
+        assert_eq!(a.step(&i), (20.0, CONSERVATIVE_START.1));
     }
 
     // ---- allocator: fan invalid → freeze ---------------------------------
@@ -599,5 +697,18 @@ mod tests {
         s.gpu_w_valid = false;
         let d = demand(&s, Some(40.0), Some(80.0), None);
         assert!((d.gpu_starved - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn demand_non_finite_readings_score_zero() {
+        let mut s = sample();
+        s.cpu_pkg_w = f64::NAN;
+        s.cpu_util_pct = f64::INFINITY;
+        s.gpu_w = f64::NAN;
+        s.gpu_util_pct = f64::NAN;
+        s.gpu_sm_mhz = f64::INFINITY; // would look "clock-pinned" unguarded
+        let d = demand(&s, Some(40.0), Some(80.0), Some(2000));
+        assert_eq!(d.cpu_starved, 0.0, "garbage reading must not raise power");
+        assert_eq!(d.gpu_starved, 0.0, "garbage reading must not raise power");
     }
 }

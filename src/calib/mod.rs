@@ -3,4 +3,5 @@
 //! it as their synthetic load source.
 
 pub mod burner;
+pub mod lut_sweep;
 pub mod steady;

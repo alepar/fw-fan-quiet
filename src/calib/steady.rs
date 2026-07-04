@@ -5,12 +5,12 @@
 
 /// Samples the tail window must span before we call it steady. At the 1 Hz
 /// sampling rate this is 20 seconds of settling time.
-// TODO(task-19): consumed by the LUT sweep; dead until then.
+// TODO(task-22): consumed by the calibration matrix runner; dead until then.
 #[allow(dead_code)]
 pub const STEADY_N: usize = 20;
 
 /// Max-min spread (RPM) the tail window may have and still count as steady.
-// TODO(task-19): consumed by the LUT sweep; dead until then.
+// TODO(task-22): consumed by the calibration matrix runner; dead until then.
 #[allow(dead_code)]
 pub const STEADY_RPM_TOLERANCE: f64 = 100.0;
 
@@ -20,8 +20,6 @@ pub const STEADY_RPM_TOLERANCE: f64 = 100.0;
 /// Any NaN inside the tail (validity gaps land in windows as NaN, per the
 /// charts convention) makes the window NOT steady: a sensor outage must never
 /// fabricate a calibration point. NaNs older than the tail are ignored.
-// TODO(task-19): consumed by the LUT sweep; dead until then.
-#[allow(dead_code)]
 pub fn is_steady(window: &[f64], n: usize, tolerance: f64) -> bool {
     if window.len() < n {
         return false;
@@ -40,8 +38,6 @@ pub fn is_steady(window: &[f64], n: usize, tolerance: f64) -> bool {
 /// Mean of the last `n` values. Returns None if the window has fewer than `n`
 /// samples or the tail contains NaN (same rationale as [`is_steady`]: never
 /// average across a sensor outage). Callers check [`is_steady`] first.
-// TODO(task-19): consumed by the LUT sweep; dead until then.
-#[allow(dead_code)]
 pub fn tail_mean(window: &[f64], n: usize) -> Option<f64> {
     if window.len() < n || n == 0 {
         return None;

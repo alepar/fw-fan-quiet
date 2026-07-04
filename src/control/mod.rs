@@ -4,6 +4,7 @@
 //! reasserts, watchdog flags and `ControlStatus` updates.
 
 pub mod controller;
+pub mod lut;
 
 // Mode/StatusFlag are reached via `controller::` where needed (view/tests).
 pub use controller::{Command, ControlStatus};

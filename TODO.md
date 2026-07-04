@@ -20,7 +20,7 @@ task's commit lands. Human-gated items are marked 👤.
 ## Milestone 2 — Manual actuation + safety
 - [x] 10. Command runner trait + ryzen_smu module handling
 - [x] 11. CPU actuator (ryzenadj) + stock restore
-- [ ] 12. GPU actuator (NVML clock locks)
+- [x] 12. GPU actuator (NVML clock locks)
 - [ ] 13. Restore guard + startup reset
 - [ ] 14. Controller thread + ControlStatus
 - [ ] 15. Manual-mode UI

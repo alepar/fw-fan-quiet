@@ -115,8 +115,10 @@ mod tests {
         match actuator.set_max_clock(3000) {
             Ok(()) => {
                 println!("set_max_clock(3000) unexpectedly permitted; releasing");
-                assert_eq!(actuator.applied(), Some(3000));
+                // Release BEFORE asserting so a failed assert can't leave clocks locked.
+                let applied = actuator.applied();
                 actuator.release().expect("release after successful lock");
+                assert_eq!(applied, Some(3000));
                 assert_eq!(actuator.applied(), None);
             }
             Err(e) => {

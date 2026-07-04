@@ -11,13 +11,10 @@ use std::path::Path;
 use super::cmd::Runner;
 
 /// Tracks whether *we* unloaded ryzen_smu, so restore is a no-op otherwise.
-// TODO(task-13): consumed by RestoreGuard; TODO(task-16): selftest.
-#[allow(dead_code)]
 pub struct SmuModule {
     unloaded_by_us: bool,
 }
 
-#[allow(dead_code)] // TODO(task-13): consumed by RestoreGuard + controller wiring.
 impl SmuModule {
     /// True iff `<sysfs>/ryzen_smu_drv` exists AND
     /// `<sysfs>/ryzen_smu_drv/pm_table` does NOT exist — the
@@ -49,6 +46,15 @@ impl SmuModule {
         Ok(Self {
             unloaded_by_us: true,
         })
+    }
+
+    /// A module we "unloaded", so `restore` will reload it. Guard tests use
+    /// this to observe the restore sequence without a sysfs fixture.
+    #[cfg(test)]
+    pub(crate) fn unloaded_for_test() -> Self {
+        Self {
+            unloaded_by_us: true,
+        }
     }
 
     /// `modprobe ryzen_smu` ONLY if we unloaded it; idempotent (second call

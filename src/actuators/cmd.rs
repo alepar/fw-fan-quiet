@@ -8,9 +8,15 @@ pub trait Runner {
     fn run(&self, program: &str, args: &[&str]) -> io::Result<Output>;
 }
 
+/// A shared reference to a Runner is itself a Runner, so several components
+/// (e.g. RestoreGuard + a borrowed actuator in tests) can share one instance.
+impl<R: Runner + ?Sized> Runner for &R {
+    fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
+        (**self).run(program, args)
+    }
+}
+
 /// Runs commands for real via `std::process::Command`.
-// TODO(task-13/14): constructed by the controller / RestoreGuard wiring.
-#[allow(dead_code)]
 pub struct RealRunner;
 
 impl Runner for RealRunner {

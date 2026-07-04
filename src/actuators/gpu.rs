@@ -113,13 +113,14 @@ pub mod test_support {
         Release,
     }
 
-    /// Recording stand-in for `GpuActuator`. The call log is behind an `Arc`
-    /// so tests keep a handle after the fake moves into the controller's
-    /// `RestoreGuard`.
+    /// Recording stand-in for `GpuActuator`. The call log and the failure
+    /// injector are behind `Arc`s so tests keep handles after the fake moves
+    /// into the controller's `RestoreGuard`.
     #[derive(Default)]
     pub struct FakeGpu {
         applied: Option<u32>,
         calls: Arc<Mutex<Vec<GpuCall>>>,
+        fail_sets: Arc<Mutex<usize>>,
     }
 
     impl FakeGpu {
@@ -131,10 +132,24 @@ pub mod test_support {
         pub fn calls(&self) -> Arc<Mutex<Vec<GpuCall>>> {
             Arc::clone(&self.calls)
         }
+
+        /// Shared failure injector: set `*handle.lock() = n` to make the
+        /// next `n` `set_max_clock` calls fail (like the real actuator, a
+        /// failed call leaves `applied` untouched and is not recorded).
+        pub fn failures(&self) -> Arc<Mutex<usize>> {
+            Arc::clone(&self.fail_sets)
+        }
     }
 
     impl GpuClockCtl for FakeGpu {
         fn set_max_clock(&mut self, mhz: u32) -> color_eyre::Result<()> {
+            {
+                let mut fail = self.fail_sets.lock().unwrap();
+                if *fail > 0 {
+                    *fail -= 1;
+                    return Err(color_eyre::eyre::eyre!("injected set_max_clock failure"));
+                }
+            }
             let clamped = clamp_gpu_clock(mhz);
             self.applied = Some(clamped);
             self.calls.lock().unwrap().push(GpuCall::Set(clamped));

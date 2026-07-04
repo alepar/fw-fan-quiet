@@ -49,7 +49,8 @@ const STICKINESS_MARGIN_W: f64 = 5.0;
 const STICKINESS_SAMPLES: u8 = 3;
 /// How long the `Resumed` flag stays visible after a suspend/resume.
 const RESUMED_FLAG_S: f64 = 30.0;
-/// Fan target clamp range (RPM); the control loop consumes it in M4.
+/// Fan target clamp range (RPM); the Auto-mode allocator consumes the
+/// target live via `status.fan_target_rpm`.
 const FAN_TARGET_MIN_RPM: f64 = 1000.0;
 const FAN_TARGET_MAX_RPM: f64 = 7000.0;
 /// Startup fan target (RPM). Shared with the UI model so the controller's
@@ -140,7 +141,7 @@ pub struct ControlStatus {
     pub cpu_limit_w: Option<f64>,
     /// Commanded (clamped) GPU max clock, MHz.
     pub gpu_max_mhz: Option<u32>,
-    /// Stored fan target (RPM); consumed by the control loop in M4.
+    /// Stored fan target (RPM); the Auto-mode allocator consumes it live.
     pub fan_target_rpm: f64,
     /// Currently active flags.
     pub flags: Vec<StatusFlag>,
@@ -262,6 +263,10 @@ impl<R: Runner> Controller<R> {
         config: Config,
         config_path: PathBuf,
     ) -> Self {
+        // Belt and suspenders (Config::load already sanitizes): out-of-range
+        // floors would trip the GPU PI's clamp / the allocator's debug
+        // assert once Auto starts. No construction path may skip this.
+        let config = config.sanitized();
         // Config owns the burst ceiling; the actuator default only covers a
         // hypothetical config-less construction.
         if let Some(cpu) = guard.cpu.as_mut() {
@@ -340,6 +345,9 @@ impl<R: Runner> Controller<R> {
                             let clamped_w = f64::from(clamped_mw) / 1000.0;
                             self.status.cpu_limit_w = Some(clamped_w);
                             self.status.mode = Mode::Manual;
+                            // Fresh command = fresh assert: any violation
+                            // streak against the previous limit is stale.
+                            self.stick_violations = 0;
                             effects.push(Effect::CpuSet(clamped_w));
                         }
                         Err(e) => tracing::warn!("SetCpuW({w}) failed, status unchanged: {e}"),
@@ -413,11 +421,7 @@ impl<R: Runner> Controller<R> {
                         // in force. With no lock applied (stock), the PI's
                         // documented first-jump-to-feedforward is safe — it
                         // only moves DOWNWARD from the stock 3090 MHz.
-                        Some(gpu) => {
-                            if let Some(applied) = gpu.applied() {
-                                auto.pid.seed_last_clock(applied);
-                            }
-                        }
+                        Some(gpu) => auto.pid.seed_last_clock(gpu.applied()),
                         None => tracing::warn!(
                             "no GPU actuator this run: auto mode will shape the CPU only"
                         ),
@@ -669,6 +673,11 @@ impl<R: Runner> Controller<R> {
                         Ok(clamped_mw) => {
                             let clamped_w = f64::from(clamped_mw) / 1000.0;
                             self.status.cpu_limit_w = Some(clamped_w);
+                            // A violation streak measured against the OLD
+                            // limit is stale evidence: the fresh allocation
+                            // gets a full 3-sample streak before the
+                            // stickiness watchdog may fire.
+                            self.stick_violations = 0;
                             effects.push(Effect::CpuSet(clamped_w));
                         }
                         Err(e) => {
@@ -706,7 +715,15 @@ impl<R: Runner> Controller<R> {
                             cause.get_or_insert("auto:gpu_clock");
                         }
                     }
-                    Err(e) => tracing::warn!("auto: GPU clock ({clock} MHz) failed: {e}"),
+                    Err(e) => {
+                        tracing::warn!("auto: GPU clock ({clock} MHz) failed: {e}");
+                        // PI honesty: update() already committed `clock` as
+                        // its rate-limit reference, but the hardware still
+                        // holds the old lock (or none). Re-seed from what is
+                        // actually applied so the next command rate-limits
+                        // from hardware state, not from failed intent.
+                        auto.pid.seed_last_clock(self.status.gpu_max_mhz);
+                    }
                 },
             }
         }
@@ -1860,7 +1877,7 @@ mod tests {
         assert_eq!(ctl.status().cpu_limit_w, None);
 
         // The state file exists, parses and carries the fitted model + LUT;
-        // the controller kept them for M4.
+        // the controller kept them, so Auto mode can start right away.
         let saved = PersistedState::load(&state_path);
         let model = saved.model.expect("model persisted");
         assert!((model.a - 25.0).abs() < 0.05 * 25.0, "a = {}", model.a);
@@ -2403,6 +2420,105 @@ mod tests {
         }
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn out_of_range_config_floors_never_panic_auto() {
+        // Reviewer-confirmed crash pre-fix: gpu_floor_mhz > 3090 made the
+        // PI's f64::clamp (min > max) panic on the first Auto tick, and
+        // cpu_floor_w > 54 tripped the allocator's floor debug_assert.
+        // Controller::new sanitizes (as does Config::load for file configs).
+        let runner = FakeRunner::new();
+        let config = Config {
+            cpu_floor_w: 99.0,
+            gpu_floor_mhz: 4000,
+            ..Config::default()
+        };
+        let (mut ctl, _gpu_calls) = auto_controller(
+            &runner,
+            PathBuf::from("/nonexistent/platform_profile"),
+            config,
+        );
+        ctl.on_command(Command::SetAuto(true));
+        for t in [0.0, 1.0, 2.0, 5.0] {
+            ctl.on_sample(&busy_at(t)); // panicked here before the fix
+        }
+        // Floors landed clamped to the hardware envelope.
+        assert_eq!(ctl.status().cpu_limit_w, Some(54.0));
+        assert_eq!(ctl.status().gpu_max_mhz, Some(3090));
+    }
+
+    #[test]
+    fn alloc_change_resets_stickiness_streak() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu_calls) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        ctl.on_sample(&busy_at(0.0)); // limit 17 W
+        let hot_at = |t: f64| Sample {
+            cpu_pkg_w: 30.0, // violates any limit here (margin 5 W)
+            ..busy_at(t)
+        };
+
+        // Two violations against the 17 W allocation: one short of firing.
+        ctl.on_sample(&hot_at(1.0));
+        ctl.on_sample(&hot_at(2.0));
+        assert!(!ctl.status().flags.contains(&StatusFlag::LimitNotSticking));
+
+        // t=5: the allocator retargets to 19 W. The stale 2-strike streak
+        // was measured against the OLD limit — the fresh allocation must
+        // get a full 3-sample streak, so this sample must NOT fire.
+        let effects = ctl.on_sample(&hot_at(5.0));
+        assert_eq!(ctl.status().cpu_limit_w, Some(19.0), "premise: retargeted");
+        assert!(
+            !ctl.status().flags.contains(&StatusFlag::LimitNotSticking),
+            "stale streak fired one sample into a fresh allocation"
+        );
+        assert!(!has_reassert(&effects, "stickiness"), "got {effects:?}");
+
+        // The watchdog still works: three fresh violations fire as usual.
+        ctl.on_sample(&hot_at(6.0));
+        let effects = ctl.on_sample(&hot_at(7.0));
+        assert!(ctl.status().flags.contains(&StatusFlag::LimitNotSticking));
+        assert!(has_reassert(&effects, "stickiness"), "got {effects:?}");
+    }
+
+    #[test]
+    fn pi_rate_reference_tracks_hardware_on_failed_gpu_set() {
+        let runner = FakeRunner::new();
+        let gpu = FakeGpu::new();
+        let gpu_calls = gpu.calls();
+        let gpu_failures = gpu.failures();
+        let mut ctl = Controller::new(
+            RestoreGuard::new(
+                &runner,
+                Some(cpu_actuator(
+                    &runner,
+                    PathBuf::from("/nonexistent/platform_profile"),
+                )),
+                Some(Box::new(gpu)),
+                None,
+            ),
+            calibrated(),
+            PathBuf::from("/nonexistent/state.json"),
+            Config::default(),
+            PathBuf::from("/nonexistent/config.toml"),
+        );
+        ctl.on_command(Command::SetGpuMaxClock(1500));
+        ctl.on_command(Command::SetAuto(true)); // PI seeded from applied 1500
+
+        // The first PI command (1605, rate-limited from 1500) FAILS: the
+        // hardware still holds 1500, so status must not move and the failed
+        // attempt must not become the rate reference.
+        *gpu_failures.lock().unwrap() = 1;
+        ctl.on_sample(&busy_at(0.0));
+        assert_eq!(ctl.status().gpu_max_mhz, Some(1500));
+        assert_eq!(gpu_sets(&gpu_calls), vec![1500], "only the manual lock");
+
+        // Next tick: the retry must rate-limit from the APPLIED 1500 (→ 1605
+        // again), not from the failed 1605 intent (which would allow 1653).
+        ctl.on_sample(&busy_at(1.0));
+        assert_eq!(gpu_sets(&gpu_calls), vec![1500, 1605]);
+        assert_eq!(ctl.status().gpu_max_mhz, Some(1605));
     }
 
     #[test]

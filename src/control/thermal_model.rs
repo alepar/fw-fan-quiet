@@ -52,8 +52,8 @@ impl std::fmt::Display for FitError {
 
 impl std::error::Error for FitError {}
 
-// TODO(task-23/26/27): allocator and trim/RLS loops consume the rest
-// (contour inversion, RLS); dead until then.
+// TODO(task-26/27): the trim/RLS loops consume `rls_update`; dead until then
+// (the allocator consumes `gpu_watts_on_contour` since Task 25).
 #[allow(dead_code)]
 impl ThermalModel {
     /// Batch least squares via SVD over the 4-column design matrix

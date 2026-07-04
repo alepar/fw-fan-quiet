@@ -72,15 +72,16 @@ impl GpuPid {
         }
     }
 
-    /// Seed the rate-limit reference (Auto-mode entry, review decision): when
-    /// a GPU clock lock is already applied, the first PI command must stay
-    /// within ±105 MHz of what is in force — without a seed the documented
-    /// first-output jump straight to the feedforward could yank an applied
-    /// lock arbitrarily far in one step. With no lock applied (stock), the
-    /// caller skips the seed and the first-jump contract is safe: it only
+    /// Sync the rate-limit reference to the APPLIED hardware state (review
+    /// decision): at Auto entry with a GPU lock in force — and again after a
+    /// failed clock command, when `update()` has already committed its
+    /// intent — the next PI command must stay within ±105 MHz of what the
+    /// hardware actually holds, not of what was merely asked. `None` (no
+    /// lock applied) restores the documented first-output contract: the next
+    /// command may jump straight to the feedforward, which is safe — it only
     /// ever moves DOWNWARD from the stock 3090 MHz ceiling.
-    pub fn seed_last_clock(&mut self, mhz: u32) {
-        self.last_clock = Some(mhz);
+    pub fn seed_last_clock(&mut self, applied: Option<u32>) {
+        self.last_clock = applied;
     }
 
     /// Update the watts setpoint (allocator, every 5 s). Bumpless: resets
@@ -105,6 +106,10 @@ impl GpuPid {
         lut: &ClockWattsLut,
         gpu_floor_mhz: u32,
     ) -> Option<u32> {
+        // Belt and suspenders (config already clamps on load): a floor above
+        // the driver ceiling would make the clamps below panic (min > max).
+        // Cap it here so no caller can crash the control loop.
+        let gpu_floor_mhz = gpu_floor_mhz.min(MAX_CLOCK_MHZ);
         // Floors win over everything, including the deadband hold and the
         // rate limit (project-wide rule; the allocator does the same): if the
         // floor was raised past the clock currently in force, jump to it now.
@@ -198,11 +203,35 @@ mod tests {
         let lut = exact_lut();
         let mut pid = GpuPid::new();
         pid.set_target_w(60.0);
-        pid.seed_last_clock(1500);
+        pid.seed_last_clock(Some(1500));
         // Unseeded, this exact stimulus jumps straight to 2400 (see the reset
         // test); seeded from an applied 1500 MHz lock it must stay within one
         // rate-limit step of it.
         assert_eq!(pid.update(40.0, &lut, FLOOR), Some(1605));
+
+        // Re-seeding with None (lock released / never applied) restores the
+        // documented jump-to-feedforward first output.
+        let mut pid = GpuPid::new();
+        pid.set_target_w(60.0);
+        pid.seed_last_clock(Some(1500));
+        pid.seed_last_clock(None);
+        assert_eq!(pid.update(40.0, &lut, FLOOR), Some(2400));
+    }
+
+    #[test]
+    fn oversized_floor_is_capped_not_a_panic() {
+        // A floor above the 3090 MHz driver ceiling (bad config reaching a
+        // non-validated caller) must cap to the ceiling, not panic the
+        // f64::clamp below it (min > max).
+        let lut = exact_lut();
+        let mut pid = GpuPid::new();
+        pid.set_target_w(60.0);
+        assert_eq!(pid.update(40.0, &lut, 4000), Some(3090));
+        // And the floor-raise fast path caps too.
+        let mut pid = GpuPid::new();
+        pid.set_target_w(60.0);
+        pid.seed_last_clock(Some(1500));
+        assert_eq!(pid.update(40.0, &lut, 4000), Some(3090));
     }
 
     #[test]

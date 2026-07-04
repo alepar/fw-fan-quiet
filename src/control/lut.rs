@@ -29,8 +29,9 @@ impl ClockWattsLut {
         }
     }
 
-    // TODO(task-25): len/is_empty/watts_for_clock feed the Auto-mode UI
-    // (calibration summary + predicted watts); test-only until then.
+    // Introspection conveniences: `clock_for_watts` below is the only entry
+    // the control path consumes; len/is_empty/watts_for_clock serve tests
+    // and future UI/telemetry (calibration summary, predicted watts).
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.points.len()

@@ -8,6 +8,8 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::actuators::gpu::clamp_gpu_clock;
+use crate::control::allocator::CPU_MAX_W;
 use crate::control::controller::DEFAULT_FAN_TARGET_RPM;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -49,13 +51,45 @@ impl Config {
                 return Config::default();
             }
         };
-        match toml::from_str(&text) {
-            Ok(config) => config,
+        match toml::from_str::<Config>(&text) {
+            Ok(config) => config.sanitized(),
             Err(e) => {
                 tracing::warn!("bad config {}, using defaults: {e}", path.display());
                 Config::default()
             }
         }
+    }
+
+    /// Clamp out-of-range floors to the hardware envelope, warning when it
+    /// bites. A bad config value must degrade to a sane floor, never panic
+    /// the control loop downstream (`f64::clamp` with min > max panics; the
+    /// allocator debug-asserts its floor range). Applied on load AND again
+    /// at controller construction (belt and suspenders for programmatic
+    /// configs).
+    pub fn sanitized(mut self) -> Self {
+        let gpu = clamp_gpu_clock(self.gpu_floor_mhz);
+        if gpu != self.gpu_floor_mhz {
+            tracing::warn!(
+                "config gpu_floor_mhz {} outside the actuator range; clamped to {gpu}",
+                self.gpu_floor_mhz
+            );
+            self.gpu_floor_mhz = gpu;
+        }
+        // Non-finite (TOML can encode nan/inf) would survive clamp() as NaN:
+        // fall back to the default floor instead.
+        let cpu = if self.cpu_floor_w.is_finite() {
+            self.cpu_floor_w.clamp(0.0, CPU_MAX_W)
+        } else {
+            Config::default().cpu_floor_w
+        };
+        if cpu != self.cpu_floor_w {
+            tracing::warn!(
+                "config cpu_floor_w {} outside [0, {CPU_MAX_W}]; clamped to {cpu}",
+                self.cpu_floor_w
+            );
+            self.cpu_floor_w = cpu;
+        }
+        self
     }
 
     /// Atomic save: write `<path>.tmp`, then rename over `path`. Creates the
@@ -107,11 +141,35 @@ mod tests {
         let config = Config {
             fan_target_rpm: 2600.0,
             cpu_floor_w: 12.0,
-            gpu_floor_mhz: 900,
+            gpu_floor_mhz: 1200,
             fast_limit_mw: 60_000,
         };
         config.save(&path).unwrap();
         assert_eq!(Config::load(&path), config);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn floors_out_of_range_are_clamped_on_load() {
+        let dir = fixture_dir("clamp-floors");
+        let path = dir.join("config.toml");
+        // Above the hardware envelope: an unclamped 4000 MHz floor would
+        // panic the GPU PI's f64::clamp (min > max) on the first Auto tick.
+        fs::write(&path, "gpu_floor_mhz = 4000\ncpu_floor_w = 99.0\n").unwrap();
+        let config = Config::load(&path);
+        assert_eq!(config.gpu_floor_mhz, 3090);
+        assert_eq!(config.cpu_floor_w, 54.0);
+        // Below it: floors clamp up to the actuator minimum / zero.
+        fs::write(&path, "gpu_floor_mhz = 100\ncpu_floor_w = -5.0\n").unwrap();
+        let config = Config::load(&path);
+        assert_eq!(config.gpu_floor_mhz, 1000);
+        assert_eq!(config.cpu_floor_w, 0.0);
+        // Non-finite cpu floor (TOML encodes nan) falls back to the default.
+        fs::write(&path, "cpu_floor_w = nan\n").unwrap();
+        assert_eq!(
+            Config::load(&path).cpu_floor_w,
+            Config::default().cpu_floor_w
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -3,6 +3,7 @@
 
 mod actuators;
 mod calib;
+mod config;
 mod control;
 mod event;
 mod logging;
@@ -10,6 +11,7 @@ mod model;
 mod ring;
 mod selftest;
 mod sensors;
+mod state;
 mod telemetry;
 mod types;
 mod ui;
@@ -57,6 +59,12 @@ struct Args {
     /// Directory for tracing logs (falls back to `.` if unwritable).
     #[arg(long, default_value = "/var/lib/bazerame-fans/log")]
     log_dir: PathBuf,
+    /// Config file (TOML); missing or invalid falls back to defaults.
+    #[arg(long, default_value = "/etc/bazerame-fans/config.toml")]
+    config: PathBuf,
+    /// Persisted calibration state (JSON); missing means "not calibrated".
+    #[arg(long, default_value = "/var/lib/bazerame-fans/state.json")]
+    state_file: PathBuf,
     /// Default (no subcommand): the live TUI dashboard.
     #[command(subcommand)]
     command: Option<Commands>,
@@ -90,6 +98,12 @@ fn main() -> Result<()> {
     }
 
     let _log_guard = logging::init(&args.log_dir);
+
+    // Loaded at startup so config/state problems surface in the log from day
+    // one. TODO(task-25): wire config fan_target/floors into the controller;
+    // TODO(task-22): calibration fills and saves the persisted state.
+    let _config = config::Config::load(&args.config);
+    let _persisted = state::PersistedState::load(&args.state_file);
 
     let telemetry = telemetry::open_with_fallback(&args.telemetry_dir, Path::new("."));
     match &telemetry {

@@ -23,7 +23,7 @@ task's commit lands. Human-gated items are marked 👤.
 - [x] 12. GPU actuator (NVML clock locks)
 - [x] 13. Restore guard + startup reset
 - [x] 14. Controller thread + ControlStatus
-- [ ] 15. Manual-mode UI
+- [x] 15. Manual-mode UI
 - [ ] 16. Selftest subcommand + M2 hardware verification
 
 ## Milestone 3 — Calibration

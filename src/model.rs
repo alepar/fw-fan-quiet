@@ -27,6 +27,9 @@ const GPU_MAX_MHZ: u32 = 3090;
 const FAN_STEP_RPM: f64 = 250.0;
 const FAN_MIN_RPM: f64 = 1000.0;
 const FAN_MAX_RPM: f64 = 7000.0;
+/// Floor steps (Task 29): CPU floor moves in 1 W steps within the manual
+/// clamp range; the GPU floor reuses the manual clock step/clamps.
+const CPU_FLOOR_STEP_W: f64 = 1.0;
 
 pub struct Model {
     pub max_fan: Ring,
@@ -49,10 +52,16 @@ pub struct Model {
     cpu_setpoint_w: Option<f64>,
     /// Locally tracked GPU max-clock setpoint (MHz); same lifecycle.
     gpu_setpoint_mhz: Option<u32>,
+    /// Locally tracked floors (what the next f/F/d/D press steps from);
+    /// seeded from the defaults, kept in sync via the echoed Status. Both
+    /// travel together in every `Command::SetFloors`.
+    cpu_floor_w: f64,
+    gpu_floor_mhz: u32,
 }
 
 impl Model {
     pub fn new() -> Self {
+        let status = ControlStatus::default();
         Self {
             max_fan: Ring::new(RING_CAP),
             cpu_w: Ring::new(RING_CAP),
@@ -61,11 +70,13 @@ impl Model {
             gpu_temp: Ring::new(RING_CAP),
             gpu_mhz: Ring::new(RING_CAP),
             latest: None,
-            status: ControlStatus::default(),
             running: true,
             fan_target_rpm: DEFAULT_FAN_TARGET_RPM,
             cpu_setpoint_w: None,
             gpu_setpoint_mhz: None,
+            cpu_floor_w: status.cpu_floor_w,
+            gpu_floor_mhz: status.gpu_floor_mhz,
+            status,
         }
     }
 
@@ -120,6 +131,8 @@ impl Model {
                 self.cpu_setpoint_w = cs.cpu_limit_w;
                 self.gpu_setpoint_mhz = cs.gpu_max_mhz;
                 self.fan_target_rpm = cs.fan_target_rpm;
+                self.cpu_floor_w = cs.cpu_floor_w;
+                self.gpu_floor_mhz = cs.gpu_floor_mhz;
                 self.status = cs;
             }
             // Render cadence is driven by the main loop; nothing to do here.
@@ -161,6 +174,27 @@ impl Model {
                 self.fan_target_rpm = v;
                 vec![Command::SetFanTarget(v)]
             }
+            'f' | 'F' => {
+                // CPU floor: safety config, allowed in any mode (the
+                // controller rejects it only while Calibrating).
+                let step = if ch == 'F' {
+                    CPU_FLOOR_STEP_W
+                } else {
+                    -CPU_FLOOR_STEP_W
+                };
+                self.cpu_floor_w = (self.cpu_floor_w + step).clamp(CPU_MIN_W, CPU_MAX_W);
+                self.set_floors()
+            }
+            'd' | 'D' => {
+                // GPU clock floor, same step size as the manual clock key.
+                let stepped = if ch == 'D' {
+                    self.gpu_floor_mhz.saturating_add(GPU_STEP_MHZ)
+                } else {
+                    self.gpu_floor_mhz.saturating_sub(GPU_STEP_MHZ)
+                };
+                self.gpu_floor_mhz = stepped.clamp(GPU_MIN_MHZ, GPU_MAX_MHZ);
+                self.set_floors()
+            }
             'p' => {
                 // Pause: back to Monitor mode with stock limits, app keeps
                 // running. Cleared setpoints make the next press re-seed.
@@ -189,6 +223,15 @@ impl Model {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// Both floors travel together in every SetFloors command, so the
+    /// controller's config copy never sees a partial update.
+    fn set_floors(&self) -> Vec<Command> {
+        vec![Command::SetFloors {
+            cpu_w: self.cpu_floor_w,
+            gpu_mhz: self.gpu_floor_mhz,
+        }]
     }
 }
 
@@ -317,6 +360,7 @@ mod tests {
             trim_rpm: 0.0,
             flags: vec![StatusFlag::Resumed],
             calib: None,
+            ..ControlStatus::default()
         };
         m.update(Event::Status(cs.clone()));
         assert_eq!(m.status, cs);
@@ -504,6 +548,7 @@ mod tests {
             trim_rpm: 0.0,
             flags: vec![],
             calib: None,
+            ..ControlStatus::default()
         }));
         assert!(cmds.is_empty());
         // The controller's clamped truth wins: next steps start from it.
@@ -597,6 +642,78 @@ mod tests {
         let mut m = Model::new();
         m.update(Event::Status(status_in(Mode::Calibrating)));
         assert_eq!(m.update(Event::Input(key('a'))), vec![]);
+    }
+
+    // --- Task 29: floor keys ---
+
+    fn set_floors(cpu_w: f64, gpu_mhz: u32) -> Vec<Command> {
+        vec![Command::SetFloors { cpu_w, gpu_mhz }]
+    }
+
+    #[test]
+    fn f_keys_step_cpu_floor_and_clamp() {
+        let mut m = Model::new();
+        // Defaults 15 W / 1000 MHz; both values always travel together.
+        assert_eq!(m.update(Event::Input(key('f'))), set_floors(14.0, 1000));
+        assert_eq!(
+            m.update(Event::Input(shift_key('F'))),
+            set_floors(15.0, 1000)
+        );
+        // Down to the 10 W floor and idempotent at the bound.
+        for _ in 0..4 {
+            m.update(Event::Input(key('f')));
+        }
+        assert_eq!(m.update(Event::Input(key('f'))), set_floors(10.0, 1000));
+        assert_eq!(m.update(Event::Input(key('f'))), set_floors(10.0, 1000));
+        // Up to the 54 W ceiling and idempotent there too.
+        for _ in 0..43 {
+            m.update(Event::Input(shift_key('F')));
+        }
+        assert_eq!(
+            m.update(Event::Input(shift_key('F'))),
+            set_floors(54.0, 1000)
+        );
+        assert_eq!(
+            m.update(Event::Input(shift_key('F'))),
+            set_floors(54.0, 1000)
+        );
+    }
+
+    #[test]
+    fn d_keys_step_gpu_floor_and_clamp() {
+        let mut m = Model::new();
+        // Default GPU floor is already at the 1000 MHz minimum: stepping
+        // down stays clamped there.
+        assert_eq!(m.update(Event::Input(key('d'))), set_floors(15.0, 1000));
+        assert_eq!(
+            m.update(Event::Input(shift_key('D'))),
+            set_floors(15.0, 1105)
+        );
+        // Up to the 3090 MHz ceiling: 1105 + 19*105 = 3100 clamps.
+        for _ in 0..18 {
+            m.update(Event::Input(shift_key('D')));
+        }
+        assert_eq!(
+            m.update(Event::Input(shift_key('D'))),
+            set_floors(15.0, 3090)
+        );
+        assert_eq!(
+            m.update(Event::Input(shift_key('D'))),
+            set_floors(15.0, 3090)
+        );
+    }
+
+    #[test]
+    fn status_seeds_floor_setpoints() {
+        let mut m = Model::new();
+        m.update(Event::Status(ControlStatus {
+            cpu_floor_w: 20.0,
+            gpu_floor_mhz: 1500,
+            ..ControlStatus::default()
+        }));
+        // The controller's sanitized truth wins: next steps start from it.
+        assert_eq!(m.update(Event::Input(key('f'))), set_floors(19.0, 1500));
+        assert_eq!(m.update(Event::Input(key('d'))), set_floors(19.0, 1395));
     }
 
     #[test]

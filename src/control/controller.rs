@@ -51,6 +51,13 @@ const ALLOC_PERIOD_S: f64 = 5.0;
 const STICKINESS_MARGIN_W: f64 = 5.0;
 /// Consecutive violating samples before the stickiness watchdog fires.
 const STICKINESS_SAMPLES: u8 = 3;
+/// Stricter streak while the post-resume window is open: limits are most
+/// likely to silently revert right after a resume (firmware reasserts its
+/// own defaults late, PPD/tuned re-apply profiles on wakeup), so the
+/// watchdog fires one sample earlier while the evidence is hottest.
+const STICKINESS_SAMPLES_STRICT: u8 = 2;
+/// Elevated-stickiness window after a resume (see above).
+const RESUMED_STRICT_S: f64 = 60.0;
 /// How long the `Resumed` flag stays visible after a suspend/resume.
 const RESUMED_FLAG_S: f64 = 30.0;
 /// Cap on the Auto-mode fan-RPM window feeding the trim integrator's
@@ -90,6 +97,14 @@ pub enum Command {
     /// Fan target (RPM): stored, echoed in status, persisted to config on
     /// change, and consumed live by the Auto-mode allocator.
     SetFanTarget(f64),
+    /// Safety floors (CPU sustained watts, GPU max-clock MHz), carrying BOTH
+    /// current values (the UI model steps them locally). Sanitized, echoed
+    /// in status, persisted to config on change; the Auto allocator/PI
+    /// consume them on their next step. Rejected only while Calibrating —
+    /// floors are safety config, not actuation, so they are allowed in every
+    /// other mode and (like SetFanTarget) pass the emergency acknowledge
+    /// gate without consuming the acknowledge.
+    SetFloors { cpu_w: f64, gpu_mhz: u32 },
     /// Enter/leave the closed-loop Auto mode. Explicit bool (not a toggle) so
     /// a queued duplicate keypress can never flip the mode back unnoticed.
     SetAuto(bool),
@@ -191,6 +206,10 @@ pub struct ControlStatus {
     pub gpu_max_mhz: Option<u32>,
     /// Stored fan target (RPM); the Auto-mode allocator consumes it live.
     pub fan_target_rpm: f64,
+    /// CPU sustained-watts floor (config, live-editable via SetFloors).
+    pub cpu_floor_w: f64,
+    /// GPU max-clock floor in MHz (config, live-editable via SetFloors).
+    pub gpu_floor_mhz: u32,
     /// Current trim offset (RPM); nonzero only in Auto mode. Positive =
     /// model under-predicts = budget cut (shown dim in the UI header).
     pub trim_rpm: f64,
@@ -200,15 +219,19 @@ pub struct ControlStatus {
     pub calib: Option<CalibProgressLite>,
 }
 
-/// Hand-written (not derived) so `fan_target_rpm` starts at the real default
-/// instead of an unrepresentable 0.0 in the first Status event.
+/// Hand-written (not derived) so `fan_target_rpm` and the floors start at
+/// the real defaults instead of unrepresentable zeros in the first Status
+/// event.
 impl Default for ControlStatus {
     fn default() -> Self {
+        let config = Config::default();
         Self {
             mode: Mode::default(),
             cpu_limit_w: None,
             gpu_max_mhz: None,
             fan_target_rpm: DEFAULT_FAN_TARGET_RPM,
+            cpu_floor_w: config.cpu_floor_w,
+            gpu_floor_mhz: config.gpu_floor_mhz,
             trim_rpm: 0.0,
             flags: Vec::new(),
             calib: None,
@@ -319,6 +342,9 @@ pub struct Controller<R: Runner> {
     stick_violations: u8,
     /// `t_mono` until which the `Resumed` flag stays visible.
     resumed_until: Option<f64>,
+    /// `t_mono` until which the post-resume elevated-stickiness window is
+    /// open ([`STICKINESS_SAMPLES_STRICT`] instead of the normal streak).
+    strict_until: Option<f64>,
     /// `t_mono` of the last (re)assert, None until the first post-command sample.
     last_reassert: Option<f64>,
     /// Running calibration session; Some exactly while `Mode::Calibrating`.
@@ -368,6 +394,8 @@ impl<R: Runner> Controller<R> {
             fan_target_rpm: config
                 .fan_target_rpm
                 .clamp(FAN_TARGET_MIN_RPM, FAN_TARGET_MAX_RPM),
+            cpu_floor_w: config.cpu_floor_w,
+            gpu_floor_mhz: config.gpu_floor_mhz,
             ..ControlStatus::default()
         };
         Self {
@@ -375,6 +403,7 @@ impl<R: Runner> Controller<R> {
             status,
             stick_violations: 0,
             resumed_until: None,
+            strict_until: None,
             last_reassert: None,
             calib: None,
             burner: None,
@@ -407,8 +436,10 @@ impl<R: Runner> Controller<R> {
         // is up, the FIRST actuating command only clears the flag(s) and
         // re-arms the watchdog — it does NOT execute. The user must see the
         // emergency and consciously press again; the second press acts
-        // normally. Quit/ReleaseAll/SetFanTarget pass through (none of them
-        // can re-apply limits behind a tripped watchdog). The latch and the
+        // normally. Quit/ReleaseAll/SetFanTarget/SetFloors pass through
+        // (none of them can re-apply limits behind a tripped watchdog —
+        // floors only bound what a FUTURE allocation may command). The
+        // latch and the
         // emergency flags move in lockstep (trip sets both, this gate clears
         // both), so gating on the latch is gating on the flags.
         if self.watchdog.is_tripped()
@@ -438,8 +469,9 @@ impl<R: Runner> Controller<R> {
             return effects;
         }
         // While calibrating the runner owns actuation: manual setters,
-        // release and Auto entry are rejected outright (Esc/AbortCalibration
-        // is the way to take control back).
+        // release, Auto entry and floor edits are rejected outright
+        // (Esc/AbortCalibration is the way to take control back; a floor
+        // change mid-run would silently skew the calibration points).
         if self.status.mode == Mode::Calibrating
             && matches!(
                 c,
@@ -447,6 +479,7 @@ impl<R: Runner> Controller<R> {
                     | Command::SetGpuMaxClock(_)
                     | Command::ReleaseAll
                     | Command::SetAuto(_)
+                    | Command::SetFloors { .. }
             )
         {
             tracing::warn!("manual command rejected while calibrating: {c:?}");
@@ -526,6 +559,35 @@ impl<R: Runner> Controller<R> {
                     }
                 }
                 "command:set_fan_target"
+            }
+            Command::SetFloors { cpu_w, gpu_mhz } => {
+                // Same clamps as config load (Config::sanitized): out-of-
+                // range floors would panic the GPU PI's clamp / trip the
+                // allocator's debug assert on the next Auto step.
+                let sanitized = Config {
+                    cpu_floor_w: cpu_w,
+                    gpu_floor_mhz: gpu_mhz,
+                    ..self.config.clone()
+                }
+                .sanitized();
+                if sanitized != self.config {
+                    self.config = sanitized;
+                    self.status.cpu_floor_w = self.config.cpu_floor_w;
+                    self.status.gpu_floor_mhz = self.config.gpu_floor_mhz;
+                    // The allocator reads self.config's floors on its next
+                    // step, the GPU PI on its next update: no extra wiring
+                    // for a live retarget. Persist on CHANGE only (a held
+                    // key repeats the clamped value at the bounds — never
+                    // spam the disk); save failure is warned, the in-session
+                    // floors apply.
+                    if let Err(e) = self.config.save(&self.config_path) {
+                        tracing::warn!(
+                            "config save to {} failed (floors still active): {e}",
+                            self.config_path.display()
+                        );
+                    }
+                }
+                "command:set_floors"
             }
             Command::SetAuto(true) => {
                 if self.status.mode == Mode::Auto {
@@ -649,6 +711,16 @@ impl<R: Runner> Controller<R> {
 
         // Resume: firmware may have forgotten our limits across the suspend.
         if s.resumed {
+            // Device-global GPU state first (persistence mode): independent
+            // of whether any lock is applied, and once per resume — not on
+            // the per-limit reassert below.
+            if let Some(gpu) = self.guard.gpu.as_mut() {
+                gpu.resumed();
+            }
+            // Elevated stickiness: limits are most likely to silently
+            // revert right AFTER a resume, so for RESUMED_STRICT_S the
+            // watchdog fires on a 2-sample streak instead of 3.
+            self.strict_until = Some(s.t_mono + RESUMED_STRICT_S);
             if let Some(all_ok) = self.reassert_actuators() {
                 self.last_reassert = Some(s.t_mono);
                 // Telemetry honesty (as in the periodic path): a failed
@@ -688,14 +760,20 @@ impl<R: Runner> Controller<R> {
         if let Some(limit) = self.status.cpu_limit_w {
             if s.cpu_pkg_w > 0.0 {
                 if s.cpu_pkg_w > limit + STICKINESS_MARGIN_W {
+                    // Post-resume strict window: fire one sample earlier.
+                    let needed = if self.strict_until.is_some_and(|until| s.t_mono < until) {
+                        STICKINESS_SAMPLES_STRICT
+                    } else {
+                        STICKINESS_SAMPLES
+                    };
                     self.stick_violations += 1;
-                    if self.stick_violations >= STICKINESS_SAMPLES {
+                    if self.stick_violations >= needed {
                         // Reset so re-triggering needs a fresh streak instead
                         // of hammering ryzenadj at 1 Hz.
                         self.stick_violations = 0;
                         tracing::warn!(
                             "CPU limit not sticking: {} W measured vs {limit} W commanded \
-                             ({STICKINESS_SAMPLES} consecutive samples); reasserting",
+                             ({needed} consecutive samples); reasserting",
                             s.cpu_pkg_w
                         );
                         if let Some(all_ok) = self.reassert_actuators() {
@@ -3887,6 +3965,289 @@ mod tests {
         let effects = ctl.on_sample(&gpu_hot_at(3.0));
         assert!(effects.contains(&Effect::Released), "got {effects:?}");
         assert!(ctl.status().flags.contains(&StatusFlag::ThermalEmergency));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- Task 29: resume hardening + floor editing ---
+
+    /// (controller, gpu call log, resumed-hook counter) fixture triple.
+    type ResumeFixture<'r> = (
+        Controller<&'r FakeRunner>,
+        Arc<Mutex<Vec<GpuCall>>>,
+        Arc<Mutex<usize>>,
+    );
+
+    /// Calibrated controller like `auto_controller`, additionally exposing
+    /// the FakeGpu's resumed-hook counter.
+    fn auto_controller_with_resume_counter(runner: &FakeRunner) -> ResumeFixture<'_> {
+        let gpu = FakeGpu::new();
+        let gpu_calls = gpu.calls();
+        let resumed_count = gpu.resumed_count();
+        let ctl = Controller::new(
+            RestoreGuard::new(
+                runner,
+                Some(cpu_actuator(
+                    runner,
+                    PathBuf::from("/nonexistent/platform_profile"),
+                )),
+                Some(Box::new(gpu)),
+                None,
+            ),
+            calibrated(),
+            PathBuf::from("/nonexistent/state.json"),
+            Config::default(),
+            PathBuf::from("/nonexistent/config.toml"),
+        );
+        (ctl, gpu_calls, resumed_count)
+    }
+
+    #[test]
+    fn resume_pokes_gpu_resumed_hook_in_manual() {
+        let runner = FakeRunner::new();
+        let (mut ctl, gpu_calls, resumed_count) = auto_controller_with_resume_counter(&runner);
+        ctl.on_command(Command::SetGpuMaxClock(1500));
+        assert_eq!(*resumed_count.lock().unwrap(), 0, "premise");
+
+        let effects = ctl.on_sample(&Sample {
+            t_mono: 100.0,
+            resumed: true,
+            ..Sample::default()
+        });
+        // Persistence hook poked exactly once, and the lock reasserted.
+        assert_eq!(*resumed_count.lock().unwrap(), 1);
+        assert!(has_reassert(&effects, "resume"), "got {effects:?}");
+        assert_eq!(gpu_sets(&gpu_calls), vec![1500, 1500], "set + reassert");
+
+        // Ordinary samples must NOT poke the hook (it is per-resume, not
+        // per-reassert: the 10 s reassert at 110.1 stays hook-free).
+        ctl.on_sample(&sample_at(105.0));
+        let effects = ctl.on_sample(&sample_at(110.2));
+        assert!(has_reassert(&effects, "reassert"), "got {effects:?}");
+        assert_eq!(*resumed_count.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn resume_pokes_gpu_resumed_hook_in_auto() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu_calls, resumed_count) = auto_controller_with_resume_counter(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        ctl.on_sample(&busy_at(0.0));
+        assert_eq!(*resumed_count.lock().unwrap(), 0, "premise");
+
+        let effects = ctl.on_sample(&Sample {
+            resumed: true,
+            ..busy_at(1.0)
+        });
+        assert_eq!(*resumed_count.lock().unwrap(), 1);
+        assert!(has_reassert(&effects, "resume"), "got {effects:?}");
+        assert_eq!(ctl.status().mode, Mode::Auto, "auto survives the resume");
+    }
+
+    #[test]
+    fn resume_without_gpu_actuator_still_reasserts() {
+        // No GPU this run: the resume path must not assume the hook exists.
+        let runner = FakeRunner::new();
+        let mut ctl = controller_no_profile(&runner);
+        ctl.on_command(Command::SetCpuW(20.0));
+        let effects = ctl.on_sample(&Sample {
+            t_mono: 100.0,
+            resumed: true,
+            ..Sample::default()
+        });
+        assert!(has_reassert(&effects, "resume"), "got {effects:?}");
+    }
+
+    #[test]
+    fn strict_stickiness_window_fires_on_two_violations_after_resume() {
+        let runner = FakeRunner::new();
+        let mut ctl = controller_no_profile(&runner);
+        ctl.on_command(Command::SetCpuW(20.0));
+
+        // Resume at t=100: the strict window opens (until t=160).
+        ctl.on_sample(&Sample {
+            t_mono: 100.0,
+            resumed: true,
+            ..Sample::default()
+        });
+
+        // TWO violations suffice inside the window (normally three).
+        assert!(
+            !ctl.status().flags.contains(&StatusFlag::LimitNotSticking),
+            "premise"
+        );
+        ctl.on_sample(&sample_with_power(101.0, 26.0));
+        assert!(!ctl.status().flags.contains(&StatusFlag::LimitNotSticking));
+        let effects = ctl.on_sample(&sample_with_power(102.0, 26.0));
+        assert!(has_reassert(&effects, "stickiness"), "got {effects:?}");
+        assert!(ctl.status().flags.contains(&StatusFlag::LimitNotSticking));
+
+        // A compliant sample clears the flag and the streak.
+        ctl.on_sample(&sample_with_power(103.0, 19.0));
+        assert!(!ctl.status().flags.contains(&StatusFlag::LimitNotSticking));
+
+        // Past the 60 s window (t >= 160): back to the normal 3-sample rule.
+        ctl.on_sample(&sample_with_power(161.0, 26.0));
+        let effects = ctl.on_sample(&sample_with_power(162.0, 26.0));
+        assert!(
+            !has_reassert(&effects, "stickiness"),
+            "two violations after the strict window must not fire, got {effects:?}"
+        );
+        assert!(!ctl.status().flags.contains(&StatusFlag::LimitNotSticking));
+        let effects = ctl.on_sample(&sample_with_power(163.0, 26.0));
+        assert!(has_reassert(&effects, "stickiness"), "got {effects:?}");
+        assert!(ctl.status().flags.contains(&StatusFlag::LimitNotSticking));
+    }
+
+    #[test]
+    fn set_floors_sanitizes_echoes_and_persists_on_change_only() {
+        let runner = FakeRunner::new();
+        let dir = std::env::temp_dir().join(format!(
+            "bazerame-controller-test-{}-floors-persist",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        let mut ctl: Controller<&FakeRunner> = Controller::new(
+            RestoreGuard::new(&runner, None, None, None),
+            PersistedState::default(),
+            PathBuf::from("/nonexistent/state.json"),
+            Config::default(),
+            config_path.clone(),
+        );
+        // Construction seeds the status floors from config.
+        assert_eq!(ctl.status().cpu_floor_w, 15.0);
+        assert_eq!(ctl.status().gpu_floor_mhz, 1000);
+
+        let effects = ctl.on_command(Command::SetFloors {
+            cpu_w: 20.0,
+            gpu_mhz: 1105,
+        });
+        assert_eq!(status_changes(&effects), 1);
+        assert_eq!(ctl.status().cpu_floor_w, 20.0);
+        assert_eq!(ctl.status().gpu_floor_mhz, 1105);
+        let saved = Config::load(&config_path);
+        assert_eq!(saved.cpu_floor_w, 20.0);
+        assert_eq!(saved.gpu_floor_mhz, 1105);
+        assert_eq!(
+            saved.fan_target_rpm,
+            Config::default().fan_target_rpm,
+            "other config fields preserved"
+        );
+        // Floors are config, not actuation: mode stays Monitor, no commands.
+        assert_eq!(ctl.status().mode, Mode::Monitor);
+        assert!(runner.calls().is_empty());
+
+        // Unchanged floors (held key at a clamp bound): no re-save, no
+        // status spam.
+        fs::remove_file(&config_path).unwrap();
+        let effects = ctl.on_command(Command::SetFloors {
+            cpu_w: 20.0,
+            gpu_mhz: 1105,
+        });
+        assert_eq!(status_changes(&effects), 0, "got {effects:?}");
+        assert!(
+            !config_path.exists(),
+            "unchanged floors must not spam config saves"
+        );
+
+        // Out-of-range floors sanitize exactly like config load.
+        ctl.on_command(Command::SetFloors {
+            cpu_w: 99.0,
+            gpu_mhz: 500,
+        });
+        assert_eq!(ctl.status().cpu_floor_w, 54.0);
+        assert_eq!(ctl.status().gpu_floor_mhz, 1000);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn set_floors_shifts_the_next_allocation() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu_calls) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+
+        // Fully idle machine at the fan target: allocation sits at the floor.
+        let idle_at = |t: f64| Sample {
+            t_mono: t,
+            gpu_w: 10.0,
+            gpu_w_valid: true,
+            fan1_rpm: 3000.0,
+            fan_valid: true,
+            cpu_temp_c: 60.0,
+            cpu_temp_valid: true,
+            ..Sample::default()
+        };
+        ctl.on_sample(&idle_at(0.0));
+        ctl.on_sample(&idle_at(5.0));
+        assert_eq!(ctl.status().cpu_limit_w, Some(15.0), "premise: at floor");
+
+        // Raise the CPU floor: honored from the next allocator step on.
+        ctl.on_command(Command::SetFloors {
+            cpu_w: 25.0,
+            gpu_mhz: 1000,
+        });
+        assert_eq!(ctl.status().mode, Mode::Auto, "floors allowed in Auto");
+        let effects = ctl.on_sample(&idle_at(10.0));
+        let (cpu_w, _) = alloc_of(&effects).expect("allocator step due");
+        assert!(cpu_w >= 25.0, "allocation {cpu_w} W below the new floor");
+        assert_eq!(ctl.status().cpu_limit_w, Some(cpu_w));
+    }
+
+    #[test]
+    fn set_floors_rejected_while_calibrating() {
+        let runner = FakeRunner::new();
+        let mut ctl = controller_no_profile(&runner);
+        ctl.on_command(Command::StartCalibration);
+        assert_eq!(ctl.status().mode, Mode::Calibrating, "premise");
+
+        let effects = ctl.on_command(Command::SetFloors {
+            cpu_w: 25.0,
+            gpu_mhz: 1200,
+        });
+        assert!(effects.is_empty(), "got {effects:?}");
+        assert_eq!(ctl.status().cpu_floor_w, 15.0, "floors unchanged");
+        assert_eq!(ctl.status().gpu_floor_mhz, 1000);
+        assert_eq!(ctl.config.cpu_floor_w, 15.0);
+    }
+
+    #[test]
+    fn set_floors_passes_the_emergency_gate_without_acknowledging() {
+        let runner = FakeRunner::new();
+        let (dir, path) = profile_fixture("floors-emergency");
+        let mut ctl = controller(&runner, path);
+        ctl.on_command(Command::SetCpuW(20.0));
+        for t in 1..=3 {
+            ctl.on_sample(&overheat_at(f64::from(t)));
+        }
+        assert!(
+            ctl.status().flags.contains(&StatusFlag::ThermalEmergency),
+            "premise: tripped"
+        );
+
+        // Floors don't actuate: they apply immediately AND leave the
+        // emergency latched (the acknowledge stays with the user).
+        let effects = ctl.on_command(Command::SetFloors {
+            cpu_w: 25.0,
+            gpu_mhz: 1200,
+        });
+        assert_eq!(ctl.status().cpu_floor_w, 25.0);
+        assert_eq!(ctl.status().gpu_floor_mhz, 1200);
+        assert!(
+            ctl.status().flags.contains(&StatusFlag::ThermalEmergency),
+            "floors must not consume the acknowledge"
+        );
+        assert!(
+            !has_status_change_cause(&effects, "watchdog:rearmed"),
+            "got {effects:?}"
+        );
+
+        // The two-step acknowledge still works as designed afterwards.
+        ctl.on_command(Command::SetCpuW(20.0)); // ack only
+        assert_eq!(ctl.status().cpu_limit_w, None);
+        ctl.on_command(Command::SetCpuW(20.0)); // acts
+        assert_eq!(ctl.status().cpu_limit_w, Some(20.0));
 
         fs::remove_dir_all(&dir).unwrap();
     }

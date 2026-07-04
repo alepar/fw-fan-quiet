@@ -51,7 +51,7 @@ pub fn view(model: &Model, frame: &mut Frame) {
         " q quit  Esc abort calibration"
     } else {
         " q quit  a auto  c/C cpu\u{2213}2W  g/G gpu\u{2213}105MHz  t/T fan\u{2213}250  \
-         p release  k calibrate"
+         f/F d/D floors  p release  k calibrate"
     };
     frame.render_widget(
         Paragraph::new(keybar).style(Style::default().fg(Color::DarkGray)),
@@ -154,6 +154,15 @@ fn header_line(model: &Model) -> Line<'static> {
             ));
         }
     }
+    // Floors: safety config, informational — dim like the trim, and LAST so
+    // it can never push a loud flag past a narrow terminal's right edge.
+    spans.push(Span::styled(
+        format!(
+            " | floors {:.0}W/{}MHz",
+            model.status.cpu_floor_w, model.status.gpu_floor_mhz
+        ),
+        Style::default().fg(Color::DarkGray),
+    ));
     Line::from(spans)
 }
 
@@ -459,6 +468,7 @@ mod tests {
             trim_rpm: 0.0,
             flags: vec![StatusFlag::LimitNotSticking, StatusFlag::Resumed],
             calib: None,
+            ..ControlStatus::default()
         }));
         let terminal = draw(&m);
         let header = row_text(&terminal, 0);
@@ -497,6 +507,7 @@ mod tests {
             trim_rpm: 0.0,
             flags: vec![StatusFlag::LimitNotSticking],
             calib: None,
+            ..ControlStatus::default()
         }));
         let terminal = draw(&m);
         let header = row_text(&terminal, 0);
@@ -520,6 +531,7 @@ mod tests {
             trim_rpm: 0.0,
             flags: vec![StatusFlag::ThermalEmergency],
             calib: None,
+            ..ControlStatus::default()
         }));
         let terminal = draw(&m);
         let header = row_text(&terminal, 0);
@@ -545,6 +557,7 @@ mod tests {
             trim_rpm: 0.0,
             flags: vec![StatusFlag::SensorLost],
             calib: None,
+            ..ControlStatus::default()
         }));
         let terminal = draw(&m);
         let header = row_text(&terminal, 0);
@@ -566,12 +579,43 @@ mod tests {
             "c/C cpu\u{2213}2W",
             "g/G gpu\u{2213}105MHz",
             "t/T fan\u{2213}250",
+            "f/F d/D floors",
             "p release",
             "k calibrate",
         ] {
             assert!(footer.contains(hint), "footer was: {footer:?}");
         }
         assert!(!footer.contains("Esc abort"), "footer was: {footer:?}");
+    }
+
+    // --- Task 29: floors in the header ---
+
+    #[test]
+    fn header_shows_floors_dim() {
+        use crate::control::ControlStatus;
+        // Defaults render right away (floors are always shown).
+        let terminal = draw(&Model::new());
+        let header = row_text(&terminal, 0);
+        assert!(
+            header.contains("floors 15W/1000MHz"),
+            "header was: {header:?}"
+        );
+        let x = header.find("floors 15W/1000MHz").unwrap() as u16;
+        let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
+        assert_eq!(cell.fg, Color::DarkGray, "floors must render dim");
+
+        // Edited floors show through the echoed status.
+        let mut m = Model::new();
+        m.update(Event::Status(ControlStatus {
+            cpu_floor_w: 20.0,
+            gpu_floor_mhz: 1210,
+            ..ControlStatus::default()
+        }));
+        let header = row_text(&draw(&m), 0);
+        assert!(
+            header.contains("floors 20W/1210MHz"),
+            "header was: {header:?}"
+        );
     }
 
     // --- Task 25: auto mode in the header ---
@@ -589,6 +633,7 @@ mod tests {
             trim_rpm: 0.0,
             flags: vec![],
             calib: None,
+            ..ControlStatus::default()
         }));
         let terminal = draw(&m);
         let header = row_text(&terminal, 0);
@@ -619,6 +664,7 @@ mod tests {
             trim_rpm: 123.0,
             flags: vec![],
             calib: None,
+            ..ControlStatus::default()
         }));
         let terminal = draw(&m);
         let header = row_text(&terminal, 0);
@@ -636,6 +682,7 @@ mod tests {
             trim_rpm: -17.0,
             flags: vec![],
             calib: None,
+            ..ControlStatus::default()
         }));
         let header = row_text(&draw(&m), 0);
         assert!(header.contains("trim -17rpm"), "header was: {header:?}");
@@ -662,6 +709,7 @@ mod tests {
             trim_rpm: 400.0,
             flags: vec![StatusFlag::TargetUnreachable],
             calib: None,
+            ..ControlStatus::default()
         }));
         let terminal = draw(&m);
         let header = row_text(&terminal, 0);
@@ -691,6 +739,7 @@ mod tests {
             trim_rpm: 200.0,
             flags: vec![StatusFlag::ModelDistrust],
             calib: None,
+            ..ControlStatus::default()
         }));
         let terminal = draw(&m);
         let header = row_text(&terminal, 0);
@@ -713,6 +762,7 @@ mod tests {
             trim_rpm: 0.0,
             flags: vec![StatusFlag::NotCalibrated],
             calib: None,
+            ..ControlStatus::default()
         }));
         let terminal = draw(&m);
         let header = row_text(&terminal, 0);
@@ -757,6 +807,7 @@ mod tests {
                 needs_load,
                 note: "matrix point 5/11: cpu 5 W, gpu 35 W".into(),
             }),
+            ..ControlStatus::default()
         }));
         m
     }
@@ -809,6 +860,7 @@ mod tests {
                 needs_load: true,
                 note: String::new(),
             }),
+            ..ControlStatus::default()
         }));
         // Tiny terminal: every wizard sub-area degenerates; must not panic.
         let mut terminal = Terminal::new(TestBackend::new(20, 6)).unwrap();
@@ -830,6 +882,7 @@ mod tests {
             trim_rpm: 0.0,
             flags: vec![],
             calib: None,
+            ..ControlStatus::default()
         }));
         draw(&m);
         // Some limits + data in the rings...
@@ -845,6 +898,7 @@ mod tests {
             trim_rpm: 0.0,
             flags: vec![],
             calib: None,
+            ..ControlStatus::default()
         }));
         draw(&m);
         // ...and back to None mid-session (release).

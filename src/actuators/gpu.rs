@@ -39,6 +39,11 @@ pub trait GpuClockCtl: Send {
     fn release(&mut self) -> color_eyre::Result<()>;
     /// Last successfully applied max clock, if a lock is active.
     fn applied(&self) -> Option<u32>;
+    /// Suspend/resume hook (Task 29): the driver may have forgotten
+    /// device-global state across the suspend. Default no-op; the real
+    /// actuator re-enables persistence mode (enabled once in
+    /// `GpuActuator::new`, not covered by the per-limit reassert path).
+    fn resumed(&mut self) {}
 }
 
 /// The trait-object form everything stores (`RestoreGuard`, constructors).
@@ -96,6 +101,22 @@ impl GpuClockCtl for GpuActuator {
     fn applied(&self) -> Option<u32> {
         self.applied_mhz
     }
+
+    /// Re-enable persistence mode after a suspend/resume: it was enabled at
+    /// construction, and a resume-triggered driver reload can drop it. The
+    /// call is idempotent and cheap; failure is only warned, exactly like at
+    /// construction (locks still work without it). The controller calls this
+    /// once per detected resume — never on the 1 Hz reassert path.
+    fn resumed(&mut self) {
+        match self.nvml.device_by_index(DEVICE_INDEX) {
+            Ok(mut device) => {
+                if let Err(e) = device.set_persistent(true) {
+                    tracing::warn!("nvml: re-enabling persistence after resume failed: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("nvml: device lookup after resume failed: {e}"),
+        }
+    }
 }
 
 /// Shared test double for controller/guard tests (cfg(test) makes it
@@ -121,6 +142,7 @@ pub mod test_support {
         applied: Option<u32>,
         calls: Arc<Mutex<Vec<GpuCall>>>,
         fail_sets: Arc<Mutex<usize>>,
+        resumed_count: Arc<Mutex<usize>>,
     }
 
     impl FakeGpu {
@@ -138,6 +160,12 @@ pub mod test_support {
         /// failed call leaves `applied` untouched and is not recorded).
         pub fn failures(&self) -> Arc<Mutex<usize>> {
             Arc::clone(&self.fail_sets)
+        }
+
+        /// Shared counter of `resumed()` hook invocations (Task 29): tests
+        /// assert the controller pokes the hook exactly once per resume.
+        pub fn resumed_count(&self) -> Arc<Mutex<usize>> {
+            Arc::clone(&self.resumed_count)
         }
     }
 
@@ -164,6 +192,10 @@ pub mod test_support {
 
         fn applied(&self) -> Option<u32> {
             self.applied
+        }
+
+        fn resumed(&mut self) {
+            *self.resumed_count.lock().unwrap() += 1;
         }
     }
 }

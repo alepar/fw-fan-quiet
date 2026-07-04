@@ -41,8 +41,9 @@ impl Hwmon {
         Self { chips }
     }
 
-    /// True if a chip with this name was discovered.
-    // TODO(task-16): selftest reports which chips are present.
+    /// True if a chip with this name was discovered. Production reads go
+    /// through the typed accessors (`fan_rpms`/`cpu_temp_c`/...); kept for the
+    /// unit tests that assert on fixture discovery.
     #[allow(dead_code)]
     pub fn has_chip(&self, name: &str) -> bool {
         self.chips.contains_key(name)

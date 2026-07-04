@@ -157,6 +157,10 @@ pub enum Effect {
     Reasserted { cause: &'static str },
     /// `status` changed vs. before the call (shell sends Event::Status).
     StatusChanged { cause: &'static str },
+    /// Telemetry-only note: something worth a Decision record happened but
+    /// the user-visible status is unchanged (e.g. a repeated calibration
+    /// NeedsGpuLoad nag — offline analysis needs the full nag history).
+    Noted { cause: &'static str },
     /// Hardware restored; the thread shell must exit its loop.
     Quit,
 }
@@ -463,6 +467,11 @@ impl<R: Runner> Controller<R> {
             effects.push(Effect::StatusChanged {
                 cause: cause.unwrap_or("calib:progress"),
             });
+        } else if let Some(cause) = cause {
+            // Notable runner event without a status delta (e.g. the second
+            // and later NeedsGpuLoad nags: needs_load is already true).
+            // Still worth a telemetry Decision line.
+            effects.push(Effect::Noted { cause });
         }
         effects
     }
@@ -724,7 +733,7 @@ fn apply_effects<R: Runner>(
     let mut cause: Option<&'static str> = None;
     for effect in effects {
         match effect {
-            Effect::Reasserted { cause: c } => {
+            Effect::Reasserted { cause: c } | Effect::Noted { cause: c } => {
                 cause.get_or_insert(c);
             }
             Effect::StatusChanged { cause: c } => {
@@ -1375,6 +1384,55 @@ mod tests {
         assert_eq!(
             ryzenadj_calls(&runner),
             vec![expected_args(15_000), expected_args(30_000)]
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn repeated_needs_load_nags_are_noted_for_telemetry() {
+        let runner = FakeRunner::new();
+        let (dir, path) = profile_fixture("calib-nag");
+        let mut ctl = controller(&runner, path);
+        ctl.on_command(Command::StartCalibration);
+        drive_sweep(&mut ctl);
+        for idx in 0..4 {
+            drive_matrix_point(&mut ctl, idx);
+        }
+        // Point 4 wants 35 GPU W; the GPU sits idle. First nag flips
+        // needs_load: a StatusChanged Decision.
+        let stalled = Sample {
+            cpu_pkg_w: 4.0,
+            gpu_w: 10.0,
+            gpu_w_valid: true,
+            gpu_util_pct: 3.0,
+            gpu_mhz_valid: true,
+            fan1_rpm: 1000.0,
+            fan_valid: true,
+            ..Sample::default()
+        };
+        for _ in 0..9 {
+            assert!(ctl.on_sample(&stalled).is_empty());
+        }
+        let effects = ctl.on_sample(&stalled);
+        assert_eq!(
+            effects,
+            vec![Effect::StatusChanged {
+                cause: "calib:needs_load"
+            }]
+        );
+        // Later nags change no status (needs_load already true) but must
+        // still surface as telemetry-only notes, so offline analysis sees
+        // the full nag history.
+        for _ in 0..9 {
+            assert!(ctl.on_sample(&stalled).is_empty());
+        }
+        let effects = ctl.on_sample(&stalled);
+        assert_eq!(
+            effects,
+            vec![Effect::Noted {
+                cause: "calib:needs_load"
+            }]
         );
 
         fs::remove_dir_all(&dir).unwrap();

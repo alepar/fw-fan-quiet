@@ -62,11 +62,15 @@ const GPU_UTIL_ACTIVE_PCT: f64 = 90.0;
 /// non-accumulating samples (same idea as the sweep's `NeedsLoad`).
 const NEEDS_LOAD_EVERY: usize = 10;
 
-/// Minimum samples on a matrix point before it may record. Fans lag heat by
-/// tens of seconds: pure flatness detection can trigger early on a
-/// slowly-rising plateau (20 flat-ish samples while RPM is still creeping
-/// up). 45 s minimum dwell + the 20-sample flatness window is the
-/// compromise between run time and settled truth.
+/// Minimum consecutive *clean* (accumulating) samples on a matrix point
+/// before it may record. Fans lag heat by tens of seconds: pure flatness
+/// detection can trigger early on a slowly-rising plateau (20 flat-ish
+/// samples while RPM is still creeping up). 45 s minimum dwell + the
+/// 20-sample flatness window is the compromise between run time and settled
+/// truth. The streak resets whenever accumulation stalls (wrong GPU state /
+/// invalid sensors): a stall changes the thermal input, so the fans must be
+/// given the full dwell again once the point's condition is re-established —
+/// wall-clock elapsed on the point must never substitute for it.
 pub const MIN_DWELL_SAMPLES: usize = 45;
 
 /// A matrix point that has not settled after this many samples times out:
@@ -168,8 +172,12 @@ pub struct CalibRunner {
     lut: Option<ClockWattsLut>,
     /// Recorded matrix points, in order.
     points: Vec<CalibPoint>,
-    /// Samples seen on the current matrix point (dwell + timeout clock).
+    /// Samples seen on the current matrix point (timeout clock only).
     elapsed: usize,
+    /// Consecutive clean (accumulating) samples on the current point: the
+    /// minimum-dwell gate. Reset by any stalled sample, alongside the
+    /// window clear.
+    clean: usize,
     /// Parallel per-point windows, pushed in lockstep on accumulating
     /// samples only: fan `max_fan_rpm`, MEASURED `cpu_pkg_w`, measured
     /// `gpu_w`. Recording averages the same 20-sample tail of all three, so
@@ -194,6 +202,7 @@ impl CalibRunner {
             lut: None,
             points: Vec::new(),
             elapsed: 0,
+            clean: 0,
             fan_window: VecDeque::new(),
             cpu_window: VecDeque::new(),
             gpu_window: VecDeque::new(),
@@ -308,6 +317,7 @@ impl CalibRunner {
     fn enter_matrix_point(&mut self, idx: usize) -> Vec<RunnerEffect> {
         self.phase = Phase::MatrixPoint { idx };
         self.elapsed = 0;
+        self.clean = 0;
         self.fan_window.clear();
         self.cpu_window.clear();
         self.gpu_window.clear();
@@ -360,12 +370,17 @@ impl CalibRunner {
 
         if gpu_ok && s.fan_valid {
             self.non_accum = 0;
+            self.clean += 1;
             self.needs_load = false;
             self.gpu_block = false;
             push_capped(&mut self.fan_window, s.max_fan_rpm());
             push_capped(&mut self.cpu_window, s.cpu_pkg_w);
             push_capped(&mut self.gpu_window, s.gpu_w);
-            if self.elapsed >= MIN_DWELL_SAMPLES
+            // Dwell gate on the CLEAN streak, not elapsed: a stall (wrong
+            // GPU state) changed the thermal input, so the fans get the
+            // full 45-sample dwell again after it clears — otherwise a
+            // still-decaying tail could pass the 20-sample flatness check.
+            if self.clean >= MIN_DWELL_SAMPLES
                 && is_steady(
                     self.fan_window.make_contiguous(),
                     STEADY_N,
@@ -376,12 +391,14 @@ impl CalibRunner {
             }
         } else {
             // Wrong operating condition (or fan reading missing): discard
-            // the windows — fan RPM measured under the wrong GPU state must
-            // never leak into this point's steady tail. The elapsed clock
-            // keeps running, so only the timeout bounds a stuck point.
+            // the windows and the dwell streak — fan RPM measured under the
+            // wrong GPU state must never leak into this point's steady
+            // tail. The elapsed clock keeps running, so only the timeout
+            // bounds a stuck point.
             self.fan_window.clear();
             self.cpu_window.clear();
             self.gpu_window.clear();
+            self.clean = 0;
             self.non_accum += 1;
             if !gpu_ok {
                 if gpu_t > 0.0 {
@@ -889,20 +906,54 @@ mod tests {
         // NeedsGpuLoad is the "start a load" nag; a hot GPU on an idle
         // point is the opposite problem and must not emit it.
 
-        // GPU quiets: dwell already elapsed (60 > 45), so the point records
-        // as soon as a fresh 20-sample steady window accumulates.
+        // GPU quiets: the stall reset the dwell streak, so the point needs
+        // the FULL 45 clean samples again (elapsed wall-clock on the point
+        // must not count — the fans were reacting to the hot GPU).
         let mut recorded = false;
-        for i in 0..STEADY_N {
+        for i in 0..MIN_DWELL_SAMPLES {
             let effects = runner.on_sample(&matrix_point_sample(0));
             recorded = effects
                 .iter()
                 .any(|e| matches!(e, RunnerEffect::PointRecorded { .. }));
-            if i < STEADY_N - 1 {
-                assert!(!recorded, "recorded before a full quiet window");
+            if i < MIN_DWELL_SAMPLES - 1 {
+                assert!(!recorded, "recorded before a full clean dwell (i={i})");
             }
         }
         assert!(recorded, "quiet GPU must let the point record");
         assert!(!runner.progress().note.contains("STOP the GPU load"));
+    }
+
+    #[test]
+    fn stall_mid_dwell_resets_the_dwell_clock() {
+        let mut runner = CalibRunner::new();
+        drive_sweep(&mut runner);
+        // 30 clean samples into point 0 (dwell part-way)...
+        for _ in 0..30 {
+            assert!(runner.on_sample(&matrix_point_sample(0)).is_empty());
+        }
+        // ...then the GPU goes hot for 50 samples: windows AND dwell reset.
+        for _ in 0..50 {
+            assert!(runner.on_sample(&matrix_sample(4.0, 40.0, true)).is_empty());
+        }
+        // Quiet again: 44 clean samples are still not enough (30 + 50 + 44
+        // = 124 elapsed, but only 44 clean)...
+        for i in 0..(MIN_DWELL_SAMPLES - 1) {
+            let effects = runner.on_sample(&matrix_point_sample(0));
+            assert!(
+                !effects
+                    .iter()
+                    .any(|e| matches!(e, RunnerEffect::PointRecorded { .. })),
+                "recorded at clean sample {i}, before the full post-stall dwell: {effects:?}"
+            );
+        }
+        // ...the 45th clean sample records.
+        let effects = runner.on_sample(&matrix_point_sample(0));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, RunnerEffect::PointRecorded { .. })),
+            "expected record at the 45th clean sample, got {effects:?}"
+        );
     }
 
     #[test]

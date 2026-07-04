@@ -27,6 +27,18 @@ pub fn init(log_dir: &Path) -> Option<WorkerGuard> {
     Some(guard)
 }
 
+/// Plain stderr tracing for non-TUI paths (the selftest subcommand): stdout
+/// stays clean for the report lines. Filter defaults to `info`, overridable
+/// via `RUST_LOG`. Errors (subscriber already set) are ignored.
+pub fn init_stderr() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(true)
+        .try_init();
+}
+
 fn build_appender(dir: &Path) -> Result<RollingFileAppender, InitError> {
     // The builder does not create missing directories; best-effort here and
     // let build() report the real error if the dir is still unusable.

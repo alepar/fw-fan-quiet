@@ -2,11 +2,13 @@
 //! and logging. Milestone 1: live read-only monitoring dashboard.
 
 mod actuators;
+mod calib;
 mod control;
 mod event;
 mod logging;
 mod model;
 mod ring;
+mod selftest;
 mod sensors;
 mod telemetry;
 mod types;
@@ -17,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use color_eyre::Result;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 
@@ -55,11 +57,29 @@ struct Args {
     /// Directory for tracing logs (falls back to `.` if unwritable).
     #[arg(long, default_value = "/var/lib/bazerame-fans/log")]
     log_dir: PathBuf,
+    /// Default (no subcommand): the live TUI dashboard.
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Hardware selftest: exercise actuators + sensors end to end and print
+    /// plain [ OK ]/[FAIL] lines (~25 s; needs root; no TUI).
+    Selftest,
 }
 
 fn main() -> Result<()> {
     color_eyre::install()?;
     let args = Args::parse();
+
+    // Selftest path: plain stdout report + stderr logging, never the TUI or
+    // file logging. Runs before the root check below so the selftest prints
+    // its own [FAIL] root-check line.
+    if let Some(Commands::Selftest) = args.command {
+        logging::init_stderr();
+        std::process::exit(selftest::run());
+    }
 
     // Root check before logging::init: a non-root run should print the hint
     // and exit without leaving a stray fallback log file in the cwd.
@@ -326,4 +346,29 @@ fn spawn_input_thread(tx: Sender<Event>) {
             }
         })
         .expect("failed to spawn input thread");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_selftest_subcommand() {
+        let args = Args::try_parse_from(["bazerame-fans", "selftest"]).unwrap();
+        assert!(matches!(args.command, Some(Commands::Selftest)));
+    }
+
+    #[test]
+    fn no_subcommand_means_tui() {
+        let args = Args::try_parse_from(["bazerame-fans"]).unwrap();
+        assert!(args.command.is_none());
+    }
+
+    #[test]
+    fn flags_still_parse_alongside_subcommand() {
+        let args =
+            Args::try_parse_from(["bazerame-fans", "--log-dir", "/tmp/x", "selftest"]).unwrap();
+        assert!(matches!(args.command, Some(Commands::Selftest)));
+        assert_eq!(args.log_dir, PathBuf::from("/tmp/x"));
+    }
 }

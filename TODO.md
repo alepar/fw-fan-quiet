@@ -43,4 +43,8 @@ task's commit lands. Human-gated items are marked 👤.
 - [x] 26. Bounded trim integrator
 - [x] 27. Online RLS + trust monitor
 - [x] 28. Watchdogs + emergency release
-- [ ] 29. Resume hardening + polish + README 👤 (acceptance + abuse tests)
+- [x] 29. Resume hardening + polish + README 👤 (acceptance + abuse tests)
+
+The plan is CODE-COMPLETE. Remaining 👤 items need the real machine: a ~30-min
+calibration run (task 22), a gaming-session Auto validation (task 25), and the design §7
+acceptance + abuse tests (task 29).

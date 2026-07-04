@@ -3,3 +3,4 @@
 //! it as their synthetic load source.
 
 pub mod burner;
+pub mod steady;

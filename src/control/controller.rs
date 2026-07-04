@@ -184,7 +184,7 @@ pub struct Controller<R: Runner> {
     state_path: PathBuf,
     /// Fitted thermal model: loaded from the state file at construction,
     /// replaced by a fresh calibration.
-    /// TODO(task-23/25): consumed by the auto-mode allocator; unread until then.
+    /// TODO(task-25): wired to the auto-mode allocator loop; unread until then.
     #[allow(dead_code)]
     model: Option<ThermalModel>,
     /// GPU clock→watts LUT, same lifecycle as `model`.

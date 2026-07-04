@@ -3,6 +3,7 @@
 //! `RestoreGuard`) and turns UI commands + 1 Hz samples into actuation,
 //! reasserts, watchdog flags and `ControlStatus` updates.
 
+pub mod allocator;
 pub mod controller;
 pub mod lut;
 pub mod thermal_model;

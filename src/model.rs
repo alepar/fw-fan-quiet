@@ -1,6 +1,8 @@
 //! TEA-style UI model: single source of UI state, mutated only in update().
 
 use crate::control::ControlStatus;
+// Shared with the controller so display default and echoed status agree.
+use crate::control::controller::DEFAULT_FAN_TARGET_RPM;
 use crate::event::Event;
 use crate::ring::Ring;
 use crate::types::Sample;
@@ -8,10 +10,6 @@ use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 
 /// Ring capacity: 5 minutes of history at 1 Hz.
 pub const RING_CAP: usize = 300;
-
-/// Display-only fan target (RPM); Task 15 wires it to the controller's
-/// echoed `status.fan_target_rpm`.
-const DEFAULT_FAN_TARGET_RPM: f64 = 3000.0;
 
 pub struct Model {
     pub max_fan: Ring,

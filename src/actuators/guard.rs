@@ -9,9 +9,13 @@
 //!   where the controller thread never gets to restore: a panicking main
 //!   kills other threads without running their drops, but unwinds its own
 //!   stack. Its Drop checks `restored`; if the controller didn't get there,
-//!   it rebuilds fresh short-lived actuators and runs the same best-effort
-//!   restore sequence. Restores are idempotent, so the race where both
-//!   layers restore is harmless.
+//!   it first waits out a short grace period (the controller is nearly
+//!   always mid-restore on the unwind path — main drops `cmd_tx` before
+//!   this Drop runs), then rebuilds fresh short-lived actuators and runs
+//!   the same best-effort restore sequence. A concurrent double restore is
+//!   power-safe (stock limits always come back); worst case the two
+//!   interleaved profile toggles clobber the user's platform-profile
+//!   preference.
 //!
 //! Signals (SIGINT/SIGTERM/SIGHUP) are funneled into the normal return path
 //! by main's `term_flag`; SIGKILL cannot be caught — `startup_reset` on the
@@ -20,6 +24,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use super::cmd::{RealRunner, Runner};
 use super::cpu::{CpuActuator, PLATFORM_PROFILE_PATH};
@@ -144,11 +149,28 @@ impl FinalRestore {
     }
 }
 
+/// How long `FinalRestore` waits for an in-flight controller restore before
+/// restoring with fresh actuators itself (20 x 100 ms = ~2 s; a controller
+/// restore takes ~400 ms). Skipping the wait would risk two concurrent
+/// `restore_stock` profile toggles interleaving and clobbering the user's
+/// platform-profile preference.
+const GRACE_POLL_SLICES: u32 = 20;
+const GRACE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 impl Drop for FinalRestore {
     fn drop(&mut self) {
         if self.restored.load(Ordering::SeqCst) {
             tracing::debug!("final restore: controller already restored, nothing to do");
             return;
+        }
+        // Grace poll: on the unwind path main drops cmd_tx before this Drop
+        // runs, so the controller is nearly always mid-restore right now.
+        for _ in 0..GRACE_POLL_SLICES {
+            std::thread::sleep(GRACE_POLL_INTERVAL);
+            if self.restored.load(Ordering::SeqCst) {
+                tracing::debug!("final restore: controller restored during grace period");
+                return;
+            }
         }
         #[cfg(test)]
         if let Some(probe) = &self.probe {
@@ -275,6 +297,31 @@ mod tests {
         assert!(
             !probe.load(Ordering::SeqCst),
             "restored=true must short-circuit before any actuator construction"
+        );
+    }
+
+    #[test]
+    fn final_restore_stands_down_when_controller_finishes_during_grace_poll() {
+        let restored = Arc::new(AtomicBool::new(false));
+        let probe = Arc::new(AtomicBool::new(false));
+        let final_restore =
+            FinalRestore::with_probe(Arc::clone(&restored), false, Arc::clone(&probe));
+
+        // Simulates the unwind race: the controller (already mid-restore
+        // because cmd_tx dropped) finishes 200 ms into the grace poll.
+        let flipper = std::thread::spawn({
+            let restored = Arc::clone(&restored);
+            move || {
+                std::thread::sleep(Duration::from_millis(200));
+                restored.store(true, Ordering::SeqCst);
+            }
+        });
+        drop(final_restore);
+        flipper.join().unwrap();
+
+        assert!(
+            !probe.load(Ordering::SeqCst),
+            "the grace poll must notice the controller's restore and stand down"
         );
     }
 

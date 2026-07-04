@@ -36,6 +36,9 @@ const RESUMED_FLAG_S: f64 = 30.0;
 /// Fan target clamp range (RPM); the control loop consumes it in M4.
 const FAN_TARGET_MIN_RPM: f64 = 1000.0;
 const FAN_TARGET_MAX_RPM: f64 = 7000.0;
+/// Startup fan target (RPM). Shared with the UI model so the controller's
+/// echoed status and the displayed default can never diverge.
+pub const DEFAULT_FAN_TARGET_RPM: f64 = 3000.0;
 
 /// UI -> controller commands. Main sends only `Quit` today; the rest are
 /// wired to keys in Task 15.
@@ -97,7 +100,7 @@ impl StatusFlag {
 
 /// What the controller is doing right now; sent to the UI (and mirrored into
 /// telemetry `Decision` records) whenever it changes.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ControlStatus {
     pub mode: Mode,
     /// Commanded (clamped) sustained CPU limit, watts.
@@ -108,6 +111,20 @@ pub struct ControlStatus {
     pub fan_target_rpm: f64,
     /// Currently active flags.
     pub flags: Vec<StatusFlag>,
+}
+
+/// Hand-written (not derived) so `fan_target_rpm` starts at the real default
+/// instead of an unrepresentable 0.0 in the first Status event.
+impl Default for ControlStatus {
+    fn default() -> Self {
+        Self {
+            mode: Mode::default(),
+            cpu_limit_w: None,
+            gpu_max_mhz: None,
+            fan_target_rpm: DEFAULT_FAN_TARGET_RPM,
+            flags: Vec::new(),
+        }
+    }
 }
 
 /// What one `on_sample`/`on_command` call did — consumed by the thread shell
@@ -253,7 +270,7 @@ impl<R: Runner> Controller<R> {
 
         // Resume: firmware may have forgotten our limits across the suspend.
         if s.resumed {
-            if self.reassert_actuators() {
+            if self.reassert_actuators().is_some() {
                 self.last_reassert = Some(s.t_mono);
                 effects.push(Effect::Reasserted { cause: "resume" });
             }
@@ -282,7 +299,7 @@ impl<R: Runner> Controller<R> {
                              ({STICKINESS_SAMPLES} consecutive samples); reasserting",
                             s.cpu_pkg_w
                         );
-                        if self.reassert_actuators() {
+                        if self.reassert_actuators().is_some() {
                             self.last_reassert = Some(s.t_mono);
                             effects.push(Effect::Reasserted {
                                 cause: "stickiness",
@@ -305,10 +322,17 @@ impl<R: Runner> Controller<R> {
             match self.last_reassert {
                 None => self.last_reassert = Some(s.t_mono),
                 Some(last) if s.t_mono - last >= REASSERT_PERIOD_S => {
-                    if self.reassert_actuators() {
+                    if let Some(all_ok) = self.reassert_actuators() {
+                        // Advance the baseline even on failure: the retry
+                        // cadence stays 10 s. Telemetry honesty: a failed
+                        // attempt must not count as a phantom reassert.
                         self.last_reassert = Some(s.t_mono);
-                        effects.push(Effect::Reasserted { cause: "reassert" });
-                        cause.get_or_insert("reassert");
+                        let cause = if all_ok {
+                            "reassert"
+                        } else {
+                            "reassert_failed"
+                        };
+                        effects.push(Effect::Reasserted { cause });
                     }
                 }
                 Some(_) => {}
@@ -324,13 +348,16 @@ impl<R: Runner> Controller<R> {
     }
 
     /// Reapply whatever limits are currently commanded (same values). Errors
-    /// are warned — the periodic retry IS the recovery. True if anything was
-    /// commanded.
-    fn reassert_actuators(&mut self) -> bool {
+    /// are warned — the periodic retry IS the recovery. `None` if nothing was
+    /// commanded; otherwise `Some(all_calls_succeeded)` so telemetry can
+    /// distinguish real reasserts from failed attempts.
+    fn reassert_actuators(&mut self) -> Option<bool> {
         let mut any = false;
+        let mut all_ok = true;
         if let (Some(w), Some(cpu)) = (self.status.cpu_limit_w, self.guard.cpu.as_ref()) {
             any = true;
             if let Err(e) = cpu.set_sustained_mw((w * 1000.0).round() as u32) {
+                all_ok = false;
                 tracing::warn!("reassert: CPU limit ({w} W) failed: {e}");
             }
         }
@@ -338,11 +365,12 @@ impl<R: Runner> Controller<R> {
             if let Some(gpu) = self.guard.gpu.as_mut() {
                 any = true;
                 if let Err(e) = gpu.set_max_clock(mhz) {
+                    all_ok = false;
                     tracing::warn!("reassert: GPU max clock ({mhz} MHz) failed: {e}");
                 }
             }
         }
-        any
+        any.then_some(all_ok)
     }
 
     fn add_flag(&mut self, flag: StatusFlag) {
@@ -700,6 +728,41 @@ mod tests {
         );
         // Reassert alone changes nothing user-visible: no status spam.
         assert_eq!(status_changes(&effects), 0);
+    }
+
+    #[test]
+    fn default_status_starts_at_the_real_fan_target() {
+        // Not 0.0: the first Status event must never show an unrepresentable
+        // target (shared const keeps model display and controller in sync).
+        assert_eq!(ControlStatus::default().fan_target_rpm, 3000.0);
+        assert_eq!(
+            ControlStatus::default().fan_target_rpm,
+            DEFAULT_FAN_TARGET_RPM
+        );
+    }
+
+    #[test]
+    fn failed_reassert_reports_reassert_failed() {
+        let runner = FakeRunner::new();
+        let mut ctl = controller_no_profile(&runner);
+        ctl.on_command(Command::SetCpuW(20.0));
+        assert!(ctl.on_sample(&sample_at(0.0)).is_empty()); // baseline
+
+        // The next ryzenadj invocation (the 10 s reassert) fails.
+        runner.push_result(Ok(output_with_code(1)));
+        let effects = ctl.on_sample(&sample_at(10.1));
+        assert!(
+            has_reassert(&effects, "reassert_failed"),
+            "a failed attempt must not count as a phantom reassert, got {effects:?}"
+        );
+        assert_eq!(status_changes(&effects), 0, "status is unchanged");
+        assert_eq!(ryzenadj_calls(&runner).len(), 2, "initial set + attempt");
+
+        // The baseline still advanced: retry follows the normal 10 s cadence.
+        assert!(ctl.on_sample(&sample_at(10.2)).is_empty());
+        let effects = ctl.on_sample(&sample_at(20.2));
+        assert!(has_reassert(&effects, "reassert"), "got {effects:?}");
+        assert_eq!(ryzenadj_calls(&runner).len(), 3);
     }
 
     #[test]

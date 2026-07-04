@@ -122,8 +122,10 @@ fn main() -> Result<()> {
     // on MAIN's stack for the paths where the controller never gets there
     // (e.g. a main-thread panic kills other threads without running their
     // drops, but unwinds its own stack): its Drop sees `restored == false`,
+    // briefly waits out an in-flight controller restore (grace poll), then
     // builds fresh short-lived actuators and reruns the same best-effort
-    // restore. Restores are idempotent, so a double restore is harmless.
+    // restore. A concurrent double restore is power-safe; worst case it
+    // clobbers the user's platform-profile preference.
     // Declared after _log_guard so its Drop still gets logged.
     let restored = Arc::new(AtomicBool::new(false));
     let _final_restore = FinalRestore::new(Arc::clone(&restored), smu_was_unloaded);
@@ -151,11 +153,16 @@ fn main() -> Result<()> {
     // hook, which install_tty_safe_panic_hook() below replaces with a
     // dead-tty-safe equivalent.
     // ORDER (shutdown, normal path): 'q' or SIGINT/SIGTERM/SIGHUP stops the
-    // event loop -> terminal restore -> Command::Quit + controller join FIRST
-    // (controller runs GPU release -> CPU restore -> ryzen_smu reload, then
-    // flips `restored`) -> telemetry flush, sampler join -> _final_restore
-    // drops as a no-op (restored is true) -> _log_guard drops last so every
-    // restore step is still logged.
+    // event loop -> Command::Quit + controller join FIRST (GPU release ->
+    // CPU restore -> ryzen_smu reload, then flips `restored`) -> terminal
+    // restore -> telemetry flush, sampler join -> _final_restore drops as a
+    // no-op (restored is true) -> _log_guard drops last so every restore
+    // step is still logged. Hardware restore deliberately precedes ALL
+    // terminal I/O: try_restore writes to stdout, and a frozen/SIGSTOP'd
+    // terminal emulator with a full pty buffer can block those writes
+    // indefinitely with main neither returning nor unwinding — neither the
+    // disconnect path nor FinalRestore would fire. The tty staying in raw
+    // mode ~400 ms longer is the accepted cost.
     // ORDER (panic path): the tty-safe panic hook restores the terminal
     // first, then main's unwind drops cmd_tx/ui_rx (the controller sees the
     // disconnect and restores from its thread) and _final_restore's Drop
@@ -177,6 +184,9 @@ fn main() -> Result<()> {
             install_tty_safe_panic_hook();
             spawn_input_thread(ui_tx);
             let result = run(&mut terminal, &ui_rx, &telemetry, &term_flag);
+            // Hardware restore BEFORE any terminal I/O (see ORDER above).
+            shutdown.store(true, Ordering::Relaxed);
+            quit_and_join_controller(cmd_tx, ctl);
             // try_restore, NOT restore(): restore() reports failure via
             // eprintln!, which itself panics when stderr is a dead tty (e.g.
             // the terminal hung up). Verified on-machine via pty-hangup repro.
@@ -188,20 +198,13 @@ fn main() -> Result<()> {
             let _ = terminal.show_cursor();
             result
         }
-        Err(e) => Err(color_eyre::eyre::eyre!(e).wrap_err("cannot initialize terminal UI")),
+        Err(e) => {
+            shutdown.store(true, Ordering::Relaxed);
+            quit_and_join_controller(cmd_tx, ctl);
+            Err(color_eyre::eyre::eyre!(e).wrap_err("cannot initialize terminal UI"))
+        }
     };
 
-    shutdown.store(true, Ordering::Relaxed);
-    // Controller FIRST: Quit makes it restore hardware; joining before any
-    // other teardown guarantees stock state is back even if a later step
-    // hangs. A send failure means the controller already exited (it restores
-    // on channel disconnect too) — the join below still reaps it.
-    if cmd_tx.send(Command::Quit).is_err() {
-        tracing::warn!("controller already gone at shutdown");
-    }
-    if ctl.join().is_err() {
-        tracing::error!("controller thread panicked");
-    }
     if let Some(t) = telemetry::lock(&telemetry).as_mut() {
         t.flush();
     }
@@ -213,6 +216,20 @@ fn main() -> Result<()> {
     // is a deliberate simplicity choice: it owns nothing needing cleanup,
     // its send fails once ui_rx drops, and process exit reclaims it.
     result
+}
+
+/// Restore hardware first: tell the controller to Quit and JOIN it, so stock
+/// state is guaranteed back before any later teardown step (terminal I/O in
+/// particular) gets a chance to block. A send failure means the controller
+/// already exited (it restores on channel disconnect too); the join still
+/// reaps it either way.
+fn quit_and_join_controller(cmd_tx: Sender<Command>, ctl: std::thread::JoinHandle<()>) {
+    if cmd_tx.send(Command::Quit).is_err() {
+        tracing::warn!("controller already gone at shutdown");
+    }
+    if ctl.join().is_err() {
+        tracing::error!("controller thread panicked");
+    }
 }
 
 /// Event loop: draw, then wait (bounded) for the next event and fold it into

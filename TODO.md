@@ -22,7 +22,7 @@ task's commit lands. Human-gated items are marked 👤.
 - [x] 11. CPU actuator (ryzenadj) + stock restore
 - [x] 12. GPU actuator (NVML clock locks)
 - [x] 13. Restore guard + startup reset
-- [ ] 14. Controller thread + ControlStatus
+- [x] 14. Controller thread + ControlStatus
 - [ ] 15. Manual-mode UI
 - [ ] 16. Selftest subcommand + M2 hardware verification
 

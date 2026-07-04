@@ -35,7 +35,7 @@ task's commit lands. Human-gated items are marked 👤.
 - [x] 22. Calibration runner + UI wizard 👤 (real ~30-min calibration run still pending)
 
 ## Milestone 4 — Closed loop
-- [ ] 23. Demand estimator + allocator
+- [x] 23. Demand estimator + allocator
 - [ ] 24. GPU watts→clock inner PI
 - [ ] 25. Auto mode wiring + UI 👤 (real gaming session validation)
 

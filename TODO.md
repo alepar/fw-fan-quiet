@@ -31,7 +31,7 @@ task's commit lands. Human-gated items are marked 👤.
 - [x] 18. Steady-state detector
 - [x] 19. Clock→watts LUT sweep
 - [x] 20. Thermal model fit + RLS
-- [ ] 21. Config + state persistence
+- [x] 21. Config + state persistence
 - [ ] 22. Calibration runner + UI wizard 👤 (real ~30-min calibration run)
 
 ## Milestone 4 — Closed loop

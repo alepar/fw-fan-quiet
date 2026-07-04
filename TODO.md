@@ -8,7 +8,7 @@ task's commit lands. Human-gated items are marked 👤.
 ## Milestone 1 — Monitor (read-only dashboard)
 - [x] 1. Project scaffold (cargo + deps)
 - [x] 2. Core types + ring buffer
-- [ ] 3. RAPL power sensor (wraparound-safe)
+- [x] 3. RAPL power sensor (wraparound-safe)
 - [ ] 4. hwmon sensors (fans, Tctl, amdgpu)
 - [ ] 5. CPU utilization + frequency sensors
 - [ ] 6. NVML sensor wrapper

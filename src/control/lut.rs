@@ -58,8 +58,13 @@ impl ClockWattsLut {
             let (m0, w0) = pair[0];
             let (m1, w1) = pair[1];
             if target_w >= w1 {
-                // The bracket's top already fits; every clock above m1 sits in
-                // a higher bracket that did not fit, so m1 is the answer.
+                // Believed unreachable; kept as defense-in-depth. Induction:
+                // the pre-loop clamp guarantees target < the first bracket's
+                // w1 (the highest point's watts), and falling through a
+                // bracket implies target < its w0 (both fall-through paths
+                // require it), which is the next bracket's w1. Should the
+                // scan ever change, returning the bracket top — the largest
+                // in-bracket clock whose watts fit — stays correct.
                 return Some(m1);
             }
             if w1 > w0 && target_w >= w0 {

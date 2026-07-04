@@ -119,17 +119,25 @@ impl LutSweep {
         vec![SweepEffect::CommandClock(SWEEP_CLOCKS[self.idx])]
     }
 
+    /// True when the GPU is demonstrably loaded and locked at `clock`. An
+    /// invalid GPU sample (power or clock reading missing) never counts as
+    /// pinned: a sensor outage must not let the sweep proceed on phantom
+    /// readings — and the check must not silently depend on the sampler's
+    /// 0.0-sentinel flattening of missing values (`gpu_mhz_valid` is checked
+    /// explicitly, not via a 0.0 clock failing the tolerance test).
+    fn is_pinned(s: &Sample, clock: u32) -> bool {
+        s.gpu_w_valid
+            && s.gpu_mhz_valid
+            && s.gpu_util_pct > PIN_UTIL_MIN_PCT
+            && (s.gpu_sm_mhz - f64::from(clock)).abs() < PIN_CLOCK_TOLERANCE_MHZ
+    }
+
     /// Consume one 1 Hz sample; returns what happened.
     pub fn on_sample(&mut self, s: &Sample) -> Vec<SweepEffect> {
         let mut effects = Vec::new();
         match self.state {
             SweepState::WaitPinned { clock } => {
-                // An invalid GPU sample never counts as pinned: a sensor
-                // outage must not let the sweep proceed on phantom readings.
-                let pinned = s.gpu_w_valid
-                    && s.gpu_util_pct > PIN_UTIL_MIN_PCT
-                    && (s.gpu_sm_mhz - f64::from(clock)).abs() < PIN_CLOCK_TOLERANCE_MHZ;
-                if pinned {
+                if Self::is_pinned(s, clock) {
                     self.unpinned_streak = 0;
                     self.pinned_streak += 1;
                     if self.pinned_streak >= PIN_STREAK {
@@ -146,12 +154,24 @@ impl LutSweep {
                 }
             }
             SweepState::Settling { clock } => {
-                if s.gpu_w_valid {
-                    if self.watts_window.len() == WATTS_WINDOW_CAP {
-                        self.watts_window.pop_front();
-                    }
-                    self.watts_window.push_back(s.gpu_w);
+                // Re-check pinned-ness on every settling sample: if the GPU
+                // load dies mid-settle, idle power is *very* flat, and
+                // without this check 15 flat idle samples would record a
+                // bogus point (e.g. 3090 MHz -> 15 W) and silently poison
+                // the LUT. Any unpinned (or invalid) sample discards the
+                // window and falls back to waiting; the NeedsLoad nag
+                // re-arms with this sample as the first unpinned one.
+                if !Self::is_pinned(s, clock) {
+                    self.watts_window.clear();
+                    self.pinned_streak = 0;
+                    self.unpinned_streak = 1;
+                    self.state = SweepState::WaitPinned { clock };
+                    return effects;
                 }
+                if self.watts_window.len() == WATTS_WINDOW_CAP {
+                    self.watts_window.pop_front();
+                }
+                self.watts_window.push_back(s.gpu_w);
                 let window = self.watts_window.make_contiguous();
                 if is_steady(window, STEADY_N_GPU_W, GPU_W_TOLERANCE) {
                     let watts = tail_mean(window, STEADY_N_GPU_W)
@@ -349,11 +369,14 @@ mod tests {
     fn invalid_samples_never_count_as_pinned() {
         let mut sweep = LutSweep::new();
         sweep.start();
-        // Looks perfectly pinned but gpu_w_valid is false: must not count.
-        let mut s = pinned(3090, 100.0);
-        s.gpu_w_valid = false;
+        // Looks perfectly pinned but a validity flag is down: must not count.
+        let mut no_w = pinned(3090, 100.0);
+        no_w.gpu_w_valid = false;
+        let mut no_mhz = pinned(3090, 100.0);
+        no_mhz.gpu_mhz_valid = false;
         for _ in 0..5 {
-            sweep.on_sample(&s);
+            sweep.on_sample(&no_w);
+            sweep.on_sample(&no_mhz);
         }
         assert_eq!(*sweep.state(), SweepState::WaitPinned { clock: 3090 });
     }
@@ -406,25 +429,75 @@ mod tests {
     }
 
     #[test]
-    fn invalid_watts_samples_are_not_pushed_while_settling() {
+    fn load_dying_mid_settle_falls_back_and_records_recovery_watts_only() {
         let mut sweep = LutSweep::new();
         sweep.start();
         for _ in 0..PIN_STREAK {
             sweep.on_sample(&pinned(3090, 100.0));
         }
-        // 14 valid flat samples + any number of invalid ones: still one short
-        // of the 15-sample tail, so no record.
-        for _ in 0..(STEADY_N_GPU_W - 1) {
+        assert_eq!(*sweep.state(), SweepState::Settling { clock: 3090 });
+        // A few settling samples accumulate...
+        for _ in 0..5 {
             assert!(sweep.on_sample(&pinned(3090, 100.0)).is_empty());
         }
+        // ...then the load dies. Idle watts are VERY flat: without the
+        // pinned re-check, 15 of these would record a bogus 3090 MHz -> 15 W
+        // point. Instead: straight back to waiting.
+        assert!(sweep.on_sample(&idle()).is_empty());
+        assert_eq!(*sweep.state(), SweepState::WaitPinned { clock: 3090 });
+        for _ in 0..(STEADY_N_GPU_W + 5) {
+            let effects = sweep.on_sample(&idle());
+            assert!(
+                record_points(&effects).is_empty(),
+                "idle watts must never record: {effects:?}"
+            );
+        }
+        assert_eq!(sweep.progress(), (0, 10));
+
+        // Recovery: re-pin, then settle at DIFFERENT watts. The recorded
+        // point must come from post-recovery samples only.
+        for _ in 0..PIN_STREAK {
+            assert!(sweep.on_sample(&pinned(3090, 97.0)).is_empty());
+        }
+        assert_eq!(*sweep.state(), SweepState::Settling { clock: 3090 });
+        let mut recorded = Vec::new();
+        for _ in 0..STEADY_N_GPU_W {
+            recorded.extend(record_points(&sweep.on_sample(&pinned(3090, 97.0))));
+        }
+        assert_eq!(recorded, vec![(3090, 97.0)]);
+        assert_eq!(sweep.progress(), (1, 10));
+    }
+
+    #[test]
+    fn invalid_sample_mid_settle_also_falls_back() {
+        let mut sweep = LutSweep::new();
+        sweep.start();
+        for _ in 0..PIN_STREAK {
+            sweep.on_sample(&pinned(3090, 100.0));
+        }
+        // Sensor blip: sample looks pinned but the power reading is missing.
+        // Trusting the window across an outage risks a poisoned point, so
+        // settle restarts from scratch.
         let mut invalid = pinned(3090, 100.0);
         invalid.gpu_w_valid = false;
-        for _ in 0..5 {
-            assert!(sweep.on_sample(&invalid).is_empty());
+        assert!(sweep.on_sample(&invalid).is_empty());
+        assert_eq!(*sweep.state(), SweepState::WaitPinned { clock: 3090 });
+    }
+
+    #[test]
+    fn needs_load_nag_rearms_after_mid_settle_fallback() {
+        let mut sweep = LutSweep::new();
+        sweep.start();
+        for _ in 0..PIN_STREAK {
+            sweep.on_sample(&pinned(3090, 100.0));
         }
-        // The 15th valid sample completes the window.
-        let effects = sweep.on_sample(&pinned(3090, 100.0));
-        assert_eq!(record_points(&effects), vec![(3090, 100.0)]);
+        // Load dies: the fallback sample counts as unpinned #1, so the nag
+        // fires on the 9th idle sample after it (10 consecutive unpinned).
+        assert!(sweep.on_sample(&idle()).is_empty());
+        for _ in 0..8 {
+            assert!(sweep.on_sample(&idle()).is_empty());
+        }
+        assert_eq!(sweep.on_sample(&idle()), vec![SweepEffect::NeedsLoad]);
     }
 
     #[test]

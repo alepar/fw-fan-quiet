@@ -97,6 +97,17 @@ impl GpuPid {
         lut: &ClockWattsLut,
         gpu_floor_mhz: u32,
     ) -> Option<u32> {
+        // Floors win over everything, including the deadband hold and the
+        // rate limit (project-wide rule; the allocator does the same): if the
+        // floor was raised past the clock currently in force, jump to it now.
+        if let Some(last) = self.last_clock
+            && last < gpu_floor_mhz
+        {
+            self.saturated = true; // clamped output: freeze the integrator
+            self.last_clock = Some(gpu_floor_mhz);
+            return Some(gpu_floor_mhz);
+        }
+
         let error = self.pid.setpoint - measured_w;
         if !error.is_finite() || error.abs() <= DEADBAND_W {
             return None;

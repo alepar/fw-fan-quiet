@@ -123,6 +123,17 @@ fn header_line(model: &Model) -> Line<'static> {
                 "MODEL DISTRUST",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
+            // Watchdog emergencies: everything was released toward stock and
+            // stays released until the user acknowledges (first actuating
+            // press re-arms without executing; the second acts normally).
+            StatusFlag::ThermalEmergency => Span::styled(
+                "THERMAL EMERGENCY (press a or c/g to acknowledge)",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            StatusFlag::SensorLost => Span::styled(
+                "SENSOR LOST (press a or c/g to acknowledge)",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
         });
     }
     if let Some(s) = &model.latest {
@@ -490,6 +501,56 @@ mod tests {
         let terminal = draw(&m);
         let header = row_text(&terminal, 0);
         let x = header.find("LIMIT-SLIP!").expect("flag text present") as u16;
+        let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
+        assert_eq!(cell.fg, Color::Red);
+        assert!(cell.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn thermal_emergency_flag_is_red_bold_with_acknowledge_hint() {
+        use crate::control::ControlStatus;
+        use crate::control::controller::{Mode, StatusFlag};
+        use ratatui::style::Modifier;
+        let mut m = Model::new();
+        m.update(Event::Status(ControlStatus {
+            mode: Mode::Monitor,
+            cpu_limit_w: None,
+            gpu_max_mhz: None,
+            fan_target_rpm: 3000.0,
+            trim_rpm: 0.0,
+            flags: vec![StatusFlag::ThermalEmergency],
+            calib: None,
+        }));
+        let terminal = draw(&m);
+        let header = row_text(&terminal, 0);
+        let x = header
+            .find("THERMAL EMERGENCY (press a or c/g to acknowledge)")
+            .expect("flag text present") as u16;
+        let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
+        assert_eq!(cell.fg, Color::Red);
+        assert!(cell.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn sensor_lost_flag_is_red_bold_with_acknowledge_hint() {
+        use crate::control::ControlStatus;
+        use crate::control::controller::{Mode, StatusFlag};
+        use ratatui::style::Modifier;
+        let mut m = Model::new();
+        m.update(Event::Status(ControlStatus {
+            mode: Mode::Monitor,
+            cpu_limit_w: None,
+            gpu_max_mhz: None,
+            fan_target_rpm: 3000.0,
+            trim_rpm: 0.0,
+            flags: vec![StatusFlag::SensorLost],
+            calib: None,
+        }));
+        let terminal = draw(&m);
+        let header = row_text(&terminal, 0);
+        let x = header
+            .find("SENSOR LOST (press a or c/g to acknowledge)")
+            .expect("flag text present") as u16;
         let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
         assert_eq!(cell.fg, Color::Red);
         assert!(cell.modifier.contains(Modifier::BOLD));

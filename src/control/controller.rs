@@ -30,6 +30,7 @@ use crate::control::lut::ClockWattsLut;
 use crate::control::thermal_model::ThermalModel;
 use crate::control::trim::{MAX_TRIM_AUTHORITY_RPM, Trim};
 use crate::control::trust::{Trust, TrustMonitor};
+use crate::control::watchdog::{ThermalWatchdog, Trip};
 use crate::event::Event;
 use crate::state::PersistedState;
 use crate::telemetry::{self, Record, Telemetry};
@@ -150,6 +151,18 @@ pub enum StatusFlag {
     /// updates are frozen and the trim runs at half gain. Clears when the
     /// EWMA recovers (steady evidence only) or on Auto exit.
     ModelDistrust,
+    /// The thermal watchdog tripped (3 consecutive samples at/over 95 °C
+    /// Tctl or 87 °C GPU) and everything was released toward stock. REQUIRES
+    /// MANUAL RE-ARM: never clears on its own — the first actuating command
+    /// (`a`, `c`/`g`, `k`) only acknowledges (clears the flag + re-arms the
+    /// watchdog) without executing; the second press acts normally.
+    ThermalEmergency,
+    /// The watchdog's sensor-lost trip (10 consecutive samples without a
+    /// valid CPU temperature while limits were applied): assume hot, same
+    /// release + manual-re-arm semantics as [`StatusFlag::ThermalEmergency`]
+    /// (design amendment, Task 7: a lost sensor must never let the watchdog
+    /// go blind).
+    SensorLost,
 }
 
 impl StatusFlag {
@@ -161,6 +174,8 @@ impl StatusFlag {
             StatusFlag::NotCalibrated => "not_calibrated",
             StatusFlag::TargetUnreachable => "target_unreachable",
             StatusFlag::ModelDistrust => "model_distrust",
+            StatusFlag::ThermalEmergency => "thermal_emergency",
+            StatusFlag::SensorLost => "sensor_lost",
         }
     }
 }
@@ -238,6 +253,11 @@ pub enum Effect {
     /// its own Decision record (cause "auto:model_snapshot") carrying
     /// a/b/e/c for offline controller-quality review.
     ModelSnapshot { a: f64, b: f64, e: f64, c: f64 },
+    /// A watchdog flag transitioned; the shell mirrors it into a standalone
+    /// telemetry `Record::Flag` line IN ADDITION to the Decision record
+    /// (whose `flags` field carries the full post-transition list) — offline
+    /// analysis gets a greppable per-flag transition stream.
+    Flagged { flag: &'static str, active: bool },
     /// Hardware restored; the thread shell must exit its loop.
     Quit,
 }
@@ -321,6 +341,10 @@ pub struct Controller<R: Runner> {
     config_path: PathBuf,
     /// Auto-mode loop state; Some exactly while `Mode::Auto`.
     auto: Option<AutoState>,
+    /// Thermal watchdog (Task 28): observes EVERY sample in EVERY mode
+    /// (including Calibrating, where the rest of the sample machinery is
+    /// suspended); a trip ACTS only when something is commanded.
+    watchdog: ThermalWatchdog,
 }
 
 impl<R: Runner> Controller<R> {
@@ -360,6 +384,7 @@ impl<R: Runner> Controller<R> {
             config,
             config_path,
             auto: None,
+            watchdog: ThermalWatchdog::new(),
         }
     }
 
@@ -378,6 +403,40 @@ impl<R: Runner> Controller<R> {
     /// Actuator failures are warned and leave the status untouched — the UI
     /// keeps showing what is actually applied, never what merely was asked.
     pub fn on_command(&mut self, c: Command) -> Vec<Effect> {
+        // Emergency acknowledge (deliberate two-step): while a watchdog flag
+        // is up, the FIRST actuating command only clears the flag(s) and
+        // re-arms the watchdog — it does NOT execute. The user must see the
+        // emergency and consciously press again; the second press acts
+        // normally. Quit/ReleaseAll/SetFanTarget pass through (none of them
+        // can re-apply limits behind a tripped watchdog). The latch and the
+        // emergency flags move in lockstep (trip sets both, this gate clears
+        // both), so gating on the latch is gating on the flags.
+        if self.watchdog.is_tripped()
+            && matches!(
+                c,
+                Command::SetCpuW(_)
+                    | Command::SetGpuMaxClock(_)
+                    | Command::SetAuto(true)
+                    | Command::StartCalibration
+            )
+        {
+            tracing::warn!("emergency acknowledged by {c:?}; command swallowed, watchdog re-armed");
+            let mut effects = Vec::new();
+            for flag in [StatusFlag::ThermalEmergency, StatusFlag::SensorLost] {
+                if self.status.flags.contains(&flag) {
+                    self.remove_flag(flag);
+                    effects.push(Effect::Flagged {
+                        flag: flag.as_str(),
+                        active: false,
+                    });
+                }
+            }
+            self.watchdog.rearm();
+            effects.push(Effect::StatusChanged {
+                cause: "watchdog:rearmed",
+            });
+            return effects;
+        }
         // While calibrating the runner owns actuation: manual setters,
         // release and Auto entry are rejected outright (Esc/AbortCalibration
         // is the way to take control back).
@@ -564,6 +623,17 @@ impl<R: Runner> Controller<R> {
     /// would fight the runner's deliberate low limits, and the runner
     /// re-commands each point itself).
     pub fn on_sample(&mut self, s: &Sample) -> Vec<Effect> {
+        // Thermal watchdog FIRST, before any mode dispatch: it observes in
+        // every mode (Calibrating included — the runner's deliberate limits
+        // are exactly what an emergency must release). A trip only ACTS when
+        // something is commanded; in pure Monitor with nothing applied there
+        // is nothing to release, so stay armed instead of latching a trip
+        // that would blind the watchdog for the next Manual/Auto session.
+        match self.watchdog.observe(s) {
+            Trip::None => {}
+            trip if self.anything_commanded() => return self.emergency_release(trip),
+            _ => self.watchdog.rearm(),
+        }
         if self.status.mode == Mode::Calibrating {
             return self.on_calib_sample(s);
         }
@@ -1088,6 +1158,51 @@ impl<R: Runner> Controller<R> {
         cause
     }
 
+    /// True when the controller has anything in force an emergency could
+    /// release: any non-Monitor mode owns actuation, and applied limits
+    /// count even during mode transitions (belt and suspenders — Monitor
+    /// implies no limits by construction).
+    fn anything_commanded(&self) -> bool {
+        self.status.mode != Mode::Monitor
+            || self.status.cpu_limit_w.is_some()
+            || self.status.gpu_max_mhz.is_some()
+    }
+
+    /// Watchdog trip: release EVERYTHING toward stock and latch the flag.
+    /// Same shape as ReleaseAll (gpu release + cpu restore_stock) plus a
+    /// calibration abort (burner stopped) and an Auto exit (AutoState
+    /// dropped). Afterwards `status.cpu_limit_w`/`gpu_max_mhz` are None, so
+    /// the stickiness/reassert machinery has nothing to reapply — the
+    /// release holds until the user re-arms (see the acknowledge gate in
+    /// `on_command`).
+    fn emergency_release(&mut self, trip: Trip) -> Vec<Effect> {
+        let (flag, cause) = match trip {
+            Trip::Thermal => (StatusFlag::ThermalEmergency, "watchdog:thermal_emergency"),
+            Trip::SensorLost => (StatusFlag::SensorLost, "watchdog:sensor_lost"),
+            Trip::None => unreachable!("emergency_release called without a trip"),
+        };
+        tracing::warn!("{cause}: releasing all limits toward stock (manual re-arm required)");
+        // A running calibration aborts first: burner threads stopped and the
+        // runner's own releases applied (same order as the Quit path).
+        if let Some(mut runner) = self.calib.take() {
+            self.apply_calib_effects(runner.abort());
+            self.end_calibration();
+        }
+        // Auto exits hard: dropping AutoState means no allocator/PI step can
+        // ever re-command until a fresh (post-re-arm) Auto entry.
+        self.auto = None;
+        self.release_to_stock();
+        self.add_flag(flag);
+        vec![
+            Effect::Released,
+            Effect::Flagged {
+                flag: flag.as_str(),
+                active: true,
+            },
+            Effect::StatusChanged { cause },
+        ]
+    }
+
     /// Back to Monitor with stock limits, actuators kept (the session goes
     /// on). NOT `guard.restore_all()`: the smu module must stay unloaded.
     /// Shared by ReleaseAll and the Auto-mode exit.
@@ -1262,6 +1377,9 @@ fn apply_effects<R: Runner>(
     let mut auto_alloc: Option<(f64, f64, f64, f64)> = None;
     let mut rls_accepted = false;
     let mut model_snapshot: Option<(f64, f64, f64, f64)> = None;
+    // Watchdog-flag transitions in this batch: each becomes a standalone
+    // Record::Flag line (in addition to the Decision carrying the full list).
+    let mut flagged: Vec<(&'static str, bool)> = Vec::new();
     for effect in effects {
         match effect {
             Effect::Reasserted { cause: c } | Effect::Noted { cause: c } => {
@@ -1282,6 +1400,7 @@ fn apply_effects<R: Runner>(
             }
             Effect::RlsAccepted => rls_accepted = true,
             Effect::ModelSnapshot { a, b, e, c } => model_snapshot = Some((*a, *b, *e, *c)),
+            Effect::Flagged { flag, active } => flagged.push((flag, *active)),
             Effect::Quit => quit = true,
             Effect::CpuSet(_) | Effect::GpuSet(_) | Effect::Released => {}
         }
@@ -1326,8 +1445,17 @@ fn apply_effects<R: Runner>(
             model_c: model.map(|m| m.3),
         }
     };
-    if cause.is_some() || rls_accepted || model_snapshot.is_some() {
+    if cause.is_some() || rls_accepted || model_snapshot.is_some() || !flagged.is_empty() {
         if let Some(t) = telemetry::lock(telemetry).as_mut() {
+            // Flag transitions first: the Decision that follows already
+            // shows the post-transition flag list.
+            for (flag, active) in flagged {
+                t.log(&Record::Flag {
+                    t_mono,
+                    flag: flag.to_string(),
+                    active,
+                });
+            }
             if let Some(cause) = cause {
                 t.log(&decision(cause, auto_alloc, None));
             }
@@ -1844,6 +1972,10 @@ mod tests {
             gpu_mhz_valid: true,
             fan1_rpm: 3000.0,
             fan_valid: true,
+            // A healthy machine reports a valid, cool Tctl: without this the
+            // long calibration drives would trip the sensor-lost watchdog.
+            cpu_temp_c: 60.0,
+            cpu_temp_valid: true,
             ..Sample::default()
         }
     }
@@ -1867,6 +1999,8 @@ mod tests {
             gpu_mhz_valid: true,
             fan1_rpm: 25.0 * cpu + 15.0 * gpu + 0.1 * cpu * gpu + 800.0,
             fan_valid: true,
+            cpu_temp_c: 60.0,
+            cpu_temp_valid: true,
             ..Sample::default()
         }
     }
@@ -1998,6 +2132,8 @@ mod tests {
             gpu_mhz_valid: true,
             fan1_rpm: 1000.0,
             fan_valid: true,
+            cpu_temp_c: 60.0,
+            cpu_temp_valid: true,
             ..Sample::default()
         };
         for _ in 0..9 {
@@ -2222,6 +2358,10 @@ mod tests {
             gpu_w_valid: true,
             fan1_rpm: 1700.0,
             fan_valid: true,
+            // Valid, cool Tctl: long Auto drives must not starve the
+            // watchdog's sensor-lost streak into a phantom trip.
+            cpu_temp_c: 60.0,
+            cpu_temp_valid: true,
             ..Sample::default()
         }
     }
@@ -3433,5 +3573,317 @@ mod tests {
         );
         assert_eq!(ctl.lut, Some(lut));
         assert!(ctl.model.is_none());
+    }
+
+    // --- Task 28: thermal watchdog + emergency release ---
+
+    /// Tctl over the 95 °C trip; every other sensor invalid/idle (the
+    /// watchdog must trip on temperature alone).
+    fn overheat_at(t: f64) -> Sample {
+        Sample {
+            t_mono: t,
+            cpu_temp_c: 96.0,
+            cpu_temp_valid: true,
+            ..Sample::default()
+        }
+    }
+
+    fn has_flagged(effects: &[Effect], want_flag: &str, want_active: bool) -> bool {
+        effects.iter().any(|e| {
+            matches!(e, Effect::Flagged { flag, active }
+                if *flag == want_flag && *active == want_active)
+        })
+    }
+
+    fn has_status_change_cause(effects: &[Effect], want: &str) -> bool {
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::StatusChanged { cause } if *cause == want))
+    }
+
+    #[test]
+    fn thermal_emergency_in_auto_releases_everything_and_stays_released() {
+        let runner = FakeRunner::new();
+        let (dir, path) = profile_fixture("watchdog-auto");
+        let (mut ctl, gpu_calls) = auto_controller(&runner, path.clone(), Config::default());
+        ctl.on_command(Command::SetAuto(true));
+        ctl.on_sample(&busy_at(0.0)); // limits applied: 17 W + 1653 MHz
+        assert_eq!(ryzenadj_calls(&runner).len(), 1, "premise");
+        assert_eq!(gpu_sets(&gpu_calls).len(), 1, "premise");
+
+        // Two hot samples: not enough (transient spikes must not release).
+        assert!(ctl.on_sample(&overheat_at(1.0)).is_empty());
+        assert!(ctl.on_sample(&overheat_at(2.0)).is_empty());
+        assert_eq!(ctl.status().mode, Mode::Auto);
+
+        // Third consecutive hot sample: full release toward stock.
+        let effects = ctl.on_sample(&overheat_at(3.0));
+        assert!(effects.contains(&Effect::Released), "got {effects:?}");
+        assert!(has_flagged(&effects, "thermal_emergency", true));
+        assert!(has_status_change_cause(
+            &effects,
+            "watchdog:thermal_emergency"
+        ));
+        assert_eq!(ctl.status().mode, Mode::Monitor);
+        assert_eq!(ctl.status().cpu_limit_w, None);
+        assert_eq!(ctl.status().gpu_max_mhz, None);
+        assert!(ctl.status().flags.contains(&StatusFlag::ThermalEmergency));
+        assert!(ctl.auto.is_none(), "AutoState must drop whole");
+        // GPU locks released + CPU stock restored (profile toggled back).
+        assert!(
+            gpu_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| matches!(c, GpuCall::Release)),
+            "GPU release missing: {:?}",
+            gpu_calls.lock().unwrap()
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "balanced");
+
+        // 20 more samples spanning the 10 s reassert window (hot AND cool):
+        // nothing may re-enter Auto or reassert the released limits, and the
+        // tripped watchdog must not re-fire.
+        let (cpu_calls, gpu_cmds) = (ryzenadj_calls(&runner).len(), gpu_sets(&gpu_calls).len());
+        for t in 4..24 {
+            let s = if t % 2 == 0 {
+                overheat_at(f64::from(t))
+            } else {
+                busy_at(f64::from(t))
+            };
+            assert!(ctl.on_sample(&s).is_empty(), "released state must hold");
+        }
+        assert_eq!(
+            ryzenadj_calls(&runner).len(),
+            cpu_calls,
+            "zero new ryzenadj"
+        );
+        assert_eq!(gpu_sets(&gpu_calls).len(), gpu_cmds, "zero new GPU locks");
+        assert_eq!(ctl.status().mode, Mode::Monitor);
+        assert!(ctl.status().flags.contains(&StatusFlag::ThermalEmergency));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn emergency_acknowledge_first_press_rearms_second_acts() {
+        let runner = FakeRunner::new();
+        let (dir, path) = profile_fixture("watchdog-ack");
+        let (mut ctl, _gpu_calls) = auto_controller(&runner, path, Config::default());
+        ctl.on_command(Command::SetAuto(true));
+        ctl.on_sample(&busy_at(0.0));
+        for t in 1..=3 {
+            ctl.on_sample(&overheat_at(f64::from(t)));
+        }
+        assert!(ctl.status().flags.contains(&StatusFlag::ThermalEmergency));
+
+        // First `a`: acknowledge only — flag cleared, watchdog re-armed,
+        // Auto NOT entered, nothing actuated.
+        let calls_before = runner.calls().len();
+        let effects = ctl.on_command(Command::SetAuto(true));
+        assert!(has_flagged(&effects, "thermal_emergency", false));
+        assert!(has_status_change_cause(&effects, "watchdog:rearmed"));
+        assert!(!ctl.status().flags.contains(&StatusFlag::ThermalEmergency));
+        assert_eq!(ctl.status().mode, Mode::Monitor, "ack must not enter Auto");
+        assert!(ctl.auto.is_none());
+        assert_eq!(runner.calls().len(), calls_before, "ack must not actuate");
+
+        // Second `a`: acts normally.
+        ctl.on_command(Command::SetAuto(true));
+        assert_eq!(ctl.status().mode, Mode::Auto);
+
+        // Re-armed for real: a fresh 3-sample hot streak trips again.
+        ctl.on_sample(&busy_at(10.0));
+        ctl.on_sample(&overheat_at(11.0));
+        ctl.on_sample(&overheat_at(12.0));
+        let effects = ctl.on_sample(&overheat_at(13.0));
+        assert!(has_flagged(&effects, "thermal_emergency", true));
+        assert_eq!(ctl.status().mode, Mode::Monitor);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn emergency_in_manual_releases_and_manual_ack_swallows_first_command() {
+        let runner = FakeRunner::new();
+        let (dir, path) = profile_fixture("watchdog-manual");
+        let mut ctl = controller(&runner, path.clone());
+        ctl.on_command(Command::SetCpuW(20.0));
+
+        ctl.on_sample(&overheat_at(1.0));
+        ctl.on_sample(&overheat_at(2.0));
+        let effects = ctl.on_sample(&overheat_at(3.0));
+        assert!(effects.contains(&Effect::Released), "got {effects:?}");
+        assert!(has_status_change_cause(
+            &effects,
+            "watchdog:thermal_emergency"
+        ));
+        assert_eq!(ctl.status().mode, Mode::Monitor);
+        assert_eq!(ctl.status().cpu_limit_w, None);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "balanced");
+
+        // First c-press: swallowed acknowledge (no ryzenadj, still Monitor).
+        let cpu_calls = ryzenadj_calls(&runner).len();
+        let effects = ctl.on_command(Command::SetCpuW(20.0));
+        assert!(has_status_change_cause(&effects, "watchdog:rearmed"));
+        assert_eq!(ryzenadj_calls(&runner).len(), cpu_calls);
+        assert_eq!(ctl.status().mode, Mode::Monitor);
+        assert_eq!(ctl.status().cpu_limit_w, None);
+
+        // Second press acts normally.
+        ctl.on_command(Command::SetCpuW(20.0));
+        assert_eq!(ctl.status().mode, Mode::Manual);
+        assert_eq!(ctl.status().cpu_limit_w, Some(20.0));
+        assert_eq!(ryzenadj_calls(&runner).len(), cpu_calls + 1);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn non_actuating_commands_pass_through_without_acknowledging() {
+        let runner = FakeRunner::new();
+        let (dir, path) = profile_fixture("watchdog-passthrough");
+        let mut ctl = controller(&runner, path);
+        ctl.on_command(Command::SetCpuW(20.0));
+        for t in 1..=3 {
+            ctl.on_sample(&overheat_at(f64::from(t)));
+        }
+        assert!(ctl.status().flags.contains(&StatusFlag::ThermalEmergency));
+
+        // Fan target and ReleaseAll execute normally and do NOT count as the
+        // acknowledgment (they cannot re-apply limits, so the emergency flag
+        // must stay visible until a deliberate re-arm).
+        ctl.on_command(Command::SetFanTarget(2500.0));
+        assert_eq!(ctl.status().fan_target_rpm, 2500.0);
+        assert!(ctl.status().flags.contains(&StatusFlag::ThermalEmergency));
+        let effects = ctl.on_command(Command::ReleaseAll);
+        assert!(effects.contains(&Effect::Released), "got {effects:?}");
+        assert!(ctl.status().flags.contains(&StatusFlag::ThermalEmergency));
+
+        // Quit works regardless of the flag.
+        let effects = ctl.on_command(Command::Quit);
+        assert_eq!(effects, vec![Effect::Quit]);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn emergency_during_calibration_aborts_it() {
+        let runner = FakeRunner::new();
+        let (dir, path) = profile_fixture("watchdog-calib");
+        let mut ctl = controller(&runner, path.clone());
+        ctl.on_command(Command::StartCalibration);
+        drive_sweep(&mut ctl);
+        drive_matrix_point(&mut ctl, 0);
+        drive_matrix_point(&mut ctl, 1); // burner + 30 W limit now active
+        assert!(ctl.burner.is_some(), "premise: loaded matrix point");
+
+        ctl.on_sample(&overheat_at(1000.0));
+        ctl.on_sample(&overheat_at(1001.0));
+        let effects = ctl.on_sample(&overheat_at(1002.0));
+        assert!(effects.contains(&Effect::Released), "got {effects:?}");
+        assert!(has_status_change_cause(
+            &effects,
+            "watchdog:thermal_emergency"
+        ));
+        assert!(ctl.burner.is_none(), "emergency must stop the burner");
+        assert!(ctl.calib.is_none());
+        assert!(ctl.status().calib.is_none());
+        assert_eq!(ctl.status().mode, Mode::Monitor);
+        assert_eq!(ctl.status().cpu_limit_w, None);
+        assert!(ctl.status().flags.contains(&StatusFlag::ThermalEmergency));
+        // The calibration release toggled the profile back; smu untouched.
+        assert_eq!(fs::read_to_string(&path).unwrap(), "balanced");
+        assert_eq!(modprobe_reload_calls(&runner), 0);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ten_invalid_temp_samples_with_a_limit_trip_sensor_lost() {
+        let runner = FakeRunner::new();
+        let (dir, path) = profile_fixture("watchdog-sensor-lost");
+        let mut ctl = controller(&runner, path.clone());
+        ctl.on_command(Command::SetCpuW(20.0));
+
+        // sample_at has cpu_temp_valid == false: nine are not enough.
+        for t in 1..=9 {
+            assert!(ctl.on_sample(&sample_at(f64::from(t))).is_empty());
+        }
+        assert_eq!(ctl.status().cpu_limit_w, Some(20.0));
+
+        // The tenth trips: assume hot, release, distinct SensorLost flag.
+        let effects = ctl.on_sample(&sample_at(10.0));
+        assert!(effects.contains(&Effect::Released), "got {effects:?}");
+        assert!(has_flagged(&effects, "sensor_lost", true));
+        assert!(has_status_change_cause(&effects, "watchdog:sensor_lost"));
+        assert!(ctl.status().flags.contains(&StatusFlag::SensorLost));
+        assert!(!ctl.status().flags.contains(&StatusFlag::ThermalEmergency));
+        assert_eq!(ctl.status().mode, Mode::Monitor);
+        assert_eq!(ctl.status().cpu_limit_w, None);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "balanced");
+
+        // Same manual re-arm semantics as the thermal trip.
+        let effects = ctl.on_command(Command::SetCpuW(20.0));
+        assert!(has_flagged(&effects, "sensor_lost", false));
+        assert!(!ctl.status().flags.contains(&StatusFlag::SensorLost));
+        assert_eq!(ctl.status().cpu_limit_w, None, "first press only acks");
+        ctl.on_command(Command::SetCpuW(20.0));
+        assert_eq!(ctl.status().cpu_limit_w, Some(20.0));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn watchdog_stays_armed_in_pure_monitor() {
+        let runner = FakeRunner::new();
+        let (dir, path) = profile_fixture("watchdog-monitor");
+        let mut ctl = controller(&runner, path);
+
+        // Hot (and invalid) samples with nothing commanded: nothing to
+        // release, no flags, no effects — and NO latched trip that would
+        // blind the watchdog later.
+        for t in 0..20 {
+            assert!(ctl.on_sample(&overheat_at(f64::from(t))).is_empty());
+        }
+        for t in 20..40 {
+            assert!(ctl.on_sample(&sample_at(f64::from(t))).is_empty());
+        }
+        assert!(ctl.status().flags.is_empty());
+
+        // Enter Manual while still hot: a fresh streak trips promptly.
+        ctl.on_command(Command::SetCpuW(20.0));
+        ctl.on_sample(&overheat_at(40.0));
+        ctl.on_sample(&overheat_at(41.0));
+        let effects = ctl.on_sample(&overheat_at(42.0));
+        assert!(effects.contains(&Effect::Released), "got {effects:?}");
+        assert!(ctl.status().flags.contains(&StatusFlag::ThermalEmergency));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn gpu_heat_trips_too() {
+        let runner = FakeRunner::new();
+        let (dir, path) = profile_fixture("watchdog-gpu-heat");
+        let mut ctl = controller(&runner, path);
+        ctl.on_command(Command::SetCpuW(20.0));
+
+        // GPU at its 87 °C threshold, CPU valid and cool: the OR trips.
+        let gpu_hot_at = |t: f64| Sample {
+            t_mono: t,
+            cpu_temp_c: 60.0,
+            cpu_temp_valid: true,
+            gpu_temp_c: 87.0,
+            gpu_temp_valid: true,
+            ..Sample::default()
+        };
+        ctl.on_sample(&gpu_hot_at(1.0));
+        ctl.on_sample(&gpu_hot_at(2.0));
+        let effects = ctl.on_sample(&gpu_hot_at(3.0));
+        assert!(effects.contains(&Effect::Released), "got {effects:?}");
+        assert!(ctl.status().flags.contains(&StatusFlag::ThermalEmergency));
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

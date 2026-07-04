@@ -28,9 +28,10 @@ const MAX_NAME_ATTEMPTS: u32 = 10;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Record<'a> {
     Sample(&'a Sample),
-    // TODO(task-28): per-flag transition records (sensor-lost etc.); flags
-    // currently ride along inside Decision lines.
-    #[allow(dead_code)]
+    /// One watchdog-flag transition (thermal_emergency, sensor_lost):
+    /// emitted by the controller shell alongside the Decision record, so
+    /// offline analysis gets a greppable per-flag stream (Decision lines
+    /// carry the full flag list, not the transition).
     Flag {
         t_mono: f64,
         flag: String,

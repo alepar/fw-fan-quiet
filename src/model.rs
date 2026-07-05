@@ -38,6 +38,9 @@ pub struct Model {
     pub cpu_temp: Ring,
     pub gpu_temp: Ring,
     pub gpu_mhz: Ring,
+    /// Average CPU core clock (MHz); no validity flag exists for it, so a
+    /// failed cpufreq read charts as 0 rather than a gap.
+    pub cpu_mhz: Ring,
     /// Most recent full sample (status panel).
     pub latest: Option<Sample>,
     /// Latest status from the controller.
@@ -69,6 +72,7 @@ impl Model {
             cpu_temp: Ring::new(RING_CAP),
             gpu_temp: Ring::new(RING_CAP),
             gpu_mhz: Ring::new(RING_CAP),
+            cpu_mhz: Ring::new(RING_CAP),
             latest: None,
             running: true,
             fan_target_rpm: DEFAULT_FAN_TARGET_RPM,
@@ -97,6 +101,7 @@ impl Model {
                 self.gpu_temp
                     .push(nan_unless(s.gpu_temp_valid, s.gpu_temp_c));
                 self.gpu_mhz.push(nan_unless(s.gpu_mhz_valid, s.gpu_sm_mhz));
+                self.cpu_mhz.push(s.cpu_avg_mhz);
                 self.latest = Some(s);
             }
             Event::Input(key) => {
@@ -345,6 +350,7 @@ mod tests {
         assert_eq!(m.cpu_temp.len(), 300);
         assert_eq!(m.gpu_temp.len(), 300);
         assert_eq!(m.gpu_mhz.len(), 300);
+        assert_eq!(m.cpu_mhz.len(), 300);
     }
 
     #[test]

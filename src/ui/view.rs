@@ -18,7 +18,8 @@ use crate::ring::Ring;
 const FAN_BOUNDS: [f64; 2] = [0.0, 7000.0];
 const WATT_BOUNDS: [f64; 2] = [0.0, 120.0];
 const TEMP_BOUNDS: [f64; 2] = [0.0, 110.0];
-const MHZ_BOUNDS: [f64; 2] = [0.0, 3200.0];
+// Covers both the GPU (3.09 GHz max lock) and the HX 370's ~5.1 GHz boost.
+const MHZ_BOUNDS: [f64; 2] = [0.0, 5200.0];
 
 pub fn view(model: &Model, frame: &mut Frame) {
     let [header, charts, footer] = Layout::vertical([
@@ -375,18 +376,23 @@ fn render_calib_wizard(progress: &CalibProgressLite, frame: &mut Frame, area: Re
 }
 
 fn render_clock(model: &Model, frame: &mut Frame, area: Rect) {
-    let segs = segments(&model.gpu_mhz);
+    let gpu_segs = segments(&model.gpu_mhz);
+    let cpu_segs = segments(&model.cpu_mhz);
     // Commanded GPU max-clock overlay.
     let limit_pts = model.status.gpu_max_mhz.map(|mhz| hline(f64::from(mhz)));
     let title = match &model.latest {
-        Some(s) => format!("gpu clock {:.0} MHz", s.gpu_sm_mhz),
-        None => "gpu clock (MHz)".into(),
+        Some(s) => format!(
+            "clocks cpu {:.0} gpu {:.0} MHz",
+            s.cpu_avg_mhz, s.gpu_sm_mhz
+        ),
+        None => "clocks (MHz)".into(),
     };
     let mut datasets = Vec::new();
     if let Some(pts) = &limit_pts {
-        datasets.push(line_dataset(Color::DarkGray, pts).name("max"));
+        datasets.push(line_dataset(Color::DarkGray, pts).name("gpu max"));
     }
-    datasets.extend(series("sm", Color::Blue, &segs));
+    datasets.extend(series("cpu", Color::Green, &cpu_segs));
+    datasets.extend(series("gpu", Color::Blue, &gpu_segs));
     render_chart(frame, area, title, datasets, MHZ_BOUNDS);
 }
 

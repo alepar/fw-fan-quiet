@@ -1,7 +1,8 @@
 //! GPU clock→watts calibration sweep (design doc §4.1): with the user running
-//! a saturating GPU load, lock the SM clock at each step, verify the GPU is
-//! actually pinned there, wait for the power reading to settle, record the
-//! steady-state watts into a [`ClockWattsLut`].
+//! a saturating GPU load, lock the SM clock at each step, verify the lock is
+//! in force (a power/thermal-limited GPU may run below it — that is fine),
+//! wait for the power reading to settle, record the steady-state
+//! (measured clock, watts) into a [`ClockWattsLut`].
 //!
 //! Sample-driven state machine, same pattern as the controller core: no
 //! wall-clock sleeps, every `on_sample` returns [`SweepEffect`]s describing
@@ -38,8 +39,9 @@ const NEEDS_LOAD_EVERY: usize = 10;
 /// Utilization above which the GPU counts as loaded.
 const PIN_UTIL_MIN_PCT: f64 = 90.0;
 
-/// Max |measured SM clock - commanded lock| (MHz) that still counts as pinned.
-const PIN_CLOCK_TOLERANCE_MHZ: f64 = 30.0;
+/// Slack (MHz) the measured SM clock may sit ABOVE the commanded lock and
+/// still count as the lock being in force (boost-clock jitter).
+const PIN_CLOCK_SLACK_MHZ: f64 = 30.0;
 
 /// Watts-window cap. Settling detection normally bounds the window at
 /// `STEADY_N_GPU_W`; the cap only prevents unbounded growth when a point
@@ -84,6 +86,10 @@ pub struct LutSweep {
     unpinned_streak: usize,
     /// gpu_w of valid samples while Settling (capped at `WATTS_WINDOW_CAP`).
     watts_window: VecDeque<f64>,
+    /// gpu_sm_mhz of the same samples, in lockstep with `watts_window`: the
+    /// recorded point uses the MEASURED clock, not the commanded lock, so a
+    /// power-limited step records its true operating point.
+    sm_window: VecDeque<f64>,
     lut: ClockWattsLut,
 }
 
@@ -98,6 +104,7 @@ impl LutSweep {
             pinned_streak: 0,
             unpinned_streak: 0,
             watts_window: VecDeque::new(),
+            sm_window: VecDeque::new(),
             lut: ClockWattsLut::new(),
         }
     }
@@ -107,17 +114,22 @@ impl LutSweep {
         vec![SweepEffect::CommandClock(SWEEP_CLOCKS[self.idx])]
     }
 
-    /// True when the GPU is demonstrably loaded and locked at `clock`. An
-    /// invalid GPU sample (power or clock reading missing) never counts as
-    /// pinned: a sensor outage must not let the sweep proceed on phantom
-    /// readings — and the check must not silently depend on the sampler's
-    /// 0.0-sentinel flattening of missing values (`gpu_mhz_valid` is checked
-    /// explicitly, not via a 0.0 clock failing the tolerance test).
+    /// True when the GPU is demonstrably loaded with the `clock` lock in
+    /// force. The clock check is deliberately one-sided: a power- or
+    /// thermal-limited GPU legitimately runs BELOW the locked max (e.g. a
+    /// 100 W TGP card holding ~2520 MHz under a 3090 MHz lock) — that
+    /// measured operating point is exactly the data we want. Only a clock
+    /// ABOVE the lock (plus slack) is disqualifying: it means the lock is
+    /// not in force. An invalid GPU sample (power or clock reading missing)
+    /// never counts as pinned: a sensor outage must not let the sweep
+    /// proceed on phantom readings — and the check must not silently depend
+    /// on the sampler's 0.0-sentinel flattening of missing values
+    /// (`gpu_mhz_valid` is checked explicitly).
     fn is_pinned(s: &Sample, clock: u32) -> bool {
         s.gpu_w_valid
             && s.gpu_mhz_valid
             && s.gpu_util_pct > PIN_UTIL_MIN_PCT
-            && (s.gpu_sm_mhz - f64::from(clock)).abs() < PIN_CLOCK_TOLERANCE_MHZ
+            && s.gpu_sm_mhz <= f64::from(clock) + PIN_CLOCK_SLACK_MHZ
     }
 
     /// Consume one 1 Hz sample; returns what happened.
@@ -131,6 +143,7 @@ impl LutSweep {
                     if self.pinned_streak >= PIN_STREAK {
                         self.pinned_streak = 0;
                         self.watts_window.clear();
+                        self.sm_window.clear();
                         self.state = SweepState::Settling { clock };
                     }
                 } else {
@@ -151,6 +164,7 @@ impl LutSweep {
                 // re-arms with this sample as the first unpinned one.
                 if !Self::is_pinned(s, clock) {
                     self.watts_window.clear();
+                    self.sm_window.clear();
                     self.pinned_streak = 0;
                     self.unpinned_streak = 1;
                     self.state = SweepState::WaitPinned { clock };
@@ -158,14 +172,24 @@ impl LutSweep {
                 }
                 if self.watts_window.len() == WATTS_WINDOW_CAP {
                     self.watts_window.pop_front();
+                    self.sm_window.pop_front();
                 }
                 self.watts_window.push_back(s.gpu_w);
+                self.sm_window.push_back(s.gpu_sm_mhz);
                 let window = self.watts_window.make_contiguous();
                 if is_steady(window, STEADY_N_GPU_W, GPU_W_TOLERANCE) {
                     let watts = tail_mean(window, STEADY_N_GPU_W)
                         .expect("is_steady guarantees a full, NaN-free tail");
-                    effects.push(SweepEffect::RecordPoint { mhz: clock, watts });
-                    self.lut.insert(clock, watts);
+                    // Record the MEASURED clock: under power/thermal limiting
+                    // it sits below the commanded lock, and (measured_mhz,
+                    // watts) is the truthful operating point. Near-duplicate
+                    // mhz across power-limited top steps is fine — the LUT
+                    // replaces exact duplicates and tolerates near ones.
+                    let mhz = tail_mean(self.sm_window.make_contiguous(), STEADY_N_GPU_W)
+                        .expect("sm_window is in lockstep with watts_window")
+                        .round() as u32;
+                    effects.push(SweepEffect::RecordPoint { mhz, watts });
+                    self.lut.insert(mhz, watts);
                     self.idx += 1;
                     match SWEEP_CLOCKS.get(self.idx) {
                         Some(&next) => {
@@ -211,6 +235,19 @@ mod tests {
         Sample {
             gpu_util_pct: 99.0,
             gpu_sm_mhz: f64::from(clock),
+            gpu_w: watts,
+            gpu_w_valid: true,
+            gpu_mhz_valid: true,
+            ..Sample::default()
+        }
+    }
+
+    /// A valid sample saturated (util 100) but power-limited: the SM clock
+    /// runs at `sm` MHz, below whatever lock is commanded.
+    fn power_limited(sm: f64, watts: f64) -> Sample {
+        Sample {
+            gpu_util_pct: 100.0,
+            gpu_sm_mhz: sm,
             gpu_w: watts,
             gpu_w_valid: true,
             gpu_mhz_valid: true,
@@ -373,9 +410,10 @@ mod tests {
     fn wrong_clock_or_low_util_is_not_pinned() {
         let mut sweep = LutSweep::new();
         sweep.start();
-        // Clock off by more than 30 MHz.
+        // Clock more than the slack ABOVE the lock (lock not in force).
+        // Below the lock is fine — see power_limited_gpu_pins_below_the_lock.
         let mut off_clock = pinned(3090, 100.0);
-        off_clock.gpu_sm_mhz = 3000.0;
+        off_clock.gpu_sm_mhz = 3130.0;
         // Util at 90 exactly (must be > 90).
         let mut low_util = pinned(3090, 100.0);
         low_util.gpu_util_pct = 90.0;
@@ -384,6 +422,89 @@ mod tests {
             sweep.on_sample(&low_util);
         }
         assert_eq!(*sweep.state(), SweepState::WaitPinned { clock: 3090 });
+    }
+
+    #[test]
+    fn power_limited_gpu_pins_below_the_lock() {
+        // Field case (RTX 5070 Laptop, 100 W TGP): lock commanded at 3090 but
+        // the power limiter holds the card at ~2520 MHz under full load. That
+        // IS the lock in force — the sweep must accept it, not stall forever.
+        let mut sweep = LutSweep::new();
+        sweep.start();
+        for _ in 0..PIN_STREAK {
+            sweep.on_sample(&power_limited(2520.0, 99.8));
+        }
+        assert_eq!(*sweep.state(), SweepState::Settling { clock: 3090 });
+    }
+
+    #[test]
+    fn clock_above_lock_never_pins() {
+        // A measured clock ABOVE the lock means the lock is not in force:
+        // never pin, no matter how loaded the GPU is.
+        let mut sweep = LutSweep::new();
+        sweep.start();
+        for _ in 0..(PIN_STREAK + 5) {
+            sweep.on_sample(&power_limited(3190.0, 99.8));
+        }
+        assert_eq!(*sweep.state(), SweepState::WaitPinned { clock: 3090 });
+    }
+
+    #[test]
+    fn records_measured_clock_not_commanded() {
+        // Power-limited at 2520 MHz under a 3090 lock: the recorded point
+        // must be the measured operating point (2520, 99.8), not the fiction
+        // (3090, 99.8).
+        let mut sweep = LutSweep::new();
+        sweep.start();
+        let mut all = Vec::new();
+        for _ in 0..PIN_STREAK {
+            all.extend(sweep.on_sample(&power_limited(2520.0, 99.8)));
+        }
+        assert_eq!(*sweep.state(), SweepState::Settling { clock: 3090 });
+        for _ in 0..STEADY_N_GPU_W {
+            all.extend(sweep.on_sample(&power_limited(2520.0, 99.8)));
+        }
+        let pts = record_points(&all);
+        assert_eq!(pts.len(), 1, "got {pts:?}");
+        assert_eq!(pts[0].0, 2520);
+        assert!((pts[0].1 - 99.8).abs() < 1e-9, "got {pts:?}");
+        assert_eq!(*sweep.state(), SweepState::WaitPinned { clock: 2880 });
+    }
+
+    #[test]
+    fn power_limited_full_sweep_builds_sane_lut() {
+        // Top three locks (3090, 2880, 2670) all run power-limited at the
+        // same ~2520 MHz; lower locks pin exactly. The three top steps record
+        // the same measured mhz, which ClockWattsLut::insert collapses into
+        // one entry — an 8-point LUT is the correct, truthful result.
+        let mut sweep = LutSweep::new();
+        let mut all = sweep.start();
+        for &clock in SWEEP_CLOCKS.iter() {
+            let sample = if clock > 2520 {
+                power_limited(2520.0, 99.8)
+            } else {
+                pinned(clock, f64::from(clock) / 30.0)
+            };
+            for _ in 0..(PIN_STREAK + STEADY_N_GPU_W) {
+                all.extend(sweep.on_sample(&sample));
+            }
+        }
+        assert_eq!(*sweep.state(), SweepState::Done);
+        let finished: Vec<&ClockWattsLut> = all
+            .iter()
+            .filter_map(|e| match e {
+                SweepEffect::Finished(lut) => Some(lut),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].len(), 8);
+        // Top entry is the measured power-limited point (2520 MHz clamps the
+        // whole range above it).
+        for probe in [2520, 3090] {
+            let w = finished[0].watts_for_clock(probe).unwrap();
+            assert!((w - 99.8).abs() < 1e-9, "watts_for_clock({probe}) = {w}");
+        }
     }
 
     #[test]

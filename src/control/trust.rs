@@ -6,9 +6,12 @@
 //! fault into the model) and correct only gently (trim at half gain), while
 //! telling the user via `StatusFlag::ModelDistrust`.
 //!
-//! Fed by the controller on steady-gated samples ONLY (the same 20-sample
-//! fan-window gate as the trim integrator): between steady windows no
-//! evidence arrives and the last verdict stands.
+//! Fed by the controller on steady, ACHIEVED samples ONLY (the same
+//! 20-sample fan-window gate as the trim integrator, plus the controller's
+//! achievement gate: the load must have actually drawn the commanded
+//! budget — a residual computed at a commanded-but-untested point is a
+//! phantom, not evidence). Between such samples nothing arrives and the
+//! last verdict stands, frozen in either direction.
 
 /// EWMA smoothing factor per steady observation (~1 Hz while steady): a
 /// time constant of ~50 samples, deliberately slow so a single transient

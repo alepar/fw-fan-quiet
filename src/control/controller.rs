@@ -159,12 +159,12 @@ pub enum StatusFlag {
     /// Auto mode was requested without a calibrated model + LUT. Cleared on
     /// a successful Auto entry or when a calibration lands its fit.
     NotCalibrated,
-    /// The trim integrator is pinned at its +max authority: the model
-    /// persistently under-predicts and even the maximum budget cut cannot
-    /// reach the fan target — fans above target, check intake/ambient
-    /// (research 03 §6: surface a status when the floor is hit instead of
-    /// silently collapsing performance). Clears once the offset drops below
-    /// [`TRIM_CLEAR_FRACTION`] of max.
+    /// The trim integrator is pinned at its +max authority: the fans stay
+    /// persistently over target even at the maximum budget cut (a model
+    /// bias beyond the trim's authority, or floors holding power above the
+    /// contour) — check intake/ambient (research 03 §6: surface a status
+    /// when the floor is hit instead of silently collapsing performance).
+    /// Clears once the offset drops below [`TRIM_CLEAR_FRACTION`] of max.
     TargetUnreachable,
     /// The trust monitor's verdict (Task 27): the model's steady-state
     /// residual EWMA has been over 300 RPM for 5+ minutes. While set, RLS
@@ -216,7 +216,9 @@ pub struct ControlStatus {
     /// GPU max-clock floor in MHz (config, live-editable via SetFloors).
     pub gpu_floor_mhz: u32,
     /// Current trim offset (RPM); nonzero only in Auto mode. Positive =
-    /// model under-predicts = budget cut (shown dim in the UI header).
+    /// fans persistently over target at the commanded budget (the model
+    /// under-predicts) = budget cut; at equilibrium it equals the model's
+    /// bias at the operating point (shown dim in the UI header).
     pub trim_rpm: f64,
     /// Currently active flags.
     pub flags: Vec<StatusFlag>,
@@ -1056,8 +1058,9 @@ impl<R: Runner> Controller<R> {
         //
         // predicted = the PRE-update model at the CURRENT operating point
         // (applied CPU allocation, PI watts target): the residual measures
-        // the model we are currently controlling with; trust and trim
-        // consume it, THEN RLS adapts.
+        // the model we are currently controlling with; TRUST consumes it,
+        // THEN RLS adapts. The TRIM deliberately does NOT (see below): it
+        // integrates the control error against the fan target.
         //
         // Persistence semantics: RLS mutates `self.model` in place, so the
         // allocator's contour uses the adapted surface LIVE — but nothing
@@ -1096,7 +1099,30 @@ impl<R: Runner> Controller<R> {
             {
                 effects.push(Effect::RlsAccepted);
             }
-            // Trim last, at half gain while distrusted.
+            // Trim last, at half gain while distrusted. It integrates the
+            // CONTROL error (measured − target), NOT the model residual:
+            // the allocator parks the plant on the TRIMMED contour
+            // (predicted = target − trim), so a model-error integrand
+            // would equal (measured − target) + trim — the trim feeding
+            // back into itself with POSITIVE sign, winding to the ±400
+            // clamp for ANY persistent model bias and parking the fans a
+            // full clamp-minus-bias below target (2026-07 field session:
+            // pinned +400, fans stable 260 RPM UNDER target, ~15 W of GPU
+            // budget withheld). With the control error the loop is
+            // error = bias − trim: the trim converges to exactly the
+            // model's bias at the operating point and the fans land ON
+            // target (see trim.rs).
+            //
+            // Off-contour operating points need no extra gating: the
+            // steadiness gate already excludes transients (backstop cuts,
+            // rate-limited moves). Floors: if floors pin power ABOVE the
+            // contour, the fans sit steady over target with nothing left
+            // to cut — the trim winds to +400 and TargetUnreachable fires,
+            // the same terminal state as a true out-of-authority bias, and
+            // an honest one (the target really is unreachable). Fans
+            // steady BELOW target can only mean negative bias (constraints
+            // only ever hold power ABOVE the contour optimum), so the trim
+            // walks negative and hands budget back, bounded at −400.
             let ki_scale = if auto.distrusted {
                 DISTRUST_TRIM_KI_SCALE
             } else {
@@ -1104,7 +1130,7 @@ impl<R: Runner> Controller<R> {
             };
             if auto
                 .trim
-                .update_scaled(s.t_mono, measured, predicted, ki_scale)
+                .update_scaled(s.t_mono, measured, self.status.fan_target_rpm, ki_scale)
             {
                 self.status.trim_rpm = auto.trim.offset_rpm();
                 cause.get_or_insert("auto:trim");
@@ -3269,7 +3295,7 @@ mod tests {
     }
 
     #[test]
-    fn steady_auto_samples_move_trim_toward_model_error() {
+    fn steady_auto_samples_move_trim_toward_control_error() {
         let runner = FakeRunner::new();
         let (mut ctl, _gpu_calls) = auto_controller_no_profile(&runner);
         ctl.on_command(Command::SetAuto(true));
@@ -3280,15 +3306,14 @@ mod tests {
             assert_eq!(ctl.status().trim_rpm, 0.0, "trim moved early at t={t}");
         }
 
-        // 20th steady sample: first trim update. Allocation is (23, 38)
-        // (four +2 steps from the conservative start), so the model
-        // predicts 25*23 + 15*38 + 0.1*23*38 + 800 = 2032.4 RPM; measured
-        // 1700 → error -332.4 → trim = -16.62 (model OVER-predicts here,
-        // so the offset goes negative = more budget).
+        // 20th steady sample: first trim update, integrating the CONTROL
+        // error (measured − target), independent of the model: measured
+        // 1700 vs the 3000 RPM target → error −1300 → trim = 0.05·(−1300)
+        // = −65 (fans under target → negative offset = more budget).
         let effects = ctl.on_sample(&busy_at(19.0));
         assert!(has_status_cause(&effects, "auto:trim"), "got {effects:?}");
         let trim = ctl.status().trim_rpm;
-        assert!((trim - (-16.62)).abs() < 0.01, "trim = {trim}");
+        assert!((trim - (-65.0)).abs() < 1e-9, "trim = {trim}");
     }
 
     #[test]
@@ -3338,10 +3363,14 @@ mod tests {
     }
 
     /// Calibrated controller pinned at a CONSTANT operating point: a 54 W
-    /// CPU floor plus a 1000 RPM target park the allocator at (54 W, 0 W)
-    /// within one step (the contour is negative-clamped at 54 W for any
-    /// plausible fan reading), so the RLS excitation gate stays closed and
-    /// trim/trust behavior is isolated from model adaptation.
+    /// CPU floor plus a target equal to the model's prediction there park
+    /// the allocator at (54 W, 0 W) within one step (the contour GPU watts
+    /// are −trim/20.4 ≤ 0 while the trim is non-negative, which holds
+    /// throughout these scenarios), so the RLS excitation gate stays closed
+    /// and trim/trust behavior is isolated from model adaptation. With
+    /// target == prediction the trim's control error and the trust
+    /// monitor's model residual coincide at this point, so feeding
+    /// `PINNED_PREDICT_RPM + x` drives both by exactly `x`.
     fn pinned_op_controller(
         runner: &FakeRunner,
     ) -> (Controller<&FakeRunner>, Arc<Mutex<Vec<GpuCall>>>) {
@@ -3352,7 +3381,7 @@ mod tests {
             // adaptation, so they opt in (see auto_controller_no_profile).
             Config {
                 cpu_floor_w: 54.0,
-                fan_target_rpm: 1000.0,
+                fan_target_rpm: PINNED_PREDICT_RPM,
                 online_rls: true,
                 ..Config::default()
             },
@@ -3360,9 +3389,10 @@ mod tests {
     }
 
     /// The calibrated model's prediction at the pinned (54, 0) point:
-    /// 25·54 + 800. Feeding this as the fan reading makes the (one)
-    /// first-steady-sample RLS acceptance carry zero error, so the model
-    /// stays EXACTLY calibrated for the rest of the scenario.
+    /// 25·54 + 800 — and the pinned fixture's fan TARGET. Feeding this as
+    /// the fan reading makes the (one) first-steady-sample RLS acceptance
+    /// carry zero error, so the model stays EXACTLY calibrated for the
+    /// rest of the scenario — and leaves the trim's control error at zero.
     const PINNED_PREDICT_RPM: f64 = 2150.0;
 
     fn rls_accepts(effects: &[Effect]) -> usize {
@@ -3382,19 +3412,22 @@ mod tests {
         let (mut ctl, _gpu_calls) = pinned_op_controller(&runner);
         ctl.on_command(Command::SetAuto(true));
 
-        // Clean baseline: fan matches the model exactly, so the single
-        // first-steady-sample RLS acceptance (t=19) changes nothing.
+        // Clean baseline: fan matches the model AND the target exactly, so
+        // the single first-steady-sample RLS acceptance (t=19) changes
+        // nothing and the trim's control error is exactly zero.
         let mut accepts = 0;
         for t in 0..40 {
             accepts += rls_accepts(&ctl.on_sample(&busy_fan_at(f64::from(t), PINNED_PREDICT_RPM)));
         }
         assert_eq!(accepts, 1, "exactly the documented first-sample accept");
-        // Not bit-zero: the SVD fit reproduces 2150 to ~1e-9, and the trim
-        // dutifully integrates that dust.
-        assert!(ctl.status().trim_rpm.abs() < 1e-9);
+        assert_eq!(ctl.status().trim_rpm, 0.0);
 
-        // Blocked intake: +295 RPM of measured drift the frozen model can't
-        // explain. 295 < the 300 RPM distrust threshold — this test isolates
+        // Blocked intake: fans steady +295 RPM over the TARGET while the
+        // 54 W floor leaves the allocator nothing to cut (the contour is
+        // already zero-clamped) — the true bias exceeds the trim's
+        // authority here, so pinning + flagging is the CORRECT terminal
+        // state under the control-error semantics. 295 is also the model
+        // residual, < the 300 RPM distrust threshold — this test isolates
         // the TargetUnreachable path (ModelDistrust must stay clear). The
         // trim walks up at 14.75 RPM/update and pins at +400 by t=599.
         for t in 40..=610 {
@@ -3424,9 +3457,9 @@ mod tests {
             assert!((got - want).abs() < 1e-6, "param moved: {got} vs {want}");
         }
 
-        // Recovery (blanket removed): fans drop under the prediction, the
-        // error flips sign and the trim walks off the clamp; the flag clears
-        // below 90% of max (360).
+        // Recovery (blanket removed): fans drop under the TARGET, the
+        // control error flips sign and the trim walks off the clamp; the
+        // flag clears below 90% of max (360).
         for t in 611..=800 {
             ctl.on_sample(&busy_fan_at(f64::from(t), 2050.0));
         }
@@ -3531,7 +3564,8 @@ mod tests {
             .find(|d| d["cause"] == "auto:trim")
             .unwrap_or_else(|| panic!("no auto:trim decision in {contents}"));
         let offset = trim_line["trim_rpm"].as_f64().expect("trim_rpm present");
-        assert!((offset - (-16.62)).abs() < 0.01, "trim_rpm = {offset}");
+        // 0.05 · (1700 measured − 3000 target) = −65 (control error).
+        assert!((offset - (-65.0)).abs() < 1e-9, "trim_rpm = {offset}");
 
         // The allocate line right after carries the current trim too.
         let alloc_line = decisions
@@ -3612,6 +3646,93 @@ mod tests {
             gpu_w < untrimmed - 2.0,
             "positive trim must CUT the allocation below the untrimmed \
              contour: {gpu_w} vs {untrimmed}"
+        );
+    }
+
+    #[test]
+    fn trim_converges_to_model_bias_and_lands_fans_on_target() {
+        // End-to-end replay of the 2026-07 field fault, fixed. The plant
+        // answers every commanded point 139 RPM louder than the trimmed
+        // contour expects (a +139 RPM model bias at the operating point):
+        // measured = target − trim + 139 for whatever trim the controller
+        // currently carries. The old model-error trim saw that constant
+        // +139 residual FOREVER — the allocator re-parks on the shifted
+        // contour after every update, so the residual never closed
+        // (positive feedback) — wound to the +400 clamp and parked the
+        // fans 261 RPM BELOW target with ~15 W of budget withheld. The
+        // control-error trim must converge to the bias, stop, and land the
+        // fans ON target with the flag clear.
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu_calls) = auto_controller(
+            &runner,
+            PathBuf::from("/nonexistent/platform_profile"),
+            Config::default(), // online RLS off: the trim is the only corrector
+        );
+        ctl.on_command(Command::SetAuto(true));
+        let target = ctl.status().fan_target_rpm; // default 3000
+
+        let mut fan = f64::NAN;
+        let mut trim_at_2800 = f64::NAN;
+        for t in 0..3000 {
+            fan = target - ctl.status().trim_rpm + 139.0;
+            ctl.on_sample(&busy_fan_at(f64::from(t), fan));
+            if t == 2800 {
+                trim_at_2800 = ctl.status().trim_rpm;
+            }
+        }
+        let trim = ctl.status().trim_rpm;
+        assert!((trim - 139.0).abs() < 10.0, "trim = {trim}, want ≈ 139");
+        assert!(
+            (trim - trim_at_2800).abs() < 1.0,
+            "converged trim must STOP: {trim} vs {trim_at_2800} at t=2800"
+        );
+        // Fans end inside the allocator's ±150 RPM band around the target
+        // (the field session sat 260 RPM below it).
+        assert!(
+            (fan - target).abs() < 150.0,
+            "fans must land on target: {fan} vs {target}"
+        );
+        assert!(
+            !ctl.status().flags.contains(&StatusFlag::TargetUnreachable),
+            "an in-authority bias must not flag TargetUnreachable"
+        );
+    }
+
+    #[test]
+    fn trust_watches_model_error_while_trim_watches_the_target() {
+        use crate::control::trust::DISTRUST_RPM;
+        // Fans exactly ON target at a floor-pinned point the model badly
+        // over-predicts (predicts 2150 at (54, 0), fans read 1400): the
+        // TRIM has nothing to do (control error 0 — the old model-error
+        // trim would have wound to −400 here and handed out watts nobody
+        // asked for), but the TRUST monitor must still be fed the MODEL
+        // residual (measured − model.predict) and flag ModelDistrust: its
+        // semantics are unchanged — distrust = model persistently wrong,
+        // a "recalibrate when convenient" hint.
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu_calls) = auto_controller(
+            &runner,
+            PathBuf::from("/nonexistent/platform_profile"),
+            // online RLS off (default): the model stays put.
+            Config {
+                cpu_floor_w: 54.0,
+                fan_target_rpm: 1400.0,
+                ..Config::default()
+            },
+        );
+        ctl.on_command(Command::SetAuto(true));
+        for t in 0..=600 {
+            ctl.on_sample(&busy_fan_at(f64::from(t), 1400.0));
+        }
+        assert!(
+            ctl.status().flags.contains(&StatusFlag::ModelDistrust),
+            "trust must keep watching the model residual"
+        );
+        assert!(ctl.auto.as_ref().unwrap().trust.ewma() > DISTRUST_RPM);
+        assert_eq!(ctl.status().trim_rpm, 0.0, "zero control error: trim holds");
+        assert!(
+            !ctl.status().flags.contains(&StatusFlag::TargetUnreachable),
+            "on-target fans must never read as an unreachable target"
         );
     }
 
@@ -3742,9 +3863,10 @@ mod tests {
         assert!(ctl.status().flags.contains(&StatusFlag::ModelDistrust));
 
         // Recovery: collapse back to the frozen (54, 0) point and feed the
-        // fan the model expects — the EWMA decays under 300 and the verdict
-        // returns Ok: flag clears (with its cause), trim gain restores.
-        ctl.on_command(Command::SetFanTarget(1000.0));
+        // fan the model expects (== the pinned target, so the trim holds
+        // still too) — the EWMA decays under 300 and the verdict returns
+        // Ok: flag clears (with its cause), trim gain restores.
+        ctl.on_command(Command::SetFanTarget(PINNED_PREDICT_RPM));
         let mut cleared_at = None;
         for _ in 0..80 {
             let effects = ctl.on_sample(&busy_fan_at(f64::from(t), PINNED_PREDICT_RPM));
@@ -3885,10 +4007,10 @@ mod tests {
             (calib.a, calib.b, calib.e, calib.c),
             "model must stay bit-identical to the calibration"
         );
-        // …while the trim keeps absorbing the drift (measured above the
-        // prediction → positive offset = budget cut).
+        // …while the trim keeps absorbing the control error (fans at 2800,
+        // under the 3000 RPM target → negative offset = more budget).
         assert!(
-            ctl.status().trim_rpm > 0.0,
+            ctl.status().trim_rpm < 0.0,
             "trim must still adapt, got {}",
             ctl.status().trim_rpm
         );

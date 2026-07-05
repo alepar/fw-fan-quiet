@@ -1,13 +1,25 @@
 //! Bounded ambient trim integrator (design doc §3; research 03 §6 "bounded
 //! integrator authority — the key safeguard").
 //!
-//! Slowest tier of the control cascade: integrates (measured − predicted)
-//! fan RPM at the current operating point into an offset added to the
-//! thermal model's `c` (via `gpu_watts_on_contour`'s trim argument), so
-//! ambient/airflow/dust drift is absorbed without refitting the model.
-//! Positive offset ⇒ the model under-predicted (real fans run higher than
-//! predicted at this power) ⇒ the contour shifts DOWN and commands fewer
-//! watts.
+//! Slowest tier of the control cascade: integrates the CONTROL error
+//! (measured − target) fan RPM into an offset added to the thermal model's
+//! `c` (via `gpu_watts_on_contour`'s trim argument), so ambient/airflow/dust
+//! drift is absorbed without refitting the model. Positive offset ⇒ the fans
+//! persistently run over the target at the commanded budget (the model
+//! under-predicts) ⇒ the contour shifts DOWN and commands fewer watts.
+//!
+//! Why the CONTROL error and not the model residual (measured − predicted):
+//! the allocator steers the operating point onto the TRIMMED contour, i.e.
+//! it holds `predicted = target − trim`. Substituting, the model-error
+//! integrand equals `(measured − target) + trim` — the trim feeds back into
+//! its own update with POSITIVE sign, so for ANY persistent model bias it
+//! winds to the ±max clamp and its equilibrium (measured − target = −trim)
+//! is unstable: the 2026-07 field session had it pinned at +400 with the
+//! fans parked stable 260 RPM BELOW target and ~15 W of budget withheld.
+//! With the control error the closed loop is `error = bias − trim` (bias =
+//! the model's offset error at the operating point): NEGATIVE feedback, the
+//! offset converges geometrically to exactly the model's bias, the error
+//! goes to zero, and the fans land ON target.
 //!
 //! The safety contract (research 03 §6): the offset saturates at
 //! [`MAX_TRIM_AUTHORITY_RPM`], so a wrong model / blocked intake can cut the
@@ -76,12 +88,20 @@ impl Trim {
     /// back-calculation buys nothing at this 20 s cadence — an error sign
     /// flip walks back from the clamp on the very next update.
     ///
+    /// Equilibrium: given the allocator holds the plant on the trimmed
+    /// contour (`predicted = target − trim`), the integrated error equals
+    /// `bias − trim`, so the offset converges to exactly the model's bias
+    /// at the operating point and stops (see the module docs for why the
+    /// model residual instead would be positive feedback). The clamp and
+    /// the controller's `TargetUnreachable` flag engage only when the true
+    /// bias exceeds the ±max authority.
+    ///
     /// Production code goes through [`update_scaled`](Self::update_scaled)
     /// (the controller always passes an explicit gain scale); this plain
     /// form is kept as the canonical unscaled API and test baseline.
     #[allow(dead_code)]
-    pub fn update(&mut self, t_mono: f64, measured_rpm: f64, predicted_rpm: f64) -> bool {
-        self.update_scaled(t_mono, measured_rpm, predicted_rpm, 1.0)
+    pub fn update(&mut self, t_mono: f64, measured_rpm: f64, target_rpm: f64) -> bool {
+        self.update_scaled(t_mono, measured_rpm, target_rpm, 1.0)
     }
 
     /// [`update`](Self::update) with the gain scaled by `ki_scale` for THIS
@@ -94,7 +114,7 @@ impl Trim {
         &mut self,
         t_mono: f64,
         measured_rpm: f64,
-        predicted_rpm: f64,
+        target_rpm: f64,
         ki_scale: f64,
     ) -> bool {
         if let Some(last) = self.last_update_t
@@ -104,11 +124,11 @@ impl Trim {
         }
         // Defensive: a non-finite reading must neither poison the offset
         // nor consume the cadence slot (callers already gate validity).
-        if !measured_rpm.is_finite() || !predicted_rpm.is_finite() {
+        if !measured_rpm.is_finite() || !target_rpm.is_finite() {
             return false;
         }
         self.last_update_t = Some(t_mono);
-        let next = (self.offset_rpm + KI_TRIM * ki_scale * (measured_rpm - predicted_rpm))
+        let next = (self.offset_rpm + KI_TRIM * ki_scale * (measured_rpm - target_rpm))
             .clamp(-MAX_TRIM_AUTHORITY_RPM, MAX_TRIM_AUTHORITY_RPM);
         let changed = next != self.offset_rpm;
         self.offset_rpm = next;
@@ -168,15 +188,79 @@ mod tests {
     }
 
     #[test]
-    fn sign_measured_above_predicted_is_positive() {
-        // Model under-predicts (real fans louder) → positive offset →
-        // contour commands FEWER watts (the contour subtracts the trim).
+    fn integrates_control_error_measured_minus_target() {
+        // One step of the field numbers: fans 150 RPM over a 3250 target →
+        // offset moves by exactly KI_TRIM · 150.
+        let mut t = Trim::new();
+        assert!(t.update(0.0, 3400.0, 3250.0));
+        assert!((t.offset_rpm() - KI_TRIM * 150.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn sign_measured_above_target_is_positive() {
+        // Fans over target (model under-predicts at this budget) → positive
+        // offset → contour commands FEWER watts (it subtracts the trim).
         let mut t = Trim::new();
         t.update(0.0, 2300.0, 2000.0);
         assert!(t.offset_rpm() > 0.0);
         let mut t = Trim::new();
         t.update(0.0, 1700.0, 2000.0);
         assert!(t.offset_rpm() < 0.0);
+    }
+
+    /// Closed-loop plant on the trimmed contour: the allocator holds
+    /// `predicted = target − trim`, so with a fixed model bias the fans
+    /// settle at `measured = target − trim + bias` between trim updates.
+    fn plant(target: f64, trim: &Trim, bias: f64) -> f64 {
+        target - trim.offset_rpm() + bias
+    }
+
+    #[test]
+    fn converges_to_model_bias_and_stops() {
+        // The stability fix, asserted at the update law: integrating the
+        // CONTROL error makes the closed loop `error = bias − trim` —
+        // negative feedback, geometric convergence to trim == bias (139,
+        // the 2026-07 field bias). The old model-error integrand was
+        // `(measured − target) + trim`: positive feedback that wound to
+        // the clamp for ANY persistent bias.
+        const BIAS: f64 = 139.0;
+        const TARGET: f64 = 3250.0;
+        let mut t = Trim::new();
+        let mut deltas = Vec::new();
+        for i in 0..100 {
+            let before = t.offset_rpm();
+            let measured = plant(TARGET, &t, BIAS);
+            t.update(f64::from(i) * TRIM_PERIOD_S, measured, TARGET);
+            assert!(
+                t.offset_rpm().abs() < MAX_TRIM_AUTHORITY_RPM,
+                "an in-authority bias must never pin the trim"
+            );
+            deltas.push((t.offset_rpm() - before).abs());
+        }
+        let trim = t.offset_rpm();
+        assert!((trim - BIAS).abs() < 10.0, "trim = {trim}, want ≈ {BIAS}");
+        assert!(
+            deltas[90..].iter().all(|d| *d < 1.0),
+            "converged trim must STOP moving: {:?}",
+            &deltas[90..]
+        );
+        // And the equilibrium is on target: the plant reads back the bias.
+        assert!((plant(TARGET, &t, BIAS) - TARGET).abs() < 10.0);
+    }
+
+    #[test]
+    fn bias_beyond_authority_pins_at_max() {
+        // 550 RPM of true bias > the 400 RPM authority: the trim walks to
+        // the +max clamp and stays — the caller's TargetUnreachable flag is
+        // now accurate (fans genuinely over target at the maximum cut).
+        const BIAS: f64 = 550.0;
+        const TARGET: f64 = 3250.0;
+        let mut t = Trim::new();
+        for i in 0..100 {
+            let measured = plant(TARGET, &t, BIAS);
+            t.update(f64::from(i) * TRIM_PERIOD_S, measured, TARGET);
+        }
+        assert_eq!(t.offset_rpm(), MAX_TRIM_AUTHORITY_RPM);
     }
 
     #[test]

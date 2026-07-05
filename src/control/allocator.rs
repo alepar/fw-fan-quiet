@@ -943,14 +943,14 @@ mod tests {
                 gpu_w = pg;
             }
             // Trim tier, every sample, steadiness-gated exactly like the
-            // controller: residual = steady-tail mean − (pre-trim) model
-            // prediction at the current operating point.
+            // controller: control error = steady-tail mean − target (the
+            // model bias reaches the trim through the contour the loop
+            // rests on, not through a residual).
             let w = window.make_contiguous();
             if is_steady(w, STEADY_N, STEADY_RPM_TOLERANCE)
                 && let Some(steady_rpm) = tail_mean(w, STEADY_N)
             {
-                let predicted = SIM_PLANT_K * gpu_w + SIM_PLANT_C - SIM_MODEL_BIAS_RPM;
-                trim.update_scaled(t as f64, steady_rpm, predicted, 1.0);
+                trim.update_scaled(t as f64, steady_rpm, SIM_TARGET_RPM, 1.0);
             }
             trace.push(rpm);
         }
@@ -979,22 +979,26 @@ mod tests {
     /// the fans are still climbing (the deadband hold needs rest INSIDE
     /// the band, which never comes), the stacked watts overshoot, the
     /// backstop cuts all the way down the drain, the undershoot re-arms
-    /// the raises — and the swing keeps the fan window unsteady, starving
-    /// the very trim that could fix the model bias. Measured here:
-    /// 8 target crossings and 66% in band over the last 300 s (field
-    /// capture: 26%). (Given a much longer horizon this sim's ungated
-    /// loop does eventually drift in-band — its noise-free-ish turnaround
-    /// dwells leak occasional steady windows to the trim, a leak the
-    /// field's deeper, dirtier cycle never had.)
+    /// the raises — and the swing keeps the fan window mostly unsteady,
+    /// starving the very trim that could fix the model bias. Measured
+    /// here: 6 target crossings and 45% in band over the last 300 s
+    /// (field capture: 26%). (Given a much longer horizon even the
+    /// ungated loop heals — its turnaround dwells leak steady windows to
+    /// the control-error trim, a leak the field's deeper, dirtier cycle
+    /// never had.)
     ///
-    /// GATED, at the adaptation tier's honest timescale (900 s — the
-    /// trim's designed time constant is TRIM_PERIOD_S/KI_TRIM = 400 s, so
-    /// "climb, rest, let the trim walk 500 RPM of bias out of the
-    /// contour" physically cannot finish inside 600 s): the gate paces
-    /// raises to heard fan responses, the loop rests, the steadiness gate
-    /// opens, the trim re-anchors the contour, and the last 300 s sit at
-    /// 100% in band with ≤2 target crossings (robust across noise seeds:
-    /// 0–2 crossings, 100%).
+    /// GATED, at the adaptation tier's honest timescale for THIS plant
+    /// (4500 s): the gate paces raises to heard fan responses, the loop
+    /// rests, the steadiness gate opens and the control-error trim walks
+    /// the bias out of the contour. The walk is long by design: the paced
+    /// climb creeps slowly enough (≈3 RPM/s) to read as steady, winding
+    /// the trim ≈ −170 RPM while the fans are still under target, and the
+    /// 500 RPM bias exceeds the +400 authority — so the trim must cover
+    /// ≈570 RPM through the sawtooth's scarce steady dwells (≈190 RPM per
+    /// 1000 s measured) before the loop can rest, pinned at +400, at
+    /// target + 100 (inside the band; the real controller additionally
+    /// flags TargetUnreachable there, as designed). The last 300 s then
+    /// sit at 100% in band with 0 target crossings.
     /// Seconds the initial climb spends between 2000 and 3000 true RPM:
     /// the signature of how hard the allocator pushes unheard power. The
     /// pre-fix allocator raises at the full UP_RATE_W regardless of what
@@ -1008,14 +1012,13 @@ mod tests {
     #[test]
     fn velocity_gate_kills_the_fan_lag_limit_cycle() {
         let old_trace = simulate_field_cycle(false, 600);
-        let gated_trace = simulate_field_cycle(true, 900);
+        let gated_trace = simulate_field_cycle(true, 4500);
         // The mechanism, asserted directly: the pre-fix allocator climbs at
         // the full up rate no matter what the fans have answered (55 s
         // through 2000→3000 RPM here); the gate paces the climb to heard
-        // responses (103 s). This is the assertion that dies first if the
-        // gate is ever removed — the convergence metrics alone cannot,
-        // because given enough time the trim heals even this sim's ungated
-        // loop.
+        // responses. This is the assertion that dies first if the gate is
+        // ever removed — the convergence metrics alone cannot, because
+        // given enough time the trim heals even this sim's ungated loop.
         let old_climb = mid_climb_duration_s(&old_trace);
         let gated_climb = mid_climb_duration_s(&gated_trace);
         assert!(
@@ -1025,7 +1028,7 @@ mod tests {
         );
         let (old_crossings, old_in_band) = cycle_metrics(&old_trace);
         assert!(
-            old_crossings > 6,
+            old_crossings > 4,
             "ungated loop should limit-cycle: {old_crossings} crossings"
         );
         assert!(

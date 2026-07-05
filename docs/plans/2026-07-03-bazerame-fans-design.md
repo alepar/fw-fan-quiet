@@ -174,3 +174,28 @@ strings.
 Acceptance (from research staging): RPM within deadband of target ≥90% of a 30-min
 gaming session with zero perceptible fan oscillation; abuse tests (blanket, blocked
 intake) degrade to flagged "target not achievable" with floors held.
+
+## Post-field addendum (2026-07-05): why online RLS is off by default
+
+Field session findings (telemetry run-1783230*): online RLS walked the cross-term `e`
+negative until the contour divisor `b + e·pc` collapsed (~0.18 at pc=28), making the
+model claim GPU watts were acoustically free; the allocator froze at high GPU power
+with fans over target. Root cause is structural, not a tuning bug:
+
+1. The steadiness gate (20-sample ≤100 RPM spread) measures spread, not slope — a slow
+   monotonic climb passes while mid-transient.
+2. Stale pairing: fans lag power by 30–90 s but Auto moves the power point every 5 s,
+   so RLS pairs *current* commanded watts with RPM reflecting watts from ~30–60 s ago.
+   Under an allocator ramp this systematically teaches "watts up, RPM unchanged" —
+   i.e. exactly the degenerate direction observed.
+3. RLS and trim double-correct the same residual; when RLS absorbs it into the shape,
+   the contour bends; trim (offset-only, hard-clamped ±400 RPM) cannot corrupt
+   invertibility.
+
+Empirical confirmation: MODEL DISTRUST mode (RLS frozen, trim-only) produced the best
+control of the session. Consequently `online_rls` defaults to false; the calibrated fit
+owns the shape, trim owns drift, MODEL DISTRUST is a recalibration hint. A correct
+online RLS would need the operating point held for the full fan-lag horizon (~45 s)
+before a sample counts — a condition real gameplay almost never satisfies.
+Guards added regardless (divisor floor in rls_update/fit_batch, model-independent
+overshoot backstop in the allocator) so no adaptation path can reproduce the failure.

@@ -15,12 +15,12 @@ use crate::ring::Ring;
 /// Fixed Y bounds per chart: auto-scaling makes live charts jumpy, and these
 /// cover the hardware's full envelope (fans max ~7000 RPM, package power well
 /// under 120 W, temps below the 110 C trip point, GPU boost under 3.2 GHz).
-const FAN_BOUNDS: [f64; 2] = [0.0, 7000.0];
+const FAN_BOUNDS: [f64; 2] = [1000.0, 6000.0];
 // Watts chart is percent-of-max like the clocks chart: 100% = 54 W CPU
 // (cTDP ceiling) / 100 W GPU (TGP), so both series span the full height.
 const CPU_MAX_W: f64 = 54.0;
 const GPU_MAX_W: f64 = 100.0;
-const TEMP_BOUNDS: [f64; 2] = [0.0, 110.0];
+const TEMP_BOUNDS: [f64; 2] = [20.0, 90.0];
 // The clocks chart normalizes each series to percent of that device's max
 // clock so both use the full chart height ("dual-scale" on one axis: 100% =
 // 5.1 GHz for the CPU, 3.09 GHz for the GPU; absolute MHz live in the title).
@@ -294,16 +294,39 @@ fn hline(y: f64) -> [(f64, f64); 2] {
     [(0.0, y), (RING_CAP as f64, y)]
 }
 
+/// Base bounds, auto-extended (never shrunk) so every observed value fits:
+/// data outside the base range widens the axis instead of clipping.
+fn bounds_fit<'a>(
+    base: [f64; 2],
+    segs: impl IntoIterator<Item = &'a Vec<(f64, f64)>>,
+    extra: impl IntoIterator<Item = f64>,
+) -> [f64; 2] {
+    let mut lo = base[0];
+    let mut hi = base[1];
+    for v in segs
+        .into_iter()
+        .flat_map(|run| run.iter().map(|&(_, y)| y))
+        .chain(extra)
+    {
+        if v.is_finite() {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+    }
+    [lo, hi]
+}
+
 fn render_fans(model: &Model, frame: &mut Frame, area: Rect) {
     let fan_segs = segments(&model.max_fan);
     let target_pts = hline(model.fan_target_rpm);
+    let bounds = bounds_fit(FAN_BOUNDS, &fan_segs, [model.fan_target_rpm]);
     let title = match &model.latest {
         Some(s) => format!("fans {:.0}/{:.0} rpm", s.fan1_rpm, s.fan2_rpm),
         None => "fans (rpm)".into(),
     };
     let mut datasets = vec![line_dataset(Color::DarkGray, &target_pts).name("target")];
     datasets.extend(series("max fan", Color::Cyan, &fan_segs));
-    render_chart(frame, area, title, datasets, FAN_BOUNDS);
+    render_chart(frame, area, title, datasets, bounds);
 }
 
 fn render_watts(model: &Model, frame: &mut Frame, area: Rect) {
@@ -340,9 +363,10 @@ fn render_temps(model: &Model, frame: &mut Frame, area: Rect) {
         ),
         None => "temps".into(),
     };
+    let bounds = bounds_fit(TEMP_BOUNDS, cpu_segs.iter().chain(gpu_segs.iter()), []);
     let mut datasets = series("cpu", Color::Red, &cpu_segs);
     datasets.extend(series("gpu", Color::Magenta, &gpu_segs));
-    render_chart(frame, area, title, datasets, TEMP_BOUNDS);
+    render_chart(frame, area, title, datasets, bounds);
 }
 
 /// Calibration wizard panel: phase, step gauge, load prompt, note, abort
@@ -490,6 +514,22 @@ mod tests {
         let terminal = draw(&m);
         let header = row_text(&terminal, 0);
         assert!(!header.contains('?'), "header was: {header:?}");
+    }
+
+    #[test]
+    fn bounds_fit_extends_only_when_data_exceeds() {
+        // Inside base range: unchanged.
+        let inside = vec![vec![(0.0, 2000.0), (1.0, 5500.0)]];
+        assert_eq!(bounds_fit([1000.0, 6000.0], &inside, []), [1000.0, 6000.0]);
+        // Above: hi extends; below: lo extends; extras (target line) count too.
+        let above = vec![vec![(0.0, 6800.0)]];
+        assert_eq!(bounds_fit([1000.0, 6000.0], &above, []), [1000.0, 6800.0]);
+        let below = vec![vec![(0.0, 15.0)]];
+        assert_eq!(bounds_fit([20.0, 90.0], &below, []), [15.0, 90.0]);
+        assert_eq!(
+            bounds_fit([1000.0, 6000.0], &[], [6500.0]),
+            [1000.0, 6500.0]
+        );
     }
 
     #[test]

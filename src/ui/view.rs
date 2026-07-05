@@ -18,8 +18,12 @@ use crate::ring::Ring;
 const FAN_BOUNDS: [f64; 2] = [0.0, 7000.0];
 const WATT_BOUNDS: [f64; 2] = [0.0, 120.0];
 const TEMP_BOUNDS: [f64; 2] = [0.0, 110.0];
-// Covers both the GPU (3.09 GHz max lock) and the HX 370's ~5.1 GHz boost.
-const MHZ_BOUNDS: [f64; 2] = [0.0, 5200.0];
+// The clocks chart normalizes each series to percent of that device's max
+// clock so both use the full chart height ("dual-scale" on one axis: 100% =
+// 5.1 GHz for the CPU, 3.09 GHz for the GPU; absolute MHz live in the title).
+const CPU_MAX_CLOCK_MHZ: f64 = 5100.0;
+const GPU_MAX_CLOCK_MHZ: f64 = 3090.0;
+const PCT_BOUNDS: [f64; 2] = [0.0, 100.0];
 
 pub fn view(model: &Model, frame: &mut Frame) {
     let [header, charts, footer] = Layout::vertical([
@@ -375,17 +379,28 @@ fn render_calib_wizard(progress: &CalibProgressLite, frame: &mut Frame, area: Re
     );
 }
 
+/// Scale every point of pre-split segments to percent of `max` (NaN gaps are
+/// already gone by this stage, so plain division is safe).
+fn to_percent(segs: &[Vec<(f64, f64)>], max: f64) -> Vec<Vec<(f64, f64)>> {
+    segs.iter()
+        .map(|run| run.iter().map(|&(x, y)| (x, y / max * 100.0)).collect())
+        .collect()
+}
+
 fn render_clock(model: &Model, frame: &mut Frame, area: Rect) {
-    let gpu_segs = segments(&model.gpu_mhz);
-    let cpu_segs = segments(&model.cpu_mhz);
-    // Commanded GPU max-clock overlay.
-    let limit_pts = model.status.gpu_max_mhz.map(|mhz| hline(f64::from(mhz)));
+    let gpu_segs = to_percent(&segments(&model.gpu_mhz), GPU_MAX_CLOCK_MHZ);
+    let cpu_segs = to_percent(&segments(&model.cpu_mhz), CPU_MAX_CLOCK_MHZ);
+    // Commanded GPU max-clock overlay, on the GPU's percent scale.
+    let limit_pts = model
+        .status
+        .gpu_max_mhz
+        .map(|mhz| hline(f64::from(mhz) / GPU_MAX_CLOCK_MHZ * 100.0));
     let title = match &model.latest {
         Some(s) => format!(
-            "clocks cpu {:.0} gpu {:.0} MHz",
+            "clocks cpu {:.0} gpu {:.0} MHz (% of max)",
             s.cpu_avg_mhz, s.gpu_sm_mhz
         ),
-        None => "clocks (MHz)".into(),
+        None => "clocks (% of max)".into(),
     };
     let mut datasets = Vec::new();
     if let Some(pts) = &limit_pts {
@@ -393,7 +408,7 @@ fn render_clock(model: &Model, frame: &mut Frame, area: Rect) {
     }
     datasets.extend(series("cpu", Color::Green, &cpu_segs));
     datasets.extend(series("gpu", Color::Blue, &gpu_segs));
-    render_chart(frame, area, title, datasets, MHZ_BOUNDS);
+    render_chart(frame, area, title, datasets, PCT_BOUNDS);
 }
 
 #[cfg(test)]

@@ -20,9 +20,10 @@
 //! Residual windup is bounded twice over: (a) at most ONE sample of
 //! integration can land past saturation (the step that first saturates has
 //! already integrated), i.e. ≤ `KI · |error|` MHz; (b) the crate's
-//! `i_limit = OUTPUT_LIMIT` caps the integral contribution at ±400 MHz
-//! absolutely, so worst-case unwind time is 400 / KI ≈ 27 s of persistent
-//! opposite error — acceptable under the allocator's 5 s retarget cadence.
+//! `i_limit = OUTPUT_LIMIT` caps the integral contribution at ±1000 MHz
+//! absolutely, so worst-case unwind time is 1000 / KI ≈ 67 s of persistent
+//! opposite error — acceptable because conditional integration keeps the
+//! integrator frozen while saturated, so it rarely winds that far.
 //! The deadband returns early (no integration), so there is no windup from
 //! in-deadband noise either.
 
@@ -36,9 +37,15 @@ const KP: f64 = 5.0;
 /// term per the design ("light PI, mostly I"): steady LUT error is trimmed at
 /// 15 MHz/s per watt.
 const KI: f64 = 15.0;
-/// Max PI correction either way, MHz. The feedforward does the bulk; the PI
-/// only trims, so its authority is kept tight (also the crate's p/i limits).
-const OUTPUT_LIMIT: f64 = 400.0;
+/// Max PI correction either way, MHz (also the crate's p/i limits). Sized for
+/// LUT-vs-real-load divergence, not just trim: the LUT is calibrated under a
+/// saturating burn (worst-case watts per clock), so a lighter game needs a
+/// substantially HIGHER clock than the feedforward guess to draw the same
+/// watts — field observation showed the gap can exceed several hundred MHz.
+/// The 105 MHz/s rate limit and the ±3 W deadband still prevent hunting;
+/// worst-case integral unwind grows to 1000/KI ≈ 67 s, acceptable because
+/// conditional integration keeps the integrator frozen while saturated.
+const OUTPUT_LIMIT: f64 = 1000.0;
 /// Hold (return None, no integration) while |measured − target| is within
 /// this band, so the loop doesn't chase NVML noise.
 const DEADBAND_W: f64 = 3.0;
@@ -542,10 +549,10 @@ mod tests {
         // error 20 → P 100 + I 300 → FF 2000 + 400 = 2400.
         assert_eq!(pid.update(40.0, &lut, FLOOR), Some(2400));
         pid.reset();
-        // error −30 → P −150, I clamps to −400, output clamps to −400 →
-        // 1600: an 800 MHz jump (no rate limit), and fresh integral (stale
+        // error −30 → P −150 + I −450 = −600 (within the 1000 authority) →
+        // 1400: a 1000 MHz jump (no rate limit), and fresh integral (stale
         // +300 would land at 1700).
-        assert_eq!(pid.update(90.0, &lut, FLOOR), Some(1600));
+        assert_eq!(pid.update(90.0, &lut, FLOOR), Some(1400));
     }
 
     #[test]

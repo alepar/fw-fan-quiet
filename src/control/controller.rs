@@ -2609,15 +2609,16 @@ mod tests {
         // First sample: the allocator steps from the conservative (15, 30)
         // start toward the both-starved optimum, up-rate-limited to
         // (17, 32) → ryzenadj 17 W + PI target 32 W. The PI (measured 10 W)
-        // commands FF(32 W) = 1253 MHz + the clamped +400 MHz correction.
+        // commands FF(32 W) = 1253 MHz + the unclamped +440 MHz correction
+        // (error 22 W: P 110 + I 330; within the 1000 MHz authority).
         let effects = ctl.on_sample(&busy_at(0.0));
         assert_eq!(alloc_of(&effects), Some((17.0, 32.0)));
         assert_eq!(ryzenadj_calls(&runner), vec![expected_args(17_000)]);
         assert_eq!(ctl.status().cpu_limit_w, Some(17.0));
         assert!(effects.contains(&Effect::CpuSet(17.0)), "got {effects:?}");
-        assert_eq!(gpu_sets(&gpu_calls), vec![1653]);
-        assert_eq!(ctl.status().gpu_max_mhz, Some(1653));
-        assert!(effects.contains(&Effect::GpuSet(1653)), "got {effects:?}");
+        assert_eq!(gpu_sets(&gpu_calls), vec![1693]);
+        assert_eq!(ctl.status().gpu_max_mhz, Some(1693));
+        assert!(effects.contains(&Effect::GpuSet(1693)), "got {effects:?}");
         assert_eq!(status_changes(&effects), 1);
     }
 
@@ -2822,7 +2823,9 @@ mod tests {
             !gpu_sets(&gpu_calls).is_empty(),
             "PI must keep working off gpu_w while the fan is lost"
         );
-        assert_eq!(ctl.status().gpu_max_mhz, Some(1600)); // FF(30)=1200 + 400
+        // FF(30)=1200; error 20 W wants +700 of correction, delivered in
+        // rate-limited steps: 1600 (t=0), 1705 (t=5), 1810 (t=10.1).
+        assert_eq!(ctl.status().gpu_max_mhz, Some(1810));
     }
 
     #[test]
@@ -2842,7 +2845,7 @@ mod tests {
             first_pi.abs_diff(1500) <= 105,
             "first PI command ({first_pi} MHz) jumped >105 MHz from the applied 1500"
         );
-        // Concretely: rate-limited toward the 1653 MHz desired clock.
+        // Concretely: rate-limited toward the ~1693 MHz desired clock.
         assert_eq!(first_pi, 1605);
     }
 
@@ -3101,7 +3104,7 @@ mod tests {
         assert_eq!(gpu_sets(&gpu_calls), vec![1500], "only the manual lock");
 
         // Next tick: the retry must rate-limit from the APPLIED 1500 (→ 1605
-        // again), not from the failed 1605 intent (which would allow 1653).
+        // again), not from the failed 1605 intent (which would allow 1710).
         ctl.on_sample(&busy_at(1.0));
         assert_eq!(gpu_sets(&gpu_calls), vec![1500, 1605]);
         assert_eq!(ctl.status().gpu_max_mhz, Some(1605));

@@ -16,7 +16,10 @@ use crate::ring::Ring;
 /// cover the hardware's full envelope (fans max ~7000 RPM, package power well
 /// under 120 W, temps below the 110 C trip point, GPU boost under 3.2 GHz).
 const FAN_BOUNDS: [f64; 2] = [0.0, 7000.0];
-const WATT_BOUNDS: [f64; 2] = [0.0, 120.0];
+// Watts chart is percent-of-max like the clocks chart: 100% = 54 W CPU
+// (cTDP ceiling) / 100 W GPU (TGP), so both series span the full height.
+const CPU_MAX_W: f64 = 54.0;
+const GPU_MAX_W: f64 = 100.0;
 const TEMP_BOUNDS: [f64; 2] = [0.0, 110.0];
 // The clocks chart normalizes each series to percent of that device's max
 // clock so both use the full chart height ("dual-scale" on one axis: 100% =
@@ -304,13 +307,19 @@ fn render_fans(model: &Model, frame: &mut Frame, area: Rect) {
 }
 
 fn render_watts(model: &Model, frame: &mut Frame, area: Rect) {
-    let cpu_segs = segments(&model.cpu_w);
-    let gpu_segs = segments(&model.gpu_w);
-    // Commanded CPU limit overlay (same pattern as the fan target line).
-    let limit_pts = model.status.cpu_limit_w.map(hline);
+    let cpu_segs = to_percent(&segments(&model.cpu_w), CPU_MAX_W);
+    let gpu_segs = to_percent(&segments(&model.gpu_w), GPU_MAX_W);
+    // Commanded CPU limit overlay, on the CPU's percent scale.
+    let limit_pts = model
+        .status
+        .cpu_limit_w
+        .map(|w| hline(w / CPU_MAX_W * 100.0));
     let title = match &model.latest {
-        Some(s) => format!("watts | cpu {:.1} W gpu {:.1} W", s.cpu_pkg_w, s.gpu_w),
-        None => "watts".into(),
+        Some(s) => format!(
+            "watts cpu {:.1} gpu {:.1} W (% of max)",
+            s.cpu_pkg_w, s.gpu_w
+        ),
+        None => "watts (% of max)".into(),
     };
     let mut datasets = Vec::new();
     if let Some(pts) = &limit_pts {
@@ -318,7 +327,7 @@ fn render_watts(model: &Model, frame: &mut Frame, area: Rect) {
     }
     datasets.extend(series("cpu", Color::Yellow, &cpu_segs));
     datasets.extend(series("gpu", Color::Green, &gpu_segs));
-    render_chart(frame, area, title, datasets, WATT_BOUNDS);
+    render_chart(frame, area, title, datasets, PCT_BOUNDS);
 }
 
 fn render_temps(model: &Model, frame: &mut Frame, area: Rect) {

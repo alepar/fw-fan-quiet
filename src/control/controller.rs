@@ -276,9 +276,10 @@ pub enum Effect {
     /// its own Decision record (cause "auto:model_snapshot") carrying
     /// a/b/e/c for offline controller-quality review.
     ModelSnapshot { a: f64, b: f64, e: f64, c: f64 },
-    /// A watchdog flag transitioned; the shell mirrors it into a standalone
-    /// telemetry `Record::Flag` line IN ADDITION to the Decision record
-    /// (whose `flags` field carries the full post-transition list) — offline
+    /// A status flag transitioned (emitted on EVERY genuine add/remove,
+    /// plan Task 14); the shell mirrors it into a standalone telemetry
+    /// `Record::Flag` line IN ADDITION to the Decision record (whose
+    /// `flags` field carries the full post-transition list) — offline
     /// analysis gets a greppable per-flag transition stream.
     Flagged { flag: &'static str, active: bool },
     /// Hardware restored; the thread shell must exit its loop.
@@ -371,6 +372,16 @@ pub struct Controller<R: Runner> {
     /// (including Calibrating, where the rest of the sample machinery is
     /// suspended); a trip ACTS only when something is commanded.
     watchdog: ThermalWatchdog,
+    /// `Effect::Flagged` transitions recorded by `add_flag`/`remove_flag`
+    /// since the last drain; `on_command`/`on_sample` drain them into their
+    /// returned batch so every flag transition lands in telemetry exactly
+    /// once.
+    pending_flags: Vec<Effect>,
+    /// Debounce for the idle-Monitor watchdog warn: the immediate re-arm
+    /// means a persistently hot idle machine re-trips every TRIP_STREAK
+    /// samples, so warn once per continuous idle-trip episode (reset when
+    /// the watchdog goes quiet again — genuinely cool/valid evidence).
+    idle_trip_warned: bool,
 }
 
 impl<R: Runner> Controller<R> {
@@ -414,6 +425,8 @@ impl<R: Runner> Controller<R> {
             config_path,
             auto: None,
             watchdog: ThermalWatchdog::new(),
+            pending_flags: Vec::new(),
+            idle_trip_warned: false,
         }
     }
 
@@ -454,15 +467,11 @@ impl<R: Runner> Controller<R> {
             tracing::warn!("emergency acknowledged by {c:?}; command swallowed, watchdog re-armed");
             let mut effects = Vec::new();
             for flag in [StatusFlag::ThermalEmergency, StatusFlag::SensorLost] {
-                if self.status.flags.contains(&flag) {
-                    self.remove_flag(flag);
-                    effects.push(Effect::Flagged {
-                        flag: flag.as_str(),
-                        active: false,
-                    });
-                }
+                // remove_flag records the Flagged effect on genuine removal.
+                self.remove_flag(flag);
             }
             self.watchdog.rearm();
+            self.drain_flag_effects(&mut effects);
             effects.push(Effect::StatusChanged {
                 cause: "watchdog:rearmed",
             });
@@ -668,10 +677,12 @@ impl<R: Runner> Controller<R> {
                     self.end_calibration();
                 }
                 self.guard.restore_all();
+                self.drain_flag_effects(&mut effects);
                 effects.push(Effect::Quit);
                 return effects;
             }
         };
+        self.drain_flag_effects(&mut effects);
         if self.status != before {
             effects.push(Effect::StatusChanged { cause });
         }
@@ -692,11 +703,25 @@ impl<R: Runner> Controller<R> {
         // is nothing to release, so stay armed instead of latching a trip
         // that would blind the watchdog for the next Manual/Auto session.
         match self.watchdog.observe(s) {
-            Trip::None => {}
+            Trip::None => {
+                // End of an idle-trip episode only on genuinely quiet
+                // evidence: right after an idle re-arm the next hot/invalid
+                // samples ALSO return Trip::None while the streak rebuilds,
+                // and resetting on those would re-warn every TRIP_STREAK
+                // samples forever.
+                if self.idle_trip_warned && self.watchdog.is_quiet() {
+                    self.idle_trip_warned = false;
+                }
+            }
             trip if self.anything_commanded() => return self.emergency_release(trip),
             trip => {
-                // Diagnostically interesting even with nothing to release.
-                tracing::warn!("watchdog tripped ({trip:?}) in idle Monitor; re-arming");
+                // Diagnostically interesting even with nothing to release —
+                // but warned once per continuous idle-trip episode, not on
+                // every re-trip of a persistently hot idle machine.
+                if !self.idle_trip_warned {
+                    self.idle_trip_warned = true;
+                    tracing::warn!("watchdog tripped ({trip:?}) in idle Monitor; re-arming");
+                }
                 self.watchdog.rearm();
             }
         }
@@ -820,6 +845,7 @@ impl<R: Runner> Controller<R> {
             }
         }
 
+        self.drain_flag_effects(&mut effects);
         if self.status != before {
             effects.push(Effect::StatusChanged {
                 cause: cause.unwrap_or("sample"),
@@ -1104,6 +1130,9 @@ impl<R: Runner> Controller<R> {
         let cause = self.apply_calib_effects(runner_effects);
         self.sync_calib_status();
         let mut effects = Vec::new();
+        // A landed fit clears NotCalibrated (apply_calib_effects): the
+        // transition must reach telemetry from this path too.
+        self.drain_flag_effects(&mut effects);
         if self.status != before {
             effects.push(Effect::StatusChanged {
                 cause: cause.unwrap_or("calib:progress"),
@@ -1275,14 +1304,12 @@ impl<R: Runner> Controller<R> {
         self.auto = None;
         self.release_to_stock();
         self.add_flag(flag);
-        vec![
-            Effect::Released,
-            Effect::Flagged {
-                flag: flag.as_str(),
-                active: true,
-            },
-            Effect::StatusChanged { cause },
-        ]
+        let mut effects = vec![Effect::Released];
+        // Carries the emergency flag itself PLUS whatever release_to_stock
+        // genuinely cleared (LimitNotSticking/TargetUnreachable/...).
+        self.drain_flag_effects(&mut effects);
+        effects.push(Effect::StatusChanged { cause });
+        effects
     }
 
     /// Back to Monitor with stock limits, actuators kept (the session goes
@@ -1356,14 +1383,37 @@ impl<R: Runner> Controller<R> {
         any.then_some(all_ok)
     }
 
+    /// Set a flag. A GENUINE insertion (not already set) also records an
+    /// `Effect::Flagged { active: true }` into `pending_flags` — plan Task
+    /// 14 promises a telemetry Flag line on every status-flag transition.
     fn add_flag(&mut self, flag: StatusFlag) {
         if !self.status.flags.contains(&flag) {
             self.status.flags.push(flag);
+            self.pending_flags.push(Effect::Flagged {
+                flag: flag.as_str(),
+                active: true,
+            });
         }
     }
 
+    /// Clear a flag; a GENUINE removal records `Flagged { active: false }`
+    /// (idempotent re-clears leave no trace — see [`Self::add_flag`]).
     fn remove_flag(&mut self, flag: StatusFlag) {
+        let before = self.status.flags.len();
         self.status.flags.retain(|&f| f != flag);
+        if self.status.flags.len() != before {
+            self.pending_flags.push(Effect::Flagged {
+                flag: flag.as_str(),
+                active: false,
+            });
+        }
+    }
+
+    /// Move the flag transitions recorded since the last drain into
+    /// `effects`. Every `on_command`/`on_sample` return path that could have
+    /// touched a flag drains, so each transition is emitted exactly once.
+    fn drain_flag_effects(&mut self, effects: &mut Vec<Effect>) {
+        effects.append(&mut self.pending_flags);
     }
 }
 
@@ -1459,8 +1509,9 @@ fn apply_effects<R: Runner>(
     let mut auto_alloc: Option<(f64, f64, f64, f64)> = None;
     let mut rls_accepted = false;
     let mut model_snapshot: Option<(f64, f64, f64, f64)> = None;
-    // Watchdog-flag transitions in this batch: each becomes a standalone
-    // Record::Flag line (in addition to the Decision carrying the full list).
+    // Status-flag transitions in this batch (watchdog or otherwise): each
+    // becomes a standalone Record::Flag line (in addition to the Decision
+    // carrying the full list).
     let mut flagged: Vec<(&'static str, bool)> = Vec::new();
     for effect in effects {
         match effect {
@@ -1843,17 +1894,74 @@ mod tests {
         assert!(ctl.on_sample(&sample_with_power(2.0, 26.0)).is_empty());
         assert!(!ctl.status().flags.contains(&StatusFlag::LimitNotSticking));
 
-        // Third consecutive violation: immediate reassert + flag.
+        // Third consecutive violation: immediate reassert + flag (with its
+        // Flagged effect — every genuine transition reaches telemetry).
         let effects = ctl.on_sample(&sample_with_power(3.0, 26.0));
         assert!(has_reassert(&effects, "stickiness"), "got {effects:?}");
         assert!(ctl.status().flags.contains(&StatusFlag::LimitNotSticking));
+        assert!(has_flagged(&effects, "limit_not_sticking", true));
         assert_eq!(status_changes(&effects), 1);
         assert_eq!(ryzenadj_calls(&runner).len(), 2, "initial set + reassert");
 
-        // A compliant sample clears the flag.
+        // A compliant sample clears the flag (Flagged again, active=false).
         let effects = ctl.on_sample(&sample_with_power(4.0, 19.0));
         assert!(!ctl.status().flags.contains(&StatusFlag::LimitNotSticking));
+        assert!(has_flagged(&effects, "limit_not_sticking", false));
         assert_eq!(status_changes(&effects), 1);
+
+        // Staying compliant is NOT a transition: no Flagged spam.
+        let effects = ctl.on_sample(&sample_with_power(5.0, 19.0));
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Flagged { .. })),
+            "got {effects:?}"
+        );
+    }
+
+    #[test]
+    fn stickiness_flag_transitions_reach_telemetry_as_flag_lines() {
+        // Task 14 promise: EVERY status-flag transition lands as a
+        // standalone Record::Flag JSONL line, not just the watchdog's.
+        let runner = FakeRunner::new();
+        let dir = std::env::temp_dir().join(format!(
+            "bazerame-controller-test-{}-flag-telemetry",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let mut ctl = controller_no_profile(&runner);
+        let (ui_tx, _ui_rx) = crossbeam_channel::unbounded();
+        let telemetry = Arc::new(Mutex::new(Some(Telemetry::open(&dir).unwrap())));
+
+        let effects = ctl.on_command(Command::SetCpuW(20.0));
+        apply_effects(&effects, &ctl, 0.0, &ui_tx, &telemetry);
+        // Three violations set the flag, one compliant sample clears it.
+        for t in 1..=3 {
+            let effects = ctl.on_sample(&sample_with_power(f64::from(t), 26.0));
+            apply_effects(&effects, &ctl, f64::from(t), &ui_tx, &telemetry);
+        }
+        let effects = ctl.on_sample(&sample_with_power(4.0, 19.0));
+        apply_effects(&effects, &ctl, 4.0, &ui_tx, &telemetry);
+        let path = {
+            let mut guard = telemetry::lock(&telemetry);
+            let t = guard.as_mut().unwrap();
+            t.flush();
+            t.path().to_path_buf()
+        };
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let flags: Vec<serde_json::Value> = contents
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|v: &serde_json::Value| v["kind"] == "flag")
+            .collect();
+        assert_eq!(flags.len(), 2, "set + clear, got: {contents}");
+        assert_eq!(flags[0]["flag"], "limit_not_sticking");
+        assert_eq!(flags[0]["active"], true);
+        assert_eq!(flags[0]["t_mono"], 3.0);
+        assert_eq!(flags[1]["flag"], "limit_not_sticking");
+        assert_eq!(flags[1]["active"], false);
+        assert_eq!(flags[1]["t_mono"], 4.0);
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

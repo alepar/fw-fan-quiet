@@ -28,10 +28,11 @@ const MAX_NAME_ATTEMPTS: u32 = 10;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Record<'a> {
     Sample(&'a Sample),
-    /// One watchdog-flag transition (thermal_emergency, sensor_lost):
-    /// emitted by the controller shell alongside the Decision record, so
-    /// offline analysis gets a greppable per-flag stream (Decision lines
-    /// carry the full flag list, not the transition).
+    /// One status-flag transition (thermal_emergency, sensor_lost,
+    /// limit_not_sticking, resumed, not_calibrated, target_unreachable,
+    /// model_distrust): emitted by the controller shell alongside the
+    /// Decision record, so offline analysis gets a greppable per-flag
+    /// stream (Decision lines carry the full flag list, not the transition).
     Flag {
         t_mono: f64,
         flag: String,

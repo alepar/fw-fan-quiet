@@ -135,14 +135,24 @@ impl Model {
                 self.gpu_floor_mhz = cs.gpu_floor_mhz;
                 self.status = cs;
             }
-            // Render cadence is driven by the main loop; nothing to do here.
-            Event::Tick => {}
         }
         Vec::new()
     }
 
     /// Manual-mode keymap: lowercase steps down, uppercase steps up.
     fn on_manual_key(&mut self, ch: char) -> Vec<Command> {
+        // Mirror the controller's Calibrating rejection: it refuses these
+        // commands while the runner owns actuation, so stepping the LOCAL
+        // setpoints/floors/target here would silently drift them away from
+        // the applied truth. 'a' and 'k' carry their own mode gates below.
+        if self.status.mode == Mode::Calibrating
+            && matches!(
+                ch,
+                'c' | 'C' | 'g' | 'G' | 't' | 'T' | 'f' | 'F' | 'd' | 'D' | 'p'
+            )
+        {
+            return Vec::new();
+        }
         match ch {
             'c' | 'C' => {
                 let step = if ch == 'C' { CPU_STEP_W } else { -CPU_STEP_W };
@@ -378,16 +388,6 @@ mod tests {
         assert_eq!(m.max_fan.last(), Some(2200.0));
     }
 
-    #[test]
-    fn tick_is_noop() {
-        let mut m = Model::new();
-        let cmds = m.update(Event::Tick);
-        assert!(cmds.is_empty());
-        assert!(m.running);
-        assert!(m.latest.is_none());
-        assert_eq!(m.max_fan.len(), 0);
-    }
-
     // --- Task 15: manual-mode keys ---
 
     fn shift_key(c: char) -> KeyEvent {
@@ -588,6 +588,40 @@ mod tests {
             m.update(Event::Status(status_in(mode)));
             assert_eq!(m.update(Event::Input(key('k'))), vec![], "mode {mode:?}");
         }
+    }
+
+    #[test]
+    fn manual_and_floor_keys_inert_while_calibrating() {
+        let mut m = Model::new();
+        m.update(Event::Status(status_in(Mode::Calibrating)));
+        // Every manual/floor key: no command AND no local-state drift (the
+        // controller would reject the command, so a local step would
+        // desynchronize the UI from the applied truth).
+        for ev in [
+            key('c'),
+            shift_key('C'),
+            key('g'),
+            shift_key('G'),
+            key('t'),
+            shift_key('T'),
+            key('f'),
+            shift_key('F'),
+            key('d'),
+            shift_key('D'),
+            key('p'),
+        ] {
+            assert_eq!(m.update(Event::Input(ev)), vec![], "key {ev:?}");
+        }
+        assert_eq!(m.fan_target_rpm, DEFAULT_FAN_TARGET_RPM);
+
+        // Calibration over (controller echoes Monitor): the setpoint did
+        // not drift, so the next 'c' still re-seeds from 40 W -> 38 W.
+        m.update(Event::Status(status_in(Mode::Monitor)));
+        assert_eq!(
+            m.update(Event::Input(key('c'))),
+            vec![Command::SetCpuW(38.0)]
+        );
+        assert_eq!(m.update(Event::Input(key('f'))), set_floors(14.0, 1000));
     }
 
     #[test]

@@ -13,8 +13,4 @@ pub enum Event {
     Input(crossterm::event::KeyEvent),
     /// Controller status update (sent only when the status actually changed).
     Status(ControlStatus),
-    /// Periodic redraw tick. Nothing constructs it yet: the main loop's
-    /// recv timeout currently plays this role.
-    #[allow(dead_code)]
-    Tick,
 }

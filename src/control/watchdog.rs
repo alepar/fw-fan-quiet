@@ -105,6 +105,15 @@ impl ThermalWatchdog {
         self.tripped
     }
 
+    /// Nothing latched and no adverse streak building. The controller uses
+    /// this to detect the END of an idle-Monitor trip episode: a mere
+    /// `Trip::None` is not enough, because after an idle re-arm the next
+    /// hot/invalid samples also return `Trip::None` while the streak
+    /// rebuilds toward the next trip.
+    pub fn is_quiet(&self) -> bool {
+        !self.tripped && self.hot_streak == 0 && self.lost_streak == 0
+    }
+
     /// Manual re-arm (the user acknowledged the emergency): clears the latch
     /// AND both streaks, so re-tripping needs fresh consecutive evidence.
     pub fn rearm(&mut self) {
@@ -283,6 +292,32 @@ mod tests {
         assert_eq!(wd.observe(&hot_cpu()), Trip::None);
         assert_eq!(wd.observe(&hot_cpu()), Trip::None);
         assert_eq!(wd.observe(&hot_cpu()), Trip::Thermal);
+    }
+
+    #[test]
+    fn is_quiet_tracks_streaks_and_latch() {
+        let mut wd = ThermalWatchdog::new();
+        assert!(wd.is_quiet());
+        // A building hot streak is not quiet, even though observe still
+        // returns Trip::None (the idle-warn debounce keys off this).
+        wd.observe(&hot_cpu());
+        assert!(!wd.is_quiet());
+        // Cool evidence resets the streak: quiet again.
+        wd.observe(&cool());
+        assert!(wd.is_quiet());
+        // A building lost streak is not quiet either.
+        wd.observe(&invalid());
+        assert!(!wd.is_quiet());
+        wd.observe(&cool());
+        assert!(wd.is_quiet());
+        // Tripped (latched) is never quiet; re-arm restores quiet.
+        for _ in 0..3 {
+            wd.observe(&hot_cpu());
+        }
+        assert!(wd.is_tripped());
+        assert!(!wd.is_quiet());
+        wd.rearm();
+        assert!(wd.is_quiet());
     }
 
     #[test]

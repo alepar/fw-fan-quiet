@@ -97,44 +97,20 @@ fn header_line(model: &Model) -> Line<'static> {
             Style::default().fg(Color::DarkGray),
         ));
     }
-    for flag in &model.status.flags {
+    // Severity-first render order: the single-line header has no wrap
+    // (ratatui clips at the right edge), so an emergency tripping AFTER
+    // milder flags must never be pushed out of view by them. The status
+    // Vec itself keeps insertion order (telemetry/tests rely on it); only
+    // the spans are sorted.
+    let mut flags: Vec<StatusFlag> = model.status.flags.clone();
+    flags.sort_by_key(|f| flag_severity(*f));
+    // With several flags competing for one row, drop the parenthetical
+    // "(press ...)" hints so every flag NAME stays visible; a lone flag
+    // keeps its full hint.
+    let with_hint = flags.len() <= 1;
+    for flag in flags {
         spans.push(Span::raw(" | "));
-        spans.push(match flag {
-            StatusFlag::LimitNotSticking => Span::styled(
-                "LIMIT-SLIP!",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            StatusFlag::Resumed => Span::styled("resumed", Style::default().fg(Color::Yellow)),
-            StatusFlag::NotCalibrated => Span::styled(
-                "NOT CALIBRATED (press k to calibrate)",
-                Style::default().fg(Color::Yellow),
-            ),
-            // No parenthetical hint: with the trim indicator also shown the
-            // header would overflow a 120-col terminal ("check intake/
-            // ambient" lives in the flag's doc + design notes).
-            StatusFlag::TargetUnreachable => Span::styled(
-                "TARGET UNREACHABLE",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            // The model's predictions have been persistently wrong for 5+
-            // minutes: RLS frozen, trim at half gain (recalibrate if this
-            // persists — the hint lives in the flag's doc, not the header).
-            StatusFlag::ModelDistrust => Span::styled(
-                "MODEL DISTRUST",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            // Watchdog emergencies: everything was released toward stock and
-            // stays released until the user acknowledges (first actuating
-            // press re-arms without executing; the second acts normally).
-            StatusFlag::ThermalEmergency => Span::styled(
-                "THERMAL EMERGENCY (press a, c/g or k to acknowledge)",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            StatusFlag::SensorLost => Span::styled(
-                "SENSOR LOST (press a, c/g or k to acknowledge)",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-        });
+        spans.push(flag_span(flag, with_hint));
     }
     if let Some(s) = &model.latest {
         let mut warnings = Vec::new();
@@ -164,6 +140,66 @@ fn header_line(model: &Model) -> Line<'static> {
         Style::default().fg(Color::DarkGray),
     ));
     Line::from(spans)
+}
+
+/// Header render priority: lower sorts (and therefore renders) first, so
+/// the loudest flag is the one guaranteed to survive right-edge clipping.
+fn flag_severity(flag: StatusFlag) -> u8 {
+    match flag {
+        StatusFlag::ThermalEmergency => 0,
+        StatusFlag::SensorLost => 1,
+        StatusFlag::ModelDistrust => 2,
+        StatusFlag::TargetUnreachable => 3,
+        StatusFlag::LimitNotSticking => 4,
+        StatusFlag::NotCalibrated => 5,
+        StatusFlag::Resumed => 6,
+    }
+}
+
+/// One header span per flag. `with_hint` selects the long form with the
+/// parenthetical key hint (single-flag header) or the bare name (several
+/// flags competing for one unwrapped row).
+fn flag_span(flag: StatusFlag, with_hint: bool) -> Span<'static> {
+    let red_bold = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+    match flag {
+        StatusFlag::LimitNotSticking => Span::styled("LIMIT-SLIP!", red_bold),
+        StatusFlag::Resumed => Span::styled("resumed", Style::default().fg(Color::Yellow)),
+        StatusFlag::NotCalibrated => Span::styled(
+            if with_hint {
+                "NOT CALIBRATED (press k to calibrate)"
+            } else {
+                "NOT CALIBRATED"
+            },
+            Style::default().fg(Color::Yellow),
+        ),
+        // No parenthetical hint even alone: with the trim indicator also
+        // shown the header would overflow a 120-col terminal ("check intake/
+        // ambient" lives in the flag's doc + design notes).
+        StatusFlag::TargetUnreachable => Span::styled("TARGET UNREACHABLE", red_bold),
+        // The model's predictions have been persistently wrong for 5+
+        // minutes: RLS frozen, trim at half gain (recalibrate if this
+        // persists — the hint lives in the flag's doc, not the header).
+        StatusFlag::ModelDistrust => Span::styled("MODEL DISTRUST", red_bold),
+        // Watchdog emergencies: everything was released toward stock and
+        // stays released until the user acknowledges (first actuating
+        // press re-arms without executing; the second acts normally).
+        StatusFlag::ThermalEmergency => Span::styled(
+            if with_hint {
+                "THERMAL EMERGENCY (press a, c/g or k to acknowledge)"
+            } else {
+                "THERMAL EMERGENCY"
+            },
+            red_bold,
+        ),
+        StatusFlag::SensorLost => Span::styled(
+            if with_hint {
+                "SENSOR LOST (press a, c/g or k to acknowledge)"
+            } else {
+                "SENSOR LOST"
+            },
+            red_bold,
+        ),
+    }
 }
 
 /// Ring -> chart points split into contiguous valid runs, X = sample index.
@@ -565,6 +601,53 @@ mod tests {
             .find("SENSOR LOST (press a, c/g or k to acknowledge)")
             .expect("flag text present") as u16;
         let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
+        assert_eq!(cell.fg, Color::Red);
+        assert!(cell.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn emergency_stays_visible_at_120_cols_with_many_flags() {
+        use crate::control::ControlStatus;
+        use crate::control::controller::{Mode, StatusFlag};
+        // Worst case from the review: THERMAL EMERGENCY trips LAST, after
+        // Auto + trim + four other flags already fill the header. Without
+        // severity-first ordering (and hint dropping) the emergency text
+        // starts past column 120 and ratatui clips it invisible.
+        let mut m = Model::new();
+        m.update(Event::Status(ControlStatus {
+            mode: Mode::Auto,
+            cpu_limit_w: Some(17.0),
+            gpu_max_mhz: Some(1653),
+            fan_target_rpm: 3000.0,
+            trim_rpm: 400.0,
+            flags: vec![
+                StatusFlag::Resumed,
+                StatusFlag::LimitNotSticking,
+                StatusFlag::TargetUnreachable,
+                StatusFlag::NotCalibrated,
+                StatusFlag::ThermalEmergency,
+            ],
+            calib: None,
+            ..ControlStatus::default()
+        }));
+        let terminal = draw(&m); // 120x40 TestBackend
+        let header = row_text(&terminal, 0);
+        let emergency = header
+            .find("THERMAL EMERGENCY")
+            .expect("emergency must survive clipping") as u16;
+        // Rendered FIRST among the flags despite being last in the Vec.
+        for other in ["TARGET UNREACHABLE", "LIMIT-SLIP!", "resumed"] {
+            if let Some(x) = header.find(other) {
+                assert!(
+                    emergency < x as u16,
+                    "{other} must render after the emergency: {header:?}"
+                );
+            }
+        }
+        // More than one flag active: parenthetical hints are dropped.
+        assert!(!header.contains("(press"), "header was: {header:?}");
+        // Loud styling still applies.
+        let cell = terminal.backend().buffer().cell((emergency, 0)).unwrap();
         assert_eq!(cell.fg, Color::Red);
         assert!(cell.modifier.contains(Modifier::BOLD));
     }

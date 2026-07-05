@@ -23,11 +23,9 @@ pub const SWEEP_CLOCKS: [u32; 10] = [3090, 2880, 2670, 2460, 2250, 2040, 1830, 1
 /// Tail-window length for GPU power settling. GPU power responds to a clock
 /// lock much faster than fan RPM responds to heat, so this is shorter than
 /// `steady::STEADY_N` (15 s vs 20 s at the 1 Hz sample rate).
-#[allow(dead_code)]
 pub const STEADY_N_GPU_W: usize = 15;
 
 /// Max-min spread (watts) the tail window may have and still count as steady.
-#[allow(dead_code)]
 pub const GPU_W_TOLERANCE: f64 = 2.0;
 
 /// Consecutive pinned samples required before we trust the clock lock took.

@@ -130,6 +130,9 @@ impl ThermalModel {
     /// covariance `P = I·1e4` on first use (or after load). Returns false
     /// (no state change whatsoever) when the update is rejected by any gate:
     ///
+    /// - Non-finite gate: any NaN/±inf among `pc`/`pg`/`rpm` — NaN passes
+    ///   the other gates (every NaN comparison is false) and one such
+    ///   sample would poison params and covariance permanently.
     /// - Excitation gate: the operating point must have moved by more than
     ///   [`RLS_EXCITATION_MIN_W`] (`|Δpc| + |Δpg|`) since the last ACCEPTED
     ///   update — same-point updates carry no information and only wind up
@@ -141,6 +144,13 @@ impl ThermalModel {
     /// it is rescaled to [`RLS_TRACE_RESCALE_TO`], bounding how hard a noisy
     /// sample can yank the parameters no matter what the update history was.
     pub fn rls_update(&mut self, pc: f64, pg: f64, rpm: f64, lambda: f64) -> bool {
+        // Poisoned-input guard: every comparison with NaN is false, so a NaN
+        // input sails through both gates below and would permanently poison
+        // params AND covariance in one update. Reject non-finite inputs
+        // outright (no state change whatsoever).
+        if !(pc.is_finite() && pg.is_finite() && rpm.is_finite()) {
+            return false;
+        }
         if let Some((last_pc, last_pg)) = self.last_rls_point
             && (pc - last_pc).abs() + (pg - last_pg).abs() <= RLS_EXCITATION_MIN_W
         {
@@ -356,6 +366,34 @@ mod tests {
         assert_eq!(m.b, before.b);
         assert_eq!(m.e, before.e);
         assert_eq!(m.c, before.c);
+    }
+
+    #[test]
+    fn rls_rejects_non_finite_inputs() {
+        let mut m = exact_model();
+        // Live covariance + excitation reference first, so "no state change"
+        // covers those too (not just the params).
+        assert!(m.rls_update(20.0, 40.0, truth_rpm(20.0, 40.0), 0.99));
+        let before = m.clone();
+        let good_rpm = truth_rpm(45.0, 100.0);
+        for (pc, pg, rpm) in [
+            (f64::NAN, 100.0, good_rpm),
+            (45.0, f64::NAN, good_rpm),
+            (45.0, 100.0, f64::NAN),
+            (f64::INFINITY, 100.0, good_rpm),
+            (45.0, f64::NEG_INFINITY, good_rpm),
+            (45.0, 100.0, f64::INFINITY),
+        ] {
+            assert!(
+                !m.rls_update(pc, pg, rpm, 0.99),
+                "({pc}, {pg}, {rpm}) must be rejected"
+            );
+            // Bit-identical params AND covariance: a rejected poisoned
+            // sample leaves no trace at all.
+            assert_eq!(m, before, "state changed after ({pc}, {pg}, {rpm})");
+        }
+        // Still alive: the next finite, excited update is accepted.
+        assert!(m.rls_update(45.0, 100.0, good_rpm, 0.99));
     }
 
     #[test]

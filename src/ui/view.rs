@@ -364,8 +364,8 @@ fn render_temps(model: &Model, frame: &mut Frame, area: Rect) {
         None => "temps".into(),
     };
     let bounds = bounds_fit(TEMP_BOUNDS, cpu_segs.iter().chain(gpu_segs.iter()), []);
-    let mut datasets = series("cpu", Color::Red, &cpu_segs);
-    datasets.extend(series("gpu", Color::Magenta, &gpu_segs));
+    let mut datasets = series("cpu", Color::Yellow, &cpu_segs);
+    datasets.extend(series("gpu", Color::Green, &gpu_segs));
     render_chart(frame, area, title, datasets, bounds);
 }
 
@@ -439,8 +439,8 @@ fn render_clock(model: &Model, frame: &mut Frame, area: Rect) {
     if let Some(pts) = &limit_pts {
         datasets.push(line_dataset(Color::DarkGray, pts).name("gpu max"));
     }
-    datasets.extend(series("cpu", Color::Green, &cpu_segs));
-    datasets.extend(series("gpu", Color::Blue, &gpu_segs));
+    datasets.extend(series("cpu", Color::Yellow, &cpu_segs));
+    datasets.extend(series("gpu", Color::Green, &gpu_segs));
     render_chart(frame, area, title, datasets, PCT_BOUNDS);
 }
 

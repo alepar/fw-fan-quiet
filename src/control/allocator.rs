@@ -21,6 +21,13 @@
 //!   drains power even when the model's contour is lying (2026-06 field
 //!   incident: a degenerate contour divisor parked the allocation over
 //!   target indefinitely).
+//! - Velocity gate: power is only pushed when the fan response to previous
+//!   pushes has been heard. Fans answer power ~15–25 s late, so raising
+//!   while they are still climbing (or piling mandatory cuts on while they
+//!   are already falling fast) acts on evidence that is still in flight —
+//!   in the field (2026-07) that made the loop a relay with transport lag
+//!   and a sustained ±350 RPM limit cycle around the target. See
+//!   [`SLOPE_GATE_RPM_S`].
 //!
 //! Floors simplification: the allocator enforces only the CPU floor. The GPU
 //! floor is a *clock* floor (MHz) and lives in the watts→clock PI's clamp
@@ -58,6 +65,25 @@ pub const OVERSHOOT_DOWN_RATE_W: f64 = 16.0;
 /// Floors still clamp afterward and WIN: at the floors the cut stops —
 /// the designed "fans above target, floors held" terminal state.
 pub const OVERSHOOT_MIN_CUT_W: f64 = 2.0;
+/// Fan-velocity gate (RPM/s) that breaks the relay-with-transport-lag limit
+/// cycle (2026-07 field capture: stable GPU-heavy load, target 3250 RPM,
+/// fans oscillating 3000↔3710 with a ~41 s period and only 26% of samples
+/// in band, while the GPU allocation sawtoothed 57→77→57 W at the ±2 W/5 s
+/// rates — UP_RATE_W up, the OVERSHOOT_MIN_CUT_W backstop down). Fans lag
+/// power by ~15–25 s, so an allocator that keeps raising while the fans are
+/// still climbing stacks not-yet-felt watts that all have to be cut back
+/// out one overshoot later; the RPM then transits the deadband still rising
+/// 30–50 RPM/s, so the in-band hold never engages. The gate only pushes
+/// power when the fan response to the previous pushes has been heard:
+/// - raises require the measured fan slope ≤ +gate (fans not still
+///   climbing), and
+/// - the mandatory overshoot cut pauses while the slope is < −gate (fans
+///   already falling fast: the pipeline is draining, and cutting more just
+///   digs the undershoot leg of the cycle).
+///
+/// Field numbers: settled |slope| < 5 RPM/s, mid-cycle 30–50 RPM/s — 10
+/// separates the regimes with margin on both sides.
+pub const SLOPE_GATE_RPM_S: f64 = 10.0;
 /// RPM deadband around the fan target (≈ just-noticeable difference).
 pub const DEADBAND_RPM: f64 = 150.0;
 /// Power deadband: candidate moves smaller than this (on both axes, while
@@ -165,6 +191,14 @@ pub struct AllocInput<'a> {
     pub measured_fan_rpm: f64,
     pub fan_target_rpm: f64,
     pub fan_valid: bool,
+    /// Fan-RPM slope estimate (RPM/s) from the controller's fan window
+    /// (~10 s of 1 Hz samples), consumed by the velocity gates
+    /// ([`SLOPE_GATE_RPM_S`]). `None` = not enough valid history — and None
+    /// ALLOWS raises: Auto entry starts with an empty window, so gating
+    /// raises on missing data would deadlock startup below the target; the
+    /// up rate limit bounds the risk to [`UP_RATE_W`] per step until the
+    /// window fills (documented decision).
+    pub fan_slope_rpm_s: Option<f64>,
 }
 
 /// Picks (cpu_w, gpu_w) on the contour honoring the demand split, deadband
@@ -204,6 +238,11 @@ impl Allocator {
     ///    model-independent backstop: even a lying contour cannot hold an
     ///    overshooting allocation in place (floors still clamp last and
     ///    win, so the drain stops AT the floors).
+    /// 7. Velocity gates ([`SLOPE_GATE_RPM_S`]): raises additionally
+    ///    require the fan slope ≤ +gate (or None); the mandatory cut of 6
+    ///    pauses (hold) while the slope is < −gate and resumes the moment
+    ///    the fall stalls with RPM still over the band. Floors win over
+    ///    both gates, as over everything else.
     pub fn step(&mut self, inp: &AllocInput) -> (f64, f64) {
         debug_assert!(
             (0.0..=CPU_MAX_W).contains(&inp.floors.0),
@@ -234,6 +273,22 @@ impl Allocator {
         }
 
         let overshoot = rpm_err > DEADBAND_RPM;
+        // Velocity gate, drain half (see [`SLOPE_GATE_RPM_S`]): overshooting
+        // while the fans are already falling faster than the gate means the
+        // pipeline is draining from cuts the fans have not finished
+        // answering — HOLD instead of cutting further, or the stacked cuts
+        // become the undershoot leg of the limit cycle. The acoustic
+        // contract is preserved: if the fall stalls while RPM is still over
+        // the band, the slope rises past −gate and the mandatory cuts
+        // resume on the very next step. (Floors already won above: `prev`
+        // is the floor-lifted held point.)
+        if overshoot
+            && inp
+                .fan_slope_rpm_s
+                .is_some_and(|slope| slope < -SLOPE_GATE_RPM_S)
+        {
+            return prev;
+        }
         // Model-independent overshoot backstop (2026-06 field incident, see
         // [`OVERSHOOT_MIN_CUT_W`]): measured fans OVER the target while the
         // contour claims the current point is fine means the model is lying
@@ -249,8 +304,18 @@ impl Allocator {
         } else {
             (cand_pc, cand_pg)
         };
+        // Velocity gate, raise half: fans still climbing faster than the
+        // gate are still answering the PREVIOUS pushes — raising now stacks
+        // not-yet-felt watts (the limit-cycle mechanism). Cuts stay
+        // available at the normal rate, and None (no history yet) allows
+        // raises — see `AllocInput::fan_slope_rpm_s`.
+        let climbing = inp
+            .fan_slope_rpm_s
+            .is_some_and(|slope| slope > SLOPE_GATE_RPM_S);
         let (up, down) = if overshoot {
             (0.0, OVERSHOOT_DOWN_RATE_W) // overshoot: cut hard, never raise
+        } else if climbing {
+            (0.0, DOWN_RATE_W)
         } else {
             (UP_RATE_W, DOWN_RATE_W)
         };
@@ -348,6 +413,7 @@ mod tests {
             measured_fan_rpm: measured,
             fan_target_rpm: target,
             fan_valid: true,
+            fan_slope_rpm_s: None,
         }
     }
 
@@ -545,6 +611,97 @@ mod tests {
         assert_eq!(a.step(&calm), (17.0, 2.0));
     }
 
+    // ---- allocator: velocity gate ----------------------------------------
+
+    #[test]
+    fn raise_blocked_while_fans_still_climbing() {
+        let c = contour_for(3000.0);
+        let mut a = Allocator::new();
+        // Below the band, candidate wants more on both axes — but the fans
+        // are still answering the previous pushes at +15 RPM/s.
+        let mut i = inp(&c, D_BOTH, 1700.0, 2000.0);
+        i.fan_slope_rpm_s = Some(15.0);
+        assert_eq!(a.step(&i), CONSERVATIVE_START, "raise must be gated");
+        assert_eq!(a.step(&i), CONSERVATIVE_START, "gate holds while climbing");
+        // At/below the gate the raise proceeds at the normal up rate...
+        i.fan_slope_rpm_s = Some(5.0);
+        assert_eq!(a.step(&i), (17.0, 32.0));
+        // ...and a FALLING fan (not overshooting) never blocks raises: the
+        // gate is one-sided per direction.
+        i.fan_slope_rpm_s = Some(-20.0);
+        assert_eq!(a.step(&i), (19.0, 34.0));
+    }
+
+    #[test]
+    fn gated_raise_still_allows_cuts() {
+        // Fans climbing fast AND the contour collapsed: the raise gate must
+        // not freeze the allocation — cuts proceed at the normal down rate.
+        let poor = contour_for(1200.0); // best candidate here is (54, 0)
+        let mut a = Allocator {
+            last: Some((30.0, 60.0)),
+        };
+        let mut i = inp(&poor, D_BOTH, 1700.0, 2000.0);
+        i.fan_slope_rpm_s = Some(15.0);
+        // cpu wants UP (blocked by the gate), gpu wants DOWN (full rate).
+        assert_eq!(a.step(&i), (30.0, 52.0));
+    }
+
+    #[test]
+    fn overshoot_cut_pauses_while_fans_already_falling_fast() {
+        // Field mechanism (2026-07): the backstop kept cutting all the way
+        // down the fall, and the stacked cuts became the undershoot leg.
+        // While the fans are already draining faster than the gate, HOLD.
+        let lying = |_pc: f64| Some(500.0);
+        let target = 3250.0;
+        let mut a = Allocator {
+            last: Some((28.0, 92.0)),
+        };
+        let mut i = inp(&lying, D_BOTH, target + 300.0, target);
+        i.fan_slope_rpm_s = Some(-15.0);
+        assert_eq!(a.step(&i), (28.0, 92.0), "pipeline draining: hold");
+        // The fall stalling with RPM still over the band resumes the
+        // mandatory cut (acoustic contract preserved)...
+        i.fan_slope_rpm_s = Some(-5.0);
+        assert_eq!(a.step(&i), (26.0, 90.0));
+        // ...and no slope estimate cuts exactly as before the gate existed.
+        i.fan_slope_rpm_s = None;
+        assert_eq!(a.step(&i), (24.0, 88.0));
+    }
+
+    #[test]
+    fn none_slope_allows_raises() {
+        // Auto entry has no fan history yet: gating raises on missing data
+        // would deadlock startup below the target (documented decision; the
+        // up rate limit bounds the risk).
+        let c = contour_for(3000.0);
+        let mut a = Allocator::new();
+        let i = inp(&c, D_BOTH, 1700.0, 2000.0); // fan_slope_rpm_s: None
+        assert_eq!(a.step(&i), (17.0, 32.0));
+    }
+
+    #[test]
+    fn floors_still_clamp_during_gated_holds() {
+        // Raise gated by a climbing fan: a raised floor still lifts cpu_w.
+        let c = contour_for(3000.0);
+        let mut a = Allocator {
+            last: Some((15.0, 30.0)),
+        };
+        let mut i = inp(&c, D_BOTH, 1700.0, 2000.0);
+        i.fan_slope_rpm_s = Some(15.0);
+        i.floors = (20.0, 1000);
+        assert_eq!(a.step(&i), (20.0, 30.0), "floor must lift a gated hold");
+        // Overshoot hold (falling fast): the floor still lifts there too —
+        // floors win over everything, velocity gates included.
+        let lying = |_pc: f64| Some(500.0);
+        let mut a = Allocator {
+            last: Some((15.0, 92.0)),
+        };
+        let mut i = inp(&lying, D_BOTH, 2300.0, 2000.0);
+        i.fan_slope_rpm_s = Some(-15.0);
+        i.floors = (20.0, 1000);
+        assert_eq!(a.step(&i), (20.0, 92.0));
+    }
+
     // ---- allocator: deadband ---------------------------------------------
 
     #[test]
@@ -687,6 +844,205 @@ mod tests {
         let out = a.step(&inp(&c, D_BOTH, 1700.0, 2000.0));
         assert!(out.0 <= CONSERVATIVE_START.0 + UP_RATE_W + 1e-9);
         assert!(out.1 <= CONSERVATIVE_START.1 + UP_RATE_W + 1e-9);
+    }
+
+    // ---- allocator: field-replay convergence -------------------------------
+
+    /// Plant + model parameters replaying the 2026-07 field limit cycle
+    /// (stable GPU-heavy load, fan target 3250 RPM: RPM oscillated
+    /// 3000↔3710 with only ~26% of samples in band while the GPU
+    /// allocation sawtoothed 57→77→57 W at the ±2 W/5 s rates).
+    ///
+    /// Plant: steady-state fan response rpm = K·gpu_w + C — 3250 RPM at
+    /// exactly 67 W, at ~46 RPM/W (the field swing: ~710 RPM across the
+    /// 57→77 W sawtooth) — reached through a [`SIM_DEAD_S`] transport
+    /// delay plus a first-order [`SIM_PLANT_TAU_S`] response ("fans lag
+    /// power ~15–25 s"). The 1 Hz readings carry ±[`SIM_NOISE_RPM`] of
+    /// tach jitter.
+    ///
+    /// Model: the calibration has drifted (summer ambient + dusty intake)
+    /// and now under-predicts RPM by a constant [`SIM_MODEL_BIAS_RPM`], so
+    /// the contour over-budgets by ~11 W — exactly the capture's regime:
+    /// the candidate always wants more watts than the target affords, and
+    /// the observed ±2 W/5 s power sawtooth is [`UP_RATE_W`] up against
+    /// the [`OVERSHOOT_MIN_CUT_W`] backstop down. The 500 RPM drift also
+    /// exceeds the trim's ±400 RPM authority, so the converged loop rests
+    /// near target + 100 RPM with the trim pinned (the real controller
+    /// additionally surfaces TargetUnreachable there, as designed).
+    const SIM_TARGET_RPM: f64 = 3250.0;
+    const SIM_PLANT_K: f64 = 46.0;
+    const SIM_PLANT_C: f64 = 168.0;
+    const SIM_PLANT_TAU_S: f64 = 15.0;
+    const SIM_DEAD_S: usize = 10;
+    const SIM_MODEL_BIAS_RPM: f64 = 500.0;
+    const SIM_NOISE_RPM: f64 = 25.0;
+
+    /// One closed-loop run at the controller's real cadences (1 Hz samples,
+    /// 5 s allocator steps, the steadiness-gated bounded trim every sample)
+    /// from the 30 W conservative start: the real [`Allocator`], the
+    /// controller's real slope estimator over the same fan window
+    /// (`controller::fan_slope_rpm_s`), and the real trim behind the real
+    /// `is_steady`/`tail_mean` gate. `gated` selects the allocator's slope
+    /// input: `None` reproduces the pre-gate allocator EXACTLY (both
+    /// velocity gates act only on `Some`). Deterministic (fixed xorshift
+    /// seed). Returns the 1 Hz true-RPM trace.
+    fn simulate_field_cycle(gated: bool, duration_s: usize) -> Vec<f64> {
+        use crate::calib::steady::{STEADY_N, STEADY_RPM_TOLERANCE, is_steady, tail_mean};
+        use crate::control::controller::fan_slope_rpm_s;
+        use crate::control::trim::Trim;
+
+        let mut alloc = Allocator::new();
+        let mut trim = Trim::new();
+        let mut window: std::collections::VecDeque<f64> = std::collections::VecDeque::new();
+        let mut gpu_w = CONSERVATIVE_START.1;
+        let mut pipe: std::collections::VecDeque<f64> =
+            std::iter::repeat_n(gpu_w, SIM_DEAD_S + 1).collect();
+        let mut rpm = SIM_PLANT_K * gpu_w + SIM_PLANT_C; // settled at the start
+        let mut trace = Vec::with_capacity(duration_s);
+        // Deterministic tach jitter (xorshift, fixed seed).
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut noise = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % 2001) as f64 / 1000.0 - 1.0 // uniform in [-1, 1]
+        };
+        for t in 0..duration_s {
+            // 1 Hz plant step + fan window (controller convention: cap 30).
+            pipe.push_back(gpu_w);
+            let felt = pipe.pop_front().unwrap();
+            rpm += (SIM_PLANT_K * felt + SIM_PLANT_C - rpm) / SIM_PLANT_TAU_S;
+            let measured = rpm + SIM_NOISE_RPM * noise();
+            if window.len() >= 30 {
+                window.pop_front();
+            }
+            window.push_back(measured);
+            // Allocator step every 5 s, slope off the same window the
+            // controller feeds it from.
+            if t % 5 == 0 {
+                let slope = if gated {
+                    fan_slope_rpm_s(window.make_contiguous())
+                } else {
+                    None
+                };
+                // The model's honest inversion of ITS OWN (biased) surface,
+                // trim-shifted like `gpu_watts_on_contour`.
+                let model_c = SIM_PLANT_C - SIM_MODEL_BIAS_RPM;
+                let offset = trim.offset_rpm();
+                let contour =
+                    move |_pc: f64| Some((SIM_TARGET_RPM - offset - model_c) / SIM_PLANT_K);
+                let (_, pg) = alloc.step(&AllocInput {
+                    contour: &contour,
+                    demand: D_GPU_ONLY, // GPU-heavy load: CPU pinned at floor
+                    floors: (15.0, 1000),
+                    measured_fan_rpm: measured,
+                    fan_target_rpm: SIM_TARGET_RPM,
+                    fan_valid: true,
+                    fan_slope_rpm_s: slope,
+                });
+                gpu_w = pg;
+            }
+            // Trim tier, every sample, steadiness-gated exactly like the
+            // controller: residual = steady-tail mean − (pre-trim) model
+            // prediction at the current operating point.
+            let w = window.make_contiguous();
+            if is_steady(w, STEADY_N, STEADY_RPM_TOLERANCE)
+                && let Some(steady_rpm) = tail_mean(w, STEADY_N)
+            {
+                let predicted = SIM_PLANT_K * gpu_w + SIM_PLANT_C - SIM_MODEL_BIAS_RPM;
+                trim.update_scaled(t as f64, steady_rpm, predicted, 1.0);
+            }
+            trace.push(rpm);
+        }
+        trace
+    }
+
+    /// (target crossings, in-band fraction) over the last 300 s.
+    fn cycle_metrics(trace: &[f64]) -> (usize, f64) {
+        let tail = &trace[trace.len() - 300..];
+        let crossings = tail
+            .windows(2)
+            .filter(|w| (w[0] - SIM_TARGET_RPM).signum() != (w[1] - SIM_TARGET_RPM).signum())
+            .count();
+        let in_band = tail
+            .iter()
+            .filter(|r| (**r - SIM_TARGET_RPM).abs() <= DEADBAND_RPM)
+            .count() as f64
+            / tail.len() as f64;
+        (crossings, in_band)
+    }
+
+    /// The field-replay A/B. Two horizons, one loop:
+    ///
+    /// UNGATED (slope `None` = the pre-fix allocator, bit-for-bit), 600 s
+    /// in: a relay with transport lag. The allocator keeps raising while
+    /// the fans are still climbing (the deadband hold needs rest INSIDE
+    /// the band, which never comes), the stacked watts overshoot, the
+    /// backstop cuts all the way down the drain, the undershoot re-arms
+    /// the raises — and the swing keeps the fan window unsteady, starving
+    /// the very trim that could fix the model bias. Measured here:
+    /// 8 target crossings and 66% in band over the last 300 s (field
+    /// capture: 26%). (Given a much longer horizon this sim's ungated
+    /// loop does eventually drift in-band — its noise-free-ish turnaround
+    /// dwells leak occasional steady windows to the trim, a leak the
+    /// field's deeper, dirtier cycle never had.)
+    ///
+    /// GATED, at the adaptation tier's honest timescale (900 s — the
+    /// trim's designed time constant is TRIM_PERIOD_S/KI_TRIM = 400 s, so
+    /// "climb, rest, let the trim walk 500 RPM of bias out of the
+    /// contour" physically cannot finish inside 600 s): the gate paces
+    /// raises to heard fan responses, the loop rests, the steadiness gate
+    /// opens, the trim re-anchors the contour, and the last 300 s sit at
+    /// 100% in band with ≤2 target crossings (robust across noise seeds:
+    /// 0–2 crossings, 100%).
+    /// Seconds the initial climb spends between 2000 and 3000 true RPM:
+    /// the signature of how hard the allocator pushes unheard power. The
+    /// pre-fix allocator raises at the full UP_RATE_W regardless of what
+    /// the fans have answered (≈ 18 RPM/s of committed steady-state here);
+    /// the velocity gate paces raises to heard responses (≾ the gate rate).
+    fn mid_climb_duration_s(trace: &[f64]) -> usize {
+        let at = |level: f64| trace.iter().position(|r| *r >= level).unwrap();
+        at(3000.0) - at(2000.0)
+    }
+
+    #[test]
+    fn velocity_gate_kills_the_fan_lag_limit_cycle() {
+        let old_trace = simulate_field_cycle(false, 600);
+        let gated_trace = simulate_field_cycle(true, 900);
+        // The mechanism, asserted directly: the pre-fix allocator climbs at
+        // the full up rate no matter what the fans have answered (55 s
+        // through 2000→3000 RPM here); the gate paces the climb to heard
+        // responses (103 s). This is the assertion that dies first if the
+        // gate is ever removed — the convergence metrics alone cannot,
+        // because given enough time the trim heals even this sim's ungated
+        // loop.
+        let old_climb = mid_climb_duration_s(&old_trace);
+        let gated_climb = mid_climb_duration_s(&gated_trace);
+        assert!(
+            2 * gated_climb >= 3 * old_climb,
+            "gated climb must be paced by the fan response: \
+             {old_climb} s ungated vs {gated_climb} s gated through 2000→3000 RPM"
+        );
+        let (old_crossings, old_in_band) = cycle_metrics(&old_trace);
+        assert!(
+            old_crossings > 6,
+            "ungated loop should limit-cycle: {old_crossings} crossings"
+        );
+        assert!(
+            old_in_band < 0.70,
+            "ungated loop should mostly miss the band: {:.0}% in band",
+            old_in_band * 100.0
+        );
+        let (crossings, in_band) = cycle_metrics(&gated_trace);
+        assert!(
+            crossings <= 2,
+            "gated loop must stop crossing the target: {crossings} crossings"
+        );
+        assert!(
+            in_band >= 0.85,
+            "gated loop must settle in band: {:.0}% in band",
+            in_band * 100.0
+        );
     }
 
     // ---- demand() ----------------------------------------------------------

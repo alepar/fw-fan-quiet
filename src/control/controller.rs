@@ -64,6 +64,11 @@ const RESUMED_FLAG_S: f64 = 30.0;
 /// steadiness gate (`is_steady` needs STEADY_N=20; a little slack beyond
 /// that is harmless).
 const FAN_WINDOW_CAP: usize = 30;
+/// Span (seconds ≙ 1 Hz samples) of the fan-slope estimate fed to the
+/// allocator's velocity gate: long enough to average sample-to-sample RPM
+/// jitter, short enough to see the mid-cycle 30–50 RPM/s transients the
+/// gate exists to catch (`allocator::SLOPE_GATE_RPM_S`).
+const FAN_SLOPE_SPAN_S: usize = 10;
 /// `TargetUnreachable` clears once the trim offset drops below this fraction
 /// of its +max — hysteresis so the flag doesn't flicker at the bound.
 const TRIM_CLEAR_FRACTION: f64 = 0.9;
@@ -332,6 +337,23 @@ impl AutoState {
             last_snapshot: None,
         }
     }
+}
+
+/// Fan-RPM slope estimate (RPM/s) over the last [`FAN_SLOPE_SPAN_S`] seconds
+/// of the Auto fan window: (newest − sample span back) / span across the
+/// 1 Hz samples. None when the window is shorter than span+1 samples or ANY
+/// sample in the span is non-finite (the fan-invalid-lands-as-NaN
+/// convention): a slope bridging a sensor outage is fiction. The allocator
+/// treats None as "insufficient evidence" and allows raises — see
+/// `AllocInput::fan_slope_rpm_s`. `pub(crate)` so the allocator's
+/// field-replay convergence test drives the exact estimator wired here.
+pub(crate) fn fan_slope_rpm_s(window: &[f64]) -> Option<f64> {
+    let start = window.len().checked_sub(FAN_SLOPE_SPAN_S + 1)?;
+    let span = &window[start..];
+    if span.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    Some((span[FAN_SLOPE_SPAN_S] - span[0]) / FAN_SLOPE_SPAN_S as f64)
 }
 
 /// Testable controller core. Owns the actuators through `RestoreGuard`, so
@@ -917,6 +939,11 @@ impl<R: Runner> Controller<R> {
             // hit the target. Floors still win — the allocator/PI clamps
             // bound the trim's effect (design invariant: floors > trim).
             let trim_rpm = auto.trim.offset_rpm();
+            // Fan slope off the same window that gates the trim: the
+            // allocator's velocity gate only pushes power when the fan
+            // response to previous pushes has been heard (2026-07 fan-lag
+            // limit-cycle fix; see `allocator::SLOPE_GATE_RPM_S`).
+            let fan_slope = fan_slope_rpm_s(auto.fan_window.make_contiguous());
             let contour = |pc: f64| model.gpu_watts_on_contour(target_rpm, trim_rpm, pc);
             let (cpu_w, gpu_w) = auto.allocator.step(&AllocInput {
                 contour: &contour,
@@ -925,6 +952,7 @@ impl<R: Runner> Controller<R> {
                 measured_fan_rpm: s.max_fan_rpm(),
                 fan_target_rpm: target_rpm,
                 fan_valid: s.fan_valid,
+                fan_slope_rpm_s: fan_slope,
             });
             // Bumpless retarget: the PI keeps its trim + rate reference.
             auto.pid.set_target_w(gpu_w);
@@ -2689,6 +2717,91 @@ mod tests {
             alloc_of(&effects),
             Some((17.0, 18.0)),
             "next step must consume the new target (gpu cut at the overshoot rate)"
+        );
+    }
+
+    #[test]
+    fn fan_slope_estimate_needs_full_valid_span() {
+        // Shorter than span+1 samples → None (insufficient evidence).
+        assert_eq!(fan_slope_rpm_s(&[1500.0; FAN_SLOPE_SPAN_S]), None);
+        // Flat 11-sample window → 0 RPM/s; a 100 RPM rise over the span →
+        // +10 RPM/s.
+        let mut w = vec![1500.0; FAN_SLOPE_SPAN_S + 1];
+        assert_eq!(fan_slope_rpm_s(&w), Some(0.0));
+        w[FAN_SLOPE_SPAN_S] = 1600.0;
+        assert_eq!(fan_slope_rpm_s(&w), Some(10.0));
+        // Only the span tail counts: older garbage (even NaN) is ignored.
+        let mut w = vec![f64::NAN; 5];
+        w.extend((0..=FAN_SLOPE_SPAN_S).map(|i| 1400.0 + 30.0 * i as f64));
+        assert_eq!(fan_slope_rpm_s(&w), Some(30.0));
+        // NaN inside the span (fan-invalid sample) → None: never estimate a
+        // slope across a sensor outage.
+        let mut w = vec![1500.0; FAN_SLOPE_SPAN_S + 1];
+        w[5] = f64::NAN;
+        assert_eq!(fan_slope_rpm_s(&w), None);
+    }
+
+    #[test]
+    fn rising_fan_window_gates_allocator_raises() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu_calls) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+
+        // Fans climbing 30 RPM/s toward the (still far) target: mid-cycle
+        // territory for the velocity gate.
+        let rising = |t: f64| Sample {
+            fan1_rpm: 1400.0 + 30.0 * t,
+            ..busy_at(t)
+        };
+        let mut allocs = Vec::new();
+        for t in 0..=10 {
+            if let Some(a) = alloc_of(&ctl.on_sample(&rising(f64::from(t)))) {
+                allocs.push(a);
+            }
+        }
+        // t=0 and t=5: window too short for a slope (None) → raises proceed.
+        assert_eq!(allocs[0], (17.0, 32.0));
+        assert_eq!(allocs[1], (19.0, 34.0));
+        // t=10: 11 samples of +30 RPM/s → the allocator holds the raise.
+        assert_eq!(allocs[2], allocs[1], "climbing fans must gate the raise");
+
+        // Fans flatten: once the slope span is flat again, raises resume.
+        let flat = |t: f64| Sample {
+            fan1_rpm: 1700.0,
+            ..busy_at(t)
+        };
+        let mut resumed = Vec::new();
+        for t in 11..=25 {
+            if let Some(a) = alloc_of(&ctl.on_sample(&flat(f64::from(t)))) {
+                resumed.push(a);
+            }
+        }
+        // t=15: the span still remembers the climb (slope > gate) → hold;
+        // t=20 and beyond: flat span → the raise proceeds again.
+        assert_eq!(resumed[0], allocs[2], "slope memory must keep the gate");
+        assert!(
+            resumed[1].0 > allocs[2].0 && resumed[1].1 > allocs[2].1,
+            "flat window must let raises proceed: {resumed:?}"
+        );
+    }
+
+    #[test]
+    fn flat_fan_window_lets_raises_proceed() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu_calls) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        // busy_at holds fan1_rpm at a constant 1700: every slope estimate is
+        // 0 RPM/s once the window fills, and the allocator keeps climbing at
+        // the up rate exactly as before the gate existed.
+        let mut allocs = Vec::new();
+        for t in 0..=15 {
+            if let Some(a) = alloc_of(&ctl.on_sample(&busy_at(f64::from(t)))) {
+                allocs.push(a);
+            }
+        }
+        assert_eq!(
+            allocs,
+            vec![(17.0, 32.0), (19.0, 34.0), (21.0, 36.0), (23.0, 38.0)]
         );
     }
 

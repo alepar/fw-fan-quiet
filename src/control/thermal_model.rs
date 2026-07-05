@@ -7,6 +7,8 @@
 
 use nalgebra::{DMatrix, DVector, Matrix4, Vector4};
 
+use crate::control::allocator::CPU_MAX_W;
+
 /// Excitation gate (Task 27 windup finding, quantified in the plan review):
 /// an RLS update is accepted only if the operating point moved by more than
 /// this (`|Δpc| + |Δpg|`, watts) since the last ACCEPTED update. At a
@@ -21,6 +23,28 @@ pub const RLS_TRACE_CAP: f64 = 1e6;
 /// slowly drifting operating point can keep passing the gate while still
 /// leaving directions unexcited, so the trace must stay bounded regardless.
 pub const RLS_TRACE_RESCALE_TO: f64 = 1e5;
+/// Contour-divisor floor (RPM per GPU watt): the smallest `b + e·pc` an
+/// adapted or fitted model may claim anywhere on the allocator's pc range
+/// `[0, CPU_MAX_W]`. A physical floor: 100 GPU watts must be able to move
+/// the fans by at least 200 RPM.
+///
+/// Field incident (2026-06): online RLS drifted a calibrated model
+/// (a=110.9, b=26.9, e=−0.47, c=−18.2) to a=62.5, b=35.9, e=−1.28, c=−105.
+/// At the live pc = 28 W the contour divisor `b + e·pc` was 0.18 — near
+/// zero, so `gpu_watts_on_contour` claimed GPU watts were acoustically
+/// free: the contour exploded to thousands of watts (clamped to 100) and
+/// the trim's ±400 RPM authority divided into nothing. The allocation
+/// stuck at (28, 92) with the fans indefinitely OVER the 3250 RPM target.
+/// The old slope-sanity gate rejected `a < 0` and `b < 0` but never
+/// guarded the DIVISOR; this floor closes that hole.
+pub const MIN_CONTOUR_DIVISOR: f64 = 2.0;
+
+/// True iff `b + e·pc >= MIN_CONTOUR_DIVISOR` for every pc in
+/// `[0, CPU_MAX_W]`. The divisor is linear in pc, so checking the two
+/// endpoints suffices.
+fn divisor_floor_ok(b: f64, e: f64) -> bool {
+    b >= MIN_CONTOUR_DIVISOR && b + e * CPU_MAX_W >= MIN_CONTOUR_DIVISOR
+}
 
 /// Fitted model parameters plus (transient) RLS covariance.
 ///
@@ -98,11 +122,29 @@ impl ThermalModel {
             return Err(FitError::Degenerate);
         }
         let theta = svd.solve(&y, eps).map_err(|_| FitError::Degenerate)?;
+        let (a, b, mut e, c) = (theta[0], theta[1], theta[2], theta[3]);
+        // Divisor-floor sanity (see [`MIN_CONTOUR_DIVISOR`]): a fit whose
+        // `b + e·pc` dips below the floor anywhere on [0, CPU_MAX_W] would
+        // hand the allocator a non-invertible contour. Clamp `e` up so the
+        // divisor at pc = CPU_MAX_W sits exactly at the floor, rather than
+        // erroring — a mediocre-but-invertible model beats a failed
+        // calibration; the caller's residuals are computed against the
+        // clamped model and stay honest.
+        if !divisor_floor_ok(b, e) {
+            let e_min = (MIN_CONTOUR_DIVISOR - b) / CPU_MAX_W;
+            let clamped = e.max(e_min);
+            tracing::warn!(
+                "fit_batch: contour divisor floor violated \
+                 (b={b:.3}, e={e:.4} -> min divisor over [0, {CPU_MAX_W}] W below \
+                 {MIN_CONTOUR_DIVISOR}); clamping e to {clamped:.4}"
+            );
+            e = clamped;
+        }
         Ok(ThermalModel {
-            a: theta[0],
-            b: theta[1],
-            e: theta[2],
-            c: theta[3],
+            a,
+            b,
+            e,
+            c,
             p: None,
             last_rls_point: None,
         })
@@ -137,8 +179,12 @@ impl ThermalModel {
     ///   [`RLS_EXCITATION_MIN_W`] (`|Δpc| + |Δpg|`) since the last ACCEPTED
     ///   update — same-point updates carry no information and only wind up
     ///   the covariance (the Task-27 review finding).
-    /// - Slope-sanity gate: any update that would make `a` or `b` negative —
-    ///   physics: more power can never mean less fan.
+    /// - Slope-sanity gate: any update that would make `a` negative
+    ///   (physics: more power can never mean less fan), or that would push
+    ///   the contour divisor `b + e·pc` below [`MIN_CONTOUR_DIVISOR`] for
+    ///   ANY pc in `[0, CPU_MAX_W]` — the 2026-06 field incident (see the
+    ///   constant's docs) was a drift past `b + e·pc ≈ 0` that sailed
+    ///   through the old `b < 0` check.
     ///
     /// After an accepted update, trace(P) is capped: above [`RLS_TRACE_CAP`]
     /// it is rescaled to [`RLS_TRACE_RESCALE_TO`], bounding how hard a noisy
@@ -164,10 +210,13 @@ impl ThermalModel {
         let k = px / (lambda + x.dot(&px));
         let err = rpm - self.predict(pc, pg);
         let theta = Vector4::new(self.a, self.b, self.e, self.c) + k * err;
-        // Slope-sanity gate: more power can never mean less fan. Reject the
-        // whole update (including the covariance step) so a poisoned sample
-        // leaves no trace.
-        if theta[0] < 0.0 || theta[1] < 0.0 {
+        // Slope-sanity gate: more power can never mean less fan, and the
+        // contour divisor `b + e·pc` must stay ≥ MIN_CONTOUR_DIVISOR across
+        // the whole pc range (linear in pc: both endpoints checked inside
+        // `divisor_floor_ok`). No divisor check on the `a` side — `a` never
+        // divides anything. Reject the whole update (including the
+        // covariance step) so a poisoned sample leaves no trace.
+        if theta[0] < 0.0 || !divisor_floor_ok(theta[1], theta[2]) {
             return false;
         }
         (self.a, self.b, self.e, self.c) = (theta[0], theta[1], theta[2], theta[3]);
@@ -184,11 +233,17 @@ impl ThermalModel {
     /// The ≤target-RPM contour: GPU watts as a function of CPU watts, with a
     /// trim offset added to `c`: `pg = (target − (c+trim) − a·pc) / (b + e·pc)`,
     /// clamped to >= 0. A clamped answer of `Some(0.0)` means "GPU gets
-    /// nothing at this pc", not "impossible". `None` only when the divisor
-    /// `b + e·pc <= 1e-9` (degenerate model).
+    /// nothing at this pc", not "impossible". `None` when the divisor
+    /// `b + e·pc < MIN_CONTOUR_DIVISOR / 2` (degenerate model): a near-zero
+    /// divisor turns the contour into thousands of phantom watts (the
+    /// 2026-06 field incident divided by 0.18), so an honest None → the
+    /// allocator's freeze path beats an insane Some. Half the floor, not
+    /// the floor itself, so a model gated AT the floor still answers;
+    /// belt-and-suspenders for a degenerate model inherited from disk that
+    /// never passed the RLS/fit gates.
     pub fn gpu_watts_on_contour(&self, target_rpm: f64, trim: f64, pc: f64) -> Option<f64> {
         let divisor = self.b + self.e * pc;
-        if divisor <= 1e-9 {
+        if divisor < MIN_CONTOUR_DIVISOR / 2.0 {
             return None;
         }
         let pg = (target_rpm - (self.c + trim) - self.a * pc) / divisor;
@@ -455,6 +510,89 @@ mod tests {
         // And RLS still works after deserialize (P re-initialized, excitation
         // gating fresh: even the SAME operating point is accepted again).
         assert!(back.rls_update(20.0, 40.0, truth_rpm(20.0, 40.0) + 10.0, 0.99));
+    }
+
+    // --- Contour divisor floor (2026-06 field incident) ---
+
+    #[test]
+    fn rls_rejects_divisor_floor_poison() {
+        // Params shaped like the drifted field model but still healthy:
+        // divisor at pc=54 is 35.9 − 0.47·54 ≈ 10.5.
+        let mut m = ThermalModel {
+            a: 62.5,
+            b: 35.9,
+            e: -0.47,
+            c: -105.0,
+            p: None,
+            last_rls_point: None,
+        };
+        let before = m.clone();
+        // Fresh P = I·1e4 at (50, 90): Δe ≈ pc·pg·err/|x|² ≈ −0.20 for
+        // err = −900, pushing the candidate e to ≈ −0.67 where
+        // b + e·54 ≈ −0.3 < MIN_CONTOUR_DIVISOR while a and b both stay
+        // positive — the old a<0/b<0 gate would have ACCEPTED this update.
+        let rpm = m.predict(50.0, 90.0) - 900.0;
+        assert!(!m.rls_update(50.0, 90.0, rpm, 0.99));
+        assert_eq!(m, before, "rejected update must leave no trace");
+        // A small innovation keeps the divisor ≥ MIN everywhere → accepted.
+        let rpm = m.predict(50.0, 90.0) - 50.0;
+        assert!(m.rls_update(50.0, 90.0, rpm, 0.99));
+        assert!(m.b >= MIN_CONTOUR_DIVISOR);
+        assert!(m.b + m.e * CPU_MAX_W >= MIN_CONTOUR_DIVISOR);
+    }
+
+    #[test]
+    fn contour_none_below_half_divisor_floor() {
+        // The field model's divisor at pc=28 was 0.18; even 0.5 must be
+        // None (was Some(thousands of phantom watts) under the 1e-9 test).
+        let m = ThermalModel {
+            a: 62.5,
+            b: 0.5,
+            e: 0.0,
+            c: -105.0,
+            p: None,
+            last_rls_point: None,
+        };
+        assert_eq!(m.gpu_watts_on_contour(3250.0, 0.0, 28.0), None);
+        // At/above half the floor the contour still answers: a gated model
+        // sits at ≥ MIN_CONTOUR_DIVISOR, comfortably above this threshold.
+        let m = ThermalModel {
+            b: 1.5,
+            ..m.clone()
+        };
+        assert!(m.gpu_watts_on_contour(3250.0, 0.0, 28.0).is_some());
+    }
+
+    #[test]
+    fn fit_batch_clamps_e_to_divisor_floor() {
+        // Truth surface shaped like the drifted field model: e so negative
+        // that b + e·54 ≈ −42. The fit must come back INVERTIBLE (e clamped
+        // up to the floor at pc = CPU_MAX_W, warn path), not error — a
+        // mediocre-but-invertible model beats a failed calibration.
+        let pts: Vec<CalibPoint> = POINTS
+            .iter()
+            .map(|&(pc, pg)| CalibPoint {
+                cpu_w: pc,
+                gpu_w: pg,
+                rpm: 62.5 * pc + 35.9 * pg - 1.28 * pc * pg - 105.0,
+            })
+            .collect();
+        let m = ThermalModel::fit_batch(&pts).unwrap();
+        assert!((m.a - 62.5).abs() < 1e-6, "a = {}", m.a);
+        assert!((m.b - 35.9).abs() < 1e-6, "b = {}", m.b);
+        let e_min = (MIN_CONTOUR_DIVISOR - m.b) / CPU_MAX_W;
+        assert!((m.e - e_min).abs() < 1e-6, "e = {} (want {e_min})", m.e);
+        assert!(m.b + m.e * CPU_MAX_W >= MIN_CONTOUR_DIVISOR - 1e-9);
+        // Residuals are recomputed against the CLAMPED model: at the high
+        // pc·pg corner the clamped e leaves a large, honest residual.
+        assert!(m.max_abs_residual(&pts) > 1000.0);
+        // And the clamped model's contour is answerable across the range.
+        for pc in [0.0, 28.0, CPU_MAX_W] {
+            assert!(
+                m.gpu_watts_on_contour(3250.0, 0.0, pc).is_some(),
+                "contour degenerate at pc={pc}"
+            );
+        }
     }
 
     // --- Task 27: windup gates ---

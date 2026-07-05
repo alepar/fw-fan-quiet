@@ -2655,12 +2655,15 @@ mod tests {
         assert_eq!(alloc_of(&effects), Some((19.0, 34.0)), "premise");
 
         // Live retarget: 1000 RPM turns the measured 1700 RPM into a 700 RPM
-        // overshoot on a collapsed contour — ups forbidden, hard cuts.
+        // overshoot on a collapsed contour — ups forbidden, hard cuts: gpu
+        // at the 16 W overshoot rate, cpu by the backstop's minimum 2 W cut
+        // (the candidate wants MORE cpu, but overshoot means every axis must
+        // genuinely decrease until the floors).
         ctl.on_command(Command::SetFanTarget(1000.0));
         let effects = ctl.on_sample(&busy_at(10.0));
         assert_eq!(
             alloc_of(&effects),
-            Some((19.0, 18.0)),
+            Some((17.0, 18.0)),
             "next step must consume the new target (gpu cut at the overshoot rate)"
         );
     }
@@ -3486,14 +3489,19 @@ mod tests {
         ctl.on_command(Command::SetAuto(true));
         let calib = fitted_model();
 
-        // busy_at: fan steady at 1700 while the model expects ~2030 at the
-        // walking allocation — a real drift. The first steady sample (t=19)
-        // must feed RLS (operating point fresh → excitation gate open).
+        // Fan steady at 2400 while the model expects ~2030 at the walking
+        // allocation — a real drift. The first steady sample (t=19) must
+        // feed RLS (operating point fresh → excitation gate open). The
+        // drift is on the POSITIVE side deliberately: a −330 RPM drift at a
+        // fresh covariance would be dumped into `e`, collapse the contour
+        // divisor and be rejected by the divisor-floor gate (see
+        // thermal_model::rls_rejects_divisor_floor_poison) — such a drift
+        // is the trim's job, not RLS's.
         let (ui_tx, _ui_rx) = crossbeam_channel::unbounded();
         let telemetry = Arc::new(Mutex::new(Some(Telemetry::open(&dir).unwrap())));
         let mut first_accept = None;
         for t in 0..=30 {
-            let effects = ctl.on_sample(&busy_at(f64::from(t)));
+            let effects = ctl.on_sample(&busy_fan_at(f64::from(t), 2400.0));
             if rls_accepts(&effects) > 0 && first_accept.is_none() {
                 first_accept = Some(t);
             }
@@ -3501,13 +3509,13 @@ mod tests {
         }
         assert_eq!(first_accept, Some(19), "first steady sample feeds RLS");
 
-        // The model moved TOWARD the measured 1700 at the operating point.
+        // The model moved TOWARD the measured 2400 at the operating point.
         let cpu_w = ctl.status().cpu_limit_w.unwrap();
         let gpu_w = ctl.auto.as_ref().unwrap().gpu_target_w.unwrap();
         let m = ctl.model.as_ref().unwrap();
         let (adapted, calibrated) = (m.predict(cpu_w, gpu_w), calib.predict(cpu_w, gpu_w));
         assert!(
-            (adapted - 1700.0).abs() < (calibrated - 1700.0).abs(),
+            (adapted - 2400.0).abs() < (calibrated - 2400.0).abs(),
             "prediction must move toward the drift: {adapted} vs {calibrated}"
         );
 
@@ -3614,11 +3622,15 @@ mod tests {
         assert!(!ctl.auto.as_ref().unwrap().distrusted, "gain restored");
 
         // And RLS unfreezes: excite the operating point again → an update
-        // is accepted once the point has moved past the gate.
+        // is accepted once the point has moved past the gate. The reading
+        // sits ABOVE the prediction: a flat PINNED_PREDICT_RPM while the
+        // GPU allocation walks up would imply "GPU watts don't move the
+        // fan" — exactly the degenerate surface the divisor-floor gate now
+        // (correctly) refuses to learn.
         ctl.on_command(Command::SetFanTarget(7000.0));
         let mut accepted = false;
         for t in cleared_at + 1..cleared_at + 30 {
-            let effects = ctl.on_sample(&busy_fan_at(f64::from(t), PINNED_PREDICT_RPM));
+            let effects = ctl.on_sample(&busy_fan_at(f64::from(t), PINNED_PREDICT_RPM + 250.0));
             if rls_accepts(&effects) > 0 {
                 accepted = true;
                 break;
@@ -3660,8 +3672,12 @@ mod tests {
 
         let (ui_tx, _ui_rx) = crossbeam_channel::unbounded();
         let telemetry = Arc::new(Mutex::new(Some(Telemetry::open(&dir).unwrap())));
+        // Fan drifted well ABOVE the prediction (2800 vs ~2030, still
+        // outside the 3000 RPM target's deadband): RLS adapts — the busy_at
+        // 1700 reading's negative innovation would collapse the contour
+        // divisor and be rejected by the divisor-floor gate.
         for t in 0..=125 {
-            let effects = ctl.on_sample(&busy_at(f64::from(t)));
+            let effects = ctl.on_sample(&busy_fan_at(f64::from(t), 2800.0));
             apply_effects(&effects, &ctl, f64::from(t), &ui_tx, &telemetry);
         }
         let path = {
@@ -3723,8 +3739,11 @@ mod tests {
             PathBuf::from("/nonexistent/config.toml"),
         );
         ctl.on_command(Command::SetAuto(true));
+        // Strong positive drift (fan 2800 over a ~2030 prediction, outside
+        // the 3000 RPM target's deadband): accepted by the divisor-floor
+        // gate, so RLS genuinely adapts in memory.
         for t in 0..=40 {
-            ctl.on_sample(&busy_at(f64::from(t)));
+            ctl.on_sample(&busy_fan_at(f64::from(t), 2800.0));
         }
 
         // In memory the model adapted (session-only)…

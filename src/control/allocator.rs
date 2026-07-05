@@ -15,7 +15,12 @@
 //!   ceiling is never urgent) but falls fast — and *twice* as fast on RPM
 //!   overshoot, because the acoustic contract is already broken and every
 //!   extra second over target is audible. Ups are forbidden entirely while
-//!   overshooting.
+//!   overshooting — and the cut is model-independent: while measured RPM
+//!   exceeds the target, every step must genuinely decrease both axes by at
+//!   least OVERSHOOT_MIN_CUT_W (down to the floors), so fans-over-target
+//!   drains power even when the model's contour is lying (2026-06 field
+//!   incident: a degenerate contour divisor parked the allocation over
+//!   target indefinitely).
 //!
 //! Floors simplification: the allocator enforces only the CPU floor. The GPU
 //! floor is a *clock* floor (MHz) and lives in the watts→clock PI's clamp
@@ -42,6 +47,17 @@ pub const DOWN_RATE_W: f64 = 8.0;
 /// DOWN_RATE_W: overshoot means the acoustic contract is already violated,
 /// so cutting hard beats staying audibly loud (research 03 §3 asymmetry).
 pub const OVERSHOOT_DOWN_RATE_W: f64 = 16.0;
+/// Minimum per-axis cut while the fan overshoots the target: the chosen
+/// candidate is capped at `last − OVERSHOOT_MIN_CUT_W` on BOTH axes, so an
+/// overshooting fan always drains power toward the floors even when the
+/// model's contour is lying (2026-06 field incident: a degenerate contour
+/// divisor claimed GPU watts were acoustically free, the candidate never
+/// dropped, and the allocation sat at (28, 92) with fans over the target
+/// indefinitely). The contour steers WHERE on the curve we sit; this
+/// backstop guarantees the DIRECTION when reality contradicts the model.
+/// Floors still clamp afterward and WIN: at the floors the cut stops —
+/// the designed "fans above target, floors held" terminal state.
+pub const OVERSHOOT_MIN_CUT_W: f64 = 2.0;
 /// RPM deadband around the fan target (≈ just-noticeable difference).
 pub const DEADBAND_RPM: f64 = 150.0;
 /// Power deadband: candidate moves smaller than this (on both axes, while
@@ -183,7 +199,11 @@ impl Allocator {
     ///    within DEADBAND_W of the held point on both axes → hold.
     /// 6. Rate limits vs the held point: up ≤ UP_RATE_W, down ≤ DOWN_RATE_W.
     ///    RPM overshoot (measured > target + DEADBAND_RPM) → ups forbidden,
-    ///    down ≤ OVERSHOOT_DOWN_RATE_W.
+    ///    down ≤ OVERSHOOT_DOWN_RATE_W, AND the candidate is capped at a
+    ///    genuine decrease of ≥ OVERSHOOT_MIN_CUT_W on both axes — the
+    ///    model-independent backstop: even a lying contour cannot hold an
+    ///    overshooting allocation in place (floors still clamp last and
+    ///    win, so the drain stops AT the floors).
     pub fn step(&mut self, inp: &AllocInput) -> (f64, f64) {
         debug_assert!(
             (0.0..=CPU_MAX_W).contains(&inp.floors.0),
@@ -213,14 +233,33 @@ impl Allocator {
             return prev;
         }
 
-        let (up, down) = if rpm_err > DEADBAND_RPM {
+        let overshoot = rpm_err > DEADBAND_RPM;
+        // Model-independent overshoot backstop (2026-06 field incident, see
+        // [`OVERSHOOT_MIN_CUT_W`]): measured fans OVER the target while the
+        // contour claims the current point is fine means the model is lying
+        // — cap the candidate at a genuine DECREASE on both axes so power
+        // always drains toward the floors. The contour steers WHERE on the
+        // curve we sit; this backstop guarantees the DIRECTION when reality
+        // contradicts the model.
+        let (cand_pc, cand_pg) = if overshoot {
+            (
+                cand_pc.min(prev.0 - OVERSHOOT_MIN_CUT_W),
+                cand_pg.min(prev.1 - OVERSHOOT_MIN_CUT_W),
+            )
+        } else {
+            (cand_pc, cand_pg)
+        };
+        let (up, down) = if overshoot {
             (0.0, OVERSHOOT_DOWN_RATE_W) // overshoot: cut hard, never raise
         } else {
             (UP_RATE_W, DOWN_RATE_W)
         };
         let out = (
             cand_pc.clamp(prev.0 - down, prev.0 + up).max(cpu_floor),
-            cand_pg.clamp(prev.1 - down, prev.1 + up),
+            // The pg floor here is 0 (the GPU *clock* floor lives in the
+            // watts→clock PI's clamp): the backstop's capped candidate may
+            // go negative near zero, the commanded watts target must not.
+            cand_pg.clamp(prev.1 - down, prev.1 + up).max(0.0),
         );
         self.last = Some(out);
         out
@@ -457,6 +496,53 @@ mod tests {
         let out = a.step(&inp(&richer, D_BOTH, 2300.0, 2000.0));
         assert!(out.0 <= prev.0 + 1e-9, "cpu rose during overshoot");
         assert!(out.1 <= prev.1 + 1e-9, "gpu rose during overshoot");
+    }
+
+    #[test]
+    fn overshoot_backstop_forces_decrease_when_contour_lies() {
+        // 2026-06 field incident: a degenerate contour divisor claimed huge
+        // "free" GPU watts, the candidate never dropped, and the allocation
+        // sat at (28, 92) with fans over target forever. The backstop must
+        // walk BOTH axes down by at least OVERSHOOT_MIN_CUT_W per step
+        // regardless of what the contour claims, stop AT the floors (never
+        // below), and resume normal behavior once back in band.
+        let lying = |_pc: f64| Some(500.0); // "GPU watts are acoustically free"
+        let target = 3250.0;
+        let mut a = Allocator {
+            last: Some((28.0, 92.0)),
+        };
+        let i = inp(&lying, D_BOTH, target + 300.0, target);
+        // First step: a genuine decrease on both axes, exactly the min cut
+        // (the lying candidate (54, 100) wants MORE of everything).
+        let first = a.step(&i);
+        assert_eq!(first, (26.0, 90.0));
+        // Repeated steps drain toward the floors and STOP there.
+        let mut prev = first;
+        for step in 0..60 {
+            let out = a.step(&i);
+            assert!(
+                out.0 >= 15.0 && out.1 >= 0.0,
+                "step {step}: below floors: {out:?}"
+            );
+            assert!(
+                out.0 <= (prev.0 - OVERSHOOT_MIN_CUT_W).max(15.0) + 1e-9,
+                "step {step}: cpu did not decrease: {} -> {}",
+                prev.0,
+                out.0
+            );
+            assert!(
+                out.1 <= (prev.1 - OVERSHOOT_MIN_CUT_W).max(0.0) + 1e-9,
+                "step {step}: gpu did not decrease: {} -> {}",
+                prev.1,
+                out.1
+            );
+            prev = out;
+        }
+        assert_eq!(prev, (15.0, 0.0), "terminal state is the floors");
+        // Back within target + DEADBAND_RPM: normal behavior resumes
+        // (up-rate-limited moves toward the candidate are allowed again).
+        let calm = inp(&lying, D_BOTH, target + 100.0, target);
+        assert_eq!(a.step(&calm), (17.0, 2.0));
     }
 
     // ---- allocator: deadband ---------------------------------------------

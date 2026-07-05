@@ -1003,6 +1003,18 @@ impl<R: Runner> Controller<R> {
         // (design invariant; non-steady/invalid samples freeze this tier
         // exactly like they freeze the allocator).
         //
+        // Online RLS is OFF by default (config `online_rls`): the 2026-06/07
+        // field sessions found that distrust mode — RLS frozen, trim-only
+        // adaptation — produced the BEST control behavior of the whole
+        // evening, while live slope adaptation double-corrected against the
+        // trim and was what walked `e` into the degenerate contour-divisor
+        // incident. Calibrated shape + bounded trim + fan feedback is the
+        // robust configuration; the flag stays available for
+        // experimentation. The trust monitor keeps running either way: the
+        // ModelDistrust flag remains valuable as a "recalibrate when
+        // convenient" hint, and the trim still drops to half gain while the
+        // evidence is suspect.
+        //
         // Separation of concerns: the trim absorbs offset drift FAST (hard-
         // bounded at ±400 RPM) while RLS reshapes the a/b/e/c surface only
         // under excitation — at a CONSTANT operating point `rls_update`'s
@@ -1045,10 +1057,15 @@ impl<R: Runner> Controller<R> {
             // stands (no evidence, no change).
             auto.distrusted =
                 auto.trust.observe(s.t_mono, (measured - predicted).abs()) == Trust::Distrust;
-            // RLS, frozen while distrusted: adapting toward readings we no
+            // RLS only when enabled (off by default, see the tier docs
+            // above) and not distrusted: adapting toward readings we no
             // longer trust would launder the fault into the model. The
-            // excitation + covariance gates live inside `rls_update`.
-            if !auto.distrusted && model.rls_update(cpu_w, gpu_w, measured, RLS_LAMBDA) {
+            // excitation + covariance + divisor-floor gates live inside
+            // `rls_update`.
+            if self.config.online_rls
+                && !auto.distrusted
+                && model.rls_update(cpu_w, gpu_w, measured, RLS_LAMBDA)
+            {
                 effects.push(Effect::RlsAccepted);
             }
             // Trim last, at half gain while distrusted.
@@ -2531,7 +2548,14 @@ mod tests {
         auto_controller(
             runner,
             PathBuf::from("/nonexistent/platform_profile"),
-            Config::default(),
+            // The Auto-mode behavior tests predate the RLS-off default and
+            // were written against live adaptation: they opt in explicitly.
+            // The production default (online_rls: false) is pinned by
+            // online_rls_off_by_default_keeps_model_frozen_but_trim_adapts.
+            Config {
+                online_rls: true,
+                ..Config::default()
+            },
         )
     }
 
@@ -3211,9 +3235,12 @@ mod tests {
         auto_controller(
             runner,
             PathBuf::from("/nonexistent/platform_profile"),
+            // online_rls: the pinned-op RLS/trust scenarios exercise live
+            // adaptation, so they opt in (see auto_controller_no_profile).
             Config {
                 cpu_floor_w: 54.0,
                 fan_target_rpm: 1000.0,
+                online_rls: true,
                 ..Config::default()
             },
         )
@@ -3712,6 +3739,49 @@ mod tests {
     }
 
     #[test]
+    fn online_rls_off_by_default_keeps_model_frozen_but_trim_adapts() {
+        // Field conclusion (2026-07): distrust mode — RLS frozen, trim-only
+        // adaptation — was empirically the best control behavior; online
+        // slope adaptation double-corrects against the trim and is what
+        // walked `e` into the degenerate-divisor incident. So the DEFAULT
+        // config runs with the calibrated shape and the trim as the only
+        // online corrector.
+        assert!(
+            !Config::default().online_rls,
+            "online RLS must be off by default"
+        );
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu_calls) = auto_controller(
+            &runner,
+            PathBuf::from("/nonexistent/platform_profile"),
+            Config::default(),
+        );
+        ctl.on_command(Command::SetAuto(true));
+
+        // The same strong steady drift that makes the RLS-on tests adapt.
+        let mut accepts = 0;
+        for t in 0..=40 {
+            accepts += rls_accepts(&ctl.on_sample(&busy_fan_at(f64::from(t), 2800.0)));
+        }
+        assert_eq!(accepts, 0, "no auto:rls Decisions with online_rls off");
+        // Model params bit-identical to the calibrated fit…
+        let calib = fitted_model();
+        let m = ctl.model.as_ref().unwrap();
+        assert_eq!(
+            (m.a, m.b, m.e, m.c),
+            (calib.a, calib.b, calib.e, calib.c),
+            "model must stay bit-identical to the calibration"
+        );
+        // …while the trim keeps absorbing the drift (measured above the
+        // prediction → positive offset = budget cut).
+        assert!(
+            ctl.status().trim_rpm > 0.0,
+            "trim must still adapt, got {}",
+            ctl.status().trim_rpm
+        );
+    }
+
+    #[test]
     fn online_rls_never_touches_the_persisted_state() {
         let runner = FakeRunner::new();
         let dir = std::env::temp_dir().join(format!(
@@ -3735,7 +3805,12 @@ mod tests {
             ),
             PersistedState::load(&state_path),
             state_path.clone(),
-            Config::default(),
+            // Live adaptation on: this test is ABOUT the adapted model
+            // never reaching the state file.
+            Config {
+                online_rls: true,
+                ..Config::default()
+            },
             PathBuf::from("/nonexistent/config.toml"),
         );
         ctl.on_command(Command::SetAuto(true));

@@ -23,6 +23,14 @@ pub struct Config {
     pub gpu_floor_mhz: u32,
     /// CPU fast (short-burst) PPT limit handed to ryzenadj, milliwatts.
     pub fast_limit_mw: u32,
+    /// Online RLS slope adaptation in Auto mode. OFF by default: the
+    /// 2026-06/07 field sessions found the distrust configuration — RLS
+    /// frozen, trim-only adaptation — gave the best control behavior of the
+    /// whole evening, while live slope adaptation double-corrected against
+    /// the trim and was what walked `e` into the degenerate contour-divisor
+    /// incident. Calibrated shape + bounded trim + fan feedback is the
+    /// robust configuration; set true to experiment with live adaptation.
+    pub online_rls: bool,
 }
 
 impl Default for Config {
@@ -32,6 +40,7 @@ impl Default for Config {
             cpu_floor_w: 15.0,
             gpu_floor_mhz: 1000,
             fast_limit_mw: 53_000,
+            online_rls: false,
         }
     }
 }
@@ -143,6 +152,7 @@ mod tests {
             cpu_floor_w: 12.0,
             gpu_floor_mhz: 1200,
             fast_limit_mw: 60_000,
+            online_rls: true,
         };
         config.save(&path).unwrap();
         assert_eq!(Config::load(&path), config);
@@ -201,6 +211,7 @@ mod tests {
         assert_eq!(config.cpu_floor_w, defaults.cpu_floor_w);
         assert_eq!(config.gpu_floor_mhz, defaults.gpu_floor_mhz);
         assert_eq!(config.fast_limit_mw, defaults.fast_limit_mw);
+        assert_eq!(config.online_rls, defaults.online_rls);
         fs::remove_dir_all(&dir).unwrap();
     }
 

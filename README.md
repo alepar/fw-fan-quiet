@@ -43,7 +43,7 @@ Flags (all optional):
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--config` | `/etc/bazerame-fans/config.toml` | User config (fan target, floors, fast limit) |
+| `--config` | `/etc/bazerame-fans/config.toml` | User config (see Configuration below) |
 | `--state-file` | `/var/lib/bazerame-fans/state.json` | Persisted calibration (model + LUT) |
 | `--telemetry-dir` | `/var/lib/bazerame-fans/telemetry` | JSONL telemetry logs |
 | `--log-dir` | `/var/lib/bazerame-fans/log` | Tracing logs |
@@ -51,6 +51,20 @@ Flags (all optional):
 Subcommand: `sudo ./target/release/bazerame-fans selftest` — exercises actuators and
 sensors end to end (~25 s, no TUI) and prints plain `[ OK ]`/`[FAIL]` lines. Run it once
 before trusting the app with a session.
+
+## Configuration
+
+TOML at the `--config` path; every key is optional (a partial file overrides only what it
+names, missing/corrupt files fall back to defaults). The fan target and floors are also
+editable live from the TUI and written back to this file.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `fan_target_rpm` | `3000.0` | Steady-state fan RPM Auto mode holds the machine at |
+| `cpu_floor_w` | `15.0` | CPU sustained-watts floor: Auto never allocates below this |
+| `gpu_floor_mhz` | `1000` | GPU locked-clock floor (MHz): Auto never locks below this |
+| `fast_limit_mw` | `53000` | CPU fast (short-burst) PPT limit handed to ryzenadj |
+| `online_rls` | `false` | Online RLS slope adaptation in Auto mode. Off by default: field sessions showed the calibrated shape + bounded trim + fan feedback is the robust configuration, while live slope adaptation double-corrects against the trim (and once walked the model into a degenerate contour). Set `true` to experiment |
 
 ## Keys
 
@@ -97,9 +111,14 @@ Press `a`. Every 5 s the allocator inverts the model to the current fan target's
 and splits the power budget by per-device starvation; a 1 Hz PI holds GPU watts at its
 allocation by moving the locked max clock along the calibrated LUT; the CPU side is
 open-loop `ryzenadj` limits, reasserted every 10 s and verified via RAPL. Short CPU
-bursts pass through untouched (the fast limit stays at stock). A bounded trim integrator
-(shown dim as `trim +N rpm`) absorbs ambient/dust drift, and online RLS keeps adapting
-the model within a trust monitor's leash.
+bursts pass through untouched (the fast limit stays at stock). The model's slopes come
+from the calibration; the online corrector is a bounded trim integrator (shown dim as
+`trim +N rpm`) that absorbs ambient/dust/offset drift. A trust monitor watches the
+model's steady-state residuals the whole time — `MODEL DISTRUST` is its
+"recalibrate when convenient" hint. Online RLS slope adaptation is off by default
+(field-validated as net-destabilizing; see Configuration) and can be enabled with
+`online_rls = true` for experimentation, in which case the trust monitor freezes it
+whenever the model goes suspect.
 
 Header flags you may see:
 
@@ -108,7 +127,7 @@ Header flags you may see:
 | `LIMIT-SLIP!` | RAPL keeps measuring above the commanded CPU limit; reasserting |
 | `NOT CALIBRATED` | Auto was requested without a calibrated model — run `k` |
 | `TARGET UNREACHABLE` | Even the maximum budget cut can't reach the fan target (floors held); check intake/ambient |
-| `MODEL DISTRUST` | Model predictions persistently wrong for 5+ min: RLS frozen, trim at half gain; recalibrate if it persists |
+| `MODEL DISTRUST` | Model predictions persistently wrong for 5+ min: trim runs at half gain (and RLS, if enabled, is frozen). Treat as a "recalibrate when convenient" hint |
 | `THERMAL EMERGENCY` | Tctl ≥ 95 °C or GPU ≥ 87 °C for 3 samples: everything released toward stock. Requires manual re-arm: the first actuating key (`a`, `c`/`g`, `k`) only acknowledges; the second acts |
 | `SENSOR LOST` | CPU temperature unreadable for 10 samples while limits were applied: assume hot, same release + re-arm semantics |
 | `resumed` | Suspend/resume detected: limits were reasserted, GPU persistence re-enabled, and the limit-slip watchdog runs stricter for 60 s |
@@ -141,8 +160,9 @@ controller review.
 
 ## File locations
 
-- `/etc/bazerame-fans/config.toml` — fan target, floors, fast limit (written back by the
-  in-app editors; missing/corrupt files fall back to defaults, never crash)
+- `/etc/bazerame-fans/config.toml` — fan target, floors, fast limit, `online_rls` (see
+  Configuration; written back by the in-app editors; missing/corrupt files fall back to
+  defaults, never crash)
 - `/var/lib/bazerame-fans/state.json` — calibration state (model + LUT)
 - `/var/lib/bazerame-fans/telemetry/` — JSONL telemetry, one file per run
 - `/var/lib/bazerame-fans/log/` — tracing logs

@@ -23,3 +23,8 @@ tracing-appender = "0.2"
 signal-hook = "0.3"
 clap = { version = "4", features = ["derive"] }
 color-eyre = "0.6"
+# LED matrix output (Framework 16 modules over USB CDC-ACM). termios puts the
+# tty into raw mode so binary frames aren't mangled; libc supplies O_NOCTTY.
+# Both are already in the tree transitively, so they add no new build cost.
+termios = "0.3"
+libc = "0.2"

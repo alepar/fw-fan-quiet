@@ -6,6 +6,7 @@ mod calib;
 mod config;
 mod control;
 mod event;
+mod led;
 mod logging;
 mod model;
 mod ring;
@@ -173,8 +174,19 @@ fn main() -> Result<()> {
     let (ctl_sample_tx, ctl_sample_rx) = unbounded::<Event>();
     let (cmd_tx, cmd_rx) = unbounded::<Command>();
     let shutdown = Arc::new(AtomicBool::new(false));
-    let sampler =
-        Sampler::new_system().spawn(vec![ui_tx.clone(), ctl_sample_tx], Arc::clone(&shutdown));
+
+    // LED wattage display: opens the modules up front. Its sample sender only
+    // joins the sampler fan-out when at least one module is live — otherwise a
+    // dropped receiver would make the sampler treat it as a dead subscriber and
+    // shut the whole pipeline down. The thread drains until the sampler drops
+    // its sender at shutdown; joined after the sampler so that drop happens.
+    let (led_sample_tx, led_sample_rx) = unbounded::<Event>();
+    let led = led::spawn(config.leds.clone(), led_sample_rx);
+    let mut sampler_txs = vec![ui_tx.clone(), ctl_sample_tx];
+    if led.is_some() {
+        sampler_txs.push(led_sample_tx);
+    }
+    let sampler = Sampler::new_system().spawn(sampler_txs, Arc::clone(&shutdown));
     let ctl = controller::spawn(
         Controller::new(guard, persisted, args.state_file, config, args.config),
         ctl_sample_rx,
@@ -246,6 +258,14 @@ fn main() -> Result<()> {
     }
     if sampler.join().is_err() {
         tracing::error!("sampler thread panicked");
+    }
+    // After the sampler: it held the only live led_sample sender, so its exit
+    // disconnects the LED channel, letting that thread blank the panels and
+    // return. A no-op when the feature was inert (`led` is None).
+    if let Some(led) = led {
+        if led.join().is_err() {
+            tracing::error!("led thread panicked");
+        }
     }
     // The input thread stays blocked in crossterm::event::read(). A
     // poll(100ms)+shutdown-flag loop would let it exit cleanly, but detaching

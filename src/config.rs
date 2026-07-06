@@ -31,6 +31,9 @@ pub struct Config {
     /// incident. Calibrated shape + bounded trim + fan feedback is the
     /// robust configuration; set true to experiment with live adaptation.
     pub online_rls: bool,
+    /// LED matrix wattage display (`[leds]` table). Optional feature; its own
+    /// `enabled` flag defaults on but a missing/failed module just stays dark.
+    pub leds: LedConfig,
 }
 
 impl Default for Config {
@@ -41,6 +44,59 @@ impl Default for Config {
             gpu_floor_mhz: 1000,
             fast_limit_mw: 53_000,
             online_rls: false,
+            leds: LedConfig::default(),
+        }
+    }
+}
+
+/// Configuration for the two Framework 16 LED Matrix modules (`[leds]`).
+///
+/// The two modules ship with an identical USB serial number, so they are
+/// addressed by their stable `by-path` USB-topology symlink rather than by
+/// serial. Defaults match THIS machine's bays (verified by lighting each
+/// panel): the left bay drives the CPU gauge, the right bay the GPU gauge. If
+/// the modules are ever swapped between bays, set `cpu_port`/`gpu_port`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct LedConfig {
+    /// Master switch for the whole LED feature.
+    pub enabled: bool,
+    /// Serial device for the CPU (left) gauge.
+    pub cpu_port: String,
+    /// Serial device for the GPU (right) gauge.
+    pub gpu_port: String,
+    /// Watts that fill the CPU panel to the top.
+    pub cpu_full_scale_w: f64,
+    /// Watts that fill the GPU panel to the top.
+    pub gpu_full_scale_w: f64,
+    /// Global PWM brightness sent to both modules (0-255).
+    pub brightness: u8,
+    /// Reverse the time axis (set if newest ends up at the bottom).
+    pub flip_time: bool,
+    /// Reverse the CPU (left) panel's wattage-bar growth direction.
+    pub cpu_flip_watts: bool,
+    /// Reverse the GPU (right) panel's wattage-bar growth direction.
+    pub gpu_flip_watts: bool,
+}
+
+impl Default for LedConfig {
+    fn default() -> Self {
+        LedConfig {
+            enabled: true,
+            cpu_port: "/dev/serial/by-path/pci-0000:c4:00.0-usb-0:4.2:1.0".to_string(),
+            gpu_port: "/dev/serial/by-path/pci-0000:c4:00.0-usb-0:3.3:1.0".to_string(),
+            cpu_full_scale_w: 60.0,
+            gpu_full_scale_w: 100.0,
+            brightness: 100,
+            // Within a column, LED index 0 is the panel's physical top
+            // (calibrated on this machine), so newest-on-top needs no time
+            // flip. Wattage bars grow "inside out" — from each panel's inner
+            // edge nearest the keyboard: the left (CPU) panel anchors on its
+            // right/inner edge (flipped), the right (GPU) panel on its
+            // left/inner edge (unflipped). Verified live on this machine.
+            flip_time: false,
+            cpu_flip_watts: true,
+            gpu_flip_watts: false,
         }
     }
 }
@@ -153,6 +209,17 @@ mod tests {
             gpu_floor_mhz: 1200,
             fast_limit_mw: 60_000,
             online_rls: true,
+            leds: LedConfig {
+                enabled: false,
+                cpu_port: "/dev/ttyACM9".to_string(),
+                gpu_port: "/dev/ttyACM8".to_string(),
+                cpu_full_scale_w: 45.0,
+                gpu_full_scale_w: 90.0,
+                brightness: 200,
+                flip_time: true,
+                cpu_flip_watts: false,
+                gpu_flip_watts: true,
+            },
         };
         config.save(&path).unwrap();
         assert_eq!(Config::load(&path), config);

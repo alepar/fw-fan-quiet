@@ -5,6 +5,7 @@
 
 pub mod allocator;
 pub mod controller;
+pub mod cooldown;
 pub mod gpu_pid;
 pub mod kalman;
 pub mod lut;

@@ -21,18 +21,30 @@
 //!
 //! Why the 2-state split cannot double-correct (the failure that got the
 //! 4-param RLS disabled: it and the trim both chased the same residual):
-//! the split is COVARIANCE-WEIGHTED, not absolute. On a fresh prior a
-//! high-`w` innovation legitimately moves `gain` first (w²·P0_GAIN ≫
-//! P0_BIAS), but each accepted sample at a held operating point collapses
-//! the gain variance toward `R/w²`, after which constant-point innovations
-//! move almost only `bias`; `gain` re-excites when the operating point
-//! jumps (or slowly, via Q_GAIN, over hours) — the idle→game onset is the
-//! highest-information gain measurement, weighted by the covariance
-//! accumulated while gain sat unexcited. So the two states cannot chase
-//! the same steady-state residual indefinitely: whichever direction the
-//! covariance still trusts absorbs it, then hands off to `bias`. The
-//! decoupling falls out of the covariance structure instead of being coded
-//! (no anchor lifecycle or secant bookkeeping).
+//! the split is COVARIANCE-WEIGHTED, not absolute — and the weights must
+//! make `bias` own the DC error. At a single operating point an absolute
+//! RPM error is CONFOUNDED between the states (it could be offset or
+//! slope); slope evidence only exists in the difference between two
+//! operating points, where the offset cancels. The tight [`P0_GAIN`] prior
+//! encodes exactly that: fresh-start innovations land on `bias`, and
+//! `gain` moves only as the operating point traverses different `w` values
+//! (or slowly, via `Q_GAIN`, over hours). So the two states cannot chase
+//! the same steady-state residual: `bias` absorbs it at whatever point the
+//! plant holds, and `gain` learns from the across-point changes `bias`
+//! cannot explain. The decoupling falls out of the covariance structure
+//! instead of being coded (no anchor lifecycle or secant bookkeeping).
+//!
+//! Field incident (2026-07-10, first validation run of this filter): the
+//! original prior (`P0_GAIN` = 0.25, std 0.5 "spans the clamp box") made
+//! the gain direction's effective prior at a game point worth
+//! `w²·P0_GAIN ≈ 360 000` RPM² against the bias's ~500 — so the FIRST
+//! gated sample after the onset (soak-low by the measured 80–160 RPM)
+//! handed ~97 % of its −490 RPM innovation to `gain`: 1.0 → 0.602, one
+//! step, to the clamp floor. The poisoned contour over-allocated, the loop
+//! rode a ±300 RPM relay cycle whose commanded point never rested 30 s,
+//! the cooldown gate (correctly) starved every further update, and the
+//! wrong gain froze — then persisted. Hence the tight prior AND
+//! [`MAX_GAIN_STEP`]: no single sample may decide the slope.
 //!
 //! Reject-whole corollary, so it is not rediscovered as a bug on hardware:
 //! while the TRUE plant sits outside the gain box (e.g. real slope > 1.6×
@@ -110,10 +122,25 @@ const Q_GAIN: f64 = 1.0e-4;
 /// gentle as the trim's first integration, never a cold-start lurch.
 const P0_BIAS: f64 = 526.0;
 
-/// Fresh gain prior variance: std 0.5 spans the [0.6, 1.6] clamp box, so
-/// the filter is maximally willing to learn the slope at the first onset
-/// (the highest-information gain measurement) instead of grinding there.
-const P0_GAIN: f64 = 0.25;
+/// Fresh gain prior variance (std 0.05), deliberately TIGHT — see the
+/// module docs' 2026-07-10 incident: a loose prior lets the first gated
+/// sample decide the slope from an absolute reading, where bias and gain
+/// are confounded. With the tight prior, `bias` (whose authority is
+/// bounded and whose mistakes unwind in minutes) owns the DC error first,
+/// and `gain` accumulates trust only across operating-point changes —
+/// the offset-cancelling secant discrimination the design intended,
+/// expressed as covariance structure.
+const P0_GAIN: f64 = 0.0025;
+
+/// Hard per-update bound on the gain step (dimensionless) — belt to
+/// [`P0_GAIN`]'s suspenders: no single sample may move the slope by more
+/// than 2 % no matter what the covariance believes. SATURATES rather than
+/// rejecting whole (unlike the gain BOX, which stays reject-whole):
+/// rejecting oversized steps would deadlock — a large true slope error
+/// keeps producing large candidates forever, so the state could never
+/// walk toward it. A true 0.3 gain error converges in ~15 accepted
+/// updates — a session or two, compounding through persistence (§4).
+pub const MAX_GAIN_STEP: f64 = 0.02;
 
 /// Covariance trace cap and rescale target — same belt-and-suspenders as
 /// `RLS_TRACE_CAP`/`RLS_TRACE_RESCALE_TO`: bounds how hard any single
@@ -244,10 +271,15 @@ impl Kalman {
         // All rejection gates passed: the update is ACCEPTED and consumes
         // the cadence slot even if the state ends up numerically unchanged.
         self.last_update_t = Some(t_mono);
-        // Bias clamp SATURATES so it can pin at ±max (flag semantics).
+        // Bias clamp SATURATES so it can pin at ±max (flag semantics); the
+        // gain step saturates at ±MAX_GAIN_STEP (2026-07-10 incident: one
+        // sample must never decide the slope). The saturated gain stays
+        // inside the box: it lies between theta[1] and candidate[1], both
+        // already inside.
+        let gain_step = (candidate[1] - self.theta[1]).clamp(-MAX_GAIN_STEP, MAX_GAIN_STEP);
         let next = Vector2::new(
             candidate[0].clamp(-MAX_BIAS_AUTHORITY_RPM, MAX_BIAS_AUTHORITY_RPM),
-            candidate[1],
+            self.theta[1] + gain_step,
         );
         let changed = next != self.theta;
         self.theta = next;
@@ -399,22 +431,52 @@ mod tests {
     }
 
     #[test]
-    fn learns_gain_at_gpu_heavy_point() {
-        // A HELD GPU-heavy operating point (w = 900 RPM of modeled GPU
-        // slope) with the plant's true slope 15% steeper than calibrated:
-        // on the fresh prior w²·P0_GAIN dominates, so the gain state
-        // absorbs the error even without an operating-point jump.
+    fn first_sample_cannot_decide_the_slope() {
+        // The 2026-07-10 field incident, replicated: fresh filter, first
+        // gated sample at a game point (w = 1200) reads 490 RPM below the
+        // corrected prediction (a soak-low first settlement). The original
+        // tuning handed ~97% of the innovation to gain — 1.0 → 0.602, one
+        // step, to the clamp floor — and the resulting relay cycle starved
+        // the cooldown gate so the wrong gain froze. Now: bias takes the
+        // DC share, and gain may move at most MAX_GAIN_STEP per update.
+        let mut kf = Kalman::new(0.0, 1.0);
+        let (baseline, w) = (2000.0, 1200.0);
+        let measured = baseline + 1.0 * w - 490.0;
+        assert!(kf.update(0.0, measured, baseline, w));
+        assert!(
+            kf.gain() >= 1.0 - MAX_GAIN_STEP - 1e-12,
+            "one sample slammed the gain: {}",
+            kf.gain()
+        );
+        assert!(kf.bias() < 0.0, "bias must take a share of the DC error");
+    }
+
+    #[test]
+    fn held_point_converges_on_target_without_gain_slams() {
+        // A HELD GPU-heavy operating point with a pure slope error: bias
+        // and gain are confounded there (any split with zero innovation
+        // explains the data), so the REQUIREMENTS are (a) the loop still
+        // lands on target, and (b) gain only ever creeps — never more than
+        // MAX_GAIN_STEP per update. The across-point attribution is
+        // asserted by gain_decouples_from_bias.
         const GAIN_TRUE: f64 = 1.15;
         const W: f64 = 900.0;
         let mut kf = Kalman::new(0.0, 1.0);
+        let mut max_step: f64 = 0.0;
         for i in 0..300 {
+            let before = kf.gain();
             let (measured, baseline) = step_plant(&kf, 3250.0, W, 0.0, GAIN_TRUE);
             kf.update(f64::from(i) * KF_PERIOD_S, measured, baseline, W);
+            max_step = max_step.max((kf.gain() - before).abs());
         }
-        let gain = kf.gain();
+        let (measured, _) = step_plant(&kf, 3250.0, W, 0.0, GAIN_TRUE);
         assert!(
-            (gain - GAIN_TRUE).abs() < 0.05,
-            "gain = {gain}, want ≈ {GAIN_TRUE}"
+            (measured - 3250.0).abs() < 10.0,
+            "fans must land on target, read {measured}"
+        );
+        assert!(
+            max_step <= MAX_GAIN_STEP + 1e-12,
+            "gain stepped {max_step} in one update"
         );
     }
 

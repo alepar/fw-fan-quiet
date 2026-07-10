@@ -75,6 +75,16 @@ const COMMANDED_RING_CAP: usize = 40;
 /// jitter, short enough to see the mid-cycle 30–50 RPM/s transients the
 /// gate exists to catch (`allocator::SLOPE_GATE_RPM_S`).
 const FAN_SLOPE_SPAN_S: usize = 10;
+/// Samples averaged into the smoothed fan RPM the allocator's band checks
+/// (deadband / raise gate / overshoot) see. A 5-sample tail mean halves the
+/// ~92 RPM soak-noise stdev (≈92 → ≈45) on the value those edges test, so a
+/// single tach blip from a near-edge equilibrium can no longer fire the
+/// mandatory overshoot drain — the exact mechanism of the field relay
+/// (run-1783720682, 2026-07-10). Detection of a genuine overshoot is delayed
+/// only ~2–3 s (30–50 RPM/s transients still cross within the span), an
+/// accepted trade. `pub(crate)` so the allocator's soak-cycle sim reads the
+/// same const it is wired from.
+pub(crate) const FAN_SMOOTH_N: usize = 5;
 /// `TargetUnreachable` clears once the KF bias drops below this fraction
 /// of its +max — hysteresis so the flag doesn't flicker at the bound.
 const TRIM_CLEAR_FRACTION: f64 = 0.9;
@@ -1042,17 +1052,27 @@ impl<R: Runner> Controller<R> {
             // KF's effect (design invariant: floors > adaptation).
             let bias = auto.kf.bias();
             let gain = auto.kf.gain();
-            // Fan slope off the same window that gates adaptation: the
-            // allocator's velocity gate only pushes power when the fan
-            // response to previous pushes has been heard (2026-07 fan-lag
-            // limit-cycle fix; see `allocator::SLOPE_GATE_RPM_S`).
-            let fan_slope = fan_slope_rpm_s(auto.fan_window.make_contiguous());
+            // Fan slope AND the smoothed RPM off the SAME window that gates
+            // adaptation (one borrow of the contiguous slice):
+            // - the slope feeds the allocator's velocity gate — only push
+            //   power when the fan response to previous pushes has been heard
+            //   (2026-07 fan-lag limit-cycle fix; see `SLOPE_GATE_RPM_S`);
+            // - the ~5 s tail mean feeds the deadband / raise-gate / overshoot
+            //   band checks: halving the soak-noise stdev stops a single tach
+            //   blip from a near-edge equilibrium firing the mandatory drain
+            //   (see `FAN_SMOOTH_N`, `allocator::RAISE_HOLD_RPM`). Fallback to
+            //   the raw latest sample when the window is broken by an outage
+            //   (NaN tail → `tail_mean` None) — conservative, today's value.
+            let fan_window = auto.fan_window.make_contiguous();
+            let fan_slope = fan_slope_rpm_s(fan_window);
+            let measured_fan_rpm =
+                tail_mean(fan_window, FAN_SMOOTH_N).unwrap_or_else(|| s.max_fan_rpm());
             let contour = |pc: f64| model.gpu_watts_on_contour(target_rpm, bias, gain, pc);
             let (cpu_w, gpu_w) = auto.allocator.step(&AllocInput {
                 contour: &contour,
                 demand,
                 floors: (self.config.cpu_floor_w, self.config.gpu_floor_mhz),
-                measured_fan_rpm: s.max_fan_rpm(),
+                measured_fan_rpm,
                 fan_target_rpm: target_rpm,
                 fan_valid: s.fan_valid,
                 fan_slope_rpm_s: fan_slope,
@@ -2968,6 +2988,101 @@ mod tests {
         );
     }
 
+    /// GPU-heavy soak sample: fan reading configurable, an invalid fan lands
+    /// as NaN in the window (the steady.rs convention). CPU stays idle so the
+    /// allocation rests GPU-only; the fan sits at the 3000 RPM default target,
+    /// so the raise gate holds the loop at the conservative (15, 30) start —
+    /// the fixed prior state every band-check assertion below cuts from.
+    fn soak_sample(t: f64, fan: f64, fan_valid: bool) -> Sample {
+        Sample {
+            t_mono: t,
+            gpu_util_pct: 100.0,
+            gpu_w: 40.0,
+            gpu_w_valid: true,
+            fan1_rpm: fan,
+            fan_valid,
+            cpu_temp_c: 60.0,
+            cpu_temp_valid: true,
+            ..Sample::default()
+        }
+    }
+
+    #[test]
+    fn allocator_sees_the_smoothed_fan_not_a_single_spike() {
+        // The band checks (deadband / raise gate / overshoot) must see the
+        // FAN_SMOOTH_N tail mean, not the last raw sample: one tach blip from
+        // a near-target equilibrium is exactly what fired the field relay
+        // (run-1783720682). A single +300 RPM spike on the last sample of an
+        // otherwise in-band window averages to target+60 across the 5-sample
+        // tail — under the +150 overshoot line — so the mandatory drain must
+        // NOT fire; five consecutive elevated samples DO cross it and cut.
+
+        // Single spike: warm 30 in-band samples (loop holds at (15, 30)), then
+        // one +300 blip at the t=30 allocator step.
+        let runner_a = FakeRunner::new();
+        let (mut ctl_a, _gpu_a) = auto_controller_no_profile(&runner_a);
+        ctl_a.on_command(Command::SetAuto(true));
+        for t in 0..=29 {
+            ctl_a.on_sample(&soak_sample(f64::from(t), 3000.0, true));
+        }
+        // t=30 alloc: tail = [3000, 3000, 3000, 3000, 3300] → mean 3060.
+        let spike = alloc_of(&ctl_a.on_sample(&soak_sample(30.0, 3300.0, true)))
+            .expect("t=30 is an allocator step");
+
+        // Sustained: the same held start, then five consecutive +300 samples
+        // fill the smoothing tail before the t=30 step.
+        let runner_b = FakeRunner::new();
+        let (mut ctl_b, _gpu_b) = auto_controller_no_profile(&runner_b);
+        ctl_b.on_command(Command::SetAuto(true));
+        for t in 0..=25 {
+            ctl_b.on_sample(&soak_sample(f64::from(t), 3000.0, true));
+        }
+        for t in 26..=29 {
+            ctl_b.on_sample(&soak_sample(f64::from(t), 3300.0, true));
+        }
+        // t=30 alloc: tail = [3300; 5] → mean 3300 > target + 150.
+        let sustained = alloc_of(&ctl_b.on_sample(&soak_sample(30.0, 3300.0, true)))
+            .expect("t=30 is an allocator step");
+
+        assert_eq!(
+            spike.1, 30.0,
+            "one blip must not cut the allocation: {spike:?}"
+        );
+        assert!(
+            sustained.1 < 30.0,
+            "five elevated samples must fire the drain: {sustained:?}"
+        );
+    }
+
+    #[test]
+    fn broken_smoothing_window_falls_back_to_the_raw_sample() {
+        // A fan-invalid sample (NaN) inside the last 5 breaks tail_mean → the
+        // allocator falls back to the RAW latest reading (design: fallback
+        // matters only when the CURRENT sample is valid but the window is
+        // broken — an invalid current sample takes the freeze path instead).
+        // The raw +300 value crosses the overshoot line even though the
+        // 5-sample MEAN would not (cf. the spike case above), proving the raw
+        // fallback — not a mean over the outage — reached the band check.
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        for t in 0..=25 {
+            ctl.on_sample(&soak_sample(f64::from(t), 3000.0, true));
+        }
+        ctl.on_sample(&soak_sample(26.0, 3000.0, true));
+        ctl.on_sample(&soak_sample(27.0, 0.0, false)); // fan invalid → NaN in tail
+        ctl.on_sample(&soak_sample(28.0, 3000.0, true));
+        ctl.on_sample(&soak_sample(29.0, 3000.0, true));
+        // t=30 alloc: tail = [3000, NaN, 3000, 3000, 3300] → tail_mean None →
+        // fallback to the raw 3300 → overshoot drain fires.
+        let out = alloc_of(&ctl.on_sample(&soak_sample(30.0, 3300.0, true)))
+            .expect("t=30 is an allocator step");
+        assert!(
+            out.1 < 30.0,
+            "raw fallback must drive the cut when smoothing is broken: {out:?}"
+        );
+    }
+
     #[test]
     fn config_floor_honored_with_zero_demand() {
         let runner = FakeRunner::new();
@@ -3547,24 +3662,24 @@ mod tests {
     /// lag, over a model that UNDER-predicts by a constant in-authority
     /// offset (the field bias). The fielded trim integrated this wind-up to
     /// its −400 pin within 3 minutes, overshot +810 RPM, limit-cycled, and
-    /// fired a false ModelDistrust. Adaptation v2's acceptance bar, all
-    /// asserted here: ZERO adaptation samples consumed for the whole run
-    /// (trust EWMA exactly 0 — the tier is gated BEFORE trust), bias
-    /// exactly 0, no ModelDistrust ever, overshoot a fraction of the
-    /// field's +810 RPM.
+    /// fired a false ModelDistrust.
     ///
-    /// Measured watch-item (deliberate design trade, for field validation):
-    /// under CONSTANT max demand this plant+allocator combo settles into a
-    /// mild residual relay cycle (~±100 RPM around target+80, commanded
-    /// point moving every ≤25 s), so the 30 s cooldown gate never opens and
-    /// the bias is never learned in-cycle — the gate starves adaptation
-    /// rather than let it poison itself (the incident's failure mode).
-    /// Learning happens at genuine ≥30 s dwells, which real fluctuating
-    /// loads provide and this adversarial constant-demand sim deliberately
-    /// does not (see kf_adaptation_waits_out_the_cooldown_window for the
-    /// dwell-then-learn path).
+    /// This test tracked the ORIGINAL adaptation-v2 watch-item: under CONSTANT
+    /// max demand the plant+allocator settled into a mild residual relay
+    /// (commanded point moving every ≤25 s), the 30 s cooldown gate never
+    /// opened, and the bias was never learned in-cycle — adaptation starved
+    /// rather than poisoned. The 2026-07-10 raise gate + RPM smoothing
+    /// (allocator::RAISE_HOLD_RPM, FAN_SMOOTH_N) RESOLVE exactly that
+    /// watch-item: the raise gate stops the re-climb at target−50 so the loop
+    /// finally RESTS ≥30 s, the cooldown opens (~t=165 here), and the KF
+    /// learns the in-authority under-prediction — driving the fans onto
+    /// target (mean |err| ≈16 RPM over the last 200 s, vs the relay it
+    /// replaced). The incident's own failure modes stay closed throughout:
+    /// no false ModelDistrust ever, and overshoot bounded to a fraction of
+    /// the field's +810 RPM. (Genuine ≥30 s dwells also learn on fluctuating
+    /// loads — see kf_adaptation_waits_out_the_cooldown_window.)
     #[test]
-    fn wind_up_staircase_produces_no_adaptation() {
+    fn wind_up_staircase_rests_and_adapts() {
         // Plant: fans reach `predict(pc, pg) + PLANT_BIAS` through a 10 s
         // dead time and a 15 s first-order response ("fans lag power
         // ~15-25 s late"); PLANT_BIAS is IN authority, so the whole error
@@ -3585,11 +3700,21 @@ mod tests {
         let mut move_count = 0u32; // commanded-point moves (staircase proof)
         let mut max_rpm: f64 = 0.0;
         let mut tail_abs_err = Vec::new();
+        // Mirror of the controller's cooldown ring (post-step command, one
+        // point per sample, same 40 s retention), for the mid-cycle guard
+        // below: it must use the real `cooldown_open` semantics, because a
+        // per-step move threshold is evaded by exactly the +2 W/5 s
+        // staircase — the incident's own lesson (cooldown.rs module docs).
+        let mut mirror: Vec<CommandedPoint> = Vec::new();
+        let (mut prev_trim, mut prev_gain) = (0.0_f64, 1.0_f64);
         for t in 0..900u32 {
             // Fans answer the COMMANDED point DEAD seconds late.
             let cmd = (
                 ctl.status().cpu_limit_w.unwrap_or(0.0),
-                ctl.auto.as_ref().and_then(|a| a.gpu_target_w).unwrap_or(0.0),
+                ctl.auto
+                    .as_ref()
+                    .and_then(|a| a.gpu_target_w)
+                    .unwrap_or(0.0),
             );
             let moved = last_cmd
                 .is_none_or(|(pc, pg)| (cmd.0 - pc).abs() > 0.1 || (cmd.1 - pg).abs() > 0.1);
@@ -3621,12 +3746,32 @@ mod tests {
                 !ctl.status().flags.contains(&StatusFlag::ModelDistrust),
                 "false ModelDistrust at t={t} (the incident's failure #4)"
             );
-            assert_eq!(
-                ctl.status().trim_rpm,
-                0.0,
-                "adaptation consumed a wind-up/mid-cycle sample at t={t}"
-            );
-            assert_eq!(ctl.status().gain, 1.0, "gain moved at t={t}");
+            // The incident's exact failure mode stays closed even though
+            // adaptation now resumes: every trim/gain move must coincide
+            // with a commanded point at REST per the real gate semantics —
+            // learning at genuine dwells only, never mid-staircase.
+            if let (Some(pc), Some(pg)) = (
+                ctl.status().cpu_limit_w,
+                ctl.auto.as_ref().and_then(|a| a.gpu_target_w),
+            ) {
+                if mirror.len() >= COMMANDED_RING_CAP {
+                    mirror.remove(0);
+                }
+                mirror.push(CommandedPoint {
+                    t_mono: f64::from(t),
+                    cpu_w: pc,
+                    gpu_w: pg,
+                });
+            }
+            if ctl.status().trim_rpm != prev_trim || ctl.status().gain != prev_gain {
+                assert!(
+                    cooldown::cooldown_open(&mirror, f64::from(t)),
+                    "adaptation consumed a mid-cycle sample at t={t} \
+                     (commanded point not at rest for the full window)"
+                );
+            }
+            prev_trim = ctl.status().trim_rpm;
+            prev_gain = ctl.status().gain;
             if t >= 700 {
                 tail_abs_err.push((rpm - TARGET).abs());
             }
@@ -3635,22 +3780,34 @@ mod tests {
         // A real staircase happened (the incident shape, not a trivial
         // hold): the onset climb alone moves the point ~25 times.
         assert!(move_count > 20, "no staircase: {move_count} moves");
-        // ZERO tier samples consumed: the trust EWMA still at exactly 0
-        // proves the cooldown gate stands BEFORE trust — the incident's
-        // false-distrust path (failure #4) is structurally closed, not
-        // just quiet.
-        assert_eq!(
-            ctl.auto.as_ref().unwrap().trust.ewma(),
-            0.0,
-            "the adaptation tier consumed at least one mid-cycle sample"
+        // The watch-item is RESOLVED, not merely quiet: the raise gate let
+        // the loop rest, so the cooldown opened and the adaptation tier
+        // CONSUMED samples (trust EWMA now > 0) and learned the in-authority
+        // under-prediction (positive trim shifts the contour down toward
+        // target). The pre-fix relay left both at exactly 0.
+        assert!(
+            ctl.auto.as_ref().unwrap().trust.ewma() > 0.0,
+            "adaptation must resume once the raise gate lets the loop rest"
         );
-        // The residual relay cycle (see the doc comment) stays acoustically
-        // bounded: mean |err| under one deadband, overshoot a fraction of
-        // the field's +810 RPM.
+        assert!(
+            ctl.status().trim_rpm > 0.0,
+            "the KF must learn the under-prediction: trim {}",
+            ctl.status().trim_rpm
+        );
+        // Gain stays inside the KF's tight prior — bias, not gain, carries a
+        // pure additive offset; this only guards against a runaway.
+        assert!(
+            (0.5..=2.0).contains(&ctl.status().gain),
+            "gain ran away: {}",
+            ctl.status().gain
+        );
+        // And the learning CONVERGES the loop onto target — the residual is
+        // now far inside the deadband (≈16 RPM measured), not the field's
+        // relay — while overshoot stays a fraction of the incident's +810.
         let mean_err = tail_abs_err.iter().sum::<f64>() / tail_abs_err.len() as f64;
         assert!(
             mean_err < 150.0,
-            "residual cycle out of band (mean |err| last 200 s = {mean_err:.0} RPM)"
+            "loop did not converge in band (mean |err| last 200 s = {mean_err:.0} RPM)"
         );
         assert!(
             max_rpm < TARGET + 400.0,
@@ -3819,8 +3976,7 @@ mod tests {
         // filter — and keeps learning FROM it (the one-time-cost rationale:
         // gain/bias are not relearned from scratch every session).
         let runner2 = FakeRunner::new();
-        let (mut ctl2, _g2) =
-            pinned_op_controller_with_state(&runner2, saved, state_path.clone());
+        let (mut ctl2, _g2) = pinned_op_controller_with_state(&runner2, saved, state_path.clone());
         ctl2.on_command(Command::SetAuto(true));
         assert_eq!(ctl2.status().trim_rpm, learned);
         assert_eq!(ctl2.status().gain, gain);
@@ -4035,7 +4191,10 @@ mod tests {
         assert_eq!(ctl.status().gain, 1.0);
         assert_eq!(ctl.status().mode, Mode::Monitor);
         ctl.on_command(Command::SetAuto(true));
-        assert!(ctl.status().trim_rpm > learned, "ReleaseAll must capture too");
+        assert!(
+            ctl.status().trim_rpm > learned,
+            "ReleaseAll must capture too"
+        );
     }
 
     #[test]

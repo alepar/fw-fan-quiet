@@ -28,6 +28,16 @@
 //!   in the field (2026-07) that made the loop a relay with transport lag
 //!   and a sustained ±350 RPM limit cycle around the target. See
 //!   [`SLOPE_GATE_RPM_S`].
+//! - Raise gate at target: raises are also forbidden once the reading is
+//!   within [`RAISE_HOLD_RPM`] of target. The band is thus: raise below
+//!   target−50, hold from target−50 to target+[`DEADBAND_RPM`], mandatory
+//!   drain above. This closes the second half of the same relay — even a
+//!   heard, non-climbing fan sitting just under the overshoot line must not
+//!   be pushed, because fan lag (≫ the step period) turns the in-flight watts
+//!   into an overshoot one crest later (2026-07 field run-1783720682: a
+//!   near-edge equilibrium relayed on soak noise alone). The reading the band
+//!   checks is the controller's ~5 s tail-mean of the fan RPM, so a single
+//!   tach blip cannot fire the drain.
 //!
 //! Floors simplification: the allocator enforces only the CPU floor. The GPU
 //! floor is a *clock* floor (MHz) and lives in the watts→clock PI's clamp
@@ -86,6 +96,23 @@ pub const OVERSHOOT_MIN_CUT_W: f64 = 2.0;
 pub const SLOPE_GATE_RPM_S: f64 = 10.0;
 /// RPM deadband around the fan target (≈ just-noticeable difference).
 pub const DEADBAND_RPM: f64 = 150.0;
+/// Raise-gate margin (RPM) below the target: raises are permitted only while
+/// the (smoothed) fan reading is more than this under target. Between
+/// target−RAISE_HOLD_RPM and the +DEADBAND_RPM overshoot line the loop holds
+/// — cuts stay available, but power never climbs.
+///
+/// Field run-1783720682 (gaming, demand pinned 1.0, CPU at its 15 W floor):
+/// the loop equilibrated at 3055 ± 92 RPM, sitting 95 RPM UNDER the
+/// target+150 overshoot line. Raises allowed anywhere up to +150 kept
+/// re-cresting that line: fan transport lag (20–30 s) is ≫ the 5 s step
+/// period, so 5–8 steps of in-flight watts overshoot after the reading
+/// finally answers — a self-sustaining 110–145 s relay, only 46% of samples
+/// in band. Gating raises at target−50 bounds in-flight watts to the
+/// below-target transit (~2–3 steps) so the crest lands in band and the hold
+/// engages. The −50 margin (not 0) also stops the slow noise-ratchet: without
+/// it, occasional low dips of the smoothed reading keep nudging +UP_RATE_W
+/// until equilibrium parks ~2σ above target, back at the trigger line.
+pub const RAISE_HOLD_RPM: f64 = 50.0;
 /// Power deadband: candidate moves smaller than this (on both axes, while
 /// RPM is in band) are noise, not demand shifts — hold the last point.
 pub const DEADBAND_W: f64 = 1.5;
@@ -193,7 +220,11 @@ pub struct AllocInput<'a> {
     /// GPU clock floor belongs to the watts→clock PI clamp (Task 24) — see
     /// the module docs.
     pub floors: (f64, u32),
-    /// Current `max(fan1, fan2)` RPM, for the deadband/overshoot checks.
+    /// Fan RPM for the deadband / raise-gate / overshoot checks: the
+    /// controller's ~5 s tail-mean of `max(fan1, fan2)` (halves the ~92 RPM
+    /// soak-noise stdev so a single tach blip cannot cross a band edge),
+    /// falling back to the raw latest sample when the smoothing window is
+    /// broken by an outage (NaN in the last 5).
     pub measured_fan_rpm: f64,
     pub fan_target_rpm: f64,
     pub fan_valid: bool,
@@ -243,18 +274,23 @@ impl Allocator {
     ///    default).
     /// 5. Deadband: RPM within ±DEADBAND_RPM of target AND the candidate
     ///    within DEADBAND_W of the held point on both axes → hold.
-    /// 6. Rate limits vs the held point: up ≤ UP_RATE_W, down ≤ DOWN_RATE_W.
-    ///    RPM overshoot (measured > target + DEADBAND_RPM) → ups forbidden,
-    ///    down ≤ OVERSHOOT_DOWN_RATE_W, AND the candidate is capped at a
-    ///    genuine decrease of ≥ OVERSHOOT_MIN_CUT_W on both axes — the
+    /// 6. Band structure vs the target on the (smoothed) reading, so the
+    ///    re-climb never carries enough in-flight watts to re-crest the
+    ///    overshoot line (2026-07 field relay fix, [`RAISE_HOLD_RPM`]):
+    ///    raises only below target − 50 (rate ≤ UP_RATE_W); hold between
+    ///    target − 50 and target + DEADBAND_RPM (cuts stay available at
+    ///    ≤ DOWN_RATE_W, power never climbs); mandatory-cut regime above
+    ///    target + DEADBAND_RPM (overshoot) — ups forbidden,
+    ///    down ≤ OVERSHOOT_DOWN_RATE_W, AND the candidate capped at a genuine
+    ///    decrease of ≥ OVERSHOOT_MIN_CUT_W on both axes (the
     ///    model-independent backstop: even a lying contour cannot hold an
-    ///    overshooting allocation in place (floors still clamp last and
-    ///    win, so the drain stops AT the floors).
+    ///    overshooting allocation in place; floors still clamp last and win,
+    ///    so the drain stops AT the floors).
     /// 7. Velocity gates ([`SLOPE_GATE_RPM_S`]): raises additionally
     ///    require the fan slope ≤ +gate (or None); the mandatory cut of 6
     ///    pauses (hold) while the slope is < −gate and resumes the moment
     ///    the fall stalls with RPM still over the band. Floors win over
-    ///    both gates, as over everything else.
+    ///    every gate, as over everything else.
     pub fn step(&mut self, inp: &AllocInput) -> (f64, f64) {
         debug_assert!(
             (0.0..=inp.cpu_max_w).contains(&inp.floors.0),
@@ -273,9 +309,13 @@ impl Allocator {
             return prev;
         }
 
-        let Some((cand_pc, cand_pg)) =
-            best_candidate(inp.contour, inp.demand, cpu_floor, inp.cpu_max_w, inp.gpu_max_w)
-        else {
+        let Some((cand_pc, cand_pg)) = best_candidate(
+            inp.contour,
+            inp.demand,
+            cpu_floor,
+            inp.cpu_max_w,
+            inp.gpu_max_w,
+        ) else {
             return prev; // degenerate contour everywhere → freeze
         };
 
@@ -327,9 +367,18 @@ impl Allocator {
         let climbing = inp
             .fan_slope_rpm_s
             .is_some_and(|slope| slope > SLOPE_GATE_RPM_S);
+        // Raise gate at target ([`RAISE_HOLD_RPM`]): once the smoothed reading
+        // is within −50 of target the loop must stop climbing, or in-flight
+        // watts (fan lag ≫ step period) re-crest the +150 line and re-arm the
+        // mandatory drain (field run-1783720682: raises allowed up to +150
+        // kept the loop in a self-sustaining relay, 46% in band). Both this
+        // gate and the climbing-velocity gate suppress raises; cuts stay at
+        // the normal down rate, and floors still win (the `.max(cpu_floor)`
+        // below).
+        let raise_held = rpm_err >= -RAISE_HOLD_RPM;
         let (up, down) = if overshoot {
             (0.0, OVERSHOOT_DOWN_RATE_W) // overshoot: cut hard, never raise
-        } else if climbing {
+        } else if climbing || raise_held {
             (0.0, DOWN_RATE_W)
         } else {
             (UP_RATE_W, DOWN_RATE_W)
@@ -624,9 +673,12 @@ mod tests {
             prev = out;
         }
         assert_eq!(prev, (15.0, 0.0), "terminal state is the floors");
-        // Back within target + DEADBAND_RPM: normal behavior resumes
-        // (up-rate-limited moves toward the candidate are allowed again).
-        let calm = inp(&lying, D_BOTH, target + 100.0, target);
+        // Genuinely back below target − RAISE_HOLD_RPM: the overshoot backstop
+        // releases and normal up-rate-limited moves toward the candidate
+        // resume. (target + 100 would now HOLD instead — that is inside the
+        // raise-gate band; see `raise_gate_leaves_the_overshoot_regime_unchanged`
+        // and the target+100 hold path.)
+        let calm = inp(&lying, D_BOTH, target - 100.0, target);
         assert_eq!(a.step(&calm), (17.0, 2.0));
     }
 
@@ -721,6 +773,79 @@ mod tests {
         assert_eq!(a.step(&i), (20.0, 92.0));
     }
 
+    // ---- allocator: raise gate at target ---------------------------------
+
+    #[test]
+    fn raise_gate_holds_within_the_margin() {
+        // Smoothed fan 40 RPM under target — inside the −RAISE_HOLD_RPM (−50)
+        // hold band — with slope None (not climbing) and a GPU-end candidate
+        // that wants far more watts: the raise must be suppressed anyway. The
+        // hold is the raise gate, NOT the deadband (the candidate (15, 100) is
+        // nowhere near DEADBAND_W of the (15, 30) held point).
+        let c = contour_for(3000.0);
+        let mut a = Allocator::new();
+        let i = inp(&c, D_GPU_ONLY, 1960.0, 2000.0); // rpm_err = −40 ≥ −50
+        assert_eq!(
+            a.step(&i),
+            CONSERVATIVE_START,
+            "raise held inside the margin"
+        );
+        assert_eq!(a.step(&i), CONSERVATIVE_START, "stays held across steps");
+    }
+
+    #[test]
+    fn raise_gate_opens_below_the_margin() {
+        // 20 RPM lower (rpm_err = −60 < −50): now genuinely below target, so
+        // the raise proceeds at the normal up rate (gpu 30 → 32).
+        let c = contour_for(3000.0);
+        let mut a = Allocator::new();
+        let i = inp(&c, D_GPU_ONLY, 1940.0, 2000.0);
+        assert_eq!(a.step(&i), (15.0, 32.0), "raise proceeds at UP_RATE_W");
+    }
+
+    #[test]
+    fn raised_floor_wins_over_the_raise_gate() {
+        // rpm_err = −30 (raises gated), but a raised CPU floor must still lift
+        // cpu_w — floors beat every gate, the raise gate included.
+        let c = contour_for(3000.0);
+        let mut a = Allocator {
+            last: Some((15.0, 30.0)),
+        };
+        let mut i = inp(&c, D_BOTH, 1970.0, 2000.0);
+        i.floors = (20.0, 1000);
+        let (cpu, _) = a.step(&i);
+        assert!(
+            (cpu - 20.0).abs() < 1e-9,
+            "floor must lift a raise-gated hold: cpu_w = {cpu}"
+        );
+    }
+
+    #[test]
+    fn raise_gate_leaves_the_overshoot_regime_unchanged() {
+        // Above target + DEADBAND_RPM the mandatory drain still governs: ups
+        // forbidden, the OVERSHOOT_MIN_CUT_W backstop and OVERSHOOT_DOWN_RATE_W
+        // both apply exactly as before the raise gate existed (the raise gate
+        // only reshapes the sub-target/hold bands, never the overshoot one).
+        let rich = contour_for(4000.0); // candidate wants MORE on both axes
+        let mut a = Allocator {
+            last: Some((30.0, 60.0)),
+        };
+        let i = inp(&rich, D_BOTH, 2200.0, 2000.0); // target + 200 → overshoot
+        let out = a.step(&i);
+        assert!(
+            out.0 <= 30.0 - OVERSHOOT_MIN_CUT_W + 1e-9,
+            "cpu must genuinely decrease: {out:?}"
+        );
+        assert!(
+            out.1 <= 60.0 - OVERSHOOT_MIN_CUT_W + 1e-9,
+            "gpu must genuinely decrease: {out:?}"
+        );
+        assert!(
+            out.1 >= 60.0 - OVERSHOOT_DOWN_RATE_W - 1e-9,
+            "gpu cut must not exceed the overshoot down rate: {out:?}"
+        );
+    }
+
     // ---- allocator: deadband ---------------------------------------------
 
     #[test]
@@ -743,10 +868,12 @@ mod tests {
     #[test]
     fn deadband_needs_both_axes_close() {
         // GPU candidate is 5 W away: RPM in band, but this is a real demand
-        // shift, not noise → must move.
+        // shift, not noise → must move. RPM at target − 100 (below the
+        // raise-gate margin) so the raise is genuinely permitted — this
+        // isolates the deadband's both-axes rule from the raise gate.
         let flat = |_pc: f64| Some(35.0);
         let mut a = Allocator::new();
-        let out = a.step(&inp(&flat, D_GPU_ONLY, 2000.0, 2000.0));
+        let out = a.step(&inp(&flat, D_GPU_ONLY, 1900.0, 2000.0));
         assert_eq!(out, (15.0, 32.0)); // rate-limited toward (15, 35)
     }
 
@@ -896,6 +1023,34 @@ mod tests {
     const SIM_MODEL_BIAS_RPM: f64 = 500.0;
     const SIM_NOISE_RPM: f64 = 25.0;
 
+    /// Soak-cycle plant replaying the 2026-07-10 overshoot-relay regime
+    /// (field run-1783720682: gaming, demand pinned 1.0, CPU at its 15 W
+    /// floor). The distinguishing feature vs [`simulate_field_cycle`] is the
+    /// noise: soak stdev ≈92 RPM (uniform ±160), an order of magnitude above
+    /// the earlier slope-gate capture — that noise, from an equilibrium
+    /// sitting just under the overshoot line, is the entire relay mechanism.
+    ///
+    /// The model over-budgets by a constant [`SOAK_MODEL_BIAS_RPM`], so the
+    /// honest contour inversion parks the TRUE settled RPM at target+55 (the
+    /// field's 3055 equilibrium): the +150 overshoot line is then only 95 RPM
+    /// (≈1σ of the raw sample, ≈2σ of the 5-sample tail mean) above the fully
+    /// raised equilibrium. Pre-fix (field baseline, not re-simulated — the
+    /// raise gate is unconditional code, not a flag): raises allowed to +150
+    /// let the loop climb to that equilibrium, single soak blips crossed the
+    /// line, fired the mandatory drain, and the 20–30 s transport lag turned
+    /// it into a self-sustaining 110–145 s relay, 46% in band. Gentle plant
+    /// (K=15 RPM/W, vs the field's 46) so the ±UP_RATE_W ratchet is fine
+    /// enough to park cleanly; dead time and tau as in the field.
+    const SOAK_TARGET_RPM: f64 = 3000.0;
+    const SOAK_PLANT_K: f64 = 15.0;
+    const SOAK_PLANT_C: f64 = 2100.0;
+    const SOAK_PLANT_TAU_S: f64 = 15.0;
+    const SOAK_DEAD_S: usize = 10;
+    /// Over-budget: honest inversion parks true settled RPM at target+this.
+    const SOAK_MODEL_BIAS_RPM: f64 = 55.0;
+    /// Uniform ±160 RPM tach jitter → stdev ≈92, the field soak figure.
+    const SOAK_NOISE_RPM: f64 = 160.0;
+
     /// One closed-loop run at the controller's real cadences (1 Hz samples,
     /// 5 s allocator steps, the steadiness-gated bounded trim every sample)
     /// from the 30 W conservative start: the real [`Allocator`], the
@@ -1009,17 +1164,19 @@ mod tests {
     /// never had.)
     ///
     /// GATED, at the adaptation tier's honest timescale for THIS plant
-    /// (4500 s): the gate paces raises to heard fan responses, the loop
-    /// rests, the steadiness gate opens and the control-error trim walks
-    /// the bias out of the contour. The walk is long by design: the paced
-    /// climb creeps slowly enough (≈3 RPM/s) to read as steady, winding
-    /// the trim ≈ −170 RPM while the fans are still under target, and the
-    /// 500 RPM bias exceeds the +400 authority — so the trim must cover
-    /// ≈570 RPM through the sawtooth's scarce steady dwells (≈190 RPM per
-    /// 1000 s measured) before the loop can rest, pinned at +400, at
-    /// target + 100 (inside the band; the real controller additionally
-    /// flags TargetUnreachable there, as designed). The last 300 s then
-    /// sit at 100% in band with 0 target crossings.
+    /// (12000 s): the slope gate paces raises to heard fan responses and the
+    /// steadiness gate opens so the control-error trim walks the bias out of
+    /// the contour, while the raise gate ([`RAISE_HOLD_RPM`]) caps the climb
+    /// at target−50. That cap is what stretches the horizon from the pre-gate
+    /// 4500 s: raises stop once the fans reach target−50, so the loop rests
+    /// UNDER target and only the scarce steady dwells there wind the trim
+    /// (the 500 RPM bias exceeds the +400 authority, so the trim must pin
+    /// before the loop can rest). The landing also drops: where the pre-gate
+    /// loop climbed to a target+100 pinned park, the raise gate now holds the
+    /// fans a hair under target and the pinned +400 trim covers the rest —
+    /// the loop parks at target+30 (3280, deterministic), nearer target and
+    /// still inside the band (the real controller flags TargetUnreachable at
+    /// the pin, as designed). The last 300 s sit at 100% in band, 0 crossings.
     /// Seconds the initial climb spends between 2000 and 3000 true RPM:
     /// the signature of how hard the allocator pushes unheard power. The
     /// pre-fix allocator raises at the full UP_RATE_W regardless of what
@@ -1033,7 +1190,16 @@ mod tests {
     #[test]
     fn velocity_gate_kills_the_fan_lag_limit_cycle() {
         let old_trace = simulate_field_cycle(false, 600);
-        let gated_trace = simulate_field_cycle(true, 4500);
+        // 12000 s, not 4500: the raise gate ([`RAISE_HOLD_RPM`]) caps the
+        // re-climb at target−50, so in this over-budgeted regime (500 RPM
+        // model bias ≫ the +400 trim authority) the trim walk to the pinned
+        // park is far slower than before the gate — the loop now spends most
+        // of the run below target, and only the scarce steady dwells there
+        // wind the trim. It DOES still converge, and to a LOWER, nearer-target
+        // landing than the pre-gate target+100: the gate holds it a hair under
+        // target while the pinned trim covers the rest, parking at target+30
+        // (3280) fully in band.
+        let gated_trace = simulate_field_cycle(true, 12000);
         // The mechanism, asserted directly: the pre-fix allocator climbs at
         // the full up rate no matter what the fans have answered (55 s
         // through 2000→3000 RPM here); the gate paces the climb to heard
@@ -1066,6 +1232,173 @@ mod tests {
             in_band >= 0.85,
             "gated loop must settle in band: {:.0}% in band",
             in_band * 100.0
+        );
+    }
+
+    /// Result of a soak-cycle run: the 1 Hz true-RPM trace plus the two
+    /// mechanism counters the fix is asserted on.
+    struct SoakRun {
+        trace: Vec<f64>,
+        /// Allocator steps after t=300 that entered the mandatory-overshoot
+        /// regime — i.e. the value FED to the band check crossed
+        /// target+DEADBAND_RPM. Zero is the "no spurious drain" property.
+        overshoot_steps_after_300: usize,
+        /// The commanded point rested ≥ WINDOW_S within TOL_W at least once
+        /// after t=300 — the un-starved-adaptation property (the field relay
+        /// starved this gate to 12 updates in 33 min).
+        cooldown_opened_after_300: bool,
+    }
+
+    /// The soak-cycle closed loop at the controller's real cadences, driving
+    /// the real [`Allocator`] with the real slope estimator, and — when
+    /// `fixed` — the real [`FAN_SMOOTH_N`] tail-mean into `measured_fan_rpm`
+    /// (the post-fix controller path). `fixed = false` feeds the raw latest
+    /// sample (pre-smoothing) with the gate still active — the raise gate is
+    /// unconditional code, so this is NOT a full pre-fix replay (that baseline
+    /// is field run-1783720682, cited above); it isolates the smoothing half.
+    /// No trim: the model bias is small and fixed, so the equilibrium stays
+    /// pinned at target+55 and the run tests the band policy alone (the field
+    /// run's KF was correctly starved, not wrong — the fix un-starves it,
+    /// asserted via `cooldown_open`). Deterministic (fixed xorshift seed).
+    fn simulate_soak_cycle(fixed: bool) -> SoakRun {
+        use crate::calib::steady::tail_mean;
+        use crate::control::controller::{FAN_SMOOTH_N, fan_slope_rpm_s};
+        use crate::control::cooldown::{CommandedPoint, WINDOW_S, cooldown_open};
+
+        let mut alloc = Allocator::new();
+        let mut window: std::collections::VecDeque<f64> = std::collections::VecDeque::new();
+        let mut gpu_w = CONSERVATIVE_START.1;
+        let mut cpu_w = CONSERVATIVE_START.0;
+        let mut pipe: std::collections::VecDeque<f64> =
+            std::iter::repeat_n(gpu_w, SOAK_DEAD_S + 1).collect();
+        let mut rpm = SOAK_PLANT_K * gpu_w + SOAK_PLANT_C; // settled at the start
+        // Commanded ring: 1 Hz, 40 s retention like the controller (> the
+        // gate's 30 s window so the coverage condition stays satisfiable).
+        let mut ring: std::collections::VecDeque<CommandedPoint> =
+            std::collections::VecDeque::new();
+        let mut trace = Vec::with_capacity(900);
+        let mut overshoot_steps_after_300 = 0usize;
+        let mut cooldown_opened_after_300 = false;
+        // Deterministic tach jitter (xorshift, fixed seed distinct from the
+        // field sim's so the two runs share no noise sequence).
+        let mut rng: u64 = 0xDEAD_BEEF_1234_5678;
+        let mut noise = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % 2001) as f64 / 1000.0 - 1.0 // uniform in [-1, 1]
+        };
+        for t in 0..900 {
+            // 1 Hz plant step + fan window (controller convention: cap 30).
+            pipe.push_back(gpu_w);
+            let felt = pipe.pop_front().unwrap();
+            rpm += (SOAK_PLANT_K * felt + SOAK_PLANT_C - rpm) / SOAK_PLANT_TAU_S;
+            let measured = rpm + SOAK_NOISE_RPM * noise();
+            if window.len() >= 30 {
+                window.pop_front();
+            }
+            window.push_back(measured);
+            if t % 5 == 0 {
+                let slope = fan_slope_rpm_s(window.make_contiguous());
+                // Post-fix feeds the smoothed reading; the raw branch isolates
+                // the smoothing half of the fix (gate still on either way).
+                let fed = if fixed {
+                    tail_mean(window.make_contiguous(), FAN_SMOOTH_N).unwrap_or(measured)
+                } else {
+                    measured
+                };
+                // Fixed, honest inversion of the model's own (biased) surface,
+                // no trim — the equilibrium stays at target+55.
+                let model_c = SOAK_PLANT_C - SOAK_MODEL_BIAS_RPM;
+                let contour = move |_pc: f64| Some((SOAK_TARGET_RPM - model_c) / SOAK_PLANT_K);
+                let out = alloc.step(&AllocInput {
+                    contour: &contour,
+                    demand: D_GPU_ONLY, // GPU-heavy load: CPU pinned at floor
+                    floors: (15.0, 1000),
+                    measured_fan_rpm: fed,
+                    fan_target_rpm: SOAK_TARGET_RPM,
+                    fan_valid: true,
+                    fan_slope_rpm_s: slope,
+                    cpu_max_w: CPU_MAX_W,
+                    gpu_max_w: GPU_MAX_W,
+                });
+                cpu_w = out.0;
+                gpu_w = out.1;
+                // Mandatory-overshoot regime, measured on the value the band
+                // check actually saw (design: instrument the fed value).
+                if t >= 300 && fed - SOAK_TARGET_RPM > DEADBAND_RPM {
+                    overshoot_steps_after_300 += 1;
+                }
+            }
+            // Commanded point every second (held between allocator steps),
+            // exactly like the controller's cooldown ring.
+            if ring.len() >= 40 {
+                ring.pop_front();
+            }
+            ring.push_back(CommandedPoint {
+                t_mono: t as f64,
+                cpu_w,
+                gpu_w,
+            });
+            if t as f64 >= 300.0 + WINDOW_S && cooldown_open(ring.make_contiguous(), t as f64) {
+                cooldown_opened_after_300 = true;
+            }
+            trace.push(rpm);
+        }
+        SoakRun {
+            trace,
+            overshoot_steps_after_300,
+            cooldown_opened_after_300,
+        }
+    }
+
+    /// In-band (±DEADBAND_RPM of the SOAK target) fraction over the last 300 s
+    /// — distinct from [`cycle_metrics`], which measures against the field
+    /// sim's 3250 target.
+    fn soak_in_band(trace: &[f64]) -> f64 {
+        let tail = &trace[trace.len() - 300..];
+        tail.iter()
+            .filter(|r| (**r - SOAK_TARGET_RPM).abs() <= DEADBAND_RPM)
+            .count() as f64
+            / tail.len() as f64
+    }
+
+    #[test]
+    fn raise_gate_and_smoothing_settle_the_soak_cycle() {
+        // Post-fix (smoothing + the raise gate, the real allocator): from the
+        // over-budgeted equilibrium 95 RPM under the +150 line — the field
+        // relay's exact geometry — the loop instead parks in band, drains
+        // nothing spuriously, and rests long enough to re-open the adaptation
+        // cooldown the field relay had starved (12 KF updates in 33 min). The
+        // pre-fix baseline is field run-1783720682 itself (46% in band, a
+        // self-sustaining 110–145 s relay): not re-simulated here, because the
+        // raise gate is unconditional code, not a flag.
+        let post = simulate_soak_cycle(true);
+        assert!(
+            soak_in_band(&post.trace) >= 0.90,
+            "post-fix must settle in band: {:.0}%",
+            soak_in_band(&post.trace) * 100.0
+        );
+        assert_eq!(
+            post.overshoot_steps_after_300, 0,
+            "no soak blip may fire the mandatory drain once smoothed"
+        );
+        assert!(
+            post.cooldown_opened_after_300,
+            "the rested commanded point must re-open the adaptation cooldown"
+        );
+
+        // The smoothing half, isolated (the raise gate is active on BOTH
+        // sides — it cannot be toggled off): feeding the raw latest sample
+        // instead of the FAN_SMOOTH_N tail mean lets single ±160 soak blips
+        // from the near-edge equilibrium cross the +150 line and fire the
+        // mandatory drain — the field mechanism. Smoothing removes them.
+        let raw = simulate_soak_cycle(false);
+        assert!(
+            raw.overshoot_steps_after_300 > post.overshoot_steps_after_300,
+            "smoothing must suppress the blip-triggered drains: raw {} vs smoothed {}",
+            raw.overshoot_steps_after_300,
+            post.overshoot_steps_after_300
         );
     }
 

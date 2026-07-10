@@ -3517,6 +3517,124 @@ mod tests {
         );
     }
 
+    /// Controller-level replay of the captured 2026-07-09 wind-up incident
+    /// (design §6): an idle→load onset drives the real allocator's +2 W/5 s
+    /// staircase while the fans answer through a dead-time + first-order
+    /// lag, over a model that UNDER-predicts by a constant in-authority
+    /// offset (the field bias). The fielded trim integrated this wind-up to
+    /// its −400 pin within 3 minutes, overshot +810 RPM, limit-cycled, and
+    /// fired a false ModelDistrust. Adaptation v2's acceptance bar, all
+    /// asserted here: ZERO adaptation samples consumed for the whole run
+    /// (trust EWMA exactly 0 — the tier is gated BEFORE trust), bias
+    /// exactly 0, no ModelDistrust ever, overshoot a fraction of the
+    /// field's +810 RPM.
+    ///
+    /// Measured watch-item (deliberate design trade, for field validation):
+    /// under CONSTANT max demand this plant+allocator combo settles into a
+    /// mild residual relay cycle (~±100 RPM around target+80, commanded
+    /// point moving every ≤25 s), so the 30 s cooldown gate never opens and
+    /// the bias is never learned in-cycle — the gate starves adaptation
+    /// rather than let it poison itself (the incident's failure mode).
+    /// Learning happens at genuine ≥30 s dwells, which real fluctuating
+    /// loads provide and this adversarial constant-demand sim deliberately
+    /// does not (see kf_adaptation_waits_out_the_cooldown_window for the
+    /// dwell-then-learn path).
+    #[test]
+    fn wind_up_staircase_produces_no_adaptation() {
+        // Plant: fans reach `predict(pc, pg) + PLANT_BIAS` through a 10 s
+        // dead time and a 15 s first-order response ("fans lag power
+        // ~15-25 s late"); PLANT_BIAS is IN authority, so the whole error
+        // is the KF's to absorb — at a genuine dwell.
+        const PLANT_BIAS: f64 = 250.0;
+        const TAU: f64 = 15.0;
+        const DEAD: usize = 10;
+        const TARGET: f64 = 3000.0; // Config::default() fan target
+        let m = fitted_model();
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu_calls) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+
+        let mut rpm = m.predict(0.0, 0.0) + PLANT_BIAS; // idle-settled fans
+        let mut pipe: std::collections::VecDeque<(f64, f64)> =
+            std::iter::repeat_n((0.0, 0.0), DEAD).collect();
+        let mut last_cmd: Option<(f64, f64)> = None;
+        let mut move_count = 0u32; // commanded-point moves (staircase proof)
+        let mut max_rpm: f64 = 0.0;
+        let mut tail_abs_err = Vec::new();
+        for t in 0..900u32 {
+            // Fans answer the COMMANDED point DEAD seconds late.
+            let cmd = (
+                ctl.status().cpu_limit_w.unwrap_or(0.0),
+                ctl.auto.as_ref().and_then(|a| a.gpu_target_w).unwrap_or(0.0),
+            );
+            let moved = last_cmd
+                .is_none_or(|(pc, pg)| (cmd.0 - pc).abs() > 0.1 || (cmd.1 - pg).abs() > 0.1);
+            if moved {
+                last_cmd = Some(cmd);
+                move_count += 1;
+            }
+            pipe.push_back(cmd);
+            let (fpc, fpg) = pipe.pop_front().unwrap();
+            rpm += (m.predict(fpc, fpg) + PLANT_BIAS - rpm) / TAU;
+            max_rpm = max_rpm.max(rpm);
+
+            // Achieved sample: draws track the commands, GPU-busy load.
+            let s = Sample {
+                t_mono: f64::from(t),
+                cpu_util_pct: 100.0,
+                gpu_util_pct: 100.0,
+                cpu_pkg_w: cmd.0,
+                gpu_w: cmd.1,
+                gpu_w_valid: true,
+                fan1_rpm: rpm,
+                fan_valid: true,
+                cpu_temp_c: 60.0,
+                cpu_temp_valid: true,
+                ..Sample::default()
+            };
+            ctl.on_sample(&s);
+            assert!(
+                !ctl.status().flags.contains(&StatusFlag::ModelDistrust),
+                "false ModelDistrust at t={t} (the incident's failure #4)"
+            );
+            assert_eq!(
+                ctl.status().trim_rpm,
+                0.0,
+                "adaptation consumed a wind-up/mid-cycle sample at t={t}"
+            );
+            assert_eq!(ctl.status().gain, 1.0, "gain moved at t={t}");
+            if t >= 700 {
+                tail_abs_err.push((rpm - TARGET).abs());
+            }
+        }
+
+        // A real staircase happened (the incident shape, not a trivial
+        // hold): the onset climb alone moves the point ~25 times.
+        assert!(move_count > 20, "no staircase: {move_count} moves");
+        // ZERO tier samples consumed: the trust EWMA still at exactly 0
+        // proves the cooldown gate stands BEFORE trust — the incident's
+        // false-distrust path (failure #4) is structurally closed, not
+        // just quiet.
+        assert_eq!(
+            ctl.auto.as_ref().unwrap().trust.ewma(),
+            0.0,
+            "the adaptation tier consumed at least one mid-cycle sample"
+        );
+        // The residual relay cycle (see the doc comment) stays acoustically
+        // bounded: mean |err| under one deadband, overshoot a fraction of
+        // the field's +810 RPM.
+        let mean_err = tail_abs_err.iter().sum::<f64>() / tail_abs_err.len() as f64;
+        assert!(
+            mean_err < 150.0,
+            "residual cycle out of band (mean |err| last 200 s = {mean_err:.0} RPM)"
+        );
+        assert!(
+            max_rpm < TARGET + 400.0,
+            "overshoot {:.0} RPM rivals the incident's +810",
+            max_rpm - TARGET
+        );
+    }
+
     #[test]
     fn non_steady_window_freezes_adaptation() {
         let runner = FakeRunner::new();

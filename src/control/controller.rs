@@ -4091,10 +4091,12 @@ mod tests {
         let (trim, gain) = (ctl.status().trim_rpm, ctl.status().gain);
         assert_eq!(trim, MAX_BIAS_AUTHORITY_RPM);
 
-        // FULL freeze while distrusted (design §1; the old tier kept
-        // integrating the trim at HALF gain here — half-weighting suspect
-        // evidence is rejected): 200 more flat/steady/achieved samples
-        // move NOTHING.
+        // Hold 200 more flat/steady/achieved samples of the same +750
+        // offset. This phase alone cannot prove the freeze (review
+        // mutation finding): at the +400 pin a POSITIVE innovation makes
+        // an unfrozen update a saturating no-op anyway (and w = 0 keeps
+        // the gain inert), so it only parks the trust EWMA at its ≈350
+        // floor for the probe below.
         for t in flagged_at + 1..=flagged_at + 200 {
             let s = achieved_fan_at(&ctl, f64::from(t), PINNED_PREDICT_RPM + 750.0);
             ctl.on_sample(&s);
@@ -4103,10 +4105,37 @@ mod tests {
         }
         assert!(ctl.status().flags.contains(&StatusFlag::ModelDistrust));
 
+        // The probe that BITES (design §1 "frozen ENTIRELY"; the old tier
+        // kept integrating the trim at HALF gain here): fans 200 RPM
+        // BELOW the corrected prediction — a NEGATIVE innovation, which an
+        // unfrozen filter would visibly absorb by walking the bias OFF the
+        // +400 clamp at its first cadence tick (a positive one would just
+        // re-saturate). The |200| residual sits UNDER the 300 RPM distrust
+        // threshold, so the EWMA decays from ≈350 toward 200 and would
+        // eventually clear the flag — the probe stays short (20 unsteady
+        // samples after the fan step + 15 gated ones, EWMA ≈ 311 at the
+        // end) and asserts the flag is STILL up on every sample, so the
+        // held state can only mean the freeze itself.
+        let probe_start = flagged_at + 201;
+        for t in probe_start..probe_start + 35 {
+            let s = achieved_fan_at(&ctl, f64::from(t), PINNED_PREDICT_RPM + trim - 200.0);
+            ctl.on_sample(&s);
+            assert!(
+                ctl.status().flags.contains(&StatusFlag::ModelDistrust),
+                "probe outlived the distrust flag at t={t}; shorten it"
+            );
+            assert_eq!(
+                ctl.status().trim_rpm,
+                trim,
+                "bias absorbed a negative innovation while distrusted (t={t})"
+            );
+            assert_eq!(ctl.status().gain, gain, "gain moved while distrusted");
+        }
+
         // Recovery: the plant falls back to what the CORRECTED model
         // expects (baseline + the pinned bias) — the residual goes to
         // zero, the EWMA decays under 300 and the flag clears.
-        let mut t = flagged_at + 201;
+        let mut t = probe_start + 35;
         let mut cleared_at = None;
         for _ in 0..200 {
             let s = achieved_fan_at(&ctl, f64::from(t), PINNED_PREDICT_RPM + trim);

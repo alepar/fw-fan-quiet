@@ -63,8 +63,10 @@ pub enum Record<'a> {
         alloc_gpu_w: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pi_target_w: Option<f64>,
-        /// Current trim offset (RPM); carried on every Auto-mode decision
-        /// (cause "auto:trim" marks the updates), None otherwise.
+        /// Current Kalman bias (RPM; the field keeps the historical "trim"
+        /// name so offline tooling reads old and new sessions alike);
+        /// carried on every Auto-mode decision (cause "auto:kf" marks the
+        /// updates), None otherwise.
         #[serde(skip_serializing_if = "Option::is_none")]
         trim_rpm: Option<f64>,
         /// Thermal-model parameters, carried ONLY on the periodic Auto-mode

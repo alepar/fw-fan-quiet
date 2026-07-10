@@ -36,6 +36,10 @@ pub struct CommandedPoint {
 ///   clear). Absence of evidence is not stationarity.
 /// - STATIONARITY: every point within the trailing window is within `TOL_W`
 ///   of the current (latest) commanded point on both legs.
+///
+/// Callers must retain ring history slightly BEYOND `WINDOW_S` (the
+/// controller keeps 40 s), or the coverage condition can never be satisfied
+/// and the gate silently stays closed forever.
 pub fn cooldown_open(ring: &[CommandedPoint], now: f64) -> bool {
     let Some(cur) = ring.last() else {
         return false;

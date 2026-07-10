@@ -10,6 +10,9 @@ pub mod gpu_pid;
 pub mod kalman;
 pub mod lut;
 pub mod thermal_model;
+// Superseded by `kalman` in production; retained test-only as the allocator
+// field-replay sim's minutes-scale adaptation stand-in.
+#[cfg(test)]
 pub mod trim;
 pub mod trust;
 pub mod watchdog;

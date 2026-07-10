@@ -1,6 +1,14 @@
 //! Bounded ambient trim integrator (design doc §3; research 03 §6 "bounded
 //! integrator authority — the key safeguard").
 //!
+//! SUPERSEDED (2026-07, adaptation v2): production adaptation is the
+//! 2-state Kalman filter in `kalman.rs`, whose `bias` state carries this
+//! integrator's role and safety contract 1:1. This module survives
+//! test-only (`#[cfg(test)]` in `control/mod.rs`) as the allocator's
+//! field-replay simulation stand-in (see `allocator.rs::simulate_field_cycle`)
+//! and as the historical reference for the control-error-not-residual
+//! lesson below.
+//!
 //! Slowest tier of the control cascade: integrates the CONTROL error
 //! (measured − target) fan RPM into an offset added to the thermal model's
 //! `c` (via `gpu_watts_on_contour`'s trim argument), so ambient/airflow/dust

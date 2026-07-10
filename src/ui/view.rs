@@ -96,11 +96,21 @@ fn header_line(model: &Model) -> Line<'static> {
             model.fan_target_rpm
         )),
     ];
-    // Ambient trim (Auto mode): informational, so dim — the loud version of
-    // this signal is the TargetUnreachable flag below.
+    // Kalman bias (Auto mode; keeps the trim-era "trim" label — same role):
+    // informational, so dim — the loud version of this signal is the
+    // TargetUnreachable flag below.
     if model.status.trim_rpm != 0.0 {
         spans.push(Span::styled(
             format!(" | trim {:+.0}rpm", model.status.trim_rpm),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    // Kalman gain (Auto mode): dim like the bias, shown only once it has
+    // moved off the identity — a learned GPU-slope correction is rare and
+    // worth a glance, a 1.00 would be noise.
+    if (model.status.gain - 1.0).abs() > 0.005 {
+        spans.push(Span::styled(
+            format!(" | gain x{:.2}", model.status.gain),
             Style::default().fg(Color::DarkGray),
         ));
     }
@@ -847,6 +857,50 @@ mod tests {
         // Default status has trim 0: no trim clutter in the header.
         let header = row_text(&draw(&Model::new()), 0);
         assert!(!header.contains("trim"), "header was: {header:?}");
+    }
+
+    #[test]
+    fn header_shows_gain_dim_when_off_identity() {
+        use crate::control::ControlStatus;
+        use crate::control::controller::Mode;
+        let mut m = Model::new();
+        m.update(Event::Status(ControlStatus {
+            mode: Mode::Auto,
+            cpu_limit_w: Some(17.0),
+            gpu_max_mhz: Some(1653),
+            fan_target_rpm: 3000.0,
+            gain: 1.12,
+            flags: vec![],
+            calib: None,
+            ..ControlStatus::default()
+        }));
+        let terminal = draw(&m);
+        let header = row_text(&terminal, 0);
+        assert!(header.contains("gain x1.12"), "header was: {header:?}");
+        let x = header.find("gain x1.12").unwrap() as u16;
+        let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
+        assert_eq!(cell.fg, Color::DarkGray, "gain must render dim");
+    }
+
+    #[test]
+    fn header_hides_gain_at_identity() {
+        // The default 1.0 gain (and anything that would DISPLAY as x1.00)
+        // is noise, not signal: hidden.
+        use crate::control::ControlStatus;
+        use crate::control::controller::Mode;
+        let mut m = Model::new();
+        m.update(Event::Status(ControlStatus {
+            mode: Mode::Auto,
+            cpu_limit_w: Some(17.0),
+            gpu_max_mhz: Some(1653),
+            fan_target_rpm: 3000.0,
+            gain: 1.002,
+            flags: vec![],
+            calib: None,
+            ..ControlStatus::default()
+        }));
+        let header = row_text(&draw(&m), 0);
+        assert!(!header.contains("gain"), "header was: {header:?}");
     }
 
     #[test]

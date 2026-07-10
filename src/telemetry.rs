@@ -69,6 +69,12 @@ pub enum Record<'a> {
         /// updates), None otherwise.
         #[serde(skip_serializing_if = "Option::is_none")]
         trim_rpm: Option<f64>,
+        /// Current Kalman gain (multiplier on the model's GPU-slope term),
+        /// carried on every Auto-mode decision alongside `trim_rpm` so the
+        /// two learned states are reviewable as one trajectory offline.
+        /// None (skipped) outside Auto.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        gain: Option<f64>,
         /// Thermal-model parameters, carried ONLY on the periodic Auto-mode
         /// "auto:model_snapshot" decisions (every 60 s): per-line params
         /// would be too heavy, one snapshot a minute keeps the online-RLS
@@ -316,6 +322,7 @@ mod tests {
             alloc_gpu_w: None,
             pi_target_w: None,
             trim_rpm: None,
+            gain: None,
             model_a: None,
             model_b: None,
             model_e: None,
@@ -374,6 +381,7 @@ mod tests {
             "alloc_gpu_w",
             "pi_target_w",
             "trim_rpm",
+            "gain",
             "model_a",
             "model_b",
             "model_e",

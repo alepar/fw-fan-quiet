@@ -1788,6 +1788,7 @@ fn apply_effects<R: Runner>(
             // analysis wants the trim context on allocate lines too);
             // non-auto lines skip it to stay lean.
             trim_rpm: (status.mode == Mode::Auto).then_some(status.trim_rpm),
+            gain: (status.mode == Mode::Auto).then_some(status.gain),
             model_a: model.map(|m| m.0),
             model_b: model.map(|m| m.1),
             model_e: model.map(|m| m.2),
@@ -3969,6 +3970,9 @@ mod tests {
         // well under one full step (the kalman.rs suite owns the exact
         // constants; here only the wiring and the sign are under test).
         assert!(offset > 0.0 && offset < 150.0, "trim_rpm = {offset}");
+        // Both learned states ride every Auto decision (Task 7): at the
+        // pinned point w = 0, so the gain must still read exactly 1.0.
+        assert_eq!(kf_line["gain"], 1.0, "gain missing/moved: {kf_line}");
 
         // The allocate line right after carries the current bias too.
         let alloc_line = decisions
@@ -3976,8 +3980,9 @@ mod tests {
             .find(|d| d["cause"] == "auto:allocate" && d["t_mono"] == 50.0)
             .unwrap_or_else(|| panic!("no t=50 allocate decision in {contents}"));
         assert_eq!(alloc_line["trim_rpm"], kf_line["trim_rpm"]);
+        assert_eq!(alloc_line["gain"], 1.0);
 
-        // Non-Auto decisions stay lean: no trim_rpm key.
+        // Non-Auto decisions stay lean: no trim_rpm/gain keys.
         let off_line = decisions
             .iter()
             .find(|d| d["cause"] == "auto:off")
@@ -3985,6 +3990,10 @@ mod tests {
         assert!(
             off_line.get("trim_rpm").is_none(),
             "trim_rpm must be skipped outside Auto: {off_line}"
+        );
+        assert!(
+            off_line.get("gain").is_none(),
+            "gain must be skipped outside Auto: {off_line}"
         );
 
         fs::remove_dir_all(&dir).unwrap();

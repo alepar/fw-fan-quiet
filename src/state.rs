@@ -44,7 +44,9 @@ impl Default for PersistedState {
             lut: None,
             calibrated_at: None,
             adapt_bias: 0.0,
-            adapt_gain: 1.0,
+            // Same source of truth as the field-level serde default: the
+            // legacy-file path and the fresh-start path must never diverge.
+            adapt_gain: default_gain(),
         }
     }
 }

@@ -2618,6 +2618,7 @@ mod tests {
             model: Some(fitted_model()),
             lut: Some(lut3()),
             calibrated_at: None,
+            ..PersistedState::default()
         }
     }
 
@@ -4313,6 +4314,7 @@ mod tests {
             model: None,
             lut: Some(lut.clone()),
             calibrated_at: None,
+            ..PersistedState::default()
         };
         let ctl: Controller<&FakeRunner> = Controller::new(
             RestoreGuard::new(&runner, None, None, None),

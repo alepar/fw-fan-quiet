@@ -11,7 +11,7 @@ use crate::config::write_atomic;
 use crate::control::lut::ClockWattsLut;
 use crate::control::thermal_model::ThermalModel;
 
-#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct PersistedState {
     /// Fitted thermal model; None until calibration has run.
@@ -20,6 +20,33 @@ pub struct PersistedState {
     pub lut: Option<ClockWattsLut>,
     /// When calibration finished, as a unix-seconds string.
     pub calibrated_at: Option<String>,
+    /// Persisted Kalman bias (RPM offset added to the model's `c`); the
+    /// covariance is deliberately NOT persisted (fresh prior each session,
+    /// mirroring `ThermalModel`'s serde-skipped `P`). Defaults to the
+    /// identity correction so a pre-v2 or fresh state file adapts from zero.
+    #[serde(default)]
+    pub adapt_bias: f64,
+    /// Persisted Kalman gain (multiplier on the model's GPU-slope term).
+    /// Defaults to 1.0 (identity). Reset to `[0, 1]` whenever a new
+    /// calibration lands (a fresh surface invalidates old corrections).
+    #[serde(default = "default_gain")]
+    pub adapt_gain: f64,
+}
+
+fn default_gain() -> f64 {
+    1.0
+}
+
+impl Default for PersistedState {
+    fn default() -> Self {
+        Self {
+            model: None,
+            lut: None,
+            calibrated_at: None,
+            adapt_bias: 0.0,
+            adapt_gain: 1.0,
+        }
+    }
 }
 
 impl PersistedState {
@@ -111,6 +138,7 @@ mod tests {
             model: Some(fitted_model()),
             lut: Some(lut3()),
             calibrated_at: Some("1751500000".to_string()),
+            ..PersistedState::default()
         };
         state.save(&path).unwrap();
         let back = PersistedState::load(&path);
@@ -162,6 +190,28 @@ mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         assert_eq!(names, vec!["state.json".to_string()]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn adapt_state_roundtrips_and_defaults_to_identity() {
+        // A pre-v2 state file has no adapt fields: serde(default) must load them
+        // as the identity correction (bias 0, gain 1), never panic.
+        let legacy = r#"{ "model": null, "lut": null, "calibrated_at": null }"#;
+        let s: PersistedState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(s.adapt_bias, 0.0);
+        assert_eq!(s.adapt_gain, 1.0);
+
+        // And a written pair survives the roundtrip.
+        let dir = fixture_dir("adapt");
+        let path = dir.join("state.json");
+        let saved = PersistedState {
+            adapt_bias: -137.0,
+            adapt_gain: 1.15,
+            ..PersistedState::default()
+        };
+        saved.save(&path).unwrap();
+        assert_eq!(PersistedState::load(&path), saved);
         fs::remove_dir_all(&dir).unwrap();
     }
 

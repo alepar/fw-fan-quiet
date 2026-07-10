@@ -490,6 +490,7 @@ impl CalibRunner {
                     model: Some(model),
                     lut: self.lut.clone(),
                     calibrated_at: Some(unix_secs_string()),
+                    ..PersistedState::default()
                 }));
                 effects.push(RunnerEffect::Finished);
                 self.phase = Phase::Done;

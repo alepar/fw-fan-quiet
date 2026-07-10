@@ -20,13 +20,26 @@
 //! innovation `r = measured − ŷ`.
 //!
 //! Why the 2-state split cannot double-correct (the failure that got the
-//! 4-param RLS disabled: it and the trim both chased the same residual): at
-//! a constant operating point `x` never changes direction, so innovations
-//! move only `bias`; `gain` moves only when the operating point jumps — the
-//! idle→game onset is the highest-information gain measurement, weighted by
-//! the covariance accumulated while gain sat unexcited. The decoupling
-//! falls out of the covariance structure instead of being coded (no anchor
-//! lifecycle or secant bookkeeping).
+//! 4-param RLS disabled: it and the trim both chased the same residual):
+//! the split is COVARIANCE-WEIGHTED, not absolute. On a fresh prior a
+//! high-`w` innovation legitimately moves `gain` first (w²·P0_GAIN ≫
+//! P0_BIAS), but each accepted sample at a held operating point collapses
+//! the gain variance toward `R/w²`, after which constant-point innovations
+//! move almost only `bias`; `gain` re-excites when the operating point
+//! jumps (or slowly, via Q_GAIN, over hours) — the idle→game onset is the
+//! highest-information gain measurement, weighted by the covariance
+//! accumulated while gain sat unexcited. So the two states cannot chase
+//! the same steady-state residual indefinitely: whichever direction the
+//! covariance still trusts absorbs it, then hands off to `bias`. The
+//! decoupling falls out of the covariance structure instead of being coded
+//! (no anchor lifecycle or secant bookkeeping).
+//!
+//! Reject-whole corollary, so it is not rediscovered as a bug on hardware:
+//! while the TRUE plant sits outside the gain box (e.g. real slope > 1.6×
+//! the model's), every candidate rejects whole — bias adaptation freezes at
+//! that operating point too, at caller rate, until the plant moves back
+//! into the box or the operating point changes. Deliberate: a plant that
+//! far off the surface needs recalibration, not a filter chasing it.
 //!
 //! No positive feedback: the allocator steers the plant onto the CORRECTED
 //! contour, i.e. it holds `baseline + bias + gain·w = target`.
@@ -202,8 +215,12 @@ impl Kalman {
         // Poisoned-input guard (the rls_update lesson): every comparison
         // with NaN is false, so a NaN would sail through the clamp check
         // below and poison state AND covariance in one update. Reject
-        // outright — no state change, no cadence consumption.
-        if !(measured.is_finite() && baseline.is_finite() && w.is_finite()) {
+        // outright — no state change, no cadence consumption. `t_mono` is
+        // included: a NaN time passes the cadence gate above (NaN compares
+        // false) and would land in `last_update_t`, bypassing the gate on
+        // the NEXT call too — silently collapsing τ from ~400 s to the
+        // caller's rate if the clock ever went bad persistently.
+        if !(t_mono.is_finite() && measured.is_finite() && baseline.is_finite() && w.is_finite()) {
             return false;
         }
         let p_minus = self.p + Matrix2::new(Q_BIAS, 0.0, 0.0, Q_GAIN);
@@ -382,10 +399,11 @@ mod tests {
     }
 
     #[test]
-    fn learns_gain_across_onsets() {
-        // A GPU-heavy operating point (w = 900 RPM of modeled GPU slope)
-        // with the plant's true slope 15% steeper than calibrated: the
-        // gain state absorbs it.
+    fn learns_gain_at_gpu_heavy_point() {
+        // A HELD GPU-heavy operating point (w = 900 RPM of modeled GPU
+        // slope) with the plant's true slope 15% steeper than calibrated:
+        // on the fresh prior w²·P0_GAIN dominates, so the gain state
+        // absorbs the error even without an operating-point jump.
         const GAIN_TRUE: f64 = 1.15;
         const W: f64 = 900.0;
         let mut kf = Kalman::new(0.0, 1.0);
@@ -465,6 +483,10 @@ mod tests {
         assert!(!kf.update(0.0, f64::NAN, 2000.0, 0.0));
         assert!(!kf.update(1.0, 2100.0, f64::INFINITY, 0.0));
         assert!(!kf.update(2.0, 2100.0, 2000.0, f64::NEG_INFINITY));
+        // A NaN clock is an input too: it would pass the cadence gate (NaN
+        // compares false) and, if accepted, poison `last_update_t` so the
+        // NEXT call also bypassed the gate.
+        assert!(!kf.update(f64::NAN, 2100.0, 2000.0, 0.0));
         assert_eq!(kf.snapshot(), before);
         // The garbage calls did not pin a cadence baseline: a clean call
         // right after still integrates immediately.

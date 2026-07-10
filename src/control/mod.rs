@@ -6,6 +6,7 @@
 pub mod allocator;
 pub mod controller;
 pub mod gpu_pid;
+pub mod kalman;
 pub mod lut;
 pub mod thermal_model;
 pub mod trim;

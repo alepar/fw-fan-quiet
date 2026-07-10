@@ -230,24 +230,41 @@ impl ThermalModel {
         true
     }
 
-    /// The ≤target-RPM contour: GPU watts as a function of CPU watts, with a
-    /// trim offset added to `c`: `pg = (target − (c+trim) − a·pc) / (b + e·pc)`,
-    /// clamped to >= 0. A clamped answer of `Some(0.0)` means "GPU gets
-    /// nothing at this pc", not "impossible". `None` when the divisor
-    /// `b + e·pc < MIN_CONTOUR_DIVISOR / 2` (degenerate model): a near-zero
-    /// divisor turns the contour into thousands of phantom watts (the
-    /// 2026-06 field incident divided by 0.18), so an honest None → the
-    /// allocator's freeze path beats an insane Some. Half the floor, not
-    /// the floor itself, so a model gated AT the floor still answers;
-    /// belt-and-suspenders for a degenerate model inherited from disk that
-    /// never passed the RLS/fit gates.
-    pub fn gpu_watts_on_contour(&self, target_rpm: f64, trim: f64, pc: f64) -> Option<f64> {
-        let divisor = self.b + self.e * pc;
+    /// The ≤target-RPM contour with the Kalman correction applied: GPU watts
+    /// as a function of CPU watts,
+    /// `pg = (target − (c + bias) − a·pc) / (g·(b + e·pc))`, clamped ≥ 0.
+    /// `bias` shifts `c` (the old trim role); `g` scales the whole GPU-slope
+    /// divisor. A clamped answer of `Some(0.0)` means "GPU gets nothing at
+    /// this pc", not "impossible". `None` when the SCALED divisor
+    /// `g·(b + e·pc) < MIN_CONTOUR_DIVISOR / 2` (degenerate): a near-zero
+    /// divisor turns the contour into thousands of phantom watts (the 2026-06
+    /// field incident divided by 0.18). With the fit-enforced
+    /// `b + e·pc ≥ MIN_CONTOUR_DIVISOR` and the Kalman gain clamped to
+    /// [0.6, 1.6], a healthy model's scaled divisor never drops below 1.2 —
+    /// the None path only guards a degenerate model inherited from disk that
+    /// never passed the fit/KF clamps.
+    pub fn gpu_watts_on_contour(
+        &self,
+        target_rpm: f64,
+        bias: f64,
+        gain: f64,
+        pc: f64,
+    ) -> Option<f64> {
+        let divisor = gain * (self.b + self.e * pc);
         if divisor < MIN_CONTOUR_DIVISOR / 2.0 {
             return None;
         }
-        let pg = (target_rpm - (self.c + trim) - self.a * pc) / divisor;
+        let pg = (target_rpm - (self.c + bias) - self.a * pc) / divisor;
         Some(pg.max(0.0))
+    }
+
+    /// The measurement model the Kalman filter regresses (design §1):
+    /// `rpm = a·pc + c + bias + g·(b·pg + e·pc·pg)`. Equals [`predict`] at
+    /// the identity correction `(bias = 0, gain = 1)`. Used for the trust
+    /// residual so the monitor grades the corrected surface we are actually
+    /// controlling with.
+    pub fn predict_corrected(&self, pc: f64, pg: f64, bias: f64, gain: f64) -> f64 {
+        self.a * pc + self.c + bias + gain * (self.b * pg + self.e * pc * pg)
     }
 }
 
@@ -452,19 +469,48 @@ mod tests {
     }
 
     #[test]
-    fn contour_roundtrip() {
+    fn contour_roundtrip_with_bias_and_gain() {
         let m = exact_model();
         let target = 3000.0;
-        for trim in [0.0, 100.0] {
-            for pc in [10.0, 25.0, 40.0] {
-                let pg = m.gpu_watts_on_contour(target, trim, pc).unwrap();
-                assert!(pg > 0.0, "expected unclamped contour at pc={pc}");
-                // With trim added to c, the *trimmed* model hits the target:
-                // predict + trim == target.
-                let rpm = m.predict(pc, pg) + trim;
-                assert!((rpm - target).abs() < 1e-6, "pc={pc} trim={trim} rpm={rpm}");
+        for bias in [0.0, 100.0, -80.0] {
+            for gain in [0.6, 1.0, 1.6] {
+                for pc in [10.0, 25.0, 40.0] {
+                    let pg = m.gpu_watts_on_contour(target, bias, gain, pc).unwrap();
+                    assert!(pg > 0.0, "expected unclamped contour at pc={pc}");
+                    // The corrected model hits the target exactly at (pc, pg).
+                    let rpm = m.predict_corrected(pc, pg, bias, gain);
+                    assert!(
+                        (rpm - target).abs() < 1e-6,
+                        "bias={bias} gain={gain} pc={pc} rpm={rpm}"
+                    );
+                }
             }
         }
+    }
+
+    #[test]
+    fn predict_corrected_is_predict_when_identity() {
+        let m = exact_model();
+        for (pc, pg) in [(10.0, 20.0), (30.0, 65.0)] {
+            assert!((m.predict_corrected(pc, pg, 0.0, 1.0) - m.predict(pc, pg)).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn contour_none_when_gain_shrinks_divisor_below_half_floor() {
+        // Divisor is now g·(b + e·pc); the None guard keys off the SCALED divisor.
+        let m = ThermalModel {
+            a: A,
+            b: 1.0,
+            e: 0.0,
+            c: C,
+            p: None,
+            last_rls_point: None,
+        };
+        // b=1.0, gain 0.6 -> scaled divisor 0.6 < MIN_CONTOUR_DIVISOR/2 = 1.0 -> None.
+        assert_eq!(m.gpu_watts_on_contour(3000.0, 0.0, 0.6, 10.0), None);
+        // gain 1.6 -> 1.6 >= 1.0 -> answerable.
+        assert!(m.gpu_watts_on_contour(3000.0, 0.0, 1.6, 10.0).is_some());
     }
 
     #[test]
@@ -472,7 +518,7 @@ mod tests {
         let m = exact_model();
         // Target below the zero-GPU floor at this pc: raw pg is negative,
         // clamped to 0.0 ("GPU gets nothing", not "impossible").
-        assert_eq!(m.gpu_watts_on_contour(500.0, 0.0, 10.0), Some(0.0));
+        assert_eq!(m.gpu_watts_on_contour(500.0, 0.0, 1.0, 10.0), Some(0.0));
         // Degenerate divisor b + e*pc <= 1e-9 -> None.
         let flat = ThermalModel {
             a: A,
@@ -482,7 +528,7 @@ mod tests {
             p: None,
             last_rls_point: None,
         };
-        assert_eq!(flat.gpu_watts_on_contour(3000.0, 0.0, 10.0), None);
+        assert_eq!(flat.gpu_watts_on_contour(3000.0, 0.0, 1.0, 10.0), None);
     }
 
     #[test]
@@ -553,14 +599,14 @@ mod tests {
             p: None,
             last_rls_point: None,
         };
-        assert_eq!(m.gpu_watts_on_contour(3250.0, 0.0, 28.0), None);
+        assert_eq!(m.gpu_watts_on_contour(3250.0, 0.0, 1.0, 28.0), None);
         // At/above half the floor the contour still answers: a gated model
         // sits at ≥ MIN_CONTOUR_DIVISOR, comfortably above this threshold.
         let m = ThermalModel {
             b: 1.5,
             ..m.clone()
         };
-        assert!(m.gpu_watts_on_contour(3250.0, 0.0, 28.0).is_some());
+        assert!(m.gpu_watts_on_contour(3250.0, 0.0, 1.0, 28.0).is_some());
     }
 
     #[test]
@@ -589,7 +635,7 @@ mod tests {
         // And the clamped model's contour is answerable across the range.
         for pc in [0.0, 28.0, CPU_MAX_W] {
             assert!(
-                m.gpu_watts_on_contour(3250.0, 0.0, pc).is_some(),
+                m.gpu_watts_on_contour(3250.0, 0.0, 1.0, pc).is_some(),
                 "contour degenerate at pc={pc}"
             );
         }

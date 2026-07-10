@@ -967,7 +967,8 @@ impl<R: Runner> Controller<R> {
             // response to previous pushes has been heard (2026-07 fan-lag
             // limit-cycle fix; see `allocator::SLOPE_GATE_RPM_S`).
             let fan_slope = fan_slope_rpm_s(auto.fan_window.make_contiguous());
-            let contour = |pc: f64| model.gpu_watts_on_contour(target_rpm, trim_rpm, pc);
+            // Identity gain until the Kalman tier lands (adaptation v2 Task 5).
+            let contour = |pc: f64| model.gpu_watts_on_contour(target_rpm, trim_rpm, 1.0, pc);
             let (cpu_w, gpu_w) = auto.allocator.step(&AllocInput {
                 contour: &contour,
                 demand,
@@ -3722,8 +3723,8 @@ mod tests {
         // The model is still calibrated, so both contours are exact:
         // untrimmed (4000 − 800 − 25·54)/20.4 ≈ 90.7 W, trimmed ≈ 85.8 W.
         let m = ctl.model.as_ref().unwrap();
-        let untrimmed = m.gpu_watts_on_contour(4000.0, 0.0, 54.0).unwrap();
-        let trimmed = m.gpu_watts_on_contour(4000.0, trim, 54.0).unwrap();
+        let untrimmed = m.gpu_watts_on_contour(4000.0, 0.0, 1.0, 54.0).unwrap();
+        let trimmed = m.gpu_watts_on_contour(4000.0, trim, 1.0, 54.0).unwrap();
         assert!((untrimmed - 90.7).abs() < 0.1, "untrimmed = {untrimmed}");
         assert!(
             (gpu_w - trimmed).abs() < 2.5,

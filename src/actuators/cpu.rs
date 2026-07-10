@@ -27,6 +27,10 @@ pub struct CpuActuator<R: Runner> {
     /// Stock burst ceiling left untouched so short spikes stay fast
     /// (design §3). Pub so config (Task 21) can set it.
     pub fast_limit_mw: u32,
+    /// Sustained operating ceiling (mW) commanded power is clamped to, from
+    /// `Config::cpu_max_w`. Set via `set_sustained_max_mw` (which re-clamps to
+    /// the hardware `MAX_SUSTAINED_MW`); defaults to that hardware ceiling.
+    max_sustained_mw: u32,
     /// Production: /sys/firmware/acpi/platform_profile.
     profile_path: PathBuf,
     /// Pause between the profile toggle writes so firmware registers both.
@@ -39,17 +43,26 @@ impl<R: Runner> CpuActuator<R> {
         Self {
             runner,
             fast_limit_mw: DEFAULT_FAST_LIMIT_MW,
+            max_sustained_mw: MAX_SUSTAINED_MW,
             profile_path,
             toggle_delay: Duration::from_millis(200),
         }
     }
 
-    /// Clamp `mw` to [10_000, 54_000] and command it as the sustained limit:
+    /// Set the sustained operating ceiling (from `Config::cpu_max_w`),
+    /// re-clamped to the hardware envelope `[MIN_SUSTAINED_MW, MAX_SUSTAINED_MW]`
+    /// so a bad config can never raise the cap above the silicon's cTDP.
+    pub fn set_sustained_max_mw(&mut self, mw: u32) {
+        self.max_sustained_mw = mw.clamp(MIN_SUSTAINED_MW, MAX_SUSTAINED_MW);
+    }
+
+    /// Clamp `mw` to `[MIN_SUSTAINED_MW, max_sustained_mw]` and command it as
+    /// the sustained limit:
     /// `ryzenadj --stapm-limit=<mw> --slow-limit=<mw> --fast-limit=<fast>`.
     /// Returns the clamped value actually commanded; Err on spawn failure or
     /// nonzero exit (stderr included in the error).
     pub fn set_sustained_mw(&self, mw: u32) -> io::Result<u32> {
-        let mw = mw.clamp(MIN_SUSTAINED_MW, MAX_SUSTAINED_MW);
+        let mw = mw.clamp(MIN_SUSTAINED_MW, self.max_sustained_mw);
         let args = [
             format!("--stapm-limit={mw}"),
             format!("--slow-limit={mw}"),

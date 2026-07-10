@@ -225,6 +225,11 @@ pub struct ControlStatus {
     pub cpu_floor_w: f64,
     /// GPU max-clock floor in MHz (config, live-editable via SetFloors).
     pub gpu_floor_mhz: u32,
+    /// CPU/GPU operating maxes (watts) from config: carried on the status so
+    /// the UI (percent-of-max chart, manual-step ceiling) reads the same
+    /// source of truth the controller allocates against.
+    pub cpu_max_w: f64,
+    pub gpu_max_w: f64,
     /// Current trim offset (RPM); nonzero only in Auto mode. Positive =
     /// fans persistently over target at the commanded budget (the model
     /// under-predicts) = budget cut; at equilibrium it equals the model's
@@ -249,6 +254,8 @@ impl Default for ControlStatus {
             fan_target_rpm: DEFAULT_FAN_TARGET_RPM,
             cpu_floor_w: config.cpu_floor_w,
             gpu_floor_mhz: config.gpu_floor_mhz,
+            cpu_max_w: config.cpu_max_w,
+            gpu_max_w: config.gpu_max_w,
             trim_rpm: 0.0,
             flags: Vec::new(),
             calib: None,
@@ -430,10 +437,12 @@ impl<R: Runner> Controller<R> {
         // floors would trip the GPU PI's clamp / the allocator's debug
         // assert once Auto starts. No construction path may skip this.
         let config = config.sanitized();
-        // Config owns the burst ceiling; the actuator default only covers a
-        // hypothetical config-less construction.
+        // Config owns the burst ceiling and the sustained operating max; the
+        // actuator defaults only cover a hypothetical config-less construction.
+        // set_sustained_max_mw re-clamps to the hardware ceiling as a backstop.
         if let Some(cpu) = guard.cpu.as_mut() {
             cpu.fast_limit_mw = config.fast_limit_mw;
+            cpu.set_sustained_max_mw((config.cpu_max_w * 1000.0) as u32);
         }
         let status = ControlStatus {
             fan_target_rpm: config
@@ -441,6 +450,8 @@ impl<R: Runner> Controller<R> {
                 .clamp(FAN_TARGET_MIN_RPM, FAN_TARGET_MAX_RPM),
             cpu_floor_w: config.cpu_floor_w,
             gpu_floor_mhz: config.gpu_floor_mhz,
+            cpu_max_w: config.cpu_max_w,
+            gpu_max_w: config.gpu_max_w,
             ..ControlStatus::default()
         };
         Self {
@@ -965,6 +976,8 @@ impl<R: Runner> Controller<R> {
                 fan_target_rpm: target_rpm,
                 fan_valid: s.fan_valid,
                 fan_slope_rpm_s: fan_slope,
+                cpu_max_w: self.config.cpu_max_w,
+                gpu_max_w: self.config.gpu_max_w,
             });
             // Bumpless retarget: the PI keeps its trim + rate reference.
             auto.pid.set_target_w(gpu_w);

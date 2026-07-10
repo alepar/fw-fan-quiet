@@ -9,8 +9,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::actuators::gpu::clamp_gpu_clock;
-use crate::control::allocator::CPU_MAX_W;
+use crate::control::allocator::{CPU_MAX_W, GPU_MAX_W};
 use crate::control::controller::DEFAULT_FAN_TARGET_RPM;
+
+/// Lower bound for `cpu_max_w`: below the actuator's ~10 W sustained floor the
+/// grid-search and the manual-mode clamps would degenerate.
+const CPU_MAX_W_FLOOR: f64 = 10.0;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -31,6 +35,15 @@ pub struct Config {
     /// incident. Calibrated shape + bounded trim + fan feedback is the
     /// robust configuration; set true to experiment with live adaptation.
     pub online_rls: bool,
+    /// CPU sustained operating max (watts): the single source of truth for the
+    /// "100%" CPU power. The allocator grid-searches up to it, the CPU actuator
+    /// clamps commanded sustained power to it, and the TUI/LED displays scale by
+    /// it. Defaults to and is clamped to the HX 370 cTDP ceiling
+    /// ([`CPU_MAX_W`]); lower it to soft-cap the CPU (quieter, less power).
+    pub cpu_max_w: f64,
+    /// GPU operating max (watts): same role for the GPU. Defaults to / clamped
+    /// to the RTX 5070 module TGP ([`GPU_MAX_W`]).
+    pub gpu_max_w: f64,
     /// LED matrix wattage display (`[leds]` table). Optional feature; its own
     /// `enabled` flag defaults on but a missing/failed module just stays dark.
     pub leds: LedConfig,
@@ -44,6 +57,8 @@ impl Default for Config {
             gpu_floor_mhz: 1000,
             fast_limit_mw: 53_000,
             online_rls: false,
+            cpu_max_w: CPU_MAX_W,
+            gpu_max_w: GPU_MAX_W,
             leds: LedConfig::default(),
         }
     }
@@ -65,10 +80,6 @@ pub struct LedConfig {
     pub cpu_port: String,
     /// Serial device for the GPU (right) gauge.
     pub gpu_port: String,
-    /// Watts that fill the CPU panel to the top.
-    pub cpu_full_scale_w: f64,
-    /// Watts that fill the GPU panel to the top.
-    pub gpu_full_scale_w: f64,
     /// Global PWM brightness sent to both modules (0-255).
     pub brightness: u8,
     /// Reverse the time axis (set if newest ends up at the bottom).
@@ -85,8 +96,6 @@ impl Default for LedConfig {
             enabled: true,
             cpu_port: "/dev/serial/by-path/pci-0000:c4:00.0-usb-0:4.2:1.0".to_string(),
             gpu_port: "/dev/serial/by-path/pci-0000:c4:00.0-usb-0:3.3:1.0".to_string(),
-            cpu_full_scale_w: 60.0,
-            gpu_full_scale_w: 100.0,
             brightness: 100,
             // Within a column, LED index 0 is the panel's physical top
             // (calibrated on this machine), so newest-on-top needs no time
@@ -140,17 +149,47 @@ impl Config {
             );
             self.gpu_floor_mhz = gpu;
         }
-        // Non-finite (TOML can encode nan/inf) would survive clamp() as NaN:
-        // fall back to the default floor instead.
-        let cpu = if self.cpu_floor_w.is_finite() {
-            self.cpu_floor_w.clamp(0.0, CPU_MAX_W)
+        // Operating maxes are the source of truth for CPU/GPU "100%", but they
+        // are hard-clamped to the hardware ceilings so a config typo can never
+        // push the allocator/actuator past the silicon (CPU) or module (GPU)
+        // limit. Non-finite (TOML nan/inf) falls back to the ceiling default.
+        let cpu_max = if self.cpu_max_w.is_finite() {
+            self.cpu_max_w.clamp(CPU_MAX_W_FLOOR, CPU_MAX_W)
         } else {
-            Config::default().cpu_floor_w
+            CPU_MAX_W
+        };
+        if cpu_max != self.cpu_max_w {
+            tracing::warn!(
+                "config cpu_max_w {} outside [{CPU_MAX_W_FLOOR}, {CPU_MAX_W}]; clamped to {cpu_max}",
+                self.cpu_max_w
+            );
+            self.cpu_max_w = cpu_max;
+        }
+        let gpu_max = if self.gpu_max_w.is_finite() {
+            self.gpu_max_w.clamp(1.0, GPU_MAX_W)
+        } else {
+            GPU_MAX_W
+        };
+        if gpu_max != self.gpu_max_w {
+            tracing::warn!(
+                "config gpu_max_w {} outside [1, {GPU_MAX_W}]; clamped to {gpu_max}",
+                self.gpu_max_w
+            );
+            self.gpu_max_w = gpu_max;
+        }
+        // Floor is bounded by the (now-sanitized) operating max, not the raw
+        // ceiling: floor ≤ cpu_max_w keeps the allocator's floor-in-range
+        // debug-assert and grid honest. Non-finite falls back to the default.
+        let cpu = if self.cpu_floor_w.is_finite() {
+            self.cpu_floor_w.clamp(0.0, self.cpu_max_w)
+        } else {
+            Config::default().cpu_floor_w.min(self.cpu_max_w)
         };
         if cpu != self.cpu_floor_w {
             tracing::warn!(
-                "config cpu_floor_w {} outside [0, {CPU_MAX_W}]; clamped to {cpu}",
-                self.cpu_floor_w
+                "config cpu_floor_w {} outside [0, {}]; clamped to {cpu}",
+                self.cpu_floor_w,
+                self.cpu_max_w
             );
             self.cpu_floor_w = cpu;
         }
@@ -209,12 +248,12 @@ mod tests {
             gpu_floor_mhz: 1200,
             fast_limit_mw: 60_000,
             online_rls: true,
+            cpu_max_w: 50.0,
+            gpu_max_w: 90.0,
             leds: LedConfig {
                 enabled: false,
                 cpu_port: "/dev/ttyACM9".to_string(),
                 gpu_port: "/dev/ttyACM8".to_string(),
-                cpu_full_scale_w: 45.0,
-                gpu_full_scale_w: 90.0,
                 brightness: 200,
                 flip_time: true,
                 cpu_flip_watts: false,
@@ -247,6 +286,30 @@ mod tests {
             Config::load(&path).cpu_floor_w,
             Config::default().cpu_floor_w
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn operating_maxes_clamp_to_hardware_ceilings() {
+        let dir = fixture_dir("clamp-maxes");
+        let path = dir.join("config.toml");
+        // Above the silicon/module ceilings: clamped down so the allocator and
+        // actuator can never be told to exceed the hardware.
+        fs::write(&path, "cpu_max_w = 999.0\ngpu_max_w = 999.0\n").unwrap();
+        let config = Config::load(&path);
+        assert_eq!(config.cpu_max_w, 54.0);
+        assert_eq!(config.gpu_max_w, 100.0);
+        // A lowered cpu_max also lowers the floor's ceiling: floor can't exceed
+        // the operating max (else the allocator's floor-in-range assert trips).
+        fs::write(&path, "cpu_max_w = 30.0\ncpu_floor_w = 40.0\n").unwrap();
+        let config = Config::load(&path);
+        assert_eq!(config.cpu_max_w, 30.0);
+        assert_eq!(config.cpu_floor_w, 30.0, "floor clamped to cpu_max_w");
+        // Non-finite maxes fall back to the ceilings.
+        fs::write(&path, "cpu_max_w = nan\ngpu_max_w = inf\n").unwrap();
+        let config = Config::load(&path);
+        assert_eq!(config.cpu_max_w, 54.0);
+        assert_eq!(config.gpu_max_w, 100.0);
         fs::remove_dir_all(&dir).unwrap();
     }
 

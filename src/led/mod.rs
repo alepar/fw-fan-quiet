@@ -66,7 +66,12 @@ impl Panel {
 /// Returns `None` (feature inert) when disabled or when neither module opens —
 /// the caller then keeps `rx`'s sender out of the sampler fan-out entirely, so
 /// no phantom receiver can make the sampler exit.
-pub fn spawn(config: LedConfig, rx: Receiver<Event>) -> Option<std::thread::JoinHandle<()>> {
+pub fn spawn(
+    config: LedConfig,
+    cpu_max_w: f64,
+    gpu_max_w: f64,
+    rx: Receiver<Event>,
+) -> Option<std::thread::JoinHandle<()>> {
     if !config.enabled {
         tracing::info!("LED display disabled by config");
         return None;
@@ -81,7 +86,7 @@ pub fn spawn(config: LedConfig, rx: Receiver<Event>) -> Option<std::thread::Join
     let cpu = Panel {
         matrix: cpu,
         history: History::new(),
-        full_scale_w: config.cpu_full_scale_w,
+        full_scale_w: cpu_max_w,
         orient: Orient {
             flip_time: config.flip_time,
             flip_watts: config.cpu_flip_watts,
@@ -91,7 +96,7 @@ pub fn spawn(config: LedConfig, rx: Receiver<Event>) -> Option<std::thread::Join
     let gpu = Panel {
         matrix: gpu,
         history: History::new(),
-        full_scale_w: config.gpu_full_scale_w,
+        full_scale_w: gpu_max_w,
         orient: Orient {
             flip_time: config.flip_time,
             flip_watts: config.gpu_flip_watts,

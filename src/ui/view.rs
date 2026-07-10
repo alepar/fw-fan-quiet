@@ -16,10 +16,9 @@ use crate::ring::Ring;
 /// cover the hardware's full envelope (fans max ~7000 RPM, package power well
 /// under 120 W, temps below the 110 C trip point, GPU boost under 3.2 GHz).
 const FAN_BOUNDS: [f64; 2] = [1000.0, 6000.0];
-// Watts chart is percent-of-max like the clocks chart: 100% = 54 W CPU
-// (cTDP ceiling) / 100 W GPU (TGP), so both series span the full height.
-const CPU_MAX_W: f64 = 54.0;
-const GPU_MAX_W: f64 = 100.0;
+// Watts chart is percent-of-max like the clocks chart: 100% = the config
+// operating maxes carried on the status (`cpu_max_w`/`gpu_max_w`), so both
+// series span the full height and the scale matches what control uses.
 const TEMP_BOUNDS: [f64; 2] = [20.0, 90.0];
 // The clocks chart normalizes each series to percent of that device's max
 // clock so both use the full chart height ("dual-scale" on one axis: 100% =
@@ -330,13 +329,15 @@ fn render_fans(model: &Model, frame: &mut Frame, area: Rect) {
 }
 
 fn render_watts(model: &Model, frame: &mut Frame, area: Rect) {
-    let cpu_segs = to_percent(&segments(&model.cpu_w), CPU_MAX_W);
-    let gpu_segs = to_percent(&segments(&model.gpu_w), GPU_MAX_W);
+    let cpu_max_w = model.status.cpu_max_w;
+    let gpu_max_w = model.status.gpu_max_w;
+    let cpu_segs = to_percent(&segments(&model.cpu_w), cpu_max_w);
+    let gpu_segs = to_percent(&segments(&model.gpu_w), gpu_max_w);
     // Commanded CPU limit overlay, on the CPU's percent scale.
     let limit_pts = model
         .status
         .cpu_limit_w
-        .map(|w| hline(w / CPU_MAX_W * 100.0));
+        .map(|w| hline(w / cpu_max_w * 100.0));
     let title = match &model.latest {
         Some(s) => format!(
             "watts cpu {:.1} gpu {:.1} W (% of max)",

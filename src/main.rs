@@ -181,7 +181,12 @@ fn main() -> Result<()> {
     // shut the whole pipeline down. The thread drains until the sampler drops
     // its sender at shutdown; joined after the sampler so that drop happens.
     let (led_sample_tx, led_sample_rx) = unbounded::<Event>();
-    let led = led::spawn(config.leds.clone(), led_sample_rx);
+    let led = led::spawn(
+        config.leds.clone(),
+        config.cpu_max_w,
+        config.gpu_max_w,
+        led_sample_rx,
+    );
     let mut sampler_txs = vec![ui_tx.clone(), ctl_sample_tx];
     if led.is_some() {
         sampler_txs.push(led_sample_tx);

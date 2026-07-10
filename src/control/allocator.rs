@@ -92,9 +92,15 @@ pub const DEADBAND_W: f64 = 1.5;
 /// First commanded point before any history exists: low enough to be quiet
 /// on any sane calibration, high enough not to stall the desktop.
 pub const CONSERVATIVE_START: (f64, f64) = (15.0, 30.0);
-/// CPU sustained ceiling (cTDP max, design §1).
+/// CPU sustained *hardware* ceiling (HX 370 cTDP max, design §1). This is the
+/// absolute backstop: the operating max (`Config::cpu_max_w`) defaults to it
+/// and is clamped to it, and the thermal model validates its contour over
+/// `[0, CPU_MAX_W]`. The allocator's own grid-search uses the runtime operating
+/// max `AllocInput::cpu_max_w`, NOT this const.
 pub const CPU_MAX_W: f64 = 54.0;
-/// GPU ceiling (module AC TGP, design §1).
+/// GPU *hardware* ceiling (RTX 5070 module AC TGP, design §1). Same role as
+/// [`CPU_MAX_W`]: the clamp bound / default for `Config::gpu_max_w`, not the
+/// live search max (that is `AllocInput::gpu_max_w`).
 pub const GPU_MAX_W: f64 = 100.0;
 /// CPU pinned-at-limit margin: measured within this of the cap → starved.
 pub const CPU_PINNED_MARGIN_W: f64 = 1.5;
@@ -199,6 +205,12 @@ pub struct AllocInput<'a> {
     /// up rate limit bounds the risk to [`UP_RATE_W`] per step until the
     /// window fills (documented decision).
     pub fan_slope_rpm_s: Option<f64>,
+    /// Operating power ceilings (watts) for this step: the config-driven
+    /// `Config::cpu_max_w`/`gpu_max_w`, already clamped to the hardware
+    /// ceilings [`CPU_MAX_W`]/[`GPU_MAX_W`]. They bound the pc grid-search and
+    /// normalize the utility score, so lowering them soft-caps the machine.
+    pub cpu_max_w: f64,
+    pub gpu_max_w: f64,
 }
 
 /// Picks (cpu_w, gpu_w) on the contour honoring the demand split, deadband
@@ -245,11 +257,12 @@ impl Allocator {
     ///    both gates, as over everything else.
     pub fn step(&mut self, inp: &AllocInput) -> (f64, f64) {
         debug_assert!(
-            (0.0..=CPU_MAX_W).contains(&inp.floors.0),
-            "cpu floor {} outside [0, {CPU_MAX_W}]",
-            inp.floors.0
+            (0.0..=inp.cpu_max_w).contains(&inp.floors.0),
+            "cpu floor {} outside [0, {}]",
+            inp.floors.0,
+            inp.cpu_max_w
         );
-        let cpu_floor = inp.floors.0.clamp(0.0, CPU_MAX_W);
+        let cpu_floor = inp.floors.0.clamp(0.0, inp.cpu_max_w);
         // Floors win over everything, freeze/hold paths included: lift the
         // held point to the floor first. The one deliberate power raise
         // without fan feedback — performance floor outranks the acoustic goal.
@@ -260,7 +273,9 @@ impl Allocator {
             return prev;
         }
 
-        let Some((cand_pc, cand_pg)) = best_candidate(inp.contour, inp.demand, cpu_floor) else {
+        let Some((cand_pc, cand_pg)) =
+            best_candidate(inp.contour, inp.demand, cpu_floor, inp.cpu_max_w, inp.gpu_max_w)
+        else {
             return prev; // degenerate contour everywhere → freeze
         };
 
@@ -347,19 +362,21 @@ fn best_candidate(
     contour: &dyn Fn(f64) -> Option<f64>,
     d: Demand,
     cpu_floor: f64,
+    cpu_max: f64,
+    gpu_max: f64,
 ) -> Option<(f64, f64)> {
     let mut best: Option<((f64, f64), f64)> = None;
     // Start at the floor rounded UP onto the 0.5 W grid: keeps the scan
-    // aligned so CPU_MAX_W itself stays reachable for non-multiple floors.
+    // aligned so cpu_max itself stays reachable for non-multiple floors.
     // The floor value itself is still enforced by the caller's clamps.
     let mut pc = (cpu_floor / GRID_STEP_W).ceil() * GRID_STEP_W;
-    while pc <= CPU_MAX_W {
+    while pc <= cpu_max {
         if let Some(pg_raw) = contour(pc) {
-            let pg = pg_raw.clamp(0.0, GPU_MAX_W);
+            let pg = pg_raw.clamp(0.0, gpu_max);
             // Concave (√) utility: diminishing returns per device → interior,
             // demand-proportional optima instead of bang-bang (module docs).
             let score =
-                d.cpu_starved * (pc / CPU_MAX_W).sqrt() + d.gpu_starved * (pg / GPU_MAX_W).sqrt();
+                d.cpu_starved * (pc / cpu_max).sqrt() + d.gpu_starved * (pg / gpu_max).sqrt();
             if best.is_none_or(|(_, s)| score > s) {
                 best = Some(((pc, pg), score));
             }
@@ -414,6 +431,8 @@ mod tests {
             fan_target_rpm: target,
             fan_valid: true,
             fan_slope_rpm_s: None,
+            cpu_max_w: CPU_MAX_W,
+            gpu_max_w: GPU_MAX_W,
         }
     }
 
@@ -939,6 +958,8 @@ mod tests {
                     fan_target_rpm: SIM_TARGET_RPM,
                     fan_valid: true,
                     fan_slope_rpm_s: slope,
+                    cpu_max_w: CPU_MAX_W,
+                    gpu_max_w: GPU_MAX_W,
                 });
                 gpu_w = pg;
             }

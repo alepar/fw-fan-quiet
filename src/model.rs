@@ -17,7 +17,9 @@ const CPU_STEP_W: f64 = 2.0;
 /// Framework Balanced sustained limit: the first press steps from stock.
 const CPU_SEED_W: f64 = 40.0;
 const CPU_MIN_W: f64 = 10.0;
-const CPU_MAX_W: f64 = 54.0;
+// The CPU manual-step ceiling is no longer a const: it comes from the
+// controller's echoed status (`status.cpu_max_w`, the config operating max) so
+// the UI clamps to the same limit the allocator/actuator honor.
 /// ~14 driver bins per press.
 const GPU_STEP_MHZ: u32 = 105;
 /// Stock GPU max boost clock.
@@ -161,8 +163,8 @@ impl Model {
         match ch {
             'c' | 'C' => {
                 let step = if ch == 'C' { CPU_STEP_W } else { -CPU_STEP_W };
-                let v =
-                    (self.cpu_setpoint_w.unwrap_or(CPU_SEED_W) + step).clamp(CPU_MIN_W, CPU_MAX_W);
+                let v = (self.cpu_setpoint_w.unwrap_or(CPU_SEED_W) + step)
+                    .clamp(CPU_MIN_W, self.status.cpu_max_w);
                 self.cpu_setpoint_w = Some(v);
                 vec![Command::SetCpuW(v)]
             }
@@ -197,7 +199,8 @@ impl Model {
                 } else {
                     -CPU_FLOOR_STEP_W
                 };
-                self.cpu_floor_w = (self.cpu_floor_w + step).clamp(CPU_MIN_W, CPU_MAX_W);
+                self.cpu_floor_w =
+                    (self.cpu_floor_w + step).clamp(CPU_MIN_W, self.status.cpu_max_w);
                 self.set_floors()
             }
             'd' | 'D' => {

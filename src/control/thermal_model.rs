@@ -262,6 +262,11 @@ impl ThermalModel {
         pc: f64,
     ) -> Option<f64> {
         let divisor = gain * (self.b + self.e * pc);
+        // The negation is load-bearing, not style (hence the allow): NaN
+        // fails EVERY comparison, so `divisor < floor` would let a NaN
+        // divisor through to Some(NaN) — `!(divisor >= floor)` puts NaN in
+        // the reject branch.
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
         if !(divisor >= MIN_CONTOUR_DIVISOR / 2.0) {
             return None;
         }

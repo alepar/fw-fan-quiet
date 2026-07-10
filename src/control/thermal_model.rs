@@ -2,8 +2,10 @@
 //! where pc = CPU sustained watts, pg = GPU watts and rpm is the steady-state
 //! `max(fan1, fan2)` RPM. Batch-fit from the 11-point calibration matrix
 //! (Task 22), inverted to the ≤target-RPM contour by the allocator (Task 23),
-//! and adapted online via trim + gated RLS (Tasks 26/27). Persisted in the
-//! state file (Task 21), hence the serde derives.
+//! and corrected online by the 2-state Kalman `[bias, gain]` (adaptation v2;
+//! the KF adapts OUTSIDE this surface — a/b/e/c only ever change when a
+//! calibration lands). Persisted in the state file (Task 21), hence the
+//! serde derives.
 
 use nalgebra::{DMatrix, DVector, Matrix4, Vector4};
 
@@ -189,6 +191,12 @@ impl ThermalModel {
     /// After an accepted update, trace(P) is capped: above [`RLS_TRACE_CAP`]
     /// it is rescaled to [`RLS_TRACE_RESCALE_TO`], bounding how hard a noisy
     /// sample can yank the parameters no matter what the update history was.
+    ///
+    /// No production caller since adaptation v2 (the Kalman `[bias, gain]`
+    /// owns Auto-mode adaptation); kept, with its unit suite, as the
+    /// reviewed reference for full-surface adaptation — the divisor-floor
+    /// math here is the canonical statement of the 2026-06 incident guard.
+    #[allow(dead_code)]
     pub fn rls_update(&mut self, pc: f64, pg: f64, rpm: f64, lambda: f64) -> bool {
         // Poisoned-input guard: every comparison with NaN is false, so a NaN
         // input sails through both gates below and would permanently poison
@@ -268,9 +276,13 @@ impl ThermalModel {
 
     /// The measurement model the Kalman filter regresses (design §1):
     /// `rpm = a·pc + c + bias + g·(b·pg + e·pc·pg)`. Equals [`predict`] at
-    /// the identity correction `(bias = 0, gain = 1)`. Used for the trust
-    /// residual so the monitor grades the corrected surface we are actually
-    /// controlling with.
+    /// the identity correction `(bias = 0, gain = 1)`. The canonical
+    /// statement of the KF measurement model, pinned against the contour
+    /// inversion by this module's tests; the controller deliberately
+    /// INLINES it from the same `baseline`/`w` primitives it hands
+    /// `Kalman::update`, so the trust residual and the filter can never
+    /// grade different numbers.
+    #[allow(dead_code)]
     pub fn predict_corrected(&self, pc: f64, pg: f64, bias: f64, gain: f64) -> f64 {
         self.a * pc + self.c + bias + gain * (self.b * pg + self.e * pc * pg)
     }

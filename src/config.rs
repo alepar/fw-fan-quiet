@@ -27,14 +27,11 @@ pub struct Config {
     pub gpu_floor_mhz: u32,
     /// CPU fast (short-burst) PPT limit handed to ryzenadj, milliwatts.
     pub fast_limit_mw: u32,
-    /// Online RLS slope adaptation in Auto mode. OFF by default: the
-    /// 2026-06/07 field sessions found the distrust configuration — RLS
-    /// frozen, trim-only adaptation — gave the best control behavior of the
-    /// whole evening, while live slope adaptation double-corrected against
-    /// the trim and was what walked `e` into the degenerate contour-divisor
-    /// incident. Calibrated shape + bounded trim + fan feedback is the
-    /// robust configuration; set true to experiment with live adaptation.
-    pub online_rls: bool,
+    // (Removed 2026-07, adaptation v2: `online_rls` is gone — the 2-state
+    // Kalman filter owns Auto-mode adaptation and full-surface RLS was
+    // field-disabled after the degenerate-divisor incident. `serde(default)`
+    // without `deny_unknown_fields` means old config files that still carry
+    // the key load fine.)
     /// CPU sustained operating max (watts): the single source of truth for the
     /// "100%" CPU power. The allocator grid-searches up to it, the CPU actuator
     /// clamps commanded sustained power to it, and the TUI/LED displays scale by
@@ -56,7 +53,6 @@ impl Default for Config {
             cpu_floor_w: 15.0,
             gpu_floor_mhz: 1000,
             fast_limit_mw: 53_000,
-            online_rls: false,
             cpu_max_w: CPU_MAX_W,
             gpu_max_w: GPU_MAX_W,
             leds: LedConfig::default(),
@@ -247,7 +243,6 @@ mod tests {
             cpu_floor_w: 12.0,
             gpu_floor_mhz: 1200,
             fast_limit_mw: 60_000,
-            online_rls: true,
             cpu_max_w: 50.0,
             gpu_max_w: 90.0,
             leds: LedConfig {
@@ -341,7 +336,6 @@ mod tests {
         assert_eq!(config.cpu_floor_w, defaults.cpu_floor_w);
         assert_eq!(config.gpu_floor_mhz, defaults.gpu_floor_mhz);
         assert_eq!(config.fast_limit_mw, defaults.fast_limit_mw);
-        assert_eq!(config.online_rls, defaults.online_rls);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -349,7 +343,13 @@ mod tests {
     fn unknown_fields_tolerated() {
         let dir = fixture_dir("unknown");
         let path = dir.join("config.toml");
-        fs::write(&path, "fan_target_rpm = 2500\nfuture_knob = true\n").unwrap();
+        // `online_rls` is a REAL legacy key (removed with adaptation v2):
+        // old config files that still carry it must keep loading.
+        fs::write(
+            &path,
+            "fan_target_rpm = 2500\nfuture_knob = true\nonline_rls = true\n",
+        )
+        .unwrap();
         assert_eq!(Config::load(&path).fan_target_rpm, 2500.0);
         fs::remove_dir_all(&dir).unwrap();
     }

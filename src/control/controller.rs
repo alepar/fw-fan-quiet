@@ -301,11 +301,6 @@ pub enum Effect {
         cpu_w: f64,
         gpu_w: f64,
     },
-    /// One online RLS update was ACCEPTED (Auto, steady sample, excitation
-    /// gate open). The shell logs it as its OWN Decision record (cause
-    /// "auto:rls") so an acceptance coinciding with e.g. a trim update never
-    /// shadows either cause in offline review.
-    RlsAccepted,
     /// Periodic (60 s) Auto-mode snapshot of the LIVE model parameters —
     /// its own Decision record (cause "auto:model_snapshot") carrying
     /// a/b/e/c for offline controller-quality review.
@@ -1651,7 +1646,6 @@ fn apply_effects<R: Runner>(
     // (demand_cpu, demand_gpu, alloc_cpu_w, alloc_gpu_w) from an Auto-mode
     // allocator step in this batch; the WHY behind an "auto:allocate" record.
     let mut auto_alloc: Option<(f64, f64, f64, f64)> = None;
-    let mut rls_accepted = false;
     let mut model_snapshot: Option<(f64, f64, f64, f64)> = None;
     // Status-flag transitions in this batch (watchdog or otherwise): each
     // becomes a standalone Record::Flag line (in addition to the Decision
@@ -1675,7 +1669,6 @@ fn apply_effects<R: Runner>(
                 auto_alloc = Some((*demand_cpu, *demand_gpu, *cpu_w, *gpu_w));
                 cause.get_or_insert("auto:allocate");
             }
-            Effect::RlsAccepted => rls_accepted = true,
             Effect::ModelSnapshot { a, b, e, c } => model_snapshot = Some((*a, *b, *e, *c)),
             Effect::Flagged { flag, active } => flagged.push((flag, *active)),
             Effect::Quit => quit = true,
@@ -1688,9 +1681,8 @@ fn apply_effects<R: Runner>(
         let _ = ui_tx.send(Event::Status(status.clone()));
     }
     // One "main" Decision per batch (whatever claimed the cause first), plus
-    // STANDALONE records for an RLS acceptance and/or model snapshot in the
-    // same batch — separate lines, so neither cause can shadow the other in
-    // offline review.
+    // a STANDALONE record for a model snapshot in the same batch — separate
+    // lines, so neither cause can shadow the other in offline review.
     let decision = |cause: &'static str,
                     alloc: Option<(f64, f64, f64, f64)>,
                     model: Option<(f64, f64, f64, f64)>| {
@@ -1722,7 +1714,7 @@ fn apply_effects<R: Runner>(
             model_c: model.map(|m| m.3),
         }
     };
-    if cause.is_some() || rls_accepted || model_snapshot.is_some() || !flagged.is_empty() {
+    if cause.is_some() || model_snapshot.is_some() || !flagged.is_empty() {
         if let Some(t) = telemetry::lock(telemetry).as_mut() {
             // Flag transitions first: the Decision that follows already
             // shows the post-transition flag list.
@@ -1735,9 +1727,6 @@ fn apply_effects<R: Runner>(
             }
             if let Some(cause) = cause {
                 t.log(&decision(cause, auto_alloc, None));
-            }
-            if rls_accepted {
-                t.log(&decision("auto:rls", None, None));
             }
             if let Some(m) = model_snapshot {
                 t.log(&decision("auto:model_snapshot", None, Some(m)));

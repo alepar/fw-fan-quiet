@@ -425,6 +425,17 @@ pub struct Controller<R: Runner> {
     /// GPU clock→watts LUT, same lifecycle as `model`; the GPU PI's
     /// feedforward.
     lut: Option<ClockWattsLut>,
+    /// Wall-clock stamp of the loaded calibration, carried so an Auto-exit
+    /// state write preserves it (only a finished calibration sets it).
+    calibrated_at: Option<String>,
+    /// Kalman `[bias, gain]` seed for the NEXT Auto entry (design §2).
+    /// Loaded from the state file, captured from the live filter on every
+    /// Auto exit, reset to the identity when a new calibration lands (a
+    /// fresh surface invalidates old corrections). The covariance is never
+    /// part of this: each session starts confident about nothing but
+    /// centered on what it learned.
+    persisted_bias: f64,
+    persisted_gain: f64,
     /// User config (fan target, floors, fast limit). Mutated + saved when
     /// the fan target changes.
     config: Config,
@@ -489,6 +500,9 @@ impl<R: Runner> Controller<R> {
             state_path,
             model: persisted.model,
             lut: persisted.lut,
+            calibrated_at: persisted.calibrated_at,
+            persisted_bias: persisted.adapt_bias,
+            persisted_gain: persisted.adapt_gain,
             config,
             config_path,
             auto: None,
@@ -611,9 +625,10 @@ impl<R: Runner> Controller<R> {
                 "command:set_gpu_max_clock"
             }
             Command::ReleaseAll => {
-                // Exiting Auto too: the loop state drops whole, so a later
-                // re-entry starts from a fresh PI + conservative allocator.
-                self.auto = None;
+                // Exiting Auto too: the loop state drops whole (fresh PI +
+                // conservative allocator on re-entry), with the learned
+                // [bias, gain] persisted on the way out.
+                self.exit_auto_and_persist();
                 self.release_to_stock();
                 effects.push(Effect::Released);
                 "release"
@@ -678,9 +693,14 @@ impl<R: Runner> Controller<R> {
                     "auto:not_calibrated"
                 } else {
                     self.remove_flag(StatusFlag::NotCalibrated);
-                    // Identity KF seed until Task 6 wires the persisted
-                    // [bias, gain] through here.
-                    let mut auto = AutoState::new(0.0, 1.0);
+                    // Seed the KF from the persisted [bias, gain] (design
+                    // §2): gain is taught only at rare operating-point
+                    // swings, so session-only state would relearn it every
+                    // evening — persistence converts the slow learning into
+                    // a one-time cost. Covariance still starts fresh (it is
+                    // never persisted), and Kalman::new sanitizes a corrupt
+                    // seed before it can touch the contour.
+                    let mut auto = AutoState::new(self.persisted_bias, self.persisted_gain);
                     match self.guard.gpu.as_ref() {
                         // Carried-over review decision: with a GPU lock
                         // applied right now (e.g. entering from Manual),
@@ -694,6 +714,12 @@ impl<R: Runner> Controller<R> {
                             "no GPU actuator this run: auto mode will shape the CPU only"
                         ),
                     }
+                    // Mirror the seeded correction into status immediately:
+                    // the header/telemetry must show the inherited bias and
+                    // gain from the first Status push, not from the first
+                    // KF update (which may be minutes away).
+                    self.status.trim_rpm = auto.kf.bias();
+                    self.status.gain = auto.kf.gain();
                     self.auto = Some(auto);
                     self.status.mode = Mode::Auto;
                     // Any manual limits stay in force for <1 s: the first
@@ -704,7 +730,9 @@ impl<R: Runner> Controller<R> {
             }
             Command::SetAuto(false) => {
                 if self.status.mode == Mode::Auto {
-                    self.auto = None; // fresh PI/allocator on re-entry
+                    // Fresh PI/allocator on re-entry; learned [bias, gain]
+                    // persisted on the way out (design §2).
+                    self.exit_auto_and_persist();
                     self.release_to_stock();
                     effects.push(Effect::Released);
                 } else {
@@ -746,6 +774,9 @@ impl<R: Runner> Controller<R> {
                     self.apply_calib_effects(runner.abort());
                     self.end_calibration();
                 }
+                // Clean quit persists a live Auto session's [bias, gain]
+                // (design §2) before the hardware restore.
+                self.exit_auto_and_persist();
                 self.guard.restore_all();
                 self.drain_flag_effects(&mut effects);
                 effects.push(Effect::Quit);
@@ -953,6 +984,10 @@ impl<R: Runner> Controller<R> {
         // requires model+LUT and they are only ever replaced, never cleared.
         if self.auto.is_none() || self.model.is_none() || self.lut.is_none() {
             tracing::warn!("auto mode lost its state/model; releasing to Monitor");
+            // Plain drop, deliberately NOT exit_auto_and_persist: this is a
+            // fault path (Auto lost its state mid-flight), so the seed from
+            // the last CLEAN exit stands rather than whatever this session
+            // had half-learned.
             self.auto = None;
             self.release_to_stock();
             effects.push(Effect::Released);
@@ -1376,6 +1411,15 @@ impl<R: Runner> Controller<R> {
                 RunnerEffect::SaveState(state) => {
                     self.model = state.model.clone();
                     self.lut = state.lut.clone();
+                    self.calibrated_at = state.calibrated_at.clone();
+                    // A fresh surface invalidates old corrections (design
+                    // §2): reset the Kalman seed to the identity. The state
+                    // written below already carries identity adapt fields
+                    // (the runner builds it via ..default()); this keeps
+                    // the in-memory seed in lockstep so a later Auto exit
+                    // cannot leak the stale pair back to disk.
+                    self.persisted_bias = 0.0;
+                    self.persisted_gain = 1.0;
                     if self.model.is_some() && self.lut.is_some() {
                         // A landed fit satisfies the Auto-entry requirement.
                         self.remove_flag(StatusFlag::NotCalibrated);
@@ -1438,8 +1482,10 @@ impl<R: Runner> Controller<R> {
             self.end_calibration();
         }
         // Auto exits hard: dropping AutoState means no allocator/PI step can
-        // ever re-command until a fresh (post-re-arm) Auto entry.
-        self.auto = None;
+        // ever re-command until a fresh (post-re-arm) Auto entry. The
+        // learned [bias, gain] still persists — the trip is thermal, not
+        // evidence against the correction, and the clamps bound any harm.
+        self.exit_auto_and_persist();
         self.release_to_stock();
         self.add_flag(flag);
         let mut effects = vec![Effect::Released];
@@ -1448,6 +1494,40 @@ impl<R: Runner> Controller<R> {
         self.drain_flag_effects(&mut effects);
         effects.push(Effect::StatusChanged { cause });
         effects
+    }
+
+    /// Write model + LUT + Kalman `[bias, gain]` to the state file (design
+    /// §2). Called from [`exit_auto_and_persist`](Self::exit_auto_and_persist)
+    /// only — never per-update (no disk churn) — and the covariance is never
+    /// serialized. Save failure is warned, not fatal: the in-memory seed
+    /// still carries the session.
+    fn save_persisted_state(&self) {
+        let state = PersistedState {
+            model: self.model.clone(),
+            lut: self.lut.clone(),
+            calibrated_at: self.calibrated_at.clone(),
+            adapt_bias: self.persisted_bias,
+            adapt_gain: self.persisted_gain,
+        };
+        if let Err(e) = state.save(&self.state_path) {
+            tracing::warn!(
+                "adapt: state save to {} failed: {e}",
+                self.state_path.display()
+            );
+        }
+    }
+
+    /// Drop the Auto loop state, capturing the live Kalman `[bias, gain]`
+    /// into the persisted seed and writing the state file (design §2:
+    /// persist on Auto exit; a quit from Auto is covered because every exit
+    /// path funnels through here). No-op when not in Auto: a Monitor/Manual
+    /// session learned nothing and must not churn the state file.
+    fn exit_auto_and_persist(&mut self) {
+        if let Some(auto) = self.auto.take() {
+            self.persisted_bias = auto.kf.bias();
+            self.persisted_gain = auto.kf.gain();
+            self.save_persisted_state();
+        }
     }
 
     /// Back to Monitor with stock limits, actuators kept (the session goes
@@ -3523,6 +3603,167 @@ mod tests {
     /// without moving the state).
     const PINNED_PREDICT_RPM: f64 = 2150.0;
 
+    /// [`pinned_op_controller`] with a caller-chosen persisted state and a
+    /// REAL state-file path: the Task-6 persistence tests read back what an
+    /// Auto exit wrote.
+    fn pinned_op_controller_with_state(
+        runner: &FakeRunner,
+        persisted: PersistedState,
+        state_path: PathBuf,
+    ) -> (Controller<&FakeRunner>, Arc<Mutex<Vec<GpuCall>>>) {
+        let gpu = FakeGpu::new();
+        let gpu_calls = gpu.calls();
+        let ctl = Controller::new(
+            RestoreGuard::new(
+                runner,
+                Some(cpu_actuator(
+                    runner,
+                    PathBuf::from("/nonexistent/platform_profile"),
+                )),
+                Some(Box::new(gpu)),
+                None,
+            ),
+            persisted,
+            state_path,
+            Config {
+                cpu_floor_w: 54.0,
+                fan_target_rpm: PINNED_PREDICT_RPM,
+                ..Config::default()
+            },
+            PathBuf::from("/nonexistent/config.toml"),
+        );
+        (ctl, gpu_calls)
+    }
+
+    /// Drive the pinned fixture through one learning stretch: entry drain
+    /// parks at t=15, the cooldown gate opens at t=45, and a +100 RPM plant
+    /// offset moves the bias positive at the first gated update.
+    fn learn_some_bias(ctl: &mut Controller<&FakeRunner>) -> (f64, f64) {
+        for t in 0..=60 {
+            let s = achieved_fan_at(ctl, f64::from(t), PINNED_PREDICT_RPM + 100.0);
+            ctl.on_sample(&s);
+        }
+        (ctl.status().trim_rpm, ctl.status().gain)
+    }
+
+    #[test]
+    fn auto_exit_persists_kalman_state_to_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "bazerame-controller-test-{}-kf-persist",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("state.json");
+        let runner = FakeRunner::new();
+        let (mut ctl, _g) =
+            pinned_op_controller_with_state(&runner, calibrated(), state_path.clone());
+        ctl.on_command(Command::SetAuto(true));
+        let (learned, gain) = learn_some_bias(&mut ctl);
+        assert!(learned > 0.0, "premise: the KF learned a bias");
+
+        // Auto exit writes [bias, gain] to the state file, next to the
+        // model + LUT it must NOT clobber (design §2). float_roundtrip is
+        // on, so the readback is bit-exact.
+        ctl.on_command(Command::SetAuto(false));
+        let saved = PersistedState::load(&state_path);
+        assert_eq!(saved.adapt_bias, learned);
+        assert_eq!(saved.adapt_gain, gain);
+        assert!(saved.model.is_some(), "model clobbered by the adapt write");
+        assert!(saved.lut.is_some(), "lut clobbered by the adapt write");
+
+        // A NEXT session seeded from that file starts Auto centered on the
+        // learned correction — visible in status from entry, live in the
+        // filter — and keeps learning FROM it (the one-time-cost rationale:
+        // gain/bias are not relearned from scratch every session).
+        let runner2 = FakeRunner::new();
+        let (mut ctl2, _g2) =
+            pinned_op_controller_with_state(&runner2, saved, state_path.clone());
+        ctl2.on_command(Command::SetAuto(true));
+        assert_eq!(ctl2.status().trim_rpm, learned);
+        assert_eq!(ctl2.status().gain, gain);
+        let (learned2, _) = learn_some_bias(&mut ctl2);
+        assert!(
+            learned2 > learned,
+            "second session must build on the seed: {learned2} vs {learned}"
+        );
+
+        // Clean quit from Auto persists too (design §2: "written on Auto
+        // exit and clean quit").
+        ctl2.on_command(Command::Quit);
+        let saved2 = PersistedState::load(&state_path);
+        assert_eq!(saved2.adapt_bias, learned2);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn seeded_state_is_live_from_auto_entry() {
+        // The persisted seed must be IN FORCE from the first second of a
+        // session — the whole point of persistence is that the second
+        // onset (next session) lands near target from the start.
+        let runner = FakeRunner::new();
+        let persisted = PersistedState {
+            adapt_bias: -120.0,
+            adapt_gain: 1.1,
+            ..calibrated()
+        };
+        let (mut ctl, _g) = pinned_op_controller_with_state(
+            &runner,
+            persisted,
+            PathBuf::from("/nonexistent/state.json"),
+        );
+        ctl.on_command(Command::SetAuto(true));
+        // Mirrored into status at entry, before any sample…
+        assert_eq!(ctl.status().trim_rpm, -120.0);
+        assert_eq!(ctl.status().gain, 1.1);
+        // …and live in the filter the allocator's contour reads.
+        let auto = ctl.auto.as_ref().unwrap();
+        assert_eq!(auto.kf.bias(), -120.0);
+        assert_eq!(auto.kf.gain(), 1.1);
+        // A sample does not reset it (no adaptation yet: gate closed).
+        let s = achieved_fan_at(&ctl, 0.0, PINNED_PREDICT_RPM);
+        ctl.on_sample(&s);
+        assert_eq!(ctl.status().trim_rpm, -120.0);
+        assert_eq!(ctl.status().gain, 1.1);
+    }
+
+    #[test]
+    fn new_calibration_resets_persisted_adaptation() {
+        // A fresh surface invalidates old corrections (design §2): when a
+        // calibration lands its SaveState, the in-memory seed must reset to
+        // the identity alongside the identity the state file just got.
+        let dir = std::env::temp_dir().join(format!(
+            "bazerame-controller-test-{}-kf-calib-reset",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("state.json");
+        let runner = FakeRunner::new();
+        let stale = PersistedState {
+            adapt_bias: 300.0,
+            adapt_gain: 1.4,
+            ..calibrated()
+        };
+        let (mut ctl, _g) = pinned_op_controller_with_state(&runner, stale, state_path.clone());
+        ctl.apply_calib_effects(vec![RunnerEffect::SaveState(PersistedState {
+            model: Some(fitted_model()),
+            lut: Some(lut3()),
+            calibrated_at: Some("1783650000".to_string()),
+            ..PersistedState::default()
+        })]);
+        // The next Auto entry seeds from the identity, not the stale pair.
+        ctl.on_command(Command::SetAuto(true));
+        assert_eq!(ctl.status().trim_rpm, 0.0);
+        assert_eq!(ctl.status().gain, 1.0);
+        // And an Auto exit re-writes identity + the new calibration stamp
+        // (a stale-seed leak here would poison every later session).
+        ctl.on_command(Command::SetAuto(false));
+        let saved = PersistedState::load(&state_path);
+        assert_eq!(saved.adapt_bias, 0.0);
+        assert_eq!(saved.adapt_gain, 1.0);
+        assert_eq!(saved.calibrated_at.as_deref(), Some("1783650000"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn persistent_residual_at_frozen_point_saturates_bias_and_flags_unreachable() {
         // At the pinned point the KF innovation is `offset − bias`
@@ -3595,7 +3836,13 @@ mod tests {
     }
 
     #[test]
-    fn auto_exit_resets_kf_state() {
+    fn auto_exit_resets_gates_but_carries_the_learned_correction() {
+        // The design-§3 lifecycle: AutoState drops whole on exit (fresh
+        // covariance, fresh steadiness window, fresh cooldown ring), but
+        // the learned [bias, gain] is CAPTURED into the persisted seed and
+        // re-entry starts centered on it — within a session exactly like
+        // across sessions (Task 6; the pre-persistence behavior reset the
+        // filter to identity on every exit).
         let runner = FakeRunner::new();
         let (mut ctl, _gpu_calls) = pinned_op_controller(&runner);
         ctl.on_command(Command::SetAuto(true));
@@ -3605,35 +3852,47 @@ mod tests {
             let s = achieved_fan_at(&ctl, f64::from(t), PINNED_PREDICT_RPM + 100.0);
             ctl.on_sample(&s);
         }
-        assert_ne!(ctl.status().trim_rpm, 0.0, "premise: bias accumulated");
+        let learned = ctl.status().trim_rpm;
+        assert_ne!(learned, 0.0, "premise: bias accumulated");
 
-        // SetAuto(false) resets (AutoState drops whole; status mirrors it).
+        // SetAuto(false): status mirrors reset while OUT of Auto (nothing
+        // is being corrected in Monitor)…
         ctl.on_command(Command::SetAuto(false));
         assert_eq!(ctl.status().trim_rpm, 0.0);
         assert_eq!(ctl.status().gain, 1.0);
 
-        // Re-entry starts fresh: a fresh KF, a fresh steadiness window AND
-        // a fresh cooldown ring — the re-entry allocation re-drains to the
-        // pinned point (parks t=115), so nothing may adapt before t=145.
+        // …but re-entry seeds from the captured pair, live immediately.
+        // The GATES are still fresh: a fresh steadiness window AND a fresh
+        // cooldown ring — the re-entry allocation re-drains to the pinned
+        // point (parks t=115), so no further adaptation before t=145.
         ctl.on_command(Command::SetAuto(true));
+        assert_eq!(ctl.status().trim_rpm, learned, "seed must carry over");
         for t in 100..145 {
             let s = achieved_fan_at(&ctl, f64::from(t), PINNED_PREDICT_RPM + 100.0);
             ctl.on_sample(&s);
             assert_eq!(
                 ctl.status().trim_rpm,
-                0.0,
-                "stale KF state after re-entry at t={t}"
+                learned,
+                "gates must hold the seeded state frozen after re-entry at t={t}"
             );
         }
+        // First gated update BUILDS on the seed (negative feedback toward
+        // the +100 plant offset), rather than restarting from zero.
         let s = achieved_fan_at(&ctl, 145.0, PINNED_PREDICT_RPM + 100.0);
         ctl.on_sample(&s);
-        assert_ne!(ctl.status().trim_rpm, 0.0);
+        assert!(
+            ctl.status().trim_rpm > learned,
+            "update must build on the seed: {} vs {learned}",
+            ctl.status().trim_rpm
+        );
 
-        // ReleaseAll is the other Auto exit: resets too.
+        // ReleaseAll is the other Auto exit: same mirror reset + capture.
         ctl.on_command(Command::ReleaseAll);
         assert_eq!(ctl.status().trim_rpm, 0.0);
         assert_eq!(ctl.status().gain, 1.0);
         assert_eq!(ctl.status().mode, Mode::Monitor);
+        ctl.on_command(Command::SetAuto(true));
+        assert!(ctl.status().trim_rpm > learned, "ReleaseAll must capture too");
     }
 
     #[test]

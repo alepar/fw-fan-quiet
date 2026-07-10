@@ -239,10 +239,13 @@ impl ThermalModel {
     /// `g·(b + e·pc) < MIN_CONTOUR_DIVISOR / 2` (degenerate): a near-zero
     /// divisor turns the contour into thousands of phantom watts (the 2026-06
     /// field incident divided by 0.18). With the fit-enforced
-    /// `b + e·pc ≥ MIN_CONTOUR_DIVISOR` and the Kalman gain clamped to
-    /// [0.6, 1.6], a healthy model's scaled divisor never drops below 1.2 —
-    /// the None path only guards a degenerate model inherited from disk that
-    /// never passed the fit/KF clamps.
+    /// `b + e·pc ≥ MIN_CONTOUR_DIVISOR` and the Kalman GAIN STATE clamped to
+    /// [0.6, 1.6] (the `g` state, not the filter's K matrix), a healthy
+    /// model's scaled divisor never drops below 1.2 — the None path only
+    /// guards a degenerate model/state inherited from disk that never passed
+    /// the fit/KF clamps. The guard is written NaN-rejecting (`!(x >= t)`):
+    /// a NaN gain or divisor must yield an honest None, never `Some(NaN)`
+    /// into the allocator (same paranoia as `rls_update`'s non-finite gate).
     pub fn gpu_watts_on_contour(
         &self,
         target_rpm: f64,
@@ -251,10 +254,15 @@ impl ThermalModel {
         pc: f64,
     ) -> Option<f64> {
         let divisor = gain * (self.b + self.e * pc);
-        if divisor < MIN_CONTOUR_DIVISOR / 2.0 {
+        if !(divisor >= MIN_CONTOUR_DIVISOR / 2.0) {
             return None;
         }
         let pg = (target_rpm - (self.c + bias) - self.a * pc) / divisor;
+        // Numerator-side garbage (e.g. a NaN bias off a corrupt state file)
+        // must not leak either: an honest None beats an insane Some.
+        if !pg.is_finite() {
+            return None;
+        }
         Some(pg.max(0.0))
     }
 
@@ -483,6 +491,17 @@ mod tests {
                         (rpm - target).abs() < 1e-6,
                         "bias={bias} gain={gain} pc={pc} rpm={rpm}"
                     );
+                    // Independent oracle at identity gain: pin the bias SIGN
+                    // against the untouched predict() so a consistent sign
+                    // error in both new functions cannot self-certify.
+                    if gain == 1.0 {
+                        let raw = m.predict(pc, pg);
+                        assert!(
+                            (raw - (target - bias)).abs() < 1e-6,
+                            "bias={bias} pc={pc}: predict={raw}, want {}",
+                            target - bias
+                        );
+                    }
                 }
             }
         }
@@ -511,6 +530,18 @@ mod tests {
         assert_eq!(m.gpu_watts_on_contour(3000.0, 0.0, 0.6, 10.0), None);
         // gain 1.6 -> 1.6 >= 1.0 -> answerable.
         assert!(m.gpu_watts_on_contour(3000.0, 0.0, 1.6, 10.0).is_some());
+    }
+
+    #[test]
+    fn contour_never_returns_nan() {
+        // A corrupt/hand-edited state file could seed NaN bias or gain before
+        // any KF clamp runs: the contour must answer an honest None, never
+        // Some(NaN) into the allocator (`x < t` is false for NaN, so the
+        // naive guard form would leak it; the guard is `!(x >= t)`).
+        let m = exact_model();
+        assert_eq!(m.gpu_watts_on_contour(3000.0, 0.0, f64::NAN, 25.0), None);
+        assert_eq!(m.gpu_watts_on_contour(3000.0, f64::NAN, 1.0, 25.0), None);
+        assert_eq!(m.gpu_watts_on_contour(f64::NAN, 0.0, 1.0, 25.0), None);
     }
 
     #[test]

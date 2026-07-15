@@ -1107,6 +1107,16 @@ impl<R: Runner> Controller<R> {
                     },
                 }
             }
+            // Vetoed overshoot hold (2026-07-14 design §3): a Noted line on
+            // episode ENTRY, pushed BEFORE AutoAllocated so it claims the
+            // batch's Decision cause (apply_effects: first claim wins). A
+            // vetoed hold changes no status, so without the explicit Note
+            // the crest would never surface for session grading.
+            if auto.allocator.overshoot_settle_started() {
+                effects.push(Effect::Noted {
+                    cause: "auto:overshoot_settle",
+                });
+            }
             effects.push(Effect::AutoAllocated {
                 demand_cpu: demand.cpu_starved,
                 demand_gpu: demand.gpu_starved,
@@ -1212,9 +1222,20 @@ impl<R: Runner> Controller<R> {
         // no evidence about the model in either direction, so the verdict
         // stands frozen, and a ModelDistrust fired from artifacts clears
         // only once gated samples bring the EWMA back down (accepted).
+        // FIFTH gate (2026-07-14 design §3), ahead of the other four: while
+        // the allocator holds under the transient-vs-static drain veto, the
+        // fan end is in a KNOWN EC transient with the command resting — so
+        // the cooldown gate opens BY CONSTRUCTION and a crest plateau can
+        // pass `is_steady` (the 2026-07-14 field plateau came within 46 RPM
+        // of the ±100 tolerance). A sample admitted there would feed
+        // +250..+400 RPM of momentum into the bias and grade the trust EWMA
+        // against a transient: skip the whole tier, same shape as the
+        // fan-invalid freeze. An EC transient is evidence about the EC, not
+        // the model.
         let now = s.t_mono;
         let cur_cmd = (self.status.cpu_limit_w, auto.gpu_target_w);
         if s.fan_valid
+            && !auto.allocator.overshoot_settle_active()
             && cooldown::cooldown_open(auto.commanded_ring.make_contiguous(), now)
             && is_steady(
                 auto.fan_window.make_contiguous(),
@@ -2975,7 +2996,9 @@ mod tests {
         ctl.on_command(Command::SetAuto(true));
         // busy_at holds fan1_rpm at a constant 1700: every slope estimate is
         // 0 RPM/s once the window fills, and the allocator keeps climbing at
-        // the up rate exactly as before the gate existed.
+        // the up rate exactly as before the gate existed — until the GPU leg
+        // enters the approach taper band of its candidate, where the last
+        // watts land at UP_RATE_TAPER_W (36 → 37, not 38).
         let mut allocs = Vec::new();
         for t in 0..=15 {
             if let Some(a) = alloc_of(&ctl.on_sample(&busy_at(f64::from(t)))) {
@@ -2984,7 +3007,7 @@ mod tests {
         }
         assert_eq!(
             allocs,
-            vec![(17.0, 32.0), (19.0, 34.0), (21.0, 36.0), (23.0, 38.0)]
+            vec![(17.0, 32.0), (19.0, 34.0), (21.0, 36.0), (23.0, 37.0)]
         );
     }
 
@@ -3014,8 +3037,11 @@ mod tests {
         // a near-target equilibrium is exactly what fired the field relay
         // (run-1783720682). A single +300 RPM spike on the last sample of an
         // otherwise in-band window averages to target+60 across the 5-sample
-        // tail — under the +150 overshoot line — so the mandatory drain must
-        // NOT fire; five consecutive elevated samples DO cross it and cut.
+        // tail — under the +150 overshoot line — so the overshoot regime must
+        // NOT engage; five consecutive elevated samples DO cross it. (Since
+        // the 2026-07-14 drain veto, crossing from a contour-covered held
+        // point HOLDS rather than cuts — the regime entry is observed via
+        // `overshoot_settle_active`, not a drained watt.)
 
         // Single spike: warm 30 in-band samples (loop holds at (15, 30)), then
         // one +300 blip at the t=30 allocator step.
@@ -3049,8 +3075,29 @@ mod tests {
             "one blip must not cut the allocation: {spike:?}"
         );
         assert!(
-            sustained.1 < 30.0,
-            "five elevated samples must fire the drain: {sustained:?}"
+            !ctl_a
+                .auto
+                .as_ref()
+                .unwrap()
+                .allocator
+                .overshoot_settle_active(),
+            "one blip must not enter the overshoot regime at all"
+        );
+        // The sustained crest engages the overshoot regime — proven by the
+        // drain veto holding (the contour covers the held (15, 30) point) —
+        // and the allocation is NOT raised.
+        assert_eq!(
+            sustained.1, 30.0,
+            "the veto must hold the sustained crest: {sustained:?}"
+        );
+        assert!(
+            ctl_b
+                .auto
+                .as_ref()
+                .unwrap()
+                .allocator
+                .overshoot_settle_active(),
+            "five elevated samples must engage the overshoot regime"
         );
     }
 
@@ -3074,12 +3121,23 @@ mod tests {
         ctl.on_sample(&soak_sample(28.0, 3000.0, true));
         ctl.on_sample(&soak_sample(29.0, 3000.0, true));
         // t=30 alloc: tail = [3000, NaN, 3000, 3000, 3300] → tail_mean None →
-        // fallback to the raw 3300 → overshoot drain fires.
+        // fallback to the raw 3300 → the overshoot regime engages (as the
+        // 5-sample MEAN would not — cf. the spike case above), proving the
+        // raw fallback reached the band check. Regime entry shows as the
+        // drain veto holding (the contour covers the held point).
         let out = alloc_of(&ctl.on_sample(&soak_sample(30.0, 3300.0, true)))
             .expect("t=30 is an allocator step");
+        assert_eq!(
+            out.1, 30.0,
+            "the veto must hold the raw-fallback crest: {out:?}"
+        );
         assert!(
-            out.1 < 30.0,
-            "raw fallback must drive the cut when smoothing is broken: {out:?}"
+            ctl.auto
+                .as_ref()
+                .unwrap()
+                .allocator
+                .overshoot_settle_active(),
+            "raw fallback must engage the overshoot regime when smoothing is broken"
         );
     }
 
@@ -3868,6 +3926,103 @@ mod tests {
         let s = achieved_fan_at(&ctl, 45.0, PINNED_PREDICT_RPM + 100.0);
         ctl.on_sample(&s);
         assert_ne!(ctl.status().trim_rpm, 0.0);
+    }
+
+    #[test]
+    fn adaptation_isolated_while_drain_veto_holds() {
+        // 2026-07-14 design §3: a vetoed crest satisfies the cooldown gate
+        // BY CONSTRUCTION (the command rests through the hold) and a crest
+        // plateau passes is_steady (constant reading here) and achievement
+        // (draws mirror commands) — every pre-veto gate admits it. Without
+        // the isolation clause the KF would ingest +300 RPM of EC transient
+        // as model error and the trust EWMA would grade the model against
+        // it. The whole tier must stay silent instead.
+        let runner = FakeRunner::new();
+        let dir = std::env::temp_dir().join(format!(
+            "bazerame-controller-test-{}-veto-isolation",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let (ui_tx, _ui_rx) = crossbeam_channel::unbounded();
+        let telemetry = Arc::new(Mutex::new(Some(Telemetry::open(&dir).unwrap())));
+        let (mut ctl, _gpu_calls) = pinned_op_controller(&runner);
+        ctl.on_command(Command::SetAuto(true));
+
+        // Settle at the pinned point with zero innovation until well past
+        // cooldown-open (t=45): premise state is exactly [0, 1].
+        for t in 0..=50 {
+            let s = achieved_fan_at(&ctl, f64::from(t), PINNED_PREDICT_RPM);
+            let effects = ctl.on_sample(&s);
+            apply_effects(&effects, &ctl, f64::from(t), &ui_tx, &telemetry);
+        }
+        assert!(
+            ctl.status().trim_rpm.abs() < 1e-9,
+            "premise: zero innovation, bias = {}",
+            ctl.status().trim_rpm
+        );
+
+        // EC-style crest: +300 over target, constant. The allocator vetoes
+        // the drain (the contour covers the pinned point) — 45 s stays
+        // inside the 60 s veto window — and the adaptation tier must not
+        // move state nor feed trust, no matter how steady the plateau is.
+        for t in 51..=95 {
+            let s = achieved_fan_at(&ctl, f64::from(t), PINNED_PREDICT_RPM + 300.0);
+            let effects = ctl.on_sample(&s);
+            apply_effects(&effects, &ctl, f64::from(t), &ui_tx, &telemetry);
+            assert!(
+                ctl.status().trim_rpm.abs() < 1e-9,
+                "KF ingested a vetoed crest at t={t}: bias = {}",
+                ctl.status().trim_rpm
+            );
+            assert!(
+                (ctl.status().gain - 1.0).abs() < 1e-9,
+                "gain moved on a vetoed crest at t={t}"
+            );
+        }
+        assert!(
+            ctl.auto.as_ref().unwrap().trust.ewma() < 1e-9,
+            "trust must not be fed during a vetoed crest: ewma = {}",
+            ctl.auto.as_ref().unwrap().trust.ewma()
+        );
+
+        // Crest decays: back in band (+80). The veto clears on band
+        // re-entry, the command never moved, and after the 20-sample steady
+        // tail refills the KF resumes — the +80 is real model error again.
+        for t in 96..=140 {
+            let s = achieved_fan_at(&ctl, f64::from(t), PINNED_PREDICT_RPM + 80.0);
+            let effects = ctl.on_sample(&s);
+            apply_effects(&effects, &ctl, f64::from(t), &ui_tx, &telemetry);
+        }
+        assert!(
+            ctl.status().trim_rpm > 1.0,
+            "adaptation must resume once the crest clears: bias = {}",
+            ctl.status().trim_rpm
+        );
+
+        // Telemetry grading hook (design §3): the vetoed steps surface as
+        // `auto:overshoot_settle` decisions, and none appear after recovery.
+        let path = {
+            let mut guard = telemetry::lock(&telemetry);
+            let t = guard.as_mut().unwrap();
+            t.flush();
+            t.path().to_path_buf()
+        };
+        let contents = fs::read_to_string(&path).unwrap();
+        let settle_ts: Vec<f64> = contents
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|v| v["kind"] == "decision" && v["cause"] == "auto:overshoot_settle")
+            .map(|v| v["t_mono"].as_f64().unwrap())
+            .collect();
+        assert!(
+            !settle_ts.is_empty(),
+            "vetoed crest must surface as auto:overshoot_settle in {contents}"
+        );
+        assert!(
+            settle_ts.iter().all(|t| (51.0..=95.0).contains(t)),
+            "settle causes outside the crest window: {settle_ts:?}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Calibrated controller pinned at a CONSTANT operating point: a 54 W

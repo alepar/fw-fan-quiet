@@ -113,6 +113,40 @@ pub const DEADBAND_RPM: f64 = 150.0;
 /// it, occasional low dips of the smoothed reading keep nudging +UP_RATE_W
 /// until equilibrium parks ~2σ above target, back at the trigger line.
 pub const RAISE_HOLD_RPM: f64 = 50.0;
+/// Transient-vs-static drain veto (2026-07-14 field run-1784082579): while
+/// the fan reading overshoots the +DEADBAND_RPM line but the model claims the
+/// HELD point is statically at-or-under target — `held pg ≤ contour(held pc)
+/// + OVERSHOOT_VETO_MARGIN_W` — the crest is EC fan-curve momentum, not a
+/// wrong operating point: climbing to the contour from a deep sag gave the EC
+/// a fast temperature ramp and it overshot its own static curve by +200..+350
+/// (measured 3250–3400 RPM at ~72 W whose settled value was 3050, in band).
+/// Draining against that transient is also acoustically useless — watts move
+/// RPM only ~26–30 s later, by which time the crest has decayed on its own;
+/// all the cut buys is a static point below target, the undershoot leg of the
+/// 2026-07-14 relay (~150 s period, 39% in band). So: HOLD instead, for at
+/// most [`OVERSHOOT_VETO_MAX_STEPS`] steps per overshoot episode.
+///
+/// The margin (1 W ≈ 20 RPM at the ~19.9 RPM/W field slope) absorbs grid
+/// rounding and the KF nudging the contour between steps.
+pub const OVERSHOOT_VETO_MARGIN_W: f64 = 1.0;
+/// Bound on the drain veto, in allocator steps (12 × 5 s = 60 s), per
+/// overshoot episode (the counter resets only when the reading re-enters the
+/// band). Sized from the measured 26–30 s watts→RPM lag and the observed
+/// 30–50 s crest decay, with margin — while bounding the exposure when the
+/// model is LYING (the 2026-06 degenerate-contour class, the very incident
+/// the mandatory backstop exists for) to one minute, after which the backstop
+/// drains exactly as before. The backstop's authority is delayed, never
+/// removed; the divisor floor guards that class independently.
+pub const OVERSHOOT_VETO_MAX_STEPS: u32 = 12;
+/// Tapered raise rate (W/step) within [`TAPER_BAND_W`] of the candidate on
+/// that axis. The EC's momentum overshoot scales with the temperature ramp
+/// rate at the moment RPM approaches target, and the worst ramp is the tail
+/// of a full-rate climb ending exactly at the contour — so land the last few
+/// watts at half rate. Cost: a 20 W onset transit grows ~50 s → ~65 s.
+pub const UP_RATE_TAPER_W: f64 = 1.0;
+/// Distance-to-candidate (W, per axis) under which raises use
+/// [`UP_RATE_TAPER_W`] instead of [`UP_RATE_W`].
+pub const TAPER_BAND_W: f64 = 6.0;
 /// Power deadband: candidate moves smaller than this (on both axes, while
 /// RPM is in band) are noise, not demand shifts — hold the last point.
 pub const DEADBAND_W: f64 = 1.5;
@@ -250,11 +284,36 @@ pub struct AllocInput<'a> {
 pub struct Allocator {
     /// Last commanded (cpu_w, gpu_w); None before the first step / after reset.
     last: Option<(f64, f64)>,
+    /// Steps spent holding under the drain veto in the CURRENT overshoot
+    /// episode; resets only on band re-entry. At
+    /// [`OVERSHOOT_VETO_MAX_STEPS`] the veto is dead for the rest of the
+    /// episode and the mandatory drain proceeds.
+    overshoot_veto_steps: u32,
+    /// True iff the LAST `step` held under the drain veto — polled by the
+    /// controller to skip the adaptation tier (a vetoed crest is a KNOWN
+    /// fan-end transient with the command resting, so the cooldown gate
+    /// opens by construction and a crest plateau can marginally pass
+    /// `is_steady`) and to label the Decision (`auto:overshoot_settle`).
+    settle_active: bool,
 }
 
 impl Allocator {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// True iff the last [`Self::step`] held under the transient-vs-static
+    /// drain veto (see [`OVERSHOOT_VETO_MAX_STEPS`]).
+    pub fn overshoot_settle_active(&self) -> bool {
+        self.settle_active
+    }
+
+    /// True iff the last [`Self::step`] was the FIRST vetoed hold of the
+    /// current overshoot episode. The controller emits the telemetry marker
+    /// on this edge: vetoed holds change no status, so without it they
+    /// would never surface in the decision stream.
+    pub fn overshoot_settle_started(&self) -> bool {
+        self.settle_active && self.overshoot_veto_steps == 1
     }
 
     /// One allocation step (called every 5 s in Auto mode). Policy:
@@ -298,6 +357,8 @@ impl Allocator {
             inp.floors.0,
             inp.cpu_max_w
         );
+        // Recomputed every step: only a veto hold below may claim it.
+        self.settle_active = false;
         let cpu_floor = inp.floors.0.clamp(0.0, inp.cpu_max_w);
         // Floors win over everything, freeze/hold paths included: lift the
         // held point to the floor first. The one deliberate power raise
@@ -320,6 +381,14 @@ impl Allocator {
         };
 
         let rpm_err = inp.measured_fan_rpm - inp.fan_target_rpm;
+        // Band re-entry re-arms the drain veto: every reset requires the
+        // reading at/inside the band, so chatter across the +150 line only
+        // ever re-arms against fresh near-band excursions — the pathological
+        // pinned-high case never re-enters and its bound holds unbroken.
+        // (NaN never resets: the comparison is false, fail-closed.)
+        if rpm_err <= DEADBAND_RPM {
+            self.overshoot_veto_steps = 0;
+        }
         if rpm_err.abs() <= DEADBAND_RPM
             && (cand_pc - prev.0).abs() < DEADBAND_W
             && (cand_pg - prev.1).abs() < DEADBAND_W
@@ -328,6 +397,24 @@ impl Allocator {
         }
 
         let overshoot = rpm_err > DEADBAND_RPM;
+        // Transient-vs-static drain veto (2026-07-14 field relay,
+        // run-1784082579; see [`OVERSHOOT_VETO_MAX_STEPS`]): fans measured
+        // OVER the band while the model claims the HELD point is statically
+        // at-or-under target means the crest is EC momentum from the recent
+        // climb, not a wrong operating point — a cut cannot lower RPM for
+        // ~26–30 s anyway and only digs the undershoot sag that re-arms the
+        // relay. HOLD instead, for a bounded window per episode. A lying
+        // model (2026-06 class) is indistinguishable from a transient here;
+        // the bound is what keeps the backstop's authority — delayed one
+        // window, never removed.
+        if overshoot
+            && self.overshoot_veto_steps < OVERSHOOT_VETO_MAX_STEPS
+            && (inp.contour)(prev.0).is_some_and(|pg_c| prev.1 <= pg_c + OVERSHOOT_VETO_MARGIN_W)
+        {
+            self.overshoot_veto_steps += 1;
+            self.settle_active = true;
+            return prev;
+        }
         // Velocity gate, drain half (see [`SLOPE_GATE_RPM_S`]): overshooting
         // while the fans are already falling faster than the gate means the
         // pipeline is draining from cuts the fans have not finished
@@ -376,19 +463,27 @@ impl Allocator {
         // the normal down rate, and floors still win (the `.max(cpu_floor)`
         // below).
         let raise_held = rpm_err >= -RAISE_HOLD_RPM;
-        let (up, down) = if overshoot {
-            (0.0, OVERSHOOT_DOWN_RATE_W) // overshoot: cut hard, never raise
+        // Approach taper ([`TAPER_BAND_W`], per axis): the EC's momentum
+        // overshoot scales with the temperature ramp rate at the moment RPM
+        // nears target, and the worst ramp is a full-rate climb ending
+        // exactly at the contour — so the last few watts land at half rate.
+        let (up_pc, up_pg, down) = if overshoot {
+            (0.0, 0.0, OVERSHOOT_DOWN_RATE_W) // overshoot: cut hard, never raise
         } else if climbing || raise_held {
-            (0.0, DOWN_RATE_W)
+            (0.0, 0.0, DOWN_RATE_W)
         } else {
-            (UP_RATE_W, DOWN_RATE_W)
+            (
+                taper_up(cand_pc - prev.0),
+                taper_up(cand_pg - prev.1),
+                DOWN_RATE_W,
+            )
         };
         let out = (
-            cand_pc.clamp(prev.0 - down, prev.0 + up).max(cpu_floor),
+            cand_pc.clamp(prev.0 - down, prev.0 + up_pc).max(cpu_floor),
             // The pg floor here is 0 (the GPU *clock* floor lives in the
             // watts→clock PI's clamp): the backstop's capped candidate may
             // go negative near zero, the commanded watts target must not.
-            cand_pg.clamp(prev.1 - down, prev.1 + up).max(0.0),
+            cand_pg.clamp(prev.1 - down, prev.1 + up_pg).max(0.0),
         );
         self.last = Some(out);
         out
@@ -401,6 +496,18 @@ impl Allocator {
     #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.last = None;
+    }
+}
+
+/// Raise rate for one axis: the full [`UP_RATE_W`] far from the candidate,
+/// [`UP_RATE_TAPER_W`] once within [`TAPER_BAND_W`] of it (approach taper —
+/// see the consts). A negative distance (candidate below the held point)
+/// returns the taper rate, but the down clamp governs there anyway.
+fn taper_up(dist_w: f64) -> f64 {
+    if dist_w <= TAPER_BAND_W {
+        UP_RATE_TAPER_W
+    } else {
+        UP_RATE_W
     }
 }
 
@@ -644,10 +751,23 @@ mod tests {
         let target = 3250.0;
         let mut a = Allocator {
             last: Some((28.0, 92.0)),
+            ..Allocator::default()
         };
         let i = inp(&lying, D_BOTH, target + 300.0, target);
-        // First step: a genuine decrease on both axes, exactly the min cut
-        // (the lying candidate (54, 100) wants MORE of everything).
+        // 2026-07-14 amendment: a lying-HIGH contour "covers" the held point,
+        // which is indistinguishable (to the allocator) from a genuine EC
+        // transient — so the drain veto holds first, for its bounded window.
+        // The backstop's authority is delayed by exactly that window, never
+        // removed; everything after is the original 2026-06 contract.
+        for step in 0..OVERSHOOT_VETO_MAX_STEPS {
+            assert_eq!(
+                a.step(&i),
+                (28.0, 92.0),
+                "bounded veto must hold at step {step}"
+            );
+        }
+        // First post-veto step: a genuine decrease on both axes, exactly the
+        // min cut (the lying candidate (54, 100) wants MORE of everything).
         let first = a.step(&i);
         assert_eq!(first, (26.0, 90.0));
         // Repeated steps drain toward the floors and STOP there.
@@ -710,6 +830,7 @@ mod tests {
         let poor = contour_for(1200.0); // best candidate here is (54, 0)
         let mut a = Allocator {
             last: Some((30.0, 60.0)),
+            ..Allocator::default()
         };
         let mut i = inp(&poor, D_BOTH, 1700.0, 2000.0);
         i.fan_slope_rpm_s = Some(15.0);
@@ -724,8 +845,13 @@ mod tests {
         // While the fans are already draining faster than the gate, HOLD.
         let lying = |_pc: f64| Some(500.0);
         let target = 3250.0;
+        // Veto pre-spent: this test isolates the falling-fast pause (the
+        // covering contour would otherwise engage the drain veto first —
+        // that path has its own tests).
         let mut a = Allocator {
             last: Some((28.0, 92.0)),
+            overshoot_veto_steps: OVERSHOOT_VETO_MAX_STEPS,
+            ..Allocator::default()
         };
         let mut i = inp(&lying, D_BOTH, target + 300.0, target);
         i.fan_slope_rpm_s = Some(-15.0);
@@ -756,6 +882,7 @@ mod tests {
         let c = contour_for(3000.0);
         let mut a = Allocator {
             last: Some((15.0, 30.0)),
+            ..Allocator::default()
         };
         let mut i = inp(&c, D_BOTH, 1700.0, 2000.0);
         i.fan_slope_rpm_s = Some(15.0);
@@ -766,6 +893,7 @@ mod tests {
         let lying = |_pc: f64| Some(500.0);
         let mut a = Allocator {
             last: Some((15.0, 92.0)),
+            ..Allocator::default()
         };
         let mut i = inp(&lying, D_BOTH, 2300.0, 2000.0);
         i.fan_slope_rpm_s = Some(-15.0);
@@ -810,6 +938,7 @@ mod tests {
         let c = contour_for(3000.0);
         let mut a = Allocator {
             last: Some((15.0, 30.0)),
+            ..Allocator::default()
         };
         let mut i = inp(&c, D_BOTH, 1970.0, 2000.0);
         i.floors = (20.0, 1000);
@@ -827,8 +956,13 @@ mod tests {
         // both apply exactly as before the raise gate existed (the raise gate
         // only reshapes the sub-target/hold bands, never the overshoot one).
         let rich = contour_for(4000.0); // candidate wants MORE on both axes
+        // Veto pre-spent: the rich contour covers the held point, so the
+        // drain veto would hold its bounded window first (tested on its
+        // own); the regime AFTER it must be exactly the pre-veto drain.
         let mut a = Allocator {
             last: Some((30.0, 60.0)),
+            overshoot_veto_steps: OVERSHOOT_VETO_MAX_STEPS,
+            ..Allocator::default()
         };
         let i = inp(&rich, D_BOTH, 2200.0, 2000.0); // target + 200 → overshoot
         let out = a.step(&i);
@@ -843,6 +977,148 @@ mod tests {
         assert!(
             out.1 >= 60.0 - OVERSHOOT_DOWN_RATE_W - 1e-9,
             "gpu cut must not exceed the overshoot down rate: {out:?}"
+        );
+    }
+
+    // ---- allocator: transient-vs-static drain veto + taper ----------------
+
+    /// Constant contour at 70 GPU watts: with D_GPU_ONLY the candidate is
+    /// always (15, 70) (all pc score equally, ties break to the lowest pc),
+    /// so "held == candidate == on the contour" is trivial to set up.
+    fn contour_70(_pc: f64) -> Option<f64> {
+        Some(70.0)
+    }
+
+    #[test]
+    fn overshoot_drain_vetoed_while_contour_covers_held_point() {
+        // 2026-07-14 field mechanism (run-1784082579): the loop rests ON the
+        // contour, the EC crests +300 past target while the static point is
+        // fine — the drain must HOLD (a cut cannot lower RPM for ~26–30 s
+        // anyway; it only digs the sag that powers the relay).
+        let mut a = Allocator {
+            last: Some((15.0, 70.0)),
+            ..Allocator::default()
+        };
+        let i = inp(&contour_70, D_GPU_ONLY, 3300.0, 3000.0);
+        assert!(!a.overshoot_settle_active(), "flag must start clear");
+        for step in 0..OVERSHOOT_VETO_MAX_STEPS {
+            assert_eq!(a.step(&i), (15.0, 70.0), "veto must hold at step {step}");
+            assert!(a.overshoot_settle_active(), "settle flag at step {step}");
+        }
+    }
+
+    #[test]
+    fn overshoot_veto_expires_then_the_backstop_drains() {
+        let mut a = Allocator {
+            last: Some((15.0, 70.0)),
+            ..Allocator::default()
+        };
+        let i = inp(&contour_70, D_GPU_ONLY, 3300.0, 3000.0);
+        for _ in 0..OVERSHOOT_VETO_MAX_STEPS {
+            a.step(&i);
+        }
+        // The bounded window is spent: the mandatory min cut resumes (the
+        // candidate == the held point, so the backstop cap is the binding
+        // edge) and STAYS resumed for the rest of the episode — the counter
+        // must not re-arm while the reading is still over the band.
+        let out = a.step(&i);
+        assert_eq!(out, (15.0, 68.0), "expired veto must drain");
+        assert!(!a.overshoot_settle_active(), "flag must drop with the veto");
+        let out2 = a.step(&i);
+        assert!(
+            out2.1 <= out.1 - OVERSHOOT_MIN_CUT_W + 1e-9,
+            "drain must continue while over the band: {out2:?}"
+        );
+    }
+
+    #[test]
+    fn overshoot_veto_rearms_only_on_band_reentry() {
+        let mut a = Allocator {
+            last: Some((15.0, 70.0)),
+            ..Allocator::default()
+        };
+        let over = inp(&contour_70, D_GPU_ONLY, 3300.0, 3000.0);
+        for _ in 0..3 {
+            assert_eq!(a.step(&over), (15.0, 70.0));
+        }
+        // Reading back inside the band: deadband hold, flag off, counter
+        // reset — the next excursion gets a FULL window (chatter across the
+        // +150 line is benign: every reset requires the reading at/inside
+        // the band, so a re-armed veto always defends a fresh near-band
+        // excursion; the pathological pinned-high case never re-enters).
+        let calm = inp(&contour_70, D_GPU_ONLY, 3000.0, 3000.0);
+        assert_eq!(a.step(&calm), (15.0, 70.0));
+        assert!(!a.overshoot_settle_active(), "no veto inside the band");
+        for step in 0..OVERSHOOT_VETO_MAX_STEPS {
+            assert_eq!(a.step(&over), (15.0, 70.0), "fresh window at step {step}");
+            assert!(a.overshoot_settle_active());
+        }
+        assert_eq!(a.step(&over), (15.0, 68.0), "then the backstop again");
+    }
+
+    #[test]
+    fn overshoot_drains_immediately_when_the_model_agrees_its_over() {
+        // Held ABOVE the contour (+margin): the model itself says the point
+        // is statically over target — nothing transient to wait out.
+        let mut a = Allocator {
+            last: Some((15.0, 80.0)),
+            ..Allocator::default()
+        };
+        let i = inp(&contour_70, D_GPU_ONLY, 3300.0, 3000.0);
+        let out = a.step(&i);
+        assert!(
+            out.1 <= 80.0 - OVERSHOOT_MIN_CUT_W + 1e-9,
+            "must cut, not veto: {out:?}"
+        );
+        assert!(!a.overshoot_settle_active());
+        // Margin edge: within +1 W of the contour still vetoes (grid
+        // rounding / the KF nudging the contour between steps).
+        let mut b = Allocator {
+            last: Some((15.0, 70.9)),
+            ..Allocator::default()
+        };
+        assert_eq!(b.step(&i), (15.0, 70.9), "inside the margin: veto");
+        assert!(b.overshoot_settle_active());
+    }
+
+    #[test]
+    fn degenerate_contour_never_claims_a_vetoed_settle() {
+        // Contour degenerate everywhere → the freeze path holds, but that is
+        // a FREEZE, not a vetoed settle: the model cannot vouch for the held
+        // point, so the controller must not skip adaptation gates off it.
+        let degenerate = |_pc: f64| None::<f64>;
+        let mut a = Allocator {
+            last: Some((15.0, 70.0)),
+            ..Allocator::default()
+        };
+        let i = inp(&degenerate, D_GPU_ONLY, 3300.0, 3000.0);
+        assert_eq!(a.step(&i), (15.0, 70.0), "degenerate contour freezes");
+        assert!(!a.overshoot_settle_active());
+    }
+
+    #[test]
+    fn raise_tapers_inside_the_band_of_the_candidate() {
+        // GPU axis: full 2 W steps down to exactly TAPER_BAND_W out, then
+        // 1 W landings onto the candidate (the EC sees a ramp, not a step).
+        let mut a = Allocator {
+            last: Some((15.0, 60.0)),
+            ..Allocator::default()
+        };
+        let i = inp(&contour_70, D_GPU_ONLY, 1700.0, 3000.0);
+        let got: Vec<f64> = (0..8).map(|_| a.step(&i).1).collect();
+        assert_eq!(got, vec![62.0, 64.0, 65.0, 66.0, 67.0, 68.0, 69.0, 70.0]);
+
+        // CPU axis, same shape — the taper is per-axis.
+        let cpu_end = |_pc: f64| Some(0.0); // candidate (54, 0): CPU-starved max
+        let mut a = Allocator {
+            last: Some((40.0, 0.0)),
+            ..Allocator::default()
+        };
+        let i = inp(&cpu_end, D_BOTH, 1700.0, 3000.0);
+        let got: Vec<f64> = (0..10).map(|_| a.step(&i).0).collect();
+        assert_eq!(
+            got,
+            vec![42.0, 44.0, 46.0, 48.0, 49.0, 50.0, 51.0, 52.0, 53.0, 54.0]
         );
     }
 
@@ -874,7 +1150,10 @@ mod tests {
         let flat = |_pc: f64| Some(35.0);
         let mut a = Allocator::new();
         let out = a.step(&inp(&flat, D_GPU_ONLY, 1900.0, 2000.0));
-        assert_eq!(out, (15.0, 32.0)); // rate-limited toward (15, 35)
+        // Moves toward (15, 35) — 5 W out is inside the approach taper band,
+        // so the step is UP_RATE_TAPER_W, not UP_RATE_W. The property under
+        // test is unchanged: a real demand shift MOVES despite in-band RPM.
+        assert_eq!(out, (15.0, 31.0));
     }
 
     // ---- allocator: floors ----------------------------------------------
@@ -1105,6 +1384,12 @@ mod tests {
                 let offset = trim.offset_rpm();
                 let contour =
                     move |_pc: f64| Some((SIM_TARGET_RPM - offset - model_c) / SIM_PLANT_K);
+                // Veto pre-spent on BOTH arms: this sim isolates the
+                // velocity-gate A/B, and the 500 RPM model bias makes the
+                // contour "cover" the held point, so the 2026-07-14 drain
+                // veto would otherwise reshape both arms (it has its own sim,
+                // `simulate_ec_overshoot_cycle`).
+                alloc.overshoot_veto_steps = OVERSHOOT_VETO_MAX_STEPS;
                 let (_, pg) = alloc.step(&AllocInput {
                     contour: &contour,
                     demand: D_GPU_ONLY, // GPU-heavy load: CPU pinned at floor
@@ -1399,6 +1684,222 @@ mod tests {
             "smoothing must suppress the blip-triggered drains: raw {} vs smoothed {}",
             raw.overshoot_steps_after_300,
             post.overshoot_steps_after_300
+        );
+    }
+
+    /// EC-momentum plant replaying the 2026-07-14 relay regime (field
+    /// run-1784082579: gaming, demand ~1.0, CPU at its 15 W floor, FIRST
+    /// session on the smoothed-trigger binary — so the crests are genuine,
+    /// not noise). The distinguishing feature vs [`simulate_soak_cycle`] is
+    /// the plant: the earlier sims are monotone first-order and structurally
+    /// CANNOT overshoot their own static curve, but the field EC does — a
+    /// fast temperature ramp makes it crest +200..+350 past the static value
+    /// (3250–3400 measured at ~72 W whose settled point is 3050, in band),
+    /// decaying over ~30–50 s. Modeled as a rate-driven kick: a low-passed
+    /// derivative of the (dead-time-delayed) static response, added on top
+    /// of the first-order settle.
+    ///
+    /// The model here is only [`EC_MODEL_BIAS_RPM`] = 50 off (the field KF
+    /// state was healthy): the honest contour parks the TRUE settled RPM at
+    /// target+50, well inside the band. Pre-veto, the momentum crest alone
+    /// crossed the +150 line, fired the mandatory drain off a point the
+    /// model correctly called fine, and the sag → re-climb → fresh-ramp
+    /// crest closed the ~150 s relay (39% in band in the field).
+    const EC_TARGET_RPM: f64 = 3000.0;
+    const EC_PLANT_K: f64 = 12.0; // RPM/W static slope (field ≈ 11)
+    const EC_PLANT_C: f64 = 2210.0; // static 3050 at the 70 W contour
+    const EC_PLANT_TAU_S: f64 = 12.0;
+    /// Field: RPM sat flat ~26–30 s into a climb before answering at all.
+    const EC_DEAD_S: usize = 25;
+    const EC_MODEL_BIAS_RPM: f64 = 50.0;
+    /// Kick gain: RPM of momentum crest per RPM/s of static slew (field:
+    /// ~+350 crest against a 0.4 W/s × 11 RPM/W ≈ 4.4 RPM/s ramp ≈ 80 s).
+    const EC_KICK_GAIN_S: f64 = 80.0;
+    /// Kick low-pass: sets both how fast momentum builds and the ~30–50 s
+    /// crest decay.
+    const EC_KICK_TAU_S: f64 = 25.0;
+    /// Uniform ±60 RPM tach jitter (stdev ≈ 35): modest by design — this
+    /// regime's mechanism is momentum, not noise (that one is
+    /// [`simulate_soak_cycle`]'s).
+    const EC_NOISE_RPM: f64 = 60.0;
+
+    /// Result of an EC-momentum run: the 1 Hz true-RPM trace plus the
+    /// mechanism counters the veto is asserted on.
+    struct EcRun {
+        trace: Vec<f64>,
+        /// Allocator steps where the commanded gpu_w genuinely DECREASED
+        /// while the fed reading was over target+DEADBAND_RPM — actual
+        /// drains against the crest (holds don't count).
+        drain_steps: usize,
+        /// The commanded point rested ≥ WINDOW_S within TOL_W at least once
+        /// after t=400 — the un-starved-adaptation property (field: 1
+        /// `auto:kf` in 10 min mid-relay).
+        cooldown_opened_after_400: bool,
+        /// Final commanded gpu_w — the veto run must END resting on the
+        /// contour, not below it.
+        final_gpu_w: f64,
+    }
+
+    /// The EC-momentum closed loop at the controller's real cadences (1 Hz
+    /// samples, 5 s allocator steps, real slope estimator, real
+    /// [`FAN_SMOOTH_N`] tail-mean into the band checks), starting from the
+    /// field relay's sag bottom (52 W, settled) with demand pinned GPU-only.
+    /// `veto = false` pre-spends the veto counter before every step — the
+    /// drain then behaves exactly as the pre-fix allocator (the veto is
+    /// unconditional code, not a flag; this is the same isolation trick the
+    /// falling-fast test uses). Deterministic (fixed xorshift seed).
+    fn simulate_ec_overshoot_cycle(veto: bool) -> EcRun {
+        use crate::calib::steady::tail_mean;
+        use crate::control::controller::{FAN_SMOOTH_N, fan_slope_rpm_s};
+        use crate::control::cooldown::{CommandedPoint, WINDOW_S, cooldown_open};
+
+        const SAG_START_W: f64 = 52.0;
+        let mut alloc = Allocator {
+            last: Some((15.0, SAG_START_W)),
+            ..Allocator::default()
+        };
+        let mut window: std::collections::VecDeque<f64> = std::collections::VecDeque::new();
+        let mut gpu_w = SAG_START_W;
+        let mut cpu_w = 15.0;
+        let mut pipe: std::collections::VecDeque<f64> =
+            std::iter::repeat_n(gpu_w, EC_DEAD_S + 1).collect();
+        // Settled at the sag bottom: no momentum, settle == static.
+        let mut settle = EC_PLANT_K * gpu_w + EC_PLANT_C;
+        let mut kick = 0.0;
+        let mut prev_static = settle;
+        let mut ring: std::collections::VecDeque<CommandedPoint> =
+            std::collections::VecDeque::new();
+        let mut trace = Vec::with_capacity(900);
+        let mut drain_steps = 0usize;
+        let mut cooldown_opened_after_400 = false;
+        // Distinct fixed seed: no noise sequence shared with the other sims.
+        let mut rng: u64 = 0x0DDB_A11C_0FFE_E000;
+        let mut noise = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % 2001) as f64 / 1000.0 - 1.0 // uniform in [-1, 1]
+        };
+        for t in 0..900 {
+            // 1 Hz plant step: dead time, then first-order settle toward the
+            // static curve PLUS the momentum kick off the static slew rate.
+            pipe.push_back(gpu_w);
+            let felt = pipe.pop_front().unwrap();
+            let stat = EC_PLANT_K * felt + EC_PLANT_C;
+            kick += (EC_KICK_GAIN_S * (stat - prev_static).max(0.0) - kick) / EC_KICK_TAU_S;
+            prev_static = stat;
+            settle += (stat - settle) / EC_PLANT_TAU_S;
+            let rpm = settle + kick;
+            let measured = rpm + EC_NOISE_RPM * noise();
+            if window.len() >= 30 {
+                window.pop_front();
+            }
+            window.push_back(measured);
+            if t % 5 == 0 {
+                let slope = fan_slope_rpm_s(window.make_contiguous());
+                let fed = tail_mean(window.make_contiguous(), FAN_SMOOTH_N).unwrap_or(measured);
+                // Honest inversion of the model's own (mildly biased)
+                // surface: the contour parks the true settled RPM at
+                // target+50, INSIDE the band — the model is right, only the
+                // momentum crest is over the line.
+                let model_c = EC_PLANT_C - EC_MODEL_BIAS_RPM;
+                let contour = move |_pc: f64| Some((EC_TARGET_RPM - model_c) / EC_PLANT_K);
+                if !veto {
+                    // Pre-fix drain behavior: veto window pre-spent.
+                    alloc.overshoot_veto_steps = OVERSHOOT_VETO_MAX_STEPS;
+                }
+                let prev_gpu = gpu_w;
+                let out = alloc.step(&AllocInput {
+                    contour: &contour,
+                    demand: D_GPU_ONLY, // GPU-heavy load: CPU pinned at floor
+                    floors: (15.0, 1000),
+                    measured_fan_rpm: fed,
+                    fan_target_rpm: EC_TARGET_RPM,
+                    fan_valid: true,
+                    fan_slope_rpm_s: slope,
+                    cpu_max_w: CPU_MAX_W,
+                    gpu_max_w: GPU_MAX_W,
+                });
+                cpu_w = out.0;
+                gpu_w = out.1;
+                if fed - EC_TARGET_RPM > DEADBAND_RPM && gpu_w < prev_gpu - 1e-9 {
+                    drain_steps += 1;
+                }
+            }
+            if ring.len() >= 40 {
+                ring.pop_front();
+            }
+            ring.push_back(CommandedPoint {
+                t_mono: t as f64,
+                cpu_w,
+                gpu_w,
+            });
+            if t as f64 >= 400.0 + WINDOW_S && cooldown_open(ring.make_contiguous(), t as f64) {
+                cooldown_opened_after_400 = true;
+            }
+            trace.push(rpm);
+        }
+        EcRun {
+            trace,
+            drain_steps,
+            cooldown_opened_after_400,
+            final_gpu_w: gpu_w,
+        }
+    }
+
+    /// In-band (±DEADBAND_RPM of the EC target) fraction over the last 300 s.
+    fn ec_in_band(trace: &[f64]) -> f64 {
+        let tail = &trace[trace.len() - 300..];
+        tail.iter()
+            .filter(|r| (**r - EC_TARGET_RPM).abs() <= DEADBAND_RPM)
+            .count() as f64
+            / tail.len() as f64
+    }
+
+    #[test]
+    fn drain_veto_captures_the_ec_momentum_crest() {
+        // Veto-less arm (window pre-spent): momentum crests cross +150 and
+        // the mandatory drain fires against points the model correctly calls
+        // fine — repeatedly, across the whole run (the field relay's engine;
+        // measured 9 spurious drain steps here). NOTE the approach taper is
+        // active on BOTH arms (unconditional code), and the taper alone
+        // already softens this gentle sim's relay below the field's 39%-in-
+        // band severity — the honest pre-fix baseline is run-1784082579
+        // itself; this arm demonstrates the drain-against-transient
+        // mechanism, not the full field amplitude.
+        let pre = simulate_ec_overshoot_cycle(false);
+        assert!(
+            pre.drain_steps >= 3,
+            "veto-less arm must drain against the crests: {} drain steps",
+            pre.drain_steps
+        );
+
+        // Veto arm: every crest is held out (model-agrees + bounded window),
+        // decays on its own, and the loop captures inside the hold band near
+        // the contour — resting long enough to re-open the adaptation
+        // cooldown the field relay starved.
+        let post = simulate_ec_overshoot_cycle(true);
+        assert_eq!(
+            post.drain_steps, 0,
+            "the veto must hold out every transient crest"
+        );
+        assert!(
+            ec_in_band(&post.trace) >= 0.90,
+            "veto run must settle in band: {:.0}% in band",
+            ec_in_band(&post.trace) * 100.0
+        );
+        // Rests high in the hold band (static ≈ target), not drained back
+        // toward the 52 W sag the relay kept revisiting. (The exact resting
+        // watts may sit under the contour: the raise gate parks wherever the
+        // reading first holds — anywhere in the band is a capture.)
+        assert!(
+            post.final_gpu_w >= 62.0,
+            "veto run must end resting near the band, not sagged: {} W",
+            post.final_gpu_w
+        );
+        assert!(
+            post.cooldown_opened_after_400,
+            "the rested commanded point must re-open the adaptation cooldown"
         );
     }
 

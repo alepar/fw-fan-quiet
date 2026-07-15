@@ -59,7 +59,11 @@ mod tests {
     /// 1 Hz flat history at `(cpu_w, gpu_w)` covering `t0..=t1` inclusive.
     fn flat(t0: i64, t1: i64, cpu_w: f64, gpu_w: f64) -> Vec<CommandedPoint> {
         (t0..=t1)
-            .map(|t| CommandedPoint { t_mono: t as f64, cpu_w, gpu_w })
+            .map(|t| CommandedPoint {
+                t_mono: t as f64,
+                cpu_w,
+                gpu_w,
+            })
             .collect()
     }
 
@@ -89,7 +93,11 @@ mod tests {
         let mut ring: Vec<CommandedPoint> = Vec::new();
         for t in 70..=100 {
             let gpu_w = 60.0 + 0.4 * (t - 70) as f64;
-            ring.push(CommandedPoint { t_mono: t as f64, cpu_w: 45.0, gpu_w });
+            ring.push(CommandedPoint {
+                t_mono: t as f64,
+                cpu_w: 45.0,
+                gpu_w,
+            });
             assert!(
                 !cooldown_open(&ring, t as f64),
                 "staircase opened the gate at t={t}"
@@ -107,10 +115,18 @@ mod tests {
         let mut ring: Vec<CommandedPoint> = (70..100)
             .map(|t| {
                 let d = if t % 2 == 0 { 1.9 } else { -1.9 };
-                CommandedPoint { t_mono: t as f64, cpu_w: 45.0 + d, gpu_w: 60.0 + d }
+                CommandedPoint {
+                    t_mono: t as f64,
+                    cpu_w: 45.0 + d,
+                    gpu_w: 60.0 + d,
+                }
             })
             .collect();
-        ring.push(CommandedPoint { t_mono: 100.0, cpu_w: 45.0, gpu_w: 60.0 });
+        ring.push(CommandedPoint {
+            t_mono: 100.0,
+            cpu_w: 45.0,
+            gpu_w: 60.0,
+        });
         assert!(cooldown_open(&ring, 100.0));
     }
 

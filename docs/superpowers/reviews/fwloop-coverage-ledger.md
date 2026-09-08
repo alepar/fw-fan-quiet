@@ -35,3 +35,66 @@ R23 refinement convergence under table error; R24 on-machine validation.
 | C1-18 | UNSATISFIABLE-ACCEPTANCE (prose) | fwloop.5 "no reference in the crate" exceeds its file scope (C) | applied | criterion narrowed to `src/control/`; repo-wide terms moved to fwloop.14 |
 | C1-19 | flag-sweep | fwloop.13 `sp:demoted-by-session` (A, B, C) | applied | demotion upheld (interface decided in §3.3); the reviewers' optional split accepted: `fit_fopdt` + IMC derivation moved to new leaf fwloop.21, blocker of 13; 13's dependents (14, 18, 19) re-checked — all still consume 13's own artifacts, unchanged |
 | C1-20 | mechanical (6a) | `(needs: fwloop.12)` in fwloop.17 | no finding | direct blocker; passes (all three reviewers) |
+
+## Round 2 (2026-09-08) — final round (cap)
+
+Reviewers: 3/3 valid (A, B, C; C was dispatched late after only two of three launched, so the
+pass ran at full strength). `requirements: 24 · mapped: 24 · unmapped: 0`. One R-new proposed
+(C: unreachable-from-below), folded into R25 below and applied under C2-33.
+
+**Divergence observation:** round 1 disposed 17 deduped findings; round 2 disposed 41, of which
+38 are novel identities (3 re-litigate round-1 subjects: the ENODATA fixture convention, the
+fwloop.12 size, hardware validation). The count did not shrink and the findings are mostly
+novel — round 2 **widened** scope rather than converged. Under the fixed two-round cap its fixes
+are applied below and are **not re-reviewed**; the root integration sweep (fwloop.23) is the
+net for what this round's own fixes may have introduced. This is the strongest signal in the
+run that the tree deserves a human read-through before execution; it is surfaced in the
+hand-off summary rather than fixed by a third round.
+
+| id | type | subject | disposition | note |
+|---|---|---|---|---|
+| C2-01 | UNOWNED-SEAM | fwloop.16 builds `Sample` without an edge to fwloop.9 (A, B, C) | applied | dep 16→9 |
+| C2-02 | GAP | no `Budget` gains API; persisted gains never reach the integrator (A) | applied | `Budget::new(&LoopGains)`/`set_gains` in 4; 12 loads on auto entry |
+| C2-03 | GAP | GPU `verify_lock` never wired (A) | applied | 12 runs both verdicts through one rule |
+| C2-04 | GAP | three-strike release + same-tick reassert untested (A, C) | applied | 12 acceptance, 17 fault list |
+| C2-05 | GAP | `gpu_*` sensors enter fw-fanctrl's max when the dGPU is powered; replica ignored them (A) | applied | §2.2 + §Facts amended: gpu_* included and controllable; second fixture tree (20); gpu channels in 16; dGPU-on run in 17 |
+| C2-06 | GAP | curve cache keyed by strategy name misses in-place edits (A, C) | applied | 10 keys on points, `t_star_changed`; 16 `edit_curve_in_place`; 17 pins the t=900 edit |
+| C2-07 | GAP | legacy state without `duty_rpm_table` must load the seed (A) | applied | `Default` = seed + serde default (1); 11 acceptance |
+| C2-08 | UNOWNED-SEAM | poller construction from config / shutdown unowned (A) | applied | 9 owns construction in `main.rs` |
+| C2-09 | UNOWNED-SEAM | `AutoAllocated.error` type would drag `LoopError` into fwloop.8 (A) | applied | `error: f64` |
+| C2-10 | UNEXERCISED-CONFIGURATION | calibration → fitted gains → closed loop never run (A, B) | applied | 17 calibration run |
+| C2-11 | GAP | `set_interval` retain-vs-clear unspecified (A) | applied | 3 contract + acceptance; 12 acceptance |
+| C2-12 | GAP | burner / `NeedsLoad` missing from fwloop.13 (A, C) | applied | 13 owns them; no-rise rejection |
+| C2-13 | GAP | `min(MA, current)` branch never graded (A) | applied | 16 acceptance; 17 load-release run |
+| C2-14 | NARRATIVE-EDGE | fwloop.10 consumes token for 9 without edge (A) | applied | token reworded: plain bool from the controller |
+| C2-15 | UNSATISFIABLE-ACCEPTANCE | fwloop.20 "matching §Facts" unverifiable (A) | applied | §Facts now records the curves; 20 asserts the truncation + steep-tread facts |
+| C2-16 | ORPHAN | `FanctrlView.update_freq` unconsumed (A, B) | applied | dropped from the struct |
+| C2-17 | UNOWNED-SEAM | test-support module layout unnamed (A) | applied | `src/test_support/{mod,fixtures,fakes,plant}.rs` owned by 20 |
+| C2-18 | GAP | RAPL stickiness watchdog preservation unowned (A, B) | applied | 7 leaves `on_sample` untouched; 12 acceptance retains the test |
+| C2-19 | GAP | `Unreadable`/`Unverifiable` policy undefined; `--info` failure is the expected state with `ryzen_smu` loaded (B, C) | applied | §2.9 non-events; `ReadbackBlind` after six; 7/8/12/15 amended |
+| C2-20 | GAP | Mode B error target unsnapped (B) | applied | §2.4: `rpm_for_duty(target_duty)`; 12 acceptance |
+| C2-21 | GAP | no `e_{k−1}` resync on T* re-derivation without a mode switch (B) | applied | `Budget::resync_error`; 10 emits `t_star_changed`; 12 calls it |
+| C2-22 | UNOWNED-SEAM | ENODATA fixture marker convention (B, C) | applied | label without `_input`; reader drops unreadable inputs (3, 20) |
+| C2-23 | GAP | clock seam for duration-shaped criteria (B) | applied | 9 owns the timestamps-not-wall-clock rule; §5 states it |
+| C2-24 | GAP | socket read-only invariant untested (B) | applied | `PrintCommand` enum; fake records; 17 global assertion |
+| C2-25 | GAP | refinement can make the table non-monotone (B) | applied | §2.3 clamp + 25 % rejection; 1 acceptance |
+| C2-26 | UNOWNED-SEAM | 5/7/8/11 co-edit controller.rs; 5 deletes trim.rs 8 still references (B, C) | applied | call sites named per task; trim.rs deletion moved to 14 |
+| C2-27 | GAP | integrator state during LutSweep unspecified (B) | applied | §3.3 whole-session `Calibrating`; 19 acceptance |
+| C2-28 | GAP | RNG dependency unowned (B) | applied | hand-rolled xorshift in 16 |
+| C2-29 | UNOWNED-SEAM | duplicate curve decoders / strategy resolution unowned (B, C) | applied | 2 owns `resolve_curve`; 1 drops `from_config` and tests on point lists (dep 1→20 dropped) |
+| C2-30 | GAP | `print speed` 5 s cadence unasserted (B) | applied | 9 acceptance |
+| C2-31 | GAP | fwloop.12 still oversized: destructive half separable (B) | applied | new leaf fwloop.22 (dep 8); 12 depends on 22; 14 re-pointed 12→22; 17/19 unchanged (§Splitting a Bead checked) |
+| C2-32 | NARRATIVE-EDGE | fwloop.12 consumes `EcAverage` without an edge to 3 (B) | applied | dep 12→3 |
+| C2-33 | GAP (R25) | target unreachable from below undetected (B, C) | applied | §2.7 low rule; `at_lower_bound_for`; 10 acceptance; 17 sub-floor run |
+| C2-34 | GAP | fwloop.12 NVMe criterion inverted ("lowers T*") (C) | applied | corrected to raises T* and the budget; 17 too |
+| C2-35 | GAP | reconciliation keyed on any-poll `observed_at` compares a stale temperature (C) | applied | two stamps in `FanctrlView`; `view_changed` keyed on `all_observed_at` (2, 9) |
+| C2-36 | UNSATISFIABLE-ACCEPTANCE | fwloop.19 "Δu = 0" unsatisfiable while the PI runs (C) | applied | reworded: not re-seeded; ordinary increment |
+| C2-37 | GAP | steady-window threshold vs ±90 RPM plant noise (C) | applied | detector on `rpm_smoothed`; 17 asserts ≥ 1 steady window per converged run |
+| C2-38 | GAP | sample cadence vs boxcar sizing; `ec_ma` never checked against the emulator (C) | applied | 1 Hz stated (3, 9); 17 tracks within 1 °C |
+| C2-39 | GAP | plant lacks utilisation / SM-clock channels for demand, GPU PI, `verify_lock` (C) | applied | 16 tracks; 17 load step is a utilisation step |
+| C2-40 | UNOWNED-SEAM | `fitted_at` set by nobody (C) | applied | 13 stamps it; 21 leaves it `None` |
+| C2-41 | UNEXERCISED-CONFIGURATION | dGPU-unpowered configuration; guards have no absent representation (C) | applied | `Option<f64>` guard inputs (6, §2.8); 17 dGPU-off run |
+| C2-42 | mechanical (6a) | `(needs: fwloop.12)`, `(needs: fwloop.19)` in fwloop.17 | no finding | both direct blockers; pass (all three reviewers) |
+
+**Root integration sweep:** fwloop.23 created after the loop ended, depending on every other
+leaf with the fixed `all leaves (integration sweep)` token.

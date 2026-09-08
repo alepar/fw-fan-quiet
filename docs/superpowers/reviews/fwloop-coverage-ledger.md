@@ -143,6 +143,19 @@ this cascade raises T* and therefore the power budget, so it heats the SoC to co
 unmeasured airflow assumption, and it has no authority at all when the SSD is hot while the SoC
 is idle. Not yet applied.
 
-**Open, awaiting measurement (R21):** Mode B's stability under `active: false`, where the EC's
-own unmodelled fan curve sits inside the loop. A live probe (fw-fanctrl paused, CPU load ramp,
-EC max vs RPM logged) was run on 2026-09-08; its result feeds the plant's second curve model.
+**R21 — measured and applied 2026-09-08.** A live probe (fw-fanctrl paused, CPU load ramp, 300
+samples of EC max against fan RPM) found the EC's own curve is a staircase that saturates early:
+4096 RPM at 61–62 °C, 4520 at 63, 4658 at 64, then **flat at ~4748 RPM across 67–73 °C**, versus
+2649 RPM under `quiet16` at a higher temperature. So under `active: false` the plant gain from
+watts to RPM is ≈ 0 in the normal band and steep (140–420 RPM/°C) below 64 °C — neither
+resembling the plant Mode B's gain was identified against. Resolution: do not fight it. §2.5 now
+states that RpmLoop under `active: false` is expected to have little authority, the `low`
+unreachable rule surfaces it as `TARGET UNREACHABLE (low)` with the achievable RPM, and the
+applied-power back-calculation stops the integrator winding meanwhile. The plant gains an
+EC-autofan mode carrying the measured staircase (fwloop.16) and fwloop.17 gains an authority run
+covering both the flat and the steep segment.
+
+**Bonus validation from the same probe:** under `quiet16` at EC max 75 °C the curve gives duty 31
+and the fans ran 2649 RPM against the seeded table's interpolated 2638 — under 0.5 % error, so
+the shipped duty→RPM seed is sound and refinement really is a refinement rather than a
+dependency.

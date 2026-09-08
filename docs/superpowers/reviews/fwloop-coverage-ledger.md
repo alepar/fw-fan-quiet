@@ -98,3 +98,51 @@ hand-off summary rather than fixed by a third round.
 
 **Root integration sweep:** fwloop.23 created after the loop ended, depending on every other
 leaf with the fixed `all leaves (integration sweep)` token.
+
+## super-roast design iteration 1 (2026-09-08)
+
+Report: `2026-09-08-fw-fanctrl-loop-roast-design-1.md`. Verdict **Blocking (23 confirmed)**, no
+qualifier: 8 scouts, 0 dead, 245 raw → 75 deduped, 57 panels + 18 spot checks, judge completion
+100 %, 0 beyond the panel cap, 0 escalations, 34 low-severity candidates dropped by the
+remainder cap. Severities: 1 Blocking, 19 Should-fix, 3 Nit.
+
+**R1 (Blocking) — `observe_applied` was an identity.** It back-calculated against the commanded
+caps, which `split_budget` guarantees sum to `u`, so it corrected nothing outside guard and slew
+cases. The demand-starved wind-up it was supposed to prevent was wide open: at idle the
+temperature error stays positive, the integrator saturates at the maxima, and the next load
+onset runs uncapped through the dead time — with the old conservative start and model contour
+deleted. Fixed by back-calculating against the **measured** smoothed draw (`cpu_pkg_w` +
+`gpu_w`, both already sampled). §2.4, fwloop.4/9/12/16/17.
+
+Applied, all 23: R1 above; R2 **held for the user** (NVMe guard remedy, see below); R3 defaults
+re-derived with `θ_eff = θ + N/2`; R4 Mode B gain scheduled on `slope_at(T*)`; R5 fit rejection
+gains magnitude and `Kc`-ratio bounds; R6 fit gain uses the measured per-axis delta and the
+burner starts before the settle; R7 the unsatisfiable 25 % criterion restated against the
+filtered plant; R8 `at_upper_bound_for` + `high` unreachable; R9 the moving average is
+reconciled too and the emulator reproduces the paused-buffer and 50 °C quirks; R10 scored views
+skipped while slewing or stale; R11 `EcAverage` seeded on every engagement, `unreconciled`
+initial state; R12 argmax-controllable debounced; R13 `resumed` invalidates the boxcar and
+windows; R14 refinement gated on `speed_pct == target_duty`; R15 relay test made
+period-agnostic; R16 `gpu_hot_c` 83 → **90/85**, derived from the measured 87 °C card target;
+R17 non-monotone curves rejected; R18 read-back keeps running after the three-strike release;
+R19 mismatch re-read once and suppressed across `on_ac` edges; R20 StepTest gates in two stages
+so it stops self-skipping, plus a 95 °C abort; R22 fwloop.8's acceptance narrowed to its own
+type surface; R23 fwloop.5 added to fwloop.14's deps.
+
+**Measurement-driven correction to round 2 (not a roast finding).** C2-05 amended §2.2 on a
+reviewer's reasoning that the EC `gpu_*` sensors come alive when the dGPU is powered. Measured
+2026-09-08 with the dGPU at 18.9 W in P0: they still read −150 and ENODATA. The original
+research doc was right and the round-2 amendment was a regression. The replica keeps the
+"every positive reading joins the max" rule (correct replication either way), the fixture set
+now pins the measured fact, and the fabricated dGPU-powered acceptance run is gone. This is
+exactly the class round 2's un-re-reviewed surface was expected to hide, and only a live
+measurement could catch it.
+
+**Open, awaiting the user (R2):** the NVMe guard's only remedy raises the fan target, which in
+this cascade raises T* and therefore the power budget, so it heats the SoC to cool the SSD on an
+unmeasured airflow assumption, and it has no authority at all when the SSD is hot while the SoC
+is idle. Not yet applied.
+
+**Open, awaiting measurement (R21):** Mode B's stability under `active: false`, where the EC's
+own unmodelled fan curve sits inside the loop. A live probe (fw-fanctrl paused, CPU load ramp,
+EC max vs RPM logged) was run on 2026-09-08; its result feeds the plant's second curve model.

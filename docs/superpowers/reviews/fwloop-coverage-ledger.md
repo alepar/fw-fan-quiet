@@ -138,10 +138,18 @@ now pins the measured fact, and the fabricated dGPU-powered acceptance run is go
 exactly the class round 2's un-re-reviewed surface was expected to hide, and only a live
 measurement could catch it.
 
-**Open, awaiting the user (R2):** the NVMe guard's only remedy raises the fan target, which in
-this cascade raises T* and therefore the power budget, so it heats the SoC to cool the SSD on an
-unmeasured airflow assumption, and it has no authority at all when the SSD is hot while the SoC
-is idle. Not yet applied.
+**R2 — measured and applied 2026-09-08 (user decision: reporting-only).** The guard's remedy
+raised the fan target, which in this cascade raises T* and therefore the power budget, on an
+unmeasured assumption that airflow beats the extra heat. A probe settled it
+(`docs/research/2026-09-08-nvme-airflow-probe.csv`, sustained O_DIRECT reads, aborted at an
+82 °C safety cap after 50 s): at 4748 RPM the drive still went 66.9 → 79.9 °C in 30 s and kept
+climbing, and the EC maximum *fell* 74 → 69 °C over the same window because the load was
+I/O-bound and left the SoC idle. So the guard's lever is weak where it exists and absent in its
+own main scenario. The run never plateaued, so it is not a clean low-versus-high airflow
+comparison, and the spec says so. Resolution: the NVMe guard becomes **reporting-only** — flag,
+status line and telemetry, no control action. `nvme_boost_rpm` and `Guards::effective_target`
+are deleted, nothing modifies the user's RPM target any more, and fwloop.6/12/17/18 assert the
+flag changes no commanded output. A follow-on in §6 records what a real lever would need.
 
 **R21 — measured and applied 2026-09-08.** A live probe (fw-fanctrl paused, CPU load ramp, 300
 samples of EC max against fan RPM) found the EC's own curve is a staircase that saturates early:

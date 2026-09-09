@@ -8,6 +8,7 @@ pub mod budget;
 pub mod controller;
 pub mod cooldown;
 pub mod gpu_pid;
+pub mod guards;
 pub mod kalman;
 pub mod lut;
 pub mod thermal_model;

@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use crate::actuators::gpu::clamp_gpu_clock;
 use crate::control::allocator::{CPU_MAX_W, GPU_MAX_W};
 use crate::control::controller::DEFAULT_FAN_TARGET_RPM;
+use crate::control::guards::{GPU_HOT_C_DEFAULT, NVME_HOT_C_DEFAULT};
 
 /// Lower bound for `cpu_max_w`: below the actuator's ~10 W sustained floor the
 /// grid-search and the manual-mode clamps would degenerate.
@@ -27,11 +28,17 @@ pub struct Config {
     pub gpu_floor_mhz: u32,
     /// CPU fast (short-burst) PPT limit handed to ryzenadj, milliwatts.
     pub fast_limit_mw: u32,
-    // (Removed 2026-07, adaptation v2: `online_rls` is gone — the 2-state
-    // Kalman filter owns Auto-mode adaptation and full-surface RLS was
-    // field-disabled after the degenerate-divisor incident. `serde(default)`
-    // without `deny_unknown_fields` means old config files that still carry
-    // the key load fine.)
+    // Unknown keys are always ignored (`serde(default)` without
+    // `deny_unknown_fields`), so old config files never fail to load just
+    // because a key was removed. Two real examples that must keep loading:
+    // `online_rls` (removed 2026-07, adaptation v2 — the 2-state Kalman
+    // filter owns Auto-mode adaptation, and full-surface RLS was
+    // field-disabled after the degenerate-divisor incident) and
+    // `nvme_boost_rpm` (never shipped — an early NVMe-guard design that
+    // raised the fan target for a hot drive, dropped per §2.8/§Facts:
+    // raising the target raises T* and therefore the CPU/GPU budget,
+    // injecting more heat into a scenario measured to have nothing to raise
+    // it for).
     /// CPU sustained operating max (watts): the single source of truth for the
     /// "100%" CPU power. The allocator grid-searches up to it, the CPU actuator
     /// clamps commanded sustained power to it, and the TUI/LED displays scale by
@@ -41,6 +48,13 @@ pub struct Config {
     /// GPU operating max (watts): same role for the GPU. Defaults to / clamped
     /// to the RTX 5070 module TGP ([`GPU_MAX_W`]).
     pub gpu_max_w: f64,
+    /// dGPU guard enter threshold (°C, exit is this − 5). See
+    /// [`crate::control::guards`] for the hysteresis and the 87 °C
+    /// card-spec derivation of the default.
+    pub gpu_hot_c: f64,
+    /// NVMe guard enter threshold (°C, exit is this − 5). Reporting-only —
+    /// see [`crate::control::guards`].
+    pub nvme_hot_c: f64,
     /// LED matrix wattage display (`[leds]` table). Optional feature; its own
     /// `enabled` flag defaults on but a missing/failed module just stays dark.
     pub leds: LedConfig,
@@ -55,6 +69,8 @@ impl Default for Config {
             fast_limit_mw: 53_000,
             cpu_max_w: CPU_MAX_W,
             gpu_max_w: GPU_MAX_W,
+            gpu_hot_c: GPU_HOT_C_DEFAULT,
+            nvme_hot_c: NVME_HOT_C_DEFAULT,
             leds: LedConfig::default(),
         }
     }
@@ -245,6 +261,8 @@ mod tests {
             fast_limit_mw: 60_000,
             cpu_max_w: 50.0,
             gpu_max_w: 90.0,
+            gpu_hot_c: 88.0,
+            nvme_hot_c: 78.0,
             leds: LedConfig {
                 enabled: false,
                 cpu_port: "/dev/ttyACM9".to_string(),
@@ -340,17 +358,46 @@ mod tests {
     }
 
     #[test]
-    fn unknown_fields_tolerated() {
+    fn unknown_keys_are_ignored() {
         let dir = fixture_dir("unknown");
         let path = dir.join("config.toml");
-        // `online_rls` is a REAL legacy key (removed with adaptation v2):
-        // old config files that still carry it must keep loading.
+        // Three unknown-key shapes that must all still load: `online_rls` is
+        // a REAL removed legacy key (adaptation v2), `nvme_boost_rpm` is a
+        // key that was designed and then dropped before ever shipping (the
+        // rejected NVMe-guard target-raise, §2.8), and `totally_made_up_key`
+        // stands in for any future removal or typo — none of them should be
+        // able to fail a load.
         fs::write(
             &path,
-            "fan_target_rpm = 2500\nfuture_knob = true\nonline_rls = true\n",
+            "fan_target_rpm = 2500\n\
+             online_rls = true\n\
+             nvme_boost_rpm = 500\n\
+             totally_made_up_key = \"whatever\"\n",
         )
         .unwrap();
-        assert_eq!(Config::load(&path).fan_target_rpm, 2500.0);
+        let config = Config::load(&path);
+        assert_eq!(config.fan_target_rpm, 2500.0);
+        // Loading survived AND fell through to real defaults for everything
+        // the file didn't name — a config that silently zeroed unnamed
+        // fields on an unknown key would also pass the line above.
+        assert_eq!(config.gpu_hot_c, Config::default().gpu_hot_c);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn guard_thresholds_default_and_round_trip() {
+        let dir = fixture_dir("guard-thresholds");
+        let path = dir.join("config.toml");
+        let defaults = Config::default();
+        assert_eq!(defaults.gpu_hot_c, 90.0);
+        assert_eq!(defaults.nvme_hot_c, 80.0);
+        let config = Config {
+            gpu_hot_c: 88.0,
+            nvme_hot_c: 77.0,
+            ..Config::default()
+        };
+        config.save(&path).unwrap();
+        assert_eq!(Config::load(&path), config);
         fs::remove_dir_all(&dir).unwrap();
     }
 

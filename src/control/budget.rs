@@ -20,9 +20,16 @@
 //!   was tried and produces a cap that tracks the draw (§2.4).
 //! - **Demand-limited halt (`Freeze::DemandLimited`), directional and
 //!   per-axis.** See [`Budget::set_demand_state`] and the note on
-//!   [`Freeze::DemandLimited`] below. The concrete predicate is a
-//!   placeholder; `fw-fanctrl-loop-9it` (a measurement spike) owns the real
-//!   rule and rewrites this section and its callers.
+//!   [`Freeze::DemandLimited`] below. `fw-fanctrl-loop-9it` (a measurement
+//!   spike) has now decided the real rule — per-axis
+//!   `cap_i > floor_i + ε AND (cap_i − draw_i) > DEMAND_MARGIN_W(i)`, with
+//!   2-tick symmetric hysteresis — and recorded it in §2.4, but
+//!   [`Budget::set_demand_state`] below still implements only the older
+//!   placeholder predicate (`draw >= cap`, no floor, no margin, no
+//!   hysteresis) because its `&[(f64, f64)]` signature has nowhere to carry
+//!   a floor or a per-axis `DEMAND_MARGIN_W`. `fw-fanctrl-loop-j6s`
+//!   (Controller loop integration) owns widening this seam and its callers
+//!   to the decided rule.
 //!
 //! # Freezes
 //!
@@ -246,21 +253,32 @@ impl Budget {
     }
 
     /// Demand-limited predicate seam (§2.4). **Placeholder — owner:
-    /// `fw-fanctrl-loop-9it`.** That spike measures the real rule against
-    /// every scenario the design's review rounds named and rewrites this
-    /// function (and §2.4) accordingly; this task only owns the fixed
-    /// invariants: judged per axis (one saturated axis can halt without the
-    /// others ever entering the decision — a combined-sum test would make
-    /// any structurally undrawn component, e.g. the GPU floor share while
-    /// the dGPU is off, a permanent gap), and the halt applies only when
-    /// `error_sign` is itself pushing in the deepening direction (positive
-    /// — the error is calling for *more* budget) — `error_sign <= 0.0` is
-    /// already the recovering direction and is never halted here regardless
-    /// of axis state.
+    /// `fw-fanctrl-loop-j6s`.** `fw-fanctrl-loop-9it` (the measurement
+    /// spike) has already decided the real rule and recorded it, with its
+    /// sweep table, in §2.4: per axis, `cap_i > floor_i + ε AND (cap_i −
+    /// draw_i) > DEMAND_MARGIN_W(i)`, latched through 2 ticks (10 s) of
+    /// symmetric hysteresis, using the post-guard-override cap. This
+    /// function still implements only the fixed invariants the spike was
+    /// scoped to preserve, not the decided predicate: judged per axis (one
+    /// saturated axis can halt without the others ever entering the
+    /// decision — a combined-sum test would make any structurally undrawn
+    /// component, e.g. the GPU floor share while the dGPU is off, a
+    /// permanent gap), and the halt applies only when `error_sign` is
+    /// itself pushing in the deepening direction (positive — the error is
+    /// calling for *more* budget) — `error_sign <= 0.0` is already the
+    /// recovering direction and is never halted here regardless of axis
+    /// state.
     ///
-    /// `axes` is `&[(draw_w, cap_w)]`, one pair per actuator. No constant is
-    /// tuned here (no `DEMAND_MARGIN_W`, no hysteresis) — those are the
-    /// spike's outputs.
+    /// `axes` is `&[(draw_w, cap_w)]`, one pair per actuator — there is no
+    /// per-axis floor and no per-axis `DEMAND_MARGIN_W` in this signature,
+    /// so it cannot express the decided predicate above (which needs both)
+    /// and its body below is still the naive `draw >= cap` pin check the
+    /// spike's floor-guard fix (scenario 5) was built to replace.
+    /// `fw-fanctrl-loop-j6s` (Controller loop integration) — the task
+    /// documented as calling this seam with "the per-axis smoothed draws,
+    /// their caps and the error sign" — must widen this signature to also
+    /// carry each axis's `floor_i` and `DEMAND_MARGIN_W(i)`, and the
+    /// hysteresis state, before it can wire in §2.4's decided rule.
     pub fn set_demand_state(&mut self, axes: &[(f64, f64)], error_sign: f64) -> bool {
         let any_axis_pinned = axes.iter().any(|&(draw, cap)| draw >= cap);
         error_sign > 0.0 && any_axis_pinned

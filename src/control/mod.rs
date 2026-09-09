@@ -11,6 +11,8 @@ pub mod guards;
 pub mod lut;
 pub mod mode;
 #[cfg(test)]
+mod sim_tests;
+#[cfg(test)]
 pub mod spike_antiwindup;
 pub mod watchdog;
 

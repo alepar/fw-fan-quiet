@@ -14,6 +14,8 @@ mod selftest;
 mod sensors;
 mod state;
 mod telemetry;
+#[cfg(test)]
+mod test_support;
 mod types;
 mod ui;
 

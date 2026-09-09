@@ -19,7 +19,7 @@ use std::thread::JoinHandle;
 use crossbeam_channel::{Receiver, Sender, never, select};
 
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::actuators::WriteVerdict;
 use crate::actuators::cmd::Runner;
@@ -30,13 +30,14 @@ use crate::calib::runner::{CalibContext, CalibRunner, RunnerEffect};
 use crate::calib::steady::tail_mean;
 use crate::config::Config;
 use crate::control::allocator::{self, AllocInput, Allocator};
-use crate::control::budget::{Budget, Freeze as BudgetFreeze, LoopError, LoopGains};
+use crate::control::budget::{Budget, Freeze as BudgetFreeze, LoopError, LoopGains, WarmStart};
 use crate::control::gpu_pid::GpuPid;
 use crate::control::guards::{GuardState, Guards, gpu_share_override};
 use crate::control::lut::ClockWattsLut;
 use crate::control::mode::{Arbiter, ArbiterInput, Decision};
 use crate::control::watchdog::{ThermalWatchdog, Trip};
 use crate::event::Event;
+use crate::fanctrl::client::Freshness;
 use crate::fanctrl::curve::Curve;
 use crate::fanctrl::table::DutyRpmTable;
 use crate::sensors::ec::EcAverage;
@@ -100,6 +101,13 @@ const ON_AC_EDGE_SUPPRESS_S: f64 = 3.0;
 /// own slope over (design §2.6: "the replica's own slope over the last
 /// 5 s"), at the 1 Hz sample rate.
 const EC_SLOPE_WINDOW_S: usize = 5;
+/// Steady-window length for passive warm-start/refinement (design §2.3):
+/// "population stdev of the smoothed RPM series < 60 over >= 40 s", at the
+/// 1 Hz sample rate.
+const STEADY_WINDOW_N: usize = 40;
+/// Population-stdev ceiling (RPM) the steady window's `rpm_smoothed` series
+/// must stay under to count as settled (design §2.3).
+const STEADY_WINDOW_STDEV_MAX_RPM: f64 = 60.0;
 
 /// UI -> controller commands: the manual-mode keys emit the setters and
 /// `ReleaseAll`; `Quit` comes from main's shutdown sequence only.
@@ -630,6 +638,17 @@ struct AutoState {
     /// `t_mono` until which a candidate actuator `Mismatch` is suppressed
     /// (design §2.9: 3 ticks after an `on_ac` edge).
     on_ac_suppress_until: Option<f64>,
+    /// Steady-window accumulator for passive warm-start/refinement (design
+    /// §2.3): `rpm_smoothed` values pushed while every steady-window gate
+    /// (active, `speed_pct == target_duty`, no guard override, `u` off both
+    /// bounds) holds this tick; cleared on any gate miss and whenever
+    /// `steady_key` changes.
+    steady_window: std::collections::VecDeque<f64>,
+    /// The warm-start key `steady_window`'s accumulated samples belong to.
+    /// A change (strategy edit, snapped-duty change, AC edge) clears the
+    /// window — the re-key itself never re-seeds `u` (§2.4); it only
+    /// changes which key the *next* steady window records into.
+    steady_key: Option<String>,
 }
 
 impl AutoState {
@@ -659,6 +678,8 @@ impl AutoState {
             target_duty: 0,
             last_on_ac: None,
             on_ac_suppress_until: None,
+            steady_window: std::collections::VecDeque::new(),
+            steady_key: None,
         }
     }
 }
@@ -719,6 +740,30 @@ pub struct Controller<R: Runner> {
     /// samples, so warn once per continuous idle-trip episode (reset when
     /// the watchdog goes quiet again — genuinely cool/valid evidence).
     idle_trip_warned: bool,
+    /// The budget integrator used while `Mode::Calibrating` (design §3.3):
+    /// Some exactly during a calibration session, always stepped with
+    /// `Freeze::Calibrating` (a hard hold — `u` only ever moves via an
+    /// explicit `RunnerEffect::SetBudget` seed) so `u` is unchanged from
+    /// calibration start through exit, LUT sweep included.
+    calib_budget: Option<Budget>,
+    /// A scratch mode arbiter run alongside a calibration session solely to
+    /// score EC/fw-fanctrl reconciliation (design §3.3: `CalibContext`
+    /// mirrors "the arbiter's decision" — its `ec_mismatch`); the mode/T*
+    /// output is discarded, calibration never reads the socket or the
+    /// arbiter itself.
+    calib_arbiter: Option<Arbiter>,
+    /// The controller's own `EcAverage` replica for a calibration session,
+    /// mirroring the auto loop's instance (design §3.3: `CalibContext.ec_ma`
+    /// is "built from the same inputs the auto loop uses").
+    calib_ec_avg: Option<EcAverage>,
+    /// `calib_ec_avg`'s last push, mirrored into `CalibContext.ec_ma`.
+    calib_ec_ma: Option<f64>,
+    /// True once `calib_ec_avg` has been seeded from `view.ma_temperature`
+    /// this calibration session (mirrors `AutoState::ec_seeded`).
+    calib_ec_seeded: bool,
+    /// Short raw `ec.max_c` history feeding `calib_arbiter`'s reconciliation
+    /// skip rule (mirrors `AutoState::ec_slope_window`).
+    calib_ec_slope_window: std::collections::VecDeque<f64>,
 }
 
 /// Static `Effect::Noted` cause for a genuine `LoopMode` transition (design
@@ -757,6 +802,18 @@ fn freeze_str(f: BudgetFreeze) -> &'static str {
         BudgetFreeze::Released => "released",
         BudgetFreeze::DemandLimited => "demand_limited",
     }
+}
+
+/// Population standard deviation (divides by `n`, not `n - 1`) — the
+/// steady-window detector's gate is stated as a population stdev (design
+/// §2.3), and the window is the entire population being judged, not a
+/// sample drawn from a larger one. `values` must be non-empty (callers only
+/// invoke this on a full [`STEADY_WINDOW_N`]-sample window).
+fn population_stdev(values: &[f64]) -> f64 {
+    let n = values.len() as f64;
+    let mean = values.iter().sum::<f64>() / n;
+    let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
+    variance.sqrt()
 }
 
 impl<R: Runner> Controller<R> {
@@ -809,6 +866,12 @@ impl<R: Runner> Controller<R> {
             watchdog: ThermalWatchdog::new(),
             pending_flags: Vec::new(),
             idle_trip_warned: false,
+            calib_budget: None,
+            calib_arbiter: None,
+            calib_ec_avg: None,
+            calib_ec_ma: None,
+            calib_ec_seeded: false,
+            calib_ec_slope_window: std::collections::VecDeque::new(),
         }
     }
 
@@ -1044,7 +1107,16 @@ impl<R: Runner> Controller<R> {
                     let runner_effects = runner.start();
                     self.calib = Some(runner);
                     self.status.mode = Mode::Calibrating;
-                    self.apply_calib_effects(runner_effects);
+                    // Whole-session calibration freeze (design §3.3): a
+                    // fresh scratch `Budget`/`Arbiter`/`EcAverage`, exactly
+                    // like a fresh `AutoState` on auto entry.
+                    self.calib_budget = Some(Budget::new(&self.loop_gains.unwrap_or_default()));
+                    self.calib_arbiter = Some(Arbiter::new());
+                    self.calib_ec_avg = Some(EcAverage::new(DEFAULT_MA_INTERVAL));
+                    self.calib_ec_ma = None;
+                    self.calib_ec_seeded = false;
+                    self.calib_ec_slope_window.clear();
+                    self.apply_calib_effects(runner_effects, None);
                     self.sync_calib_status();
                 }
                 "calib:start"
@@ -1053,7 +1125,7 @@ impl<R: Runner> Controller<R> {
                 match self.calib.take() {
                     None => tracing::warn!("AbortCalibration ignored: no calibration running"),
                     Some(mut runner) => {
-                        self.apply_calib_effects(runner.abort());
+                        self.apply_calib_effects(runner.abort(), None);
                         self.end_calibration();
                     }
                 }
@@ -1064,7 +1136,7 @@ impl<R: Runner> Controller<R> {
                 // and calibration limits released before the guard's full
                 // restore (which reloads ryzen_smu last).
                 if let Some(mut runner) = self.calib.take() {
-                    self.apply_calib_effects(runner.abort());
+                    self.apply_calib_effects(runner.abort(), None);
                     self.end_calibration();
                 }
                 // Clean quit drops a live Auto session's loop state before
@@ -1478,6 +1550,81 @@ impl<R: Runner> Controller<R> {
         }
 
         self.run_gpu_pi(s, effects, cause);
+
+        // Passive warm-start/refinement (design §2.3/§2.4): every sample,
+        // after this tick's `u`/guard state are final.
+        self.observe_steady_window(s, guard_state);
+    }
+
+    /// Steady-window detector for passive warm-start/refinement (design
+    /// §2.3). Accumulates `rpm_smoothed` into `AutoState::steady_window`
+    /// while every gate holds this tick: `active`, the view's own
+    /// `speed_pct == target_duty` (a window whose achieved duty differs
+    /// from the target's must never write into the target's entry — a
+    /// `GPU HOT` episode or a budget bound can run fw-fanctrl a tread away
+    /// from what `target_duty` names), no guard override (`GuardState::
+    /// gpu_hot`), and `u` off both bounds. Any gate miss, or a warm-start
+    /// key change (strategy/target_duty/on_ac — §2.4: a re-key restarts the
+    /// window under the new key without touching `u`), clears the window.
+    /// Once the window reaches [`STEADY_WINDOW_N`] samples, a population
+    /// stdev under [`STEADY_WINDOW_STDEV_MAX_RPM`] records the current `u`
+    /// into `warm_start[key]` and refines `duty_rpm_table` toward the
+    /// window's mean — every tick the window stays this settled, not just
+    /// once (§2.4: "the current `u` is written ... whenever the loop has
+    /// been steady", i.e. the *latest* settled budget).
+    fn observe_steady_window(&mut self, s: &Sample, guard_state: GuardState) {
+        let auto_ref = self.auto.as_ref().expect("called only from on_auto_sample");
+        let target_duty = auto_ref.target_duty;
+        let rpm_smoothed = self.rpm_smoothed_now(auto_ref);
+        let off_bounds = auto_ref.budget.at_lower_bound_for() == Duration::ZERO
+            && auto_ref.budget.at_upper_bound_for() == Duration::ZERO;
+
+        let key = self
+            .status
+            .strategy
+            .as_deref()
+            .map(|strat| WarmStart::key(strat, target_duty, s.on_ac));
+        let active = s.fanctrl.as_ref().is_some_and(|v| v.active);
+        let speed_matches = s
+            .fanctrl
+            .as_ref()
+            .is_some_and(|v| v.speed_pct == target_duty);
+        let no_guard_override = !guard_state.gpu_hot;
+        let u = self.status.budget_w;
+
+        let auto = self.auto.as_mut().expect("checked above");
+        if auto.steady_key != key {
+            auto.steady_key = key.clone();
+            auto.steady_window.clear();
+        }
+
+        let qualifies = key.is_some()
+            && active
+            && speed_matches
+            && no_guard_override
+            && off_bounds
+            && rpm_smoothed.is_finite();
+        if !qualifies {
+            auto.steady_window.clear();
+            return;
+        }
+
+        auto.steady_window.push_back(rpm_smoothed);
+        if auto.steady_window.len() > STEADY_WINDOW_N {
+            auto.steady_window.pop_front();
+        }
+        if auto.steady_window.len() < STEADY_WINDOW_N {
+            return;
+        }
+
+        let values: Vec<f64> = auto.steady_window.iter().copied().collect();
+        if population_stdev(&values) >= STEADY_WINDOW_STDEV_MAX_RPM {
+            return;
+        }
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        let key = key.expect("qualifies requires Some");
+        WarmStart::record(&mut self.warm_start, key, u);
+        self.duty_rpm_table.refine(target_duty, mean);
     }
 
     /// Sets/clears a plain (non-arbiter-owned) flag from a live bool
@@ -1636,10 +1783,29 @@ impl<R: Runner> Controller<R> {
         };
 
         // Seed on the first tick of this engagement — auto entry, or
-        // re-engaging from `Released` (design §2.4).
+        // re-engaging from `Released` (design §2.4). Warm-start: looks up
+        // this tick's key (strategy/target_duty/on_ac) in the persisted
+        // map, falling back to the floors on a miss (unknown strategy yet,
+        // or no prior recording for this exact key). This single gate
+        // covers all three seeding points the design names (auto entry,
+        // re-engagement from `Released`, and re-entering auto after a
+        // calibration exit) — each funnels through a fresh `AutoState` with
+        // `budget_seeded: false`, so there is exactly one seeding call
+        // site. A mid-session key change never reaches here again this
+        // engagement (`budget_seeded` only ever flips back to `false` on a
+        // `Released` transition), which is what makes the no-reseed rule
+        // (§2.4) fall out of this gate rather than needing separate code.
         if !self.auto.as_ref().expect("in auto").budget_seeded {
+            let target_duty = self.auto.as_ref().expect("in auto").target_duty;
+            let seed_u = self
+                .status
+                .strategy
+                .as_deref()
+                .map(|strat| WarmStart::key(strat, target_duty, s.on_ac))
+                .and_then(|key| WarmStart::lookup(&self.warm_start, &key))
+                .unwrap_or(cpu_floor_w + gpu_floor_w);
             let auto = self.auto.as_mut().expect("in auto");
-            auto.budget.seed(cpu_floor_w + gpu_floor_w);
+            auto.budget.seed(seed_u);
             auto.budget_seeded = true;
         }
 
@@ -1962,14 +2128,18 @@ impl<R: Runner> Controller<R> {
         self.sync_bool_flag(StatusFlag::ReadbackBlind, blind);
     }
 
-    /// One calibrating-mode sample: feed the runner, execute its effects,
-    /// refresh the wizard progress in status.
+    /// One calibrating-mode sample: build this tick's `CalibContext`, feed
+    /// the runner, execute its effects, refresh the wizard progress in
+    /// status.
     fn on_calib_sample(&mut self, s: &Sample) -> Vec<Effect> {
         let before = self.status.clone();
+        let (lo, hi) = self.calib_bounds();
+        if let Some(budget) = self.calib_budget.as_mut() {
+            budget.set_bounds(lo, hi);
+        }
+        let ctx = self.build_calib_context(s, lo, hi);
         let runner_effects = match self.calib.as_mut() {
-            // CalibContext::default() until fw-fanctrl-loop-438 wires the
-            // real arbiter/budget-integrator signals through.
-            Some(runner) => runner.on_sample(s, &CalibContext::default()),
+            Some(runner) => runner.on_sample(s, &ctx),
             None => {
                 // Defensive: mode says Calibrating but no runner; recover.
                 tracing::warn!("Calibrating mode without a runner; returning to Monitor");
@@ -1977,7 +2147,18 @@ impl<R: Runner> Controller<R> {
                 Vec::new()
             }
         };
-        let cause = self.apply_calib_effects(runner_effects);
+        let cause = self.apply_calib_effects(runner_effects, Some(s));
+        // Whole-session calibration freeze (design §3.3): every sample,
+        // including a LUT-sweep sample that carries no `SetBudget` at all,
+        // steps the scratch integrator under `Freeze::Calibrating` — a hard
+        // hold, so `u` never moves except through `apply_calib_set_budget`'s
+        // explicit seed.
+        if let Some(budget) = self.calib_budget.as_mut() {
+            budget.step(
+                LoopError::Temp { e_c: 0.0 },
+                Some(BudgetFreeze::Calibrating),
+            );
+        }
         self.sync_calib_status();
         let mut effects = Vec::new();
         // A landed fit clears NotCalibrated (apply_calib_effects): the
@@ -1996,12 +2177,181 @@ impl<R: Runner> Controller<R> {
         effects
     }
 
+    /// The budget integrator's `(lo, hi)` clamp bounds (design §2.4),
+    /// computed the same way `on_auto_sample`'s every-5s block does —
+    /// tolerant of `self.lut` still being `None` (a calibration's own LUT
+    /// sweep hasn't landed in `self.lut` yet the first time this runs;
+    /// `self.lut` only updates at `RunnerEffect::SaveState`, i.e. session
+    /// end), falling the GPU floor back to 0 W in that case.
+    fn calib_bounds(&self) -> (f64, f64) {
+        let gpu_floor_w = self
+            .lut
+            .as_ref()
+            .and_then(|l| l.watts_for_clock(self.config.gpu_floor_mhz))
+            .unwrap_or(0.0);
+        let lo = self.config.cpu_floor_w + gpu_floor_w;
+        let hi = self.config.cpu_max_w + self.config.gpu_max_w;
+        (lo, hi)
+    }
+
+    /// Builds this tick's `CalibContext` (design §3.3): `ec_ma` and
+    /// `ec_mismatch` from the controller's own scratch `EcAverage`/`Arbiter`
+    /// (the same inputs — EC replica, `print all` view, reconciliation
+    /// scoring — the auto loop feeds its own instances), `fanctrl_active`
+    /// and `argmax_controllable` read directly off the sample, and
+    /// `budget_bounds` as computed by `calib_bounds`.
+    fn build_calib_context(&mut self, s: &Sample, lo: f64, hi: f64) -> CalibContext {
+        // EC boxcar: seed from the first view this session, retarget its
+        // interval on a fresh view, push every EC reading — mirrors
+        // `on_auto_sample`'s own window-push block exactly.
+        if !self.calib_ec_seeded
+            && let Some(view) = &s.fanctrl
+        {
+            if let Some(avg) = self.calib_ec_avg.as_mut() {
+                avg.reseed(view.ma_temperature);
+            }
+            self.calib_ec_ma = Some(view.ma_temperature);
+            self.calib_ec_seeded = true;
+        }
+        if s.fanctrl_view_changed
+            && let Some(view) = &s.fanctrl
+            && let Some(avg) = self.calib_ec_avg.as_mut()
+        {
+            avg.set_interval(view.ma_interval as usize);
+        }
+        if let Some(ec) = &s.ec {
+            let max_c = f64::from(ec.max_c);
+            if let Some(avg) = self.calib_ec_avg.as_mut() {
+                self.calib_ec_ma = avg.push(max_c);
+            }
+            if self.calib_ec_slope_window.len() >= EC_SLOPE_WINDOW_S {
+                self.calib_ec_slope_window.pop_front();
+            }
+            self.calib_ec_slope_window.push_back(max_c);
+        }
+
+        let curve_valid = s
+            .fanctrl
+            .as_ref()
+            .is_none_or(|v| Curve::from_points(v.curve.clone()).is_ok());
+        let (replica_slope_5s_c_per_s, view_to_sample_gap_s) = if s.fanctrl_view_changed {
+            let slope = if self.calib_ec_slope_window.len() >= 2 {
+                let first = *self.calib_ec_slope_window.front().expect("len >= 2");
+                let last = *self.calib_ec_slope_window.back().expect("len >= 2");
+                (last - first) / (self.calib_ec_slope_window.len() - 1) as f64
+            } else {
+                0.0
+            };
+            let gap = s
+                .fanctrl
+                .as_ref()
+                .and_then(|v| v.all_observed_at)
+                .map(|t| Instant::now().saturating_duration_since(t).as_secs_f64())
+                .unwrap_or(0.0);
+            (slope, gap)
+        } else {
+            (0.0, 0.0)
+        };
+
+        let target_duty = self.duty_rpm_table.duty_for_rpm(self.status.fan_target_rpm);
+        let ec_mismatch = self
+            .calib_arbiter
+            .as_mut()
+            .map(|a| {
+                a.decide(&ArbiterInput {
+                    fanctrl: s.fanctrl.as_ref(),
+                    freshness: s.fanctrl_freshness,
+                    view_changed: s.fanctrl_view_changed,
+                    ec: s.ec.as_ref(),
+                    ec_ma: self.calib_ec_ma,
+                    fan_valid: s.fan_valid,
+                    target_duty,
+                    at_lower_bound_for: Duration::ZERO,
+                    at_upper_bound_for: Duration::ZERO,
+                    error_sign: 0.0,
+                    curve_valid,
+                    replica_slope_5s_c_per_s,
+                    view_to_sample_gap_s,
+                })
+                .ec_mismatch
+            })
+            .unwrap_or(false);
+
+        let fanctrl_active =
+            s.fanctrl_freshness == Freshness::Fresh && s.fanctrl.as_ref().is_some_and(|v| v.active);
+        let argmax_controllable = s.ec.as_ref().is_some_and(|e| e.argmax.is_controllable());
+
+        CalibContext {
+            ec_ma: self.calib_ec_ma,
+            ec_mismatch,
+            fanctrl_active,
+            argmax_controllable,
+            budget_bounds: (lo, hi),
+        }
+    }
+
+    /// Applies one `RunnerEffect::SetBudget(w)`: seeds the scratch
+    /// calibration integrator to (clamped) `w`, then runs the normal
+    /// `split_budget` -> command path (design §3.3) — calibration never
+    /// bypasses the caps. Only the CPU axis is ever commanded here: the
+    /// step test's GPU load is user-provided (no clock actuation during
+    /// the step phase), so `split_budget`'s GPU share is computed (it feeds
+    /// the CPU/GPU proportional split) but never written to hardware.
+    fn apply_calib_set_budget(&mut self, w: f64, s: Option<&Sample>) {
+        let (lo, hi) = self.calib_bounds();
+        let u = w.clamp(lo, hi);
+        if let Some(budget) = self.calib_budget.as_mut() {
+            budget.seed(u);
+        }
+        self.status.budget_w = u;
+
+        let Some(s) = s else {
+            // Defensive: every real SetBudget effect is produced from
+            // `runner.on_sample`, called only from `on_calib_sample`, which
+            // always passes `Some(s)`. `start`/`abort` never emit
+            // `SetBudget` today.
+            tracing::warn!("calib: SetBudget({w}) with no live sample; command skipped");
+            return;
+        };
+        let cpu_floor_w = self.config.cpu_floor_w;
+        let gpu_floor_w = self
+            .lut
+            .as_ref()
+            .and_then(|l| l.watts_for_clock(self.config.gpu_floor_mhz))
+            .unwrap_or(0.0);
+        let cpu_max_w = self.config.cpu_max_w;
+        let gpu_max_w = self.config.gpu_max_w;
+        let demand = allocator::demand(s, self.status.cpu_limit_w, None, self.status.gpu_max_mhz);
+        let (cpu_w, _gpu_w) =
+            allocator::split_budget(u, demand, cpu_floor_w, gpu_floor_w, cpu_max_w, gpu_max_w);
+        match self.guard.cpu.as_ref() {
+            None => tracing::warn!("calib: no CPU actuator; SetBudget({w}) not applied"),
+            Some(cpu) => {
+                let cpu_mw = (cpu_w * 1000.0).round() as u32;
+                match cpu.set_sustained_mw(cpu_mw) {
+                    WriteVerdict::Verified(clamped_w) => {
+                        self.status.cpu_limit_w = Some(clamped_w);
+                    }
+                    verdict => {
+                        tracing::warn!("calib: SetBudget({w}) cpu write not verified: {verdict:?}");
+                    }
+                }
+            }
+        }
+    }
+
     /// Execute one batch of runner effects against the guard's actuators,
     /// the burner and the state file. Actuator failures are warned — the
     /// runner records MEASURED watts, so a missed command skews one point
     /// instead of breaking the machine. Returns the most significant
-    /// telemetry cause the batch produced.
-    fn apply_calib_effects(&mut self, effects: Vec<RunnerEffect>) -> Option<&'static str> {
+    /// telemetry cause the batch produced. `s` is the live sample driving
+    /// this batch (`Some` from `on_calib_sample`, `None` from `start`/
+    /// `abort` call sites, which never produce `RunnerEffect::SetBudget`).
+    fn apply_calib_effects(
+        &mut self,
+        effects: Vec<RunnerEffect>,
+        s: Option<&Sample>,
+    ) -> Option<&'static str> {
         /// Higher wins when a batch carries several notable events (the
         /// final batch is releases + PointRecorded + Fitted + Finished).
         fn rank(cause: &str) -> u8 {
@@ -2022,10 +2372,7 @@ impl<R: Runner> Controller<R> {
         let mut ended = false;
         for effect in effects {
             match effect {
-                // fw-fanctrl-loop-438 wires this through split_budget/the
-                // integrator; until then the step test's requested power is
-                // ignored (see the on_calib_sample call site's own note).
-                RunnerEffect::SetBudget(_) => {}
+                RunnerEffect::SetBudget(w) => self.apply_calib_set_budget(w, s),
                 RunnerEffect::SetGpuMaxClock(mhz) => match self.guard.gpu.as_mut() {
                     None => tracing::warn!("calib: no GPU actuator; SetGpuMaxClock({mhz}) skipped"),
                     Some(gpu) => match gpu.set_max_clock(mhz) {
@@ -2078,19 +2425,21 @@ impl<R: Runner> Controller<R> {
                 RunnerEffect::SaveState(state) => {
                     self.lut = state.lut.clone();
                     self.calibrated_at = state.calibrated_at.clone();
+                    // The runner's own `PersistedState` carries only what it
+                    // owns (`lut`/`calibrated_at`/`loop_gains`); its
+                    // `duty_rpm_table`/`warm_start` are bare defaults
+                    // (`..PersistedState::default()`), NOT the controller's
+                    // actual table/warm-start map. Saving it directly would
+                    // silently wipe both on every calibration. Fold in just
+                    // the fields the runner owns, then persist the FULL
+                    // state (table + warm-start preserved) through the same
+                    // `save_persisted_state` the auto-exit path uses.
+                    self.loop_gains = state.loop_gains;
                     if self.lut.is_some() {
                         // A landed fit satisfies the Auto-entry requirement.
                         self.remove_flag(StatusFlag::NotCalibrated);
                     }
-                    match state.save(&self.state_path) {
-                        Ok(()) => {
-                            tracing::info!("calib: state saved to {}", self.state_path.display());
-                        }
-                        Err(e) => tracing::warn!(
-                            "calib: state save to {} failed: {e}",
-                            self.state_path.display()
-                        ),
-                    }
+                    self.save_persisted_state();
                 }
                 RunnerEffect::Finished => {
                     raise(&mut cause, "calib:finished");
@@ -2131,7 +2480,7 @@ impl<R: Runner> Controller<R> {
         // A running calibration aborts first: burner threads stopped and the
         // runner's own releases applied (same order as the Quit path).
         if let Some(mut runner) = self.calib.take() {
-            self.apply_calib_effects(runner.abort());
+            self.apply_calib_effects(runner.abort(), None);
             self.end_calibration();
         }
         // Auto exits hard: dropping AutoState means no allocator/PI step can
@@ -2236,6 +2585,12 @@ impl<R: Runner> Controller<R> {
             burner.stop();
         }
         self.calib = None;
+        self.calib_budget = None;
+        self.calib_arbiter = None;
+        self.calib_ec_avg = None;
+        self.calib_ec_ma = None;
+        self.calib_ec_seeded = false;
+        self.calib_ec_slope_window.clear();
         self.status.mode = Mode::Monitor;
         self.status.calib = None;
     }
@@ -3177,13 +3532,12 @@ mod tests {
         }
     }
 
-    /// A step-test settle-phase sample. The controller's `on_calib_sample`
-    /// call site always hands the runner `CalibContext::default()` this
-    /// task (fw-fanctrl-loop-438 wires the real arbiter/budget signals
-    /// through) — `fanctrl_active` is therefore always false, so any drive
-    /// through the controller settles never and times out at the 5-minute
+    /// A step-test settle-phase sample. It carries no `fanctrl` view, so the
+    /// controller's real `build_calib_context` computes `fanctrl_active:
+    /// false` — the settle gate is therefore never met and any drive
+    /// through the controller settles never, timing out at the 5-minute
     /// cap. That is exactly what these tests exercise: burner/actuator
-    /// bookkeeping around a step test the controller cannot yet complete.
+    /// bookkeeping around a step test that never leaves the settle phase.
     fn settle_sample() -> Sample {
         Sample {
             cpu_pkg_w: 10.0,
@@ -3290,13 +3644,27 @@ mod tests {
             ctl.burner.is_some(),
             "burner must start as soon as the sweep hands off"
         );
-        // SetBudget is ignored this task (fw-fanctrl-loop-438 wires it): no
-        // CPU limit is ever commanded during the step test here.
-        assert!(ryzenadj_calls(&runner).is_empty());
+        // `StepTest::enter` also emits `SetBudget(lo)` on that same
+        // hand-off (holding the floor while settle detection runs): the
+        // controller lands that through the real split_budget -> command
+        // path, so a ryzenadj call has already happened.
+        assert!(
+            !ryzenadj_calls(&runner).is_empty(),
+            "SetBudget(lo) on step-test entry must land a real command"
+        );
+        assert_eq!(
+            ctl.status().cpu_limit_w,
+            Some(15.0),
+            "held at the CPU floor (no GPU LUT yet: gpu_floor_w falls back to 0 W)"
+        );
 
         drive_step_test_to_skip(&mut ctl);
         assert!(ctl.burner.is_none(), "burner must stop once the step skips");
         assert_eq!(ctl.status().mode, Mode::Monitor);
+        // The skip path restores the floor (`SetBudget(lo)`), not a release
+        // — calibration's terminal state pins the CPU at the floor rather
+        // than releasing to stock (design §3.3's `conclude_skip`).
+        assert_eq!(ctl.status().cpu_limit_w, Some(15.0));
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -3432,17 +3800,24 @@ mod tests {
         drive_sweep(&mut ctl);
         drive_step_test_to_skip(&mut ctl);
 
-        // Finished: back to Monitor, wizard gone, everything released.
+        // Finished: back to Monitor, wizard gone, burner stopped. The CPU
+        // limit itself is left pinned at the floor (design §3.3's
+        // `conclude_skip`: "restore the floor", not a release), landed
+        // through the real `SetBudget` -> split_budget -> command path.
         assert_eq!(ctl.status().mode, Mode::Monitor);
         assert!(ctl.status().calib.is_none());
         assert!(ctl.burner.is_none());
-        assert_eq!(ctl.status().cpu_limit_w, None);
+        assert_eq!(
+            ctl.status().cpu_limit_w,
+            Some(Config::default().cpu_floor_w)
+        );
 
         // The state file exists, parses and carries the LUT (PersistedState
         // no longer carries a model field, fw-fanctrl-loop-dsh); the
         // controller kept it, so Auto mode can start right away.
-        // `loop_gains` stays None: with `CalibContext::default()` the step
-        // test's settle gate never clears, so it skips and keeps defaults.
+        // `loop_gains` stays None: `settle_sample()` carries no `fanctrl`
+        // view, so `fanctrl_active` is always false and the step test's
+        // settle gate never clears — it skips and keeps defaults.
         let saved = PersistedState::load(&state_path);
         assert_eq!(saved.lut.expect("lut persisted").len(), 10);
         assert_eq!(saved.loop_gains, None);
@@ -3452,6 +3827,63 @@ mod tests {
             .parse::<u64>()
             .expect("unix seconds");
         assert!(ctl.lut.is_some());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn calibration_save_preserves_the_duty_rpm_table_and_warm_start_it_does_not_own() {
+        // Regression: `RunnerEffect::SaveState`'s `PersistedState` carries
+        // only what the step-test runner itself owns (`lut`/`calibrated_at`/
+        // `loop_gains`) — its `duty_rpm_table`/`warm_start` are bare
+        // `..PersistedState::default()` filler, NOT the controller's actual
+        // table/warm-start map. Saving that struct directly to disk would
+        // silently wipe both on every calibration. The controller must fold
+        // in only the fields the runner owns, then persist the FULL state
+        // through `save_persisted_state`.
+        let runner = FakeRunner::new();
+        let (dir, profile) = profile_fixture("calib-preserves-table");
+        let state_path = dir.join("state.json");
+        let guard = RestoreGuard::new(
+            &runner,
+            Some(cpu_actuator(&runner, profile)),
+            None,
+            Some(SmuModule::assume_unloaded()),
+        );
+        let mut pre_refined_table = DutyRpmTable::default();
+        pre_refined_table.refine(30, 2600.0); // a real, observable change from the seed
+        let mut pre_warm_start = BTreeMap::new();
+        pre_warm_start.insert("quiet16:36:batt".to_string(), 77.0);
+        let persisted = PersistedState {
+            duty_rpm_table: pre_refined_table.clone(),
+            warm_start: pre_warm_start.clone(),
+            ..PersistedState::default()
+        };
+        let mut ctl = Controller::new(
+            guard,
+            persisted,
+            state_path.clone(),
+            Config::default(),
+            PathBuf::from("/nonexistent/config.toml"),
+        );
+
+        ctl.on_command(Command::StartCalibration);
+        drive_sweep(&mut ctl);
+        drive_step_test_to_skip(&mut ctl);
+        assert_eq!(ctl.status().mode, Mode::Monitor, "calibration finished");
+
+        let saved = PersistedState::load(&state_path);
+        assert_eq!(
+            saved.duty_rpm_table, pre_refined_table,
+            "the pre-existing refined table must survive a calibration save unchanged"
+        );
+        assert_eq!(
+            saved.warm_start, pre_warm_start,
+            "the pre-existing warm-start map must survive a calibration save unchanged"
+        );
+        // The in-memory controller state agrees too (not just the file).
+        assert_eq!(ctl.duty_rpm_table, pre_refined_table);
+        assert_eq!(ctl.warm_start, pre_warm_start);
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -5033,6 +5465,422 @@ mod tests {
             (budget_w - 45.053).abs() < 1e-9,
             "re-engagement must reseed from the floors with no kick, not resume from the old u: {budget_w}"
         );
+    }
+
+    // ---- fw-fanctrl-loop-438: steady-window / warm-start / calibration hooks ----
+
+    /// An Auto-eligible RpmLoop sample carrying a fanctrl view (so
+    /// `self.status.strategy` is known — the warm-start key needs it) but
+    /// no EC reading (`ec: None`), which keeps the arbiter's `hard_ok` false
+    /// and the loop pinned in RpmLoop regardless of the view's own content.
+    /// The tests below only care about the RpmLoop error (`rpm_for_duty
+    /// (target_duty) - rpm_smoothed`) and the warm-start key, not TempLoop/
+    /// reconciliation.
+    fn rpm_view_sample(t: f64, fan_rpm: f64, strategy: &str, speed_pct: u8, on_ac: bool) -> Sample {
+        let view = FanctrlView {
+            strategy: strategy.to_string(),
+            active: true,
+            speed_pct,
+            temperature: 60.0,
+            ma_temperature: 60.0,
+            ma_interval: 60,
+            curve: TEMP_CURVE.to_vec(),
+            observed_at: Instant::now(),
+            all_observed_at: Some(Instant::now()),
+        };
+        Sample {
+            t_mono: t,
+            fan_valid: true,
+            fan1_rpm: fan_rpm,
+            fan2_rpm: fan_rpm,
+            on_ac,
+            fanctrl: Some(view),
+            fanctrl_freshness: Freshness::Fresh,
+            // A healthy machine reports a valid, cool Tctl: without this a
+            // long run (this file's steady-window tests drive 40+ samples)
+            // trips the sensor-lost watchdog and releases everything.
+            cpu_temp_c: 60.0,
+            cpu_temp_valid: true,
+            ..Sample::default()
+        }
+    }
+
+    #[test]
+    fn steady_window_on_the_smoothed_series_records_warm_start_and_refines_the_table() {
+        // target_duty for the default 3000 RPM fan target snaps to the
+        // seeded duty 36 (rpm_for_duty(36) == 3030.0); a fan reading held
+        // flat at 3000.0 (30 RPM below) keeps the window's `rpm_smoothed`
+        // series perfectly flat (population stdev 0, comfortably under 60)
+        // while the resulting small, constant positive error nudges `u` up
+        // off the seeded floor and keeps it strictly between the bounds for
+        // the whole run (never returns to exactly the floor once moved).
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+
+        for i in 0..u64::try_from(STEADY_WINDOW_N).unwrap() {
+            ctl.on_sample(&rpm_view_sample(i as f64, 3000.0, "quiet16", 36, false));
+        }
+
+        let key = WarmStart::key("quiet16", 36, false);
+        assert_eq!(
+            WarmStart::lookup(&ctl.warm_start, &key),
+            Some(ctl.status().budget_w),
+            "the steady window must record the CURRENT u under this tick's key"
+        );
+        // refine: 0.8*3030.0 (seed) + 0.2*3000.0 (window mean) == 3024.0.
+        assert_eq!(
+            ctl.duty_rpm_table.rpm_for_duty(36),
+            3024.0,
+            "the table entry for duty 36 must have blended toward the window's mean"
+        );
+    }
+
+    #[test]
+    fn steady_window_still_qualifies_despite_raw_90_rpm_noise() {
+        // Raw fan readings alternate +/-90 RPM around 2500.0 (well below
+        // the target's 3030.0, like `busy_at`'s own gap — a REPEATED small
+        // alternation centered close to the target instead risks the error
+        // flipping sign tick to tick and the budget bouncing back onto the
+        // lower bound between ticks, which would spuriously fail the "off
+        // both bounds" gate; centering well below keeps the RpmLoop error
+        // reliably positive throughout, off the floor from the first due
+        // tick on). The steady-window detector runs on `rpm_smoothed` (a
+        // 5-sample tail mean), not this raw series, so the population
+        // stdev it actually judges stays well under 60 despite the swing.
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+
+        for i in 0..u64::try_from(STEADY_WINDOW_N).unwrap() {
+            let raw = if i % 2 == 0 { 2410.0 } else { 2590.0 };
+            ctl.on_sample(&rpm_view_sample(i as f64, raw, "quiet16", 36, false));
+        }
+
+        let key = WarmStart::key("quiet16", 36, false);
+        assert!(
+            WarmStart::lookup(&ctl.warm_start, &key).is_some(),
+            "raw +/-90 RPM noise must still qualify once smoothed"
+        );
+        assert_ne!(
+            ctl.duty_rpm_table.rpm_for_duty(36),
+            3030.0,
+            "the table entry for duty 36 must have been refined"
+        );
+    }
+
+    #[test]
+    fn steady_window_never_records_when_speed_pct_differs_from_target_duty_for_part_of_the_window()
+    {
+        // First 10 samples: fw-fanctrl is actually running a different
+        // tread than the one `target_duty` names (a `GPU HOT` episode or a
+        // budget bound can do exactly this) — the view's own `speed_pct`
+        // (99) mismatches `target_duty` (36). The remaining 30 samples
+        // match, but that is short of `STEADY_WINDOW_N` (40) on its own, so
+        // the window must never fire.
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+
+        for i in 0..10u64 {
+            ctl.on_sample(&rpm_view_sample(i as f64, 3000.0, "quiet16", 99, false));
+        }
+        for i in 10..u64::try_from(STEADY_WINDOW_N).unwrap() {
+            ctl.on_sample(&rpm_view_sample(i as f64, 3000.0, "quiet16", 36, false));
+        }
+
+        assert!(
+            ctl.warm_start.is_empty(),
+            "a window whose achieved duty differed from the target's for any \
+             part of it must never record: {:?}",
+            ctl.warm_start
+        );
+        assert_eq!(
+            ctl.duty_rpm_table.rpm_for_duty(36),
+            3030.0,
+            "no refinement either"
+        );
+    }
+
+    #[test]
+    fn auto_entry_seeds_u_from_a_matching_warm_start_key() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
+        let key = WarmStart::key("quiet16", 36, false);
+        ctl.warm_start.insert(key, 99.0);
+        ctl.on_command(Command::SetAuto(true));
+
+        // rpm_for_duty(36) == 3030.0: a fan reading that exactly matches
+        // keeps this tick's RpmLoop error at 0, so the PI increment is
+        // exactly 0 and `u` stays at whatever it was seeded to.
+        ctl.on_sample(&rpm_view_sample(0.0, 3030.0, "quiet16", 36, false));
+
+        assert_eq!(
+            ctl.status().budget_w,
+            99.0,
+            "auto entry must seed u from the matching warm-start entry, not the floors"
+        );
+    }
+
+    #[test]
+    fn a_strategy_change_re_keys_without_reseeding_the_budget() {
+        // Two otherwise-identical sessions: `base` never changes strategy;
+        // `rekey` switches strategy on its last tick, with a DIFFERENT
+        // warm-start value pre-seeded under the NEW key — if the code
+        // incorrectly re-seeded on a key change, `rekey`'s `u` would jump
+        // toward that 999.0 and the two sessions would diverge sharply. The
+        // no-reseed rule (§2.4) says they must land bit-identical: that
+        // tick's delta is the ordinary PI increment, nothing else.
+        let base_runner = FakeRunner::new();
+        let (mut base, _g1) = auto_controller_no_profile(&base_runner);
+        base.on_command(Command::SetAuto(true));
+
+        let rekey_runner = FakeRunner::new();
+        let (mut rekey, _g2) = auto_controller_no_profile(&rekey_runner);
+        rekey
+            .warm_start
+            .insert(WarmStart::key("cool16", 36, false), 999.0);
+        rekey.on_command(Command::SetAuto(true));
+
+        for i in 0..3u64 {
+            let t = i as f64 * ALLOC_PERIOD_S;
+            base.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
+            rekey.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
+        }
+        assert_eq!(
+            base.status().budget_w,
+            rekey.status().budget_w,
+            "premise: identical trajectory so far"
+        );
+
+        let t = 3.0 * ALLOC_PERIOD_S;
+        base.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
+        rekey.on_sample(&rpm_view_sample(t, 3000.0, "cool16", 36, false));
+
+        assert_eq!(
+            base.status().budget_w,
+            rekey.status().budget_w,
+            "a strategy change must re-key without touching u"
+        );
+    }
+
+    #[test]
+    fn an_on_ac_change_re_keys_without_reseeding_the_budget() {
+        // Same shape as the strategy-change case above, but the LAST tick
+        // flips `on_ac` (false -> true) instead of strategy. `WarmStart::
+        // key` includes `on_ac`, so an AC-unplug/replug tick must re-key
+        // exactly like a strategy change: no reseed, the tick's delta is
+        // the ordinary PI increment.
+        let base_runner = FakeRunner::new();
+        let (mut base, _g1) = auto_controller_no_profile(&base_runner);
+        base.on_command(Command::SetAuto(true));
+
+        let rekey_runner = FakeRunner::new();
+        let (mut rekey, _g2) = auto_controller_no_profile(&rekey_runner);
+        rekey
+            .warm_start
+            .insert(WarmStart::key("quiet16", 36, true), 999.0);
+        rekey.on_command(Command::SetAuto(true));
+
+        for i in 0..3u64 {
+            let t = i as f64 * ALLOC_PERIOD_S;
+            base.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
+            rekey.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
+        }
+        assert_eq!(
+            base.status().budget_w,
+            rekey.status().budget_w,
+            "premise: identical trajectory so far"
+        );
+
+        let t = 3.0 * ALLOC_PERIOD_S;
+        base.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
+        rekey.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, true));
+
+        assert_eq!(
+            base.status().budget_w,
+            rekey.status().budget_w,
+            "an on_ac change must re-key without touching u"
+        );
+    }
+
+    #[test]
+    fn a_snapped_duty_change_re_keys_without_reseeding_the_budget() {
+        // Same shape again, but the LAST tick's `SetFanTarget` moves the fan
+        // target from the default 3000 RPM (snaps to duty 36) to 3380 RPM
+        // (the table's exact seeded point for duty 40) — the allocator
+        // recomputes `target_duty` from `fan_target_rpm` every ALLOC_PERIOD_S
+        // tick, so this re-keys `WarmStart::key` on its `target_duty`
+        // component, not strategy or on_ac. Same rule (§2.4): no reseed.
+        let base_runner = FakeRunner::new();
+        let (mut base, _g1) = auto_controller_no_profile(&base_runner);
+        base.on_command(Command::SetAuto(true));
+
+        let rekey_runner = FakeRunner::new();
+        let (mut rekey, _g2) = auto_controller_no_profile(&rekey_runner);
+        rekey
+            .warm_start
+            .insert(WarmStart::key("quiet16", 40, false), 999.0);
+        rekey.on_command(Command::SetAuto(true));
+
+        for i in 0..3u64 {
+            let t = i as f64 * ALLOC_PERIOD_S;
+            base.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
+            rekey.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
+        }
+        assert_eq!(
+            base.status().budget_w,
+            rekey.status().budget_w,
+            "premise: identical trajectory so far"
+        );
+
+        rekey.on_command(Command::SetFanTarget(3380.0));
+        assert_eq!(
+            rekey
+                .duty_rpm_table
+                .duty_for_rpm(rekey.status().fan_target_rpm),
+            40,
+            "premise: the new fan target snaps to a different tread"
+        );
+
+        let t = 3.0 * ALLOC_PERIOD_S;
+        base.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
+        rekey.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
+
+        assert_eq!(
+            base.status().budget_w,
+            rekey.status().budget_w,
+            "a snapped target_duty change must re-key without touching u"
+        );
+    }
+
+    #[test]
+    fn reengaging_from_released_seeds_from_the_warm_start_when_a_key_matches() {
+        // `budget_seeded` resets to `false` on the tick `LoopMode`
+        // transitions INTO `Released` (`handle_mode_transition`), and the
+        // seed-check re-fires within that SAME `on_auto_sample` call if
+        // `due` also holds that tick (exactly the case here, one
+        // `ALLOC_PERIOD_S` after the first sample) — `Freeze::Released`
+        // then holds the just-seeded `u` exactly, so the seeded value is
+        // what "re-engagement" actually reads back once the loop resumes.
+        // The warm-start entry must therefore already be in place BEFORE
+        // this tick, not after.
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        ctl.on_sample(&rpm_view_sample(0.0, 3000.0, "quiet16", 36, false));
+        assert_eq!(ctl.status().loop_mode, LoopMode::RpmLoop);
+
+        let key = WarmStart::key("quiet16", 36, false);
+        ctl.warm_start.insert(key, 99.0);
+
+        // Drop to Released (fan invalid) — the re-seed happens here.
+        ctl.on_sample(&Sample {
+            fan_valid: false,
+            ..rpm_view_sample(ALLOC_PERIOD_S, 3000.0, "quiet16", 36, false)
+        });
+        assert_eq!(ctl.status().loop_mode, LoopMode::Released);
+        assert_eq!(
+            ctl.status().budget_w,
+            99.0,
+            "must seed from the matching warm-start entry, not the floor sum (45.0)"
+        );
+    }
+
+    #[test]
+    fn calib_budget_w_stays_at_default_through_the_lut_sweep_before_any_setbudget() {
+        // The whole-session calibration freeze (`Freeze::Calibrating`) holds
+        // `u` exactly through the LUT sweep — no `SetBudget` fires until the
+        // step test's hand-off, so `status.budget_w` (only ever written by
+        // `apply_calib_set_budget`) never moves off its default.
+        let runner = FakeRunner::new();
+        let (dir, path) = profile_fixture("calib-freeze-sweep");
+        let mut ctl = controller(&runner, path);
+        ctl.on_command(Command::StartCalibration);
+        assert_eq!(ctl.status().budget_w, 0.0, "no SetBudget has fired yet");
+
+        use crate::calib::lut_sweep::SWEEP_CLOCKS;
+        for &clock in SWEEP_CLOCKS.iter().take(3) {
+            for _ in 0..60 {
+                ctl.on_sample(&sweep_pinned(clock));
+                if ctl.status().calib.as_ref().map(|c| c.phase.as_str()) != Some("lut") {
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            ctl.status().calib.as_ref().map(|c| c.phase.clone()),
+            Some("lut".to_string()),
+            "premise: still mid-sweep, no hand-off to the step test yet"
+        );
+        assert_eq!(
+            ctl.status().budget_w,
+            0.0,
+            "u must be unchanged across the LUT sweep"
+        );
+        ctl.on_command(Command::AbortCalibration);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn calib_context_real_wiring_lets_the_step_test_actually_settle() {
+        // Regression: before this task, the controller always handed the
+        // runner `CalibContext::default()`, so `fanctrl_active` was always
+        // false and the step test's settle gate could NEVER clear — every
+        // real calibration timed out at the 5-minute cap. With the real
+        // `CalibContext` wired through, a scripted run with an active,
+        // reconciled fanctrl view and a controllable, steady EC reading
+        // must actually leave the settle sub-phase.
+        let runner = FakeRunner::new();
+        let (dir, profile) = profile_fixture("calib-context-real");
+        let mut ctl = controller(&runner, profile);
+        ctl.on_command(Command::StartCalibration);
+        drive_sweep(&mut ctl);
+        assert_eq!(
+            ctl.status().calib.as_ref().map(|c| c.phase.clone()),
+            Some("step".to_string())
+        );
+
+        let settle = |t_mono: f64| -> Sample {
+            let view = FanctrlView {
+                strategy: "quiet16".to_string(),
+                active: true,
+                speed_pct: 31,
+                temperature: 60.0,
+                ma_temperature: 60.0,
+                ma_interval: 60,
+                curve: TEMP_CURVE.to_vec(),
+                observed_at: Instant::now(),
+                all_observed_at: Some(Instant::now()),
+            };
+            let ec = ec_reading_c(&[("apu@4c", 60.0)]);
+            Sample {
+                t_mono,
+                fan_valid: true,
+                fan1_rpm: 3000.0,
+                ec: Some(ec),
+                ec_valid: true,
+                fanctrl: Some(view),
+                fanctrl_freshness: Freshness::Fresh,
+                fanctrl_view_changed: true,
+                cpu_temp_c: 60.0,
+                cpu_temp_valid: true,
+                ..Sample::default()
+            }
+        };
+
+        for i in 0..65u64 {
+            ctl.on_sample(&settle(i as f64));
+        }
+        let calib = ctl.status().calib.as_ref().expect("still calibrating");
+        assert_eq!(calib.phase, "step", "phase label stays step");
+        assert!(
+            calib.step >= 1,
+            "must have LEFT the settle sub-phase within 65 flat, active, \
+             reconciled samples: {calib:?}"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

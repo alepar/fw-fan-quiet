@@ -4198,12 +4198,12 @@ mod tests {
             ..calibrated()
         };
         let (mut ctl, _g) = pinned_op_controller_with_state(&runner, stale, state_path.clone());
-        ctl.apply_calib_effects(vec![RunnerEffect::SaveState(PersistedState {
+        ctl.apply_calib_effects(vec![RunnerEffect::SaveState(Box::new(PersistedState {
             model: Some(fitted_model()),
             lut: Some(lut3()),
             calibrated_at: Some("1783650000".to_string()),
             ..PersistedState::default()
-        })]);
+        }))]);
         // The next Auto entry seeds from the identity, not the stale pair.
         ctl.on_command(Command::SetAuto(true));
         assert_eq!(ctl.status().trim_rpm, 0.0);

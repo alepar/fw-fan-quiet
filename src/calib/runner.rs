@@ -137,7 +137,7 @@ pub enum RunnerEffect {
         max_residual: f64,
     },
     /// Persist this state (the runner produces it; the controller saves it).
-    SaveState(PersistedState),
+    SaveState(Box<PersistedState>),
     /// Calibration failed; everything already released. Terminal.
     Failed(String),
     /// Calibration finished successfully. Terminal.
@@ -486,12 +486,12 @@ impl CalibRunner {
                     c: model.c,
                     max_residual,
                 });
-                effects.push(RunnerEffect::SaveState(PersistedState {
+                effects.push(RunnerEffect::SaveState(Box::new(PersistedState {
                     model: Some(model),
                     lut: self.lut.clone(),
                     calibrated_at: Some(unix_secs_string()),
                     ..PersistedState::default()
-                }));
+                })));
                 effects.push(RunnerEffect::Finished);
                 self.phase = Phase::Done;
                 self.note = format!("calibration complete (max residual {max_residual:.0} RPM)");
@@ -775,7 +775,7 @@ mod tests {
         let saved: Vec<&PersistedState> = all
             .iter()
             .filter_map(|e| match e {
-                RunnerEffect::SaveState(ps) => Some(ps),
+                RunnerEffect::SaveState(ps) => Some(ps.as_ref()),
                 _ => None,
             })
             .collect();

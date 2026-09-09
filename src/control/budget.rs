@@ -21,15 +21,14 @@
 //! - **Demand-limited halt (`Freeze::DemandLimited`), directional and
 //!   per-axis.** See [`Budget::set_demand_state`] and the note on
 //!   [`Freeze::DemandLimited`] below. `fw-fanctrl-loop-9it` (a measurement
-//!   spike) has now decided the real rule — per-axis
-//!   `cap_i > floor_i + ε AND (cap_i − draw_i) > DEMAND_MARGIN_W(i)`, with
-//!   2-tick symmetric hysteresis — and recorded it in §2.4, but
-//!   [`Budget::set_demand_state`] below still implements only the older
-//!   placeholder predicate (`draw >= cap`, no floor, no margin, no
-//!   hysteresis) because its `&[(f64, f64)]` signature has nowhere to carry
-//!   a floor or a per-axis `DEMAND_MARGIN_W`. `fw-fanctrl-loop-j6s`
-//!   (Controller loop integration) owns widening this seam and its callers
-//!   to the decided rule.
+//!   spike) decided the real rule and recorded it in §2.4:
+//!   per-axis `cap_i > floor_i + ε AND (cap_i − draw_i) > DEMAND_MARGIN_W(i)`,
+//!   with 2-tick symmetric hysteresis, using the **post**-guard-override
+//!   cap. [`Budget::set_demand_state`] below implements exactly that —
+//!   `fw-fanctrl-loop-j6s` (Controller loop integration) wired it in, with
+//!   the hysteresis state owned by `Budget` itself (one axis pair, CPU and
+//!   GPU — this design has exactly two actuators, so the seam is two named
+//!   tuples rather than a generic per-axis slice).
 //!
 //! # Freezes
 //!
@@ -62,6 +61,34 @@ const SLOPE_REF_PCT_PER_C: f64 = 1.0;
 /// (`Budget::new`'s initial state) or when it resolves to `None` (§2.4: "the
 /// conservative `0.25x` clamp, never `1x`").
 const RPM_GAIN_SCALE_FLOOR: f64 = 0.25;
+
+/// CPU axis demand-limited margin, watts (§2.4, decided by `fwloop.24`
+/// / `fw-fanctrl-loop-9it`: `ryzenadj --info`'s `PPT VALUE SLOW` against
+/// `PPT LIMIT SLOW`, RAPL-cross-validated; ~25x the measured noise floor,
+/// ~8x below the smallest measured genuine demand-limited gap — see §Facts
+/// and `src/control/spike_antiwindup.rs`).
+pub const DEMAND_MARGIN_W_CPU: f64 = 2.0;
+/// GPU axis demand-limited margin, watts (§2.4, decided by `fwloop.24`
+/// / `fw-fanctrl-loop-9it`: NVML `power.draw` at a locked clock; see
+/// §Facts and `src/control/spike_antiwindup.rs`).
+pub const DEMAND_MARGIN_W_GPU: f64 = 3.0;
+/// Demand-limited hysteresis dwell, ticks at [`PI_PERIOD_S`] each (§2.4,
+/// decided by `fwloop.24`): a raw per-tick verdict must persist this many
+/// consecutive ticks, symmetric entering and leaving, before the effective
+/// (debounced) halt state changes.
+const DEMAND_HYSTERESIS_TICKS: u32 = 2;
+
+/// One axis's demand-limited predicate (§2.4's decided rule): only an axis
+/// actually offered headroom above its own floor (`cap > floor`) can ever
+/// register a false "unused headroom" signal — an axis pinned exactly at
+/// its floor (a structurally undrawn GPU, say) was never given room to
+/// waste. This is the "judge each axis separately" invariant's actual
+/// content, not just "loop over axes". Mirrors
+/// `spike_antiwindup::demand_limited_axis` exactly (that copy stays
+/// private to the throwaway harness; this is the production seam).
+fn demand_limited_axis(draw_w: f64, cap_w: f64, floor_w: f64, margin_w: f64) -> bool {
+    cap_w > floor_w + 1e-9 && (cap_w - draw_w) > margin_w
+}
 
 /// Persisted PI gains for both loop legs (§2.4). `Default` is the
 /// θ_eff-derived IMC tuning; the FOPDT fit outputs (`tau_s`, `theta_s`,
@@ -179,6 +206,11 @@ pub struct Budget {
     rpm_gain_scale: f64,
     lower_bound_dwell: Duration,
     upper_bound_dwell: Duration,
+    /// Demand-limited hysteresis state (§2.4), one axis pair.
+    cpu_demand_halted: bool,
+    cpu_demand_pending: u32,
+    gpu_demand_halted: bool,
+    gpu_demand_pending: u32,
 }
 
 impl Budget {
@@ -197,6 +229,10 @@ impl Budget {
             rpm_gain_scale: RPM_GAIN_SCALE_FLOOR,
             lower_bound_dwell: Duration::ZERO,
             upper_bound_dwell: Duration::ZERO,
+            cpu_demand_halted: false,
+            cpu_demand_pending: 0,
+            gpu_demand_halted: false,
+            gpu_demand_pending: 0,
         }
     }
 
@@ -243,45 +279,68 @@ impl Budget {
     pub fn scale_rpm_gain(&mut self, slope: Option<f64>) -> f64 {
         let scale = match slope {
             None => RPM_GAIN_SCALE_FLOOR,
-            Some(slope_at_t_star) => {
-                (SLOPE_REF_PCT_PER_C / slope_at_t_star.max(SLOPE_REF_PCT_PER_C))
-                    .clamp(RPM_GAIN_SCALE_FLOOR, 1.0)
-            }
+            Some(slope_at_t_star) => (SLOPE_REF_PCT_PER_C
+                / slope_at_t_star.max(SLOPE_REF_PCT_PER_C))
+            .clamp(RPM_GAIN_SCALE_FLOOR, 1.0),
         };
         self.rpm_gain_scale = scale;
         scale
     }
 
-    /// Demand-limited predicate seam (§2.4). **Placeholder — owner:
-    /// `fw-fanctrl-loop-j6s`.** `fw-fanctrl-loop-9it` (the measurement
-    /// spike) has already decided the real rule and recorded it, with its
-    /// sweep table, in §2.4: per axis, `cap_i > floor_i + ε AND (cap_i −
-    /// draw_i) > DEMAND_MARGIN_W(i)`, latched through 2 ticks (10 s) of
-    /// symmetric hysteresis, using the post-guard-override cap. This
-    /// function still implements only the fixed invariants the spike was
-    /// scoped to preserve, not the decided predicate: judged per axis (one
-    /// saturated axis can halt without the others ever entering the
-    /// decision — a combined-sum test would make any structurally undrawn
-    /// component, e.g. the GPU floor share while the dGPU is off, a
-    /// permanent gap), and the halt applies only when `error_sign` is
-    /// itself pushing in the deepening direction (positive — the error is
-    /// calling for *more* budget) — `error_sign <= 0.0` is already the
-    /// recovering direction and is never halted here regardless of axis
-    /// state.
+    /// Demand-limited predicate (§2.4's decided rule, `fwloop.24` /
+    /// `fw-fanctrl-loop-9it`): per axis, `cap_i > floor_i + ε AND (cap_i −
+    /// draw_i) > DEMAND_MARGIN_W(i)` ([`demand_limited_axis`]), latched
+    /// through [`DEMAND_HYSTERESIS_TICKS`] of symmetric hysteresis
+    /// (entering AND leaving) so single-tick noise at the margin does not
+    /// chatter the hold. `cpu`/`gpu` are each `(draw_w, cap_w, floor_w)` —
+    /// `cap_w` must be the **post**-guard-override cap (what `split_budget`
+    /// actually produced this tick after e.g. `gpu_share_override`), never
+    /// a hypothetical pre-override value.
     ///
-    /// `axes` is `&[(draw_w, cap_w)]`, one pair per actuator — there is no
-    /// per-axis floor and no per-axis `DEMAND_MARGIN_W` in this signature,
-    /// so it cannot express the decided predicate above (which needs both)
-    /// and its body below is still the naive `draw >= cap` pin check the
-    /// spike's floor-guard fix (scenario 5) was built to replace.
-    /// `fw-fanctrl-loop-j6s` (Controller loop integration) — the task
-    /// documented as calling this seam with "the per-axis smoothed draws,
-    /// their caps and the error sign" — must widen this signature to also
-    /// carry each axis's `floor_i` and `DEMAND_MARGIN_W(i)`, and the
-    /// hysteresis state, before it can wire in §2.4's decided rule.
-    pub fn set_demand_state(&mut self, axes: &[(f64, f64)], error_sign: f64) -> bool {
-        let any_axis_pinned = axes.iter().any(|&(draw, cap)| draw >= cap);
-        error_sign > 0.0 && any_axis_pinned
+    /// Judged per axis (one saturated axis halts without the other ever
+    /// entering the decision — a combined-sum test would make any
+    /// structurally undrawn component, e.g. the GPU floor share while the
+    /// dGPU is unpowered, a permanent gap), and the overall halt applies
+    /// only when `error_sign` is itself pushing in the deepening direction
+    /// (positive — the error is calling for *more* budget); `error_sign <=
+    /// 0.0` is already the recovering direction and is never halted here
+    /// regardless of axis state. Returns the value to pass as
+    /// `Some(Freeze::DemandLimited)` (when true) to [`Budget::step`].
+    pub fn set_demand_state(
+        &mut self,
+        cpu: (f64, f64, f64),
+        gpu: (f64, f64, f64),
+        error_sign: f64,
+    ) -> bool {
+        let cpu_raw = demand_limited_axis(cpu.0, cpu.1, cpu.2, DEMAND_MARGIN_W_CPU);
+        let gpu_raw = demand_limited_axis(gpu.0, gpu.1, gpu.2, DEMAND_MARGIN_W_GPU);
+        let cpu_halted = Self::debounce_demand(
+            &mut self.cpu_demand_halted,
+            &mut self.cpu_demand_pending,
+            cpu_raw,
+        );
+        let gpu_halted = Self::debounce_demand(
+            &mut self.gpu_demand_halted,
+            &mut self.gpu_demand_pending,
+            gpu_raw,
+        );
+        error_sign > 0.0 && (cpu_halted || gpu_halted)
+    }
+
+    /// One axis's hysteresis step: `raw` is this tick's un-debounced
+    /// verdict; `halted`/`pending` are that axis's persistent state.
+    /// Returns the (possibly still-debounced) effective verdict.
+    fn debounce_demand(halted: &mut bool, pending: &mut u32, raw: bool) -> bool {
+        if raw == *halted {
+            *pending = 0;
+        } else {
+            *pending += 1;
+            if *pending >= DEMAND_HYSTERESIS_TICKS {
+                *halted = raw;
+                *pending = 0;
+            }
+        }
+        *halted
     }
 
     /// Advances the integrator one tick and returns the new `u`, watts.
@@ -573,7 +632,10 @@ mod tests {
         // tick's overshoot to bleed off, so v lands back inside the bounds
         // in this one step — both counters reset.
         let u = budget.step(LoopError::Temp { e_c: 0.0 }, None);
-        assert!((0.0..10.0).contains(&u), "expected u inside bounds, got {u}");
+        assert!(
+            (0.0..10.0).contains(&u),
+            "expected u inside bounds, got {u}"
+        );
         assert_eq!(budget.at_upper_bound_for(), Duration::ZERO);
         assert_eq!(budget.at_lower_bound_for(), Duration::ZERO);
 
@@ -675,7 +737,45 @@ mod tests {
         );
     }
 
-    // ---- Step 8: the roast-3 regression — directional, per-axis halt ----
+    // ---- Step 8: §2.4's decided demand-limited rule (fwloop.24) ----
+
+    /// A CPU axis reading well clear of its floor with a gap past its
+    /// margin: `demand_limited_axis` would score it `true` on a bare call.
+    const CPU_LIMITED: (f64, f64, f64) = (28.0, 40.0, 10.0); // cap-draw=12 > 2.0
+    /// A GPU axis pinned exactly at its floor: never demand-limited
+    /// regardless of draw/cap gap (the floor-headroom guard).
+    const GPU_AT_FLOOR: (f64, f64, f64) = (0.0, 5.0, 5.0);
+    /// Neither axis ever demand-limited (both at/under their own floor).
+    const CPU_NOT_LIMITED: (f64, f64, f64) = (10.0, 10.0, 10.0);
+
+    /// Calls `set_demand_state` twice with identical inputs so the 2-tick
+    /// hysteresis dwell latches, returning the second (settled) verdict.
+    fn latch(budget: &mut Budget, cpu: (f64, f64, f64), gpu: (f64, f64, f64), sign: f64) -> bool {
+        budget.set_demand_state(cpu, gpu, sign);
+        budget.set_demand_state(cpu, gpu, sign)
+    }
+
+    #[test]
+    fn demand_hysteresis_needs_two_consecutive_ticks_to_latch() {
+        let mut budget = Budget::new(&LoopGains::default());
+        // First tick: CPU axis is raw-demand-limited, but the hysteresis
+        // dwell (2 ticks) has not yet elapsed — must NOT halt on tick one.
+        // (A rule with no hysteresis, i.e. `Conditional` not
+        // `ConditionalHysteresis`, would return true here; this assertion
+        // is what tells the two apart.)
+        assert!(
+            !budget.set_demand_state(CPU_LIMITED, GPU_AT_FLOOR, 1.0),
+            "halted on the very first raw-limited tick; hysteresis not applied"
+        );
+        // Second consecutive tick: now latched.
+        assert!(budget.set_demand_state(CPU_LIMITED, GPU_AT_FLOOR, 1.0));
+        // Leaving is symmetric: one clear tick alone must not release it.
+        assert!(
+            budget.set_demand_state(CPU_NOT_LIMITED, GPU_AT_FLOOR, 1.0),
+            "released on the first clear tick; leaving hysteresis not applied"
+        );
+        assert!(!budget.set_demand_state(CPU_NOT_LIMITED, GPU_AT_FLOOR, 1.0));
+    }
 
     #[test]
     fn demand_limited_halt_still_integrates_down_when_error_calls_for_less_heat() {
@@ -683,10 +783,10 @@ mod tests {
         budget.set_bounds(-1.0e6, 1.0e6);
         budget.seed(50.0);
 
-        // Condition active: an axis is pinned at its cap, and error_sign
+        // Condition active: the CPU axis is demand-limited and error_sign
         // says the *current* error direction is deepening — a caller would
         // report DemandLimited this tick.
-        let halted = budget.set_demand_state(&[(30.0, 30.0)], 1.0);
+        let halted = latch(&mut budget, CPU_LIMITED, GPU_AT_FLOOR, 1.0);
         assert!(halted);
 
         // But THIS tick's error calls for LESS heat (negative e_c) — the
@@ -704,7 +804,7 @@ mod tests {
         let mut budget = Budget::new(&LoopGains::default());
         budget.set_bounds(-1.0e6, 1.0e6);
         budget.seed(50.0);
-        budget.set_demand_state(&[(30.0, 30.0)], 1.0);
+        latch(&mut budget, CPU_LIMITED, GPU_AT_FLOOR, 1.0);
 
         // Error calls for MORE heat: deepening direction is blocked, u must
         // not move at all this tick (not "not much" — exactly held, no
@@ -720,33 +820,51 @@ mod tests {
         budget.set_bounds(-1.0e6, 1.0e6);
         let seeded = 80.0;
         budget.seed(seeded);
-        let draw = 20.0; // far below u — a tracker would drag u toward this.
+        // Far below the cap — a tracker would drag u toward this.
+        let cpu = (20.0, 40.0, 10.0);
+        // Pre-latch the hysteresis dwell so every iteration below starts
+        // already halted (the dwell itself is covered by its own test).
+        latch(&mut budget, cpu, GPU_AT_FLOOR, 1.0);
 
         // Deepening direction, held every tick for a long window.
         for _ in 0..200 {
-            budget.set_demand_state(&[(draw, draw)], 1.0);
+            let halted = budget.set_demand_state(cpu, GPU_AT_FLOOR, 1.0);
+            assert!(halted, "hysteresis dropped the latch mid-run");
             let u = budget.step(LoopError::Temp { e_c: 50.0 }, Some(Freeze::DemandLimited));
-            assert_eq!(u, seeded, "u decayed toward the draw: {u} (draw={draw})");
+            assert_eq!(u, seeded, "u decayed toward the draw: {u} (cpu={cpu:?})");
         }
     }
 
     #[test]
     fn set_demand_state_judges_each_axis_separately() {
         let mut budget = Budget::new(&LoopGains::default());
-        // Neither axis pinned: no halt.
-        assert!(!budget.set_demand_state(&[(10.0, 30.0), (5.0, 20.0)], 1.0));
-        // One axis pinned (GPU floor share while the dGPU draws nothing —
-        // structurally undrawn, cap 0): halts, without the CPU axis (well
-        // under its cap) entering the decision at all.
-        assert!(budget.set_demand_state(&[(29.0, 30.0), (0.0, 0.0)], 1.0));
+        // Neither axis limited: no halt.
+        assert!(!latch(&mut budget, CPU_NOT_LIMITED, GPU_AT_FLOOR, 1.0));
+        // One axis limited (CPU only, GPU sitting exactly at its floor —
+        // structurally undrawn, never offered headroom): halts, without
+        // the GPU axis's own floor-pinned state ever entering the
+        // decision as a false "unused headroom" signal.
+        assert!(latch(&mut budget, CPU_LIMITED, GPU_AT_FLOOR, 1.0));
+    }
+
+    #[test]
+    fn set_demand_state_floor_pinned_axis_never_halts_even_with_a_large_cap_draw_gap() {
+        let mut budget = Budget::new(&LoopGains::default());
+        // cap == floor: this axis was never offered headroom above its
+        // floor, so even a huge (cap - draw) gap must not register — the
+        // guard the naive `draw >= cap` / combined-sum rules both lacked.
+        let pinned_at_floor = (0.0, 5.0, 5.0);
+        assert!(!latch(&mut budget, pinned_at_floor, GPU_AT_FLOOR, 1.0));
     }
 
     #[test]
     fn set_demand_state_never_halts_the_recovering_error_sign() {
         let mut budget = Budget::new(&LoopGains::default());
-        // Axis pinned, but error_sign already recovering: never halted.
-        assert!(!budget.set_demand_state(&[(30.0, 30.0)], -1.0));
-        assert!(!budget.set_demand_state(&[(30.0, 30.0)], 0.0));
+        // Axis raw-limited every tick, but error_sign already recovering:
+        // never halted, regardless of the hysteresis latch's own state.
+        assert!(!budget.set_demand_state(CPU_LIMITED, GPU_AT_FLOOR, -1.0));
+        assert!(!budget.set_demand_state(CPU_LIMITED, GPU_AT_FLOOR, -1.0));
+        assert!(!budget.set_demand_state(CPU_LIMITED, GPU_AT_FLOOR, 0.0));
     }
 
     // ---- Step 9: scale_rpm_gain ----

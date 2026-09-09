@@ -5129,4 +5129,339 @@ mod tests {
             ctl.status().budget_w
         );
     }
+
+    // --- Fix round 1 (task 19 review): controller-level anti-windup /
+    // actuator-verdict gaps the report itself flagged as not covered ---
+
+    /// One confirmed CPU `Mismatch` needs the read-back to disagree on BOTH
+    /// the initial attempt and its re-read (design §2.9's "re-read once
+    /// before scoring": `run_budget_and_allocate` discards the first
+    /// verdict's value and feeds `VerdictState::observe` only the SECOND
+    /// call's result whenever the first was itself a `Mismatch`) — so both
+    /// attempts need a disagreeing table queued, not just one. `0.1 W` on
+    /// PPT LIMIT SLOW disagrees with anything this test could plausibly
+    /// command (the actuator's whole legal range is `[10, 54]` W), so this
+    /// works regardless of TempLoop's own exact commanded wattage that
+    /// tick — this test is about the verdict/freeze/release wiring, not
+    /// about pinning a specific commanded value.
+    fn queue_confirmed_cpu_mismatch(runner: &FakeRunner) {
+        for _ in 0..2 {
+            crate::actuators::cmd::test_support::queue_ryzenadj_readback(runner, 0.1, 53.0, 0.0);
+        }
+    }
+
+    #[test]
+    fn cpu_mismatch_freezes_flags_reasserts_and_releases_to_stock_then_a_later_verified_recovers() {
+        // Acceptance criteria (bead fw-fanctrl-loop-j6s, design §2.9): "a
+        // CPU ... Mismatch ... freezes, flags and reasserts on the same
+        // tick ... three consecutive mismatches release to stock with the
+        // flag held ... and a later Verified re-engages [the actuator]
+        // without a step." Unlike the report's own `VerdictState` unit
+        // tests (which call `.observe(...)` directly), this drives the
+        // REAL write path end-to-end: `CpuActuator::set_sustained_mw`
+        // through a scripted `FakeRunner` `ryzenadj --info` table, from
+        // inside `run_budget_and_allocate`'s actual write -> re-read ->
+        // observe -> apply_verdict_outcome chain.
+        let runner = FakeRunner::new();
+        let (dir, profile_path) = profile_fixture("cpu-mismatch");
+        let (mut ctl, _gpu) = auto_controller(&runner, profile_path, Config::default());
+        ctl.on_command(Command::SetAuto(true));
+
+        // `due` (the allocate/write cadence, every 5 s) fires on the FIRST
+        // sample regardless of mode, and `mode` is already RpmLoop (not
+        // Released) from t=0 onward (fan_valid is true from the first
+        // sample) -- so the first WRITE attempt is at t=0, not after
+        // TempLoop's own entry hysteresis (ENTRY_HYSTERESIS_TICKS = 3,
+        // engaging by t=2) finishes. Due ticks thereafter land every 5 s:
+        // t=0, 5, 10, 15, 20. Script three confirmed mismatches for the
+        // three due ticks that follow (t=0, 5, 10 --
+        // MISMATCH_RELEASE_STRIKES = 3), then leave the queue empty for
+        // t=15's write so `FakeRunner`'s own auto-agreeing default (see
+        // `cmd::test_support::FakeRunner`'s doc) verifies it -- proving
+        // recovery works through the *ordinary* write path, not a
+        // specially scripted one.
+        for _ in 0..3 {
+            queue_confirmed_cpu_mismatch(&runner);
+        }
+
+        // `cpu_temp_valid: true` (temploop_sample's own default is false,
+        // fine for the ~6-sample runs its existing callers use) --
+        // otherwise `ThermalWatchdog`'s SENSOR_LOST_STREAK (10 consecutive
+        // invalid-Tctl samples) trips and forcibly releases everything
+        // partway through this test's 21-sample run, well before the
+        // scripted mismatch chain finishes.
+        let mut effects_at = std::collections::HashMap::new();
+        let mut status_at = std::collections::HashMap::new();
+        for i in 0..=20u32 {
+            let t = f64::from(i);
+            let s = Sample {
+                cpu_temp_valid: true,
+                cpu_temp_c: 60.0,
+                ..temploop_sample(t, 75.0, 74.0, TEMP_CURVE)
+            };
+            let effects = ctl.on_sample(&s);
+            effects_at.insert(i, effects);
+            status_at.insert(i, ctl.status().clone());
+        }
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(
+            ctl.status().loop_mode,
+            LoopMode::TempLoop,
+            "premise: must actually be running the loop this whole time"
+        );
+
+        let freeze_at = |i: u32| -> Option<Option<&'static str>> {
+            effects_at.get(&i).and_then(|effects| {
+                effects.iter().find_map(|e| match e {
+                    Effect::AutoAllocated { freeze, .. } => Some(*freeze),
+                    _ => None,
+                })
+            })
+        };
+        let has_noted = |i: u32, want_cause: &str| {
+            effects_at[&i]
+                .iter()
+                .any(|e| matches!(e, Effect::Noted { cause } if *cause == want_cause))
+        };
+
+        // t=0: the FIRST confirmed mismatch. `in_episode()` at the START
+        // of this tick is still false (no prior trouble), so the freeze
+        // computed THIS tick is not yet `actuator_mismatch` -- the design's
+        // "freeze ... on the same tick" is the write's own immediate
+        // reassert + the `LimitNotSticking` flag landing this tick, not a
+        // same-tick Budget freeze (structurally impossible: the freeze
+        // decision happens before the write that produces the verdict).
+        assert!(
+            has_noted(0, "auto:cpu_mismatch"),
+            "t=0 must carry the first confirmed Mismatch: {:?}",
+            effects_at[&0]
+        );
+        assert_ne!(
+            freeze_at(0),
+            Some(Some("actuator_mismatch")),
+            "t=0's OWN freeze can't reflect a verdict this same tick's write hasn't produced yet"
+        );
+        assert!(
+            status_at[&0].flags.contains(&StatusFlag::LimitNotSticking),
+            "the flag must be raised the same tick the first mismatch is confirmed"
+        );
+
+        // t=5: the SECOND confirmed mismatch, and NOW the previous tick's
+        // trouble (t=0's) freezes this tick's budget -- "reasserts on the
+        // same tick" as the confirmed verdict, one tick lagged for the
+        // freeze itself per the design's own documented circularity.
+        assert!(has_noted(5, "auto:cpu_mismatch"), "{:?}", effects_at[&5]);
+        assert_eq!(
+            freeze_at(5),
+            Some(Some("actuator_mismatch")),
+            "an in-progress mismatch episode must freeze the NEXT tick's budget"
+        );
+
+        // t=10: the THIRD confirmed mismatch releases to stock (§2.9).
+        assert!(
+            has_noted(10, "auto:cpu_released"),
+            "third strike must release: {:?}",
+            effects_at[&10]
+        );
+        assert_eq!(
+            freeze_at(10),
+            Some(Some("actuator_mismatch")),
+            "still an in-progress episode as of the start of the release tick"
+        );
+        assert_eq!(
+            status_at[&10].cpu_limit_w, None,
+            "released actuator must read back as released (no live commanded limit)"
+        );
+
+        // t=15: released actuator still reasserts (write + read-back) on
+        // its own every due tick with the flag held -- this write hits the
+        // now-empty script queue, so FakeRunner's ordinary auto-agreeing
+        // default verifies it, proving recovery through the REAL write
+        // path rather than a hand-picked scripted agreement.
+        assert_eq!(
+            freeze_at(15),
+            Some(Some("actuator_mismatch")),
+            "still judged against t=10's released state as of the start of this tick"
+        );
+        assert!(
+            has_noted(15, "auto:cpu_verdict_recovered"),
+            "a later Verified must recover: {:?}",
+            effects_at[&15]
+        );
+        assert!(
+            status_at[&15].cpu_limit_w.is_some(),
+            "recovery must re-engage the actuator (a live commanded limit again)"
+        );
+
+        // t=20: the episode is over -- the NEXT tick's freeze must no
+        // longer be actuator_mismatch (in_episode() is false again).
+        assert_ne!(
+            freeze_at(20),
+            Some(Some("actuator_mismatch")),
+            "a recovered actuator must not keep freezing later ticks: {:?}",
+            effects_at[&20]
+        );
+    }
+
+    /// GPU-HOT episode replayed at controller level (design §2.4/§2.8's
+    /// interaction, the wiring the idle-tick anti-windup test never
+    /// touches at all: `guard_state.gpu_hot` -> `gpu_share_override` ->
+    /// `gpu_max_w` fed into `split_budget`/`last_gpu_cap_w`). The spike's
+    /// own decision (task 19's report, quoting the merged §2.4): GPU HOT
+    /// does not itself freeze the integrator -- the guard's ratchet folds
+    /// into `split_budget`'s `gpu_max_w` and the GENERIC demand-limited
+    /// predicate, judged against the resulting post-override cap, is
+    /// supposed to behave correctly on its own with no bespoke Budget-level
+    /// freeze. This test's job is exactly what the review asked for:
+    /// confirm that predicate does not spuriously fire purely because the
+    /// guard is ratcheting the ceiling down underneath a GPU that is
+    /// actually consuming whatever cap it's handed (never idle) -- the
+    /// scenario where a bug (e.g. judging demand against a stale
+    /// pre-override cap) would show up as a false halt.
+    #[test]
+    fn gpu_hot_episode_ratchets_the_cap_without_spuriously_triggering_demand_limited() {
+        let runner = FakeRunner::new();
+        let config = Config {
+            fan_target_rpm: 6900.0, // keeps RpmLoop's error_sign > 0 all run
+            ..Config::default()
+        };
+        let (mut ctl, _gpu) = auto_controller(
+            &runner,
+            PathBuf::from("/nonexistent/platform_profile"),
+            config,
+        );
+        ctl.on_command(Command::SetAuto(true));
+        // `calibrated()`'s LUT starts at 1200 MHz -> 30 W; the default
+        // `gpu_floor_mhz` (1000) is below that, so `watts_for_clock` clamps
+        // low to the LUT's first point (§Facts: never below the lowest
+        // known clock) -- this IS `gpu_floor_w` as the controller computes
+        // it, not a value this test invents.
+        let gpu_floor_w = 30.0;
+        let mut saw_positive_error = false;
+
+        // Track each axis's draw against the SAME raw (pre-slew,
+        // post-guard-override) cap the demand-limited predicate itself
+        // judges against (`AutoState::last_cpu_cap_w`/`last_gpu_cap_w` --
+        // private fields this `tests` submodule can read, per Rust's
+        // ordinary child-module visibility) rather than either axis's
+        // slew-clamped committed output. That distinction matters here:
+        // the allocator's own CPU up-slew (`UP_RATE_W`, 2 W/tick) is far
+        // slower than the GPU guard's down-ratchet (`DOWN_RATE_W`, 8
+        // W/tick), so surplus the shrinking GPU cap frees up floods into
+        // the CPU's RAW split immediately while its actual commit can only
+        // climb 2 W/tick -- tracking draw against the slew-limited commit
+        // (instead of the raw cap the predicate actually reads) would make
+        // the CPU axis spuriously demand-limited by this test's OWN
+        // modeling gap, not by anything the controller does.
+        let raw_caps = |ctl: &Controller<&FakeRunner>| -> (f64, f64) {
+            let auto = ctl.auto.as_ref().expect("in auto");
+            (auto.last_cpu_cap_w, auto.last_gpu_cap_w)
+        };
+
+        // Phase 1 (cold, loaded): let real demand wind a genuine cap up
+        // over several ticks so the hot phase has somewhere real to
+        // descend FROM (starting hot from AutoState's zeroed
+        // `last_gpu_cap_w` would clamp straight to the floor on tick one
+        // and never exercise a multi-tick ratchet at all).
+        for i in 0..100 {
+            let t = f64::from(i) * ALLOC_PERIOD_S;
+            let (last_cpu, last_gpu) = raw_caps(&ctl);
+            let s = Sample {
+                cpu_pkg_w: (last_cpu - 0.1).max(0.0), // "loaded": tracks its own last raw cap
+                gpu_w: (last_gpu - 0.1).max(0.0),
+                gpu_w_valid: true,
+                gpu_temp_valid: true,
+                gpu_temp_c: 60.0,     // well below GPU_HOT_C_DEFAULT (90): cold
+                cpu_temp_valid: true, // avoid ThermalWatchdog's SENSOR_LOST_STREAK trip over this long a run
+                cpu_temp_c: 60.0,
+                ..busy_at(t)
+            };
+            ctl.on_sample(&s);
+        }
+        assert!(
+            !ctl.status().flags.contains(&StatusFlag::GpuHot),
+            "premise: still cold at the end of warm-up"
+        );
+        let peak_gpu_w = raw_caps(&ctl).1;
+        assert!(
+            peak_gpu_w > gpu_floor_w + allocator::DOWN_RATE_W,
+            "premise: warm-up must build a real cap more than one ratchet \
+             step above the floor ({peak_gpu_w} vs floor {gpu_floor_w} + \
+             {} W), or the hot phase below proves nothing about a \
+             multi-tick descent",
+            allocator::DOWN_RATE_W
+        );
+
+        // Phase 2 (hot, still loaded): the guard ratchets `gpu_max_w` down
+        // DOWN_RATE_W per allocator tick from ITS OWN last post-override
+        // cap; the GPU keeps consuming whatever it is handed the whole
+        // way down.
+        let mut saw_demand_limited = false;
+        let mut reached_floor = false;
+        for i in 100..140 {
+            let t = f64::from(i) * ALLOC_PERIOD_S;
+            let (last_cpu, last_gpu) = raw_caps(&ctl);
+            let s = Sample {
+                cpu_pkg_w: (last_cpu - 0.1).max(0.0),
+                gpu_w: (last_gpu - 0.1).max(0.0),
+                gpu_w_valid: true,
+                gpu_temp_valid: true,
+                // The dGPU guard's own enter threshold (GPU_HOT_C_DEFAULT,
+                // 90 C) sits ABOVE `ThermalWatchdog`'s separate GPU_TRIP_C
+                // (87 C, TRIP_STREAK=3 consecutive samples): a temperature
+                // that latches the guard hot would also, within 3 samples,
+                // trip the unrelated thermal emergency and release
+                // everything -- collapsing this test's premise before the
+                // ratchet gets anywhere. So: one sample AT the guard's
+                // enter threshold (90) to latch it, then hold at 86 C --
+                // inside the guard's OWN hysteresis band (exit is
+                // enter-5=85, so 86 keeps it latched hot per
+                // `gpu_hysteresis_enters_at_threshold_and_exits_five_below`)
+                // but below the watchdog's 87 C trip, so its hot_streak
+                // keeps resetting to 0 every tick instead of accumulating.
+                gpu_temp_c: if i == 100 { 90.0 } else { 86.0 },
+                cpu_temp_valid: true,
+                cpu_temp_c: 60.0,
+                ..busy_at(t)
+            };
+            let effects = ctl.on_sample(&s);
+            let (_, new_gpu) = raw_caps(&ctl);
+            if new_gpu <= gpu_floor_w + 0.01 {
+                reached_floor = true;
+            }
+            for e in &effects {
+                if let Effect::AutoAllocated { freeze, error, .. } = e {
+                    if *error > 0.0 {
+                        saw_positive_error = true;
+                    }
+                    if *freeze == Some("demand_limited") {
+                        saw_demand_limited = true;
+                    }
+                }
+            }
+        }
+
+        assert!(
+            ctl.status().flags.contains(&StatusFlag::GpuHot),
+            "premise: the guard must have latched hot"
+        );
+        assert!(
+            saw_positive_error,
+            "premise: error_sign must stay positive (RpmLoop, high fan \
+             target) for the halt to even be eligible -- otherwise a \
+             `false` result below would prove nothing"
+        );
+        assert!(
+            reached_floor,
+            "the ratchet must actually walk gpu_w down to its LUT floor \
+             over the hot episode (peak was {peak_gpu_w})"
+        );
+        assert!(
+            !saw_demand_limited,
+            "a GPU that keeps consuming whatever cap gpu_share_override \
+             hands it must never spuriously trip demand_limited just \
+             because that cap is shrinking underneath it"
+        );
+    }
 }

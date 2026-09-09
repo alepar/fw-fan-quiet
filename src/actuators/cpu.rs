@@ -218,24 +218,22 @@ mod tests {
         ]
     }
 
-    /// A successful `Output` with the given stdout text.
+    /// A successful `Output` with the given stdout text. Thin local alias
+    /// for the shared `cmd::test_support` builder (kept so this module's
+    /// many existing call sites don't need a rename) — see that module's
+    /// doc comment for why it lives there now, not here: `controller.rs`'s
+    /// tests need the same table shape to script a real `WriteVerdict`
+    /// through this actuator's write path.
     fn info_output(stdout: &str) -> Output {
-        let mut out = output_with_code(0);
-        out.stdout = stdout.as_bytes().to_vec();
-        out
+        crate::actuators::cmd::test_support::output_with_stdout(stdout)
     }
 
     /// A `| Name | Value | Parameter |` table with the given slow/fast/stapm
     /// watt values, in the shape `ryzenadj --info` actually prints (see
-    /// `tests/fixtures/ryzenadj_info.txt`).
+    /// `tests/fixtures/ryzenadj_info.txt`). Thin local alias — see
+    /// `info_output` above.
     fn info_table_text(slow_w: f64, fast_w: f64, stapm_w: f64) -> String {
-        format!(
-            "|        Name         |   Value   |     Parameter      |\n\
-             |---------------------|-----------|--------------------|\n\
-             | STAPM LIMIT         |{stapm_w:>11.3}| stapm-limit        |\n\
-             | PPT LIMIT FAST      |{fast_w:>11.3}| fast-limit         |\n\
-             | PPT LIMIT SLOW      |{slow_w:>11.3}| slow-limit         |\n"
-        )
+        crate::actuators::cmd::test_support::ryzenadj_info_table(slow_w, fast_w, stapm_w)
     }
 
     #[test]

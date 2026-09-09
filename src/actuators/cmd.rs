@@ -109,16 +109,7 @@ pub mod test_support {
         let stapm_w = watts_for("--stapm-limit=");
         let slow_w = watts_for("--slow-limit=");
         let fast_w = watts_for("--fast-limit=");
-        let stdout = format!(
-            "|        Name         |   Value   |     Parameter      |\n\
-             |---------------------|-----------|--------------------|\n\
-             | STAPM LIMIT         |{stapm_w:>11.3}| stapm-limit        |\n\
-             | PPT LIMIT FAST      |{fast_w:>11.3}| fast-limit         |\n\
-             | PPT LIMIT SLOW      |{slow_w:>11.3}| slow-limit         |\n"
-        );
-        let mut out = output_with_code(0);
-        out.stdout = stdout.into_bytes();
-        out
+        output_with_stdout(&ryzenadj_info_table(slow_w, fast_w, stapm_w))
     }
 
     /// An `Output` with the given exit code and empty stdout/stderr.
@@ -130,6 +121,51 @@ pub mod test_support {
             stdout: Vec::new(),
             stderr: Vec::new(),
         }
+    }
+
+    /// A successful (`output_with_code(0)`) `Output` whose stdout is `stdout`.
+    pub fn output_with_stdout(stdout: &str) -> Output {
+        let mut out = output_with_code(0);
+        out.stdout = stdout.as_bytes().to_vec();
+        out
+    }
+
+    /// A `ryzenadj --info`-shaped `| Name | Value | Parameter |` read-back
+    /// table reporting the given slow/fast/STAPM watts, in the exact shape
+    /// `ryzenadj --info` prints (see `tests/fixtures/ryzenadj_info.txt` and
+    /// `actuators::cpu`'s own parser). Shared here (not private to
+    /// `actuators::cpu`'s test module) so any actuator-module OR
+    /// controller-level test can script a specific `WriteVerdict` — in
+    /// particular a genuine `Mismatch` (a table that disagrees with what
+    /// was actually commanded), not just the auto-agreeing default this
+    /// `FakeRunner` otherwise synthesizes — through the real
+    /// `CpuActuator::set_sustained_mw` write path.
+    pub fn ryzenadj_info_table(slow_w: f64, fast_w: f64, stapm_w: f64) -> String {
+        format!(
+            "|        Name         |   Value   |     Parameter      |\n\
+             |---------------------|-----------|--------------------|\n\
+             | STAPM LIMIT         |{stapm_w:>11.3}| stapm-limit        |\n\
+             | PPT LIMIT FAST      |{fast_w:>11.3}| fast-limit         |\n\
+             | PPT LIMIT SLOW      |{slow_w:>11.3}| slow-limit         |\n"
+        )
+    }
+
+    /// Queues one full write + read-back cycle — exactly the two `Runner`
+    /// calls one `CpuActuator::set_sustained_mw` call makes (the write,
+    /// then `ryzenadj --info`) — reporting the given table on the
+    /// read-back regardless of what gets commanded. A table that disagrees
+    /// with the actual command (e.g. an arbitrary slow-limit watts value
+    /// outside the real operating range) yields a genuine
+    /// `WriteVerdict::Mismatch` from the real write path; a table that
+    /// agrees yields `Verified`. Each `set_sustained_mw` call needing a
+    /// specific scripted read-back needs its own call to this (the
+    /// re-read `CpuActuator::set_sustained_mw` makes when the first result
+    /// comes back `Mismatch` is a second, independent call).
+    pub fn queue_ryzenadj_readback(runner: &FakeRunner, slow_w: f64, fast_w: f64, stapm_w: f64) {
+        runner.push_result(Ok(output_with_code(0))); // the write
+        runner.push_result(Ok(output_with_stdout(&ryzenadj_info_table(
+            slow_w, fast_w, stapm_w,
+        ))));
     }
 
     #[cfg(test)]

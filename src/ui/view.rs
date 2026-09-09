@@ -97,8 +97,8 @@ fn header_line(model: &Model) -> Line<'static> {
         )),
     ];
     // The Kalman trim/gain readout is removed (`ControlStatus` no longer
-    // carries `trim_rpm`/`gain`, Task 4's type surface); the arbiter/budget
-    // segment below (design §3.5) takes its place.
+    // carries the old bias/gain fields, Task 4's type surface); the
+    // arbiter/budget segment below (design §3.5) takes its place.
     spans.push(Span::raw(" | "));
     spans.push(Span::raw(loop_status_segment(model)));
     // Severity-first render order: the single-line header has no wrap
@@ -896,7 +896,7 @@ mod tests {
 
     // --- Task 26: TargetUnreachable in the header ---
     // (the trim/gain readout these tests used to also exercise is removed —
-    // Task 4 drops `trim_rpm`/`gain` from `ControlStatus`.)
+    // Task 4 drops the old bias/gain fields from `ControlStatus`.)
 
     #[test]
     fn target_unreachable_flag_is_red_bold() {

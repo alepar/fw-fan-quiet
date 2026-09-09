@@ -289,7 +289,7 @@ mod tests {
     }
 
     /// Deterministic pseudo-noise in [-1, 1) W: inline LCG, no rand crate
-    /// (same generator as the thermal_model tests).
+    /// (same generator used across this crate's plant sims).
     fn lcg_noise(state: &mut u64) -> f64 {
         *state = state
             .wrapping_mul(6364136223846793005)

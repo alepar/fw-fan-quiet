@@ -40,7 +40,7 @@ pub use crate::calib::runner::CalibProgress as CalibProgressLite;
 /// Reapply active limits at least this often (defends against PPD/tuned
 /// clobbering the ryzenadj limits behind our back; design §3).
 const REASSERT_PERIOD_S: f64 = 10.0;
-/// Auto-mode allocator cadence (design §3: retarget the contour split every
+/// Auto-mode allocator cadence (design §3: retarget the CPU/GPU split every
 /// 5 s; the GPU PI runs every sample in between).
 const ALLOC_PERIOD_S: f64 = 5.0;
 /// A sample must exceed the CPU limit by this margin to count as a
@@ -600,8 +600,8 @@ impl<R: Runner> Controller<R> {
             return Vec::new();
         }
         // While in Auto the closed loop owns actuation: manual setters are
-        // rejected (SetFanTarget stays allowed — it retargets the contour
-        // live; ReleaseAll/SetAuto(false) are the ways out).
+        // rejected (SetFanTarget stays allowed — it retargets the fan
+        // target live; ReleaseAll/SetAuto(false) are the ways out).
         if self.status.mode == Mode::Auto
             && matches!(c, Command::SetCpuW(_) | Command::SetGpuMaxClock(_))
         {
@@ -978,7 +978,7 @@ impl<R: Runner> Controller<R> {
 
     /// One Auto-mode control step, driven off the 1 Hz samples (t_mono-based
     /// like the reassert): every [`ALLOC_PERIOD_S`] an allocator step runs
-    /// (see its stubbed-contour note below); every sample the GPU
+    /// (see its stubbed-split note below); every sample the GPU
     /// watts→clock PI trims the locked clock toward its watts target.
     ///
     /// Sensor-loss semantics: the PI is driven by the GPU WATTS sensor, not
@@ -1087,7 +1087,7 @@ impl<R: Runner> Controller<R> {
             }
             // Vetoed overshoot hold (2026-07-14 design §3) no longer exists:
             // fw-fanctrl-loop-zct's scalar-budget-split allocator (design
-            // §3.1) replaced the contour grid-search + overshoot-settle
+            // §3.1) replaced the inverted-model grid-search + overshoot-settle
             // state machine with demand/split_budget/quantize/slew-clamp,
             // which has no equivalent episode to gate or Note on.
             effects.push(Effect::AutoAllocated {
@@ -2637,15 +2637,16 @@ mod tests {
         assert_eq!(ctl.lut, Some(lut));
     }
 
-    // --- Task 12 (fw-fanctrl-loop-24s): auto mode with no thermal model ---
+    // --- Task 12 (fw-fanctrl-loop-24s): auto mode with no learned thermal model ---
     //
-    // The five-gate adaptation tier (KF + trust + cooldown), the fitted
-    // ThermalModel contour and the periodic model-snapshot Note are gone.
-    // These tests exercise what is left: Auto entry now gates on the LUT
-    // alone, and the allocator's contour is stubbed degenerate, so a step
-    // can only ever hold at the floor-raised last point (never explore
-    // above it) — see the `on_auto_sample` comment at the stub's
-    // construction for why that is the correct behavior with no model.
+    // The five-gate adaptation tier (the drift filter, the trust gate and
+    // the command-quiet window), the fitted plant-inversion split and the
+    // periodic model-snapshot Note are gone. These tests exercise what is
+    // left: Auto entry now gates on the LUT alone, and the allocator's
+    // split is stubbed degenerate, so a step can only ever hold at the
+    // floor-raised last point (never explore above it) — see the
+    // `on_auto_sample` comment at the stub's construction for why that is
+    // the correct behavior with no model.
 
     /// Auto entry only needs the LUT now (no thermal model).
     fn calibrated() -> PersistedState {
@@ -2740,8 +2741,8 @@ mod tests {
     }
 
     #[test]
-    fn auto_entry_with_lut_pins_the_cpu_floor_with_no_contour() {
-        // No thermal model until the arbiter lands: the allocator's contour
+    fn auto_entry_with_lut_pins_the_cpu_floor_with_no_split() {
+        // No thermal model until the arbiter lands: the allocator's split
         // is stubbed degenerate everywhere (`on_auto_sample`'s stub), so a
         // step can only ever hold at the floor-raised last point — the CPU
         // allocation lands at the configured floor and never explores
@@ -2756,10 +2757,10 @@ mod tests {
         assert_eq!(
             alloc_of(&effects),
             Some((floor, 30.0)),
-            "CONSERVATIVE_START.1"
+            "stubbed-split.1"
         );
 
-        // A later step changes nothing: still no contour to search.
+        // A later step changes nothing: still no split to search.
         let effects = ctl.on_sample(&busy_at(ALLOC_PERIOD_S));
         assert_eq!(alloc_of(&effects), Some((floor, 30.0)));
     }
@@ -3401,7 +3402,7 @@ mod tests {
     // --- Restored tier-independent tests (fw-fanctrl-loop-24s fix round 1) ---
     //
     // These were dropped alongside the adaptation-tier deletion even though
-    // none of them exercise the KF/trust/cooldown/contour machinery: they
+    // none of them exercise the deleted adaptation-tier machinery: they
     // cover the GPU watts->clock PI, command gating in Auto, plain Config
     // persistence, and a real historical crash regression. Ported unchanged
     // (or trivially, per the comments below) from the pre-refactor
@@ -3457,7 +3458,7 @@ mod tests {
         assert_eq!(ryzenadj_calls(&runner).len(), cpu_calls_before);
         assert_eq!(gpu_sets(&gpu_calls).len(), gpu_calls_before);
 
-        // SetFanTarget stays allowed: it retargets the contour live.
+        // SetFanTarget stays allowed: it retargets the fan target live.
         ctl.on_command(Command::SetFanTarget(2500.0));
         assert_eq!(ctl.status().fan_target_rpm, 2500.0);
         assert_eq!(ctl.status().mode, Mode::Auto);
@@ -3522,9 +3523,9 @@ mod tests {
             first_pi.abs_diff(1500) <= 105,
             "first PI command ({first_pi} MHz) jumped >105 MHz from the applied 1500"
         );
-        // Concretely: with the contour stubbed degenerate (Task 12), the
-        // allocator's first step always holds at CONSERVATIVE_START (30 W
-        // GPU target, unlike the pre-refactor fitted-model contour, which
+        // Concretely: with the split stubbed degenerate (Task 12), the
+        // allocator's first step always holds at its conservative 30 W
+        // GPU target (unlike the pre-refactor fitted-model split, which
         // could climb off it on the very first step) — FF(30)=1200 + the
         // fresh-integrator correction lands the desired clock at 1600,
         // inside the ±105 MHz window from the seeded 1500, so the rate

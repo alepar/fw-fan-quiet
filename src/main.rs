@@ -23,7 +23,7 @@ mod ui;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
@@ -37,7 +37,10 @@ use actuators::smu_module::SmuModule;
 use control::Command;
 use control::controller::{self, Controller};
 use event::Event;
+use fanctrl::client::{FanctrlSource, UnixFanctrlClient};
 use model::Model;
+use sensors::hwmon::Hwmon;
+use sensors::poller::{FanctrlPoller, SharedFanctrl, SharedNvme, spawn_nvme_poller};
 use sensors::sampler::Sampler;
 use telemetry::{Record, Telemetry};
 use ui::view::view;
@@ -190,11 +193,32 @@ fn main() -> Result<()> {
         config.gpu_max_w,
         led_sample_rx,
     );
+    // fw-fanctrl socket poller + NVMe poller (design doc §3.4 / Task 14):
+    // each gets its own thread, sharing an `Arc<Mutex<_>>` the sampler tick
+    // only ever reads through -- see `sensors::poller`'s module doc for why
+    // neither lives on the sampler tick itself. Construction only, here:
+    // the cadence/merge logic is `sensors::poller`'s and `Sampler`'s.
+    let fanctrl_source: SharedFanctrl = Arc::new(Mutex::new(Box::new(UnixFanctrlClient::new(
+        config.fanctrl_socket.clone(),
+    ))
+        as Box<dyn FanctrlSource + Send>));
+    let fanctrl_poller = FanctrlPoller::new(Arc::clone(&fanctrl_source), Instant::now());
+    let fanctrl_poller_thread = fanctrl_poller.spawn(Arc::clone(&shutdown));
+
+    let nvme_hwmon = Hwmon::discover(Path::new("/sys/class/hwmon"));
+    let nvme_cache: SharedNvme = Arc::new(Mutex::new(None));
+    let nvme_poller_thread = spawn_nvme_poller(
+        move || nvme_hwmon.nvme_composite_c(),
+        Arc::clone(&nvme_cache),
+        Arc::clone(&shutdown),
+    );
+
     let mut sampler_txs = vec![ui_tx.clone(), ctl_sample_tx];
     if led.is_some() {
         sampler_txs.push(led_sample_tx);
     }
-    let sampler = Sampler::new_system().spawn(sampler_txs, Arc::clone(&shutdown));
+    let sampler =
+        Sampler::new_system(fanctrl_source, nvme_cache).spawn(sampler_txs, Arc::clone(&shutdown));
     let ctl = controller::spawn(
         Controller::new(guard, persisted, args.state_file, config, args.config),
         ctl_sample_rx,
@@ -266,6 +290,15 @@ fn main() -> Result<()> {
     }
     if sampler.join().is_err() {
         tracing::error!("sampler thread panicked");
+    }
+    // The fanctrl/NVMe poller threads: `shutdown` is already set above, so
+    // both are already exiting (or exited) by the time we get here; this is
+    // just reaping them, same as the sampler join above.
+    if fanctrl_poller_thread.join().is_err() {
+        tracing::error!("fanctrl poller thread panicked");
+    }
+    if nvme_poller_thread.join().is_err() {
+        tracing::error!("nvme poller thread panicked");
     }
     // After the sampler: it held the only live led_sample sender, so its exit
     // disconnects the LED channel, letting that thread blank the panels and

@@ -23,7 +23,6 @@ use crate::actuators::cmd::Runner;
 use crate::actuators::guard::RestoreGuard;
 use crate::calib::burner::Burner;
 use crate::calib::runner::{CalibRunner, RunnerEffect};
-use crate::calib::steady::tail_mean;
 use crate::config::Config;
 use crate::control::allocator::{self, AllocInput, Allocator};
 use crate::control::gpu_pid::GpuPid;
@@ -59,24 +58,14 @@ const RESUMED_STRICT_S: f64 = 60.0;
 /// How long the `Resumed` flag stays visible after a suspend/resume.
 const RESUMED_FLAG_S: f64 = 30.0;
 /// Cap on the Auto-mode fan-RPM window feeding the allocator's velocity-gate
-/// slope estimate and smoothed reading (`FAN_SLOPE_SPAN_S`/`FAN_SMOOTH_N`
-/// both need less than this; a little slack beyond that is harmless).
+/// slope estimate (`FAN_SLOPE_SPAN_S` needs less than this; a little slack
+/// beyond that is harmless).
 const FAN_WINDOW_CAP: usize = 30;
 /// Span (seconds ≙ 1 Hz samples) of the fan-slope estimate fed to the
 /// allocator's velocity gate: long enough to average sample-to-sample RPM
 /// jitter, short enough to see the mid-cycle 30–50 RPM/s transients the
 /// gate exists to catch (`allocator::SLOPE_GATE_RPM_S`).
 const FAN_SLOPE_SPAN_S: usize = 10;
-/// Samples averaged into the smoothed fan RPM the allocator's band checks
-/// (deadband / raise gate / overshoot) see. A 5-sample tail mean halves the
-/// ~92 RPM soak-noise stdev (≈92 → ≈45) on the value those edges test, so a
-/// single tach blip from a near-edge equilibrium can no longer fire the
-/// mandatory overshoot drain — the exact mechanism of the field relay
-/// (run-1783720682, 2026-07-10). Detection of a genuine overshoot is delayed
-/// only ~2–3 s (30–50 RPM/s transients still cross within the span), an
-/// accepted trade. `pub(crate)` so the allocator's soak-cycle sim reads the
-/// same const it is wired from.
-pub(crate) const FAN_SMOOTH_N: usize = 5;
 /// Fan target clamp range (RPM); the Auto-mode allocator consumes the
 /// target live via `status.fan_target_rpm`.
 const FAN_TARGET_MIN_RPM: f64 = 1000.0;
@@ -1070,41 +1059,24 @@ impl<R: Runner> Controller<R> {
                 auto.gpu_target_w,
                 self.status.gpu_max_mhz,
             );
-            let target_rpm = self.status.fan_target_rpm;
-            // Fan slope AND the smoothed RPM off the SAME window (one borrow
-            // of the contiguous slice): the slope feeds the allocator's
-            // velocity gate — only push power when the fan response to
-            // previous pushes has been heard (2026-07 fan-lag limit-cycle
-            // fix; see `SLOPE_GATE_RPM_S`); the ~5 s tail mean feeds the
-            // deadband / raise-gate / overshoot band checks (see
-            // `FAN_SMOOTH_N`, `allocator::RAISE_HOLD_RPM`). Fallback to the
-            // raw latest sample when the window is broken by an outage (NaN
-            // tail → `tail_mean` None) — conservative, today's value.
-            let fan_window = auto.fan_window.make_contiguous();
-            let fan_slope = fan_slope_rpm_s(fan_window);
-            let measured_fan_rpm =
-                tail_mean(fan_window, FAN_SMOOTH_N).unwrap_or_else(|| s.max_fan_rpm());
-            // No thermal model until the arbiter/budget integrator lands
-            // (fw-fanctrl-loop-j6s): there is no fitted surface left to
-            // invert to a target-RPM contour. Stub it degenerate everywhere
-            // — `Allocator::step` still raises the held point to the CPU
-            // floor before ever consulting the contour (floors win over
-            // everything), so a fully-degenerate contour just means "no
-            // candidate above the floor is known to be safe," and the step
-            // freezes there. The GPU floor is a *clock* floor and is
-            // enforced independently by the watts→clock PI's own
-            // `gpu_floor_mhz` clamp below, regardless of this target.
-            let contour: &dyn Fn(f64) -> Option<f64> = &|_pc: f64| None;
+            // GPU floor in watts, from the same clock→watts LUT the watts→clock
+            // PI already uses below (design §2.4: `gpu_floor_w` is the LUT's
+            // watts at `gpu_floor_mhz`); no entry at the floor clock → 0.0,
+            // matching the pre-existing "no LUT coverage" fallback elsewhere.
+            let gpu_floor_w = lut
+                .watts_for_clock(self.config.gpu_floor_mhz)
+                .unwrap_or(0.0);
             let (cpu_w, gpu_w) = auto.allocator.step(&AllocInput {
-                contour,
+                // TODO(fw-fanctrl-loop-j6s): placeholder until the single
+                // integrator (`control/budget.rs`, design §2.4) supplies the
+                // real budget; sum of both floors keeps the loop at its
+                // quietest legal point in the meantime.
+                budget_w: self.config.cpu_floor_w + gpu_floor_w,
                 demand,
-                floors: (self.config.cpu_floor_w, self.config.gpu_floor_mhz),
-                measured_fan_rpm,
-                fan_target_rpm: target_rpm,
-                fan_valid: s.fan_valid,
-                fan_slope_rpm_s: fan_slope,
+                floors: self.config.cpu_floor_w,
                 cpu_max_w: self.config.cpu_max_w,
                 gpu_max_w: self.config.gpu_max_w,
+                gpu_floor_w,
             });
             // Bumpless retarget: the PI keeps its trim + rate reference.
             auto.pid.set_target_w(gpu_w);

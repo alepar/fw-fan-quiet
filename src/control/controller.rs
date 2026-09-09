@@ -23,7 +23,6 @@ use crate::actuators::cmd::Runner;
 use crate::actuators::guard::RestoreGuard;
 use crate::calib::burner::Burner;
 use crate::calib::runner::{CalibRunner, RunnerEffect};
-use crate::calib::steady::tail_mean;
 use crate::config::Config;
 use crate::control::allocator::{self, AllocInput, Allocator};
 use crate::control::gpu_pid::GpuPid;
@@ -58,25 +57,8 @@ const STICKINESS_SAMPLES_STRICT: u8 = 2;
 const RESUMED_STRICT_S: f64 = 60.0;
 /// How long the `Resumed` flag stays visible after a suspend/resume.
 const RESUMED_FLAG_S: f64 = 30.0;
-/// Cap on the Auto-mode fan-RPM window feeding the allocator's velocity-gate
-/// slope estimate and smoothed reading (`FAN_SLOPE_SPAN_S`/`FAN_SMOOTH_N`
-/// both need less than this; a little slack beyond that is harmless).
+/// Cap on the Auto-mode fan-RPM window (`auto.fan_window`, 1 Hz samples).
 const FAN_WINDOW_CAP: usize = 30;
-/// Span (seconds ≙ 1 Hz samples) of the fan-slope estimate fed to the
-/// allocator's velocity gate: long enough to average sample-to-sample RPM
-/// jitter, short enough to see the mid-cycle 30–50 RPM/s transients the
-/// gate exists to catch (`allocator::SLOPE_GATE_RPM_S`).
-const FAN_SLOPE_SPAN_S: usize = 10;
-/// Samples averaged into the smoothed fan RPM the allocator's band checks
-/// (deadband / raise gate / overshoot) see. A 5-sample tail mean halves the
-/// ~92 RPM soak-noise stdev (≈92 → ≈45) on the value those edges test, so a
-/// single tach blip from a near-edge equilibrium can no longer fire the
-/// mandatory overshoot drain — the exact mechanism of the field relay
-/// (run-1783720682, 2026-07-10). Detection of a genuine overshoot is delayed
-/// only ~2–3 s (30–50 RPM/s transients still cross within the span), an
-/// accepted trade. `pub(crate)` so the allocator's soak-cycle sim reads the
-/// same const it is wired from.
-pub(crate) const FAN_SMOOTH_N: usize = 5;
 /// Fan target clamp range (RPM); the Auto-mode allocator consumes the
 /// target live via `status.fan_target_rpm`.
 const FAN_TARGET_MIN_RPM: f64 = 1000.0;
@@ -452,23 +434,6 @@ impl AutoState {
             fan_window: std::collections::VecDeque::new(),
         }
     }
-}
-
-/// Fan-RPM slope estimate (RPM/s) over the last [`FAN_SLOPE_SPAN_S`] seconds
-/// of the Auto fan window: (newest − sample span back) / span across the
-/// 1 Hz samples. None when the window is shorter than span+1 samples or ANY
-/// sample in the span is non-finite (the fan-invalid-lands-as-NaN
-/// convention): a slope bridging a sensor outage is fiction. The allocator
-/// treats None as "insufficient evidence" and allows raises — see
-/// `AllocInput::fan_slope_rpm_s`. `pub(crate)` so the allocator's
-/// field-replay convergence test drives the exact estimator wired here.
-pub(crate) fn fan_slope_rpm_s(window: &[f64]) -> Option<f64> {
-    let start = window.len().checked_sub(FAN_SLOPE_SPAN_S + 1)?;
-    let span = &window[start..];
-    if span.iter().any(|v| !v.is_finite()) {
-        return None;
-    }
-    Some((span[FAN_SLOPE_SPAN_S] - span[0]) / FAN_SLOPE_SPAN_S as f64)
 }
 
 /// Testable controller core. Owns the actuators through `RestoreGuard`, so
@@ -1070,41 +1035,24 @@ impl<R: Runner> Controller<R> {
                 auto.gpu_target_w,
                 self.status.gpu_max_mhz,
             );
-            let target_rpm = self.status.fan_target_rpm;
-            // Fan slope AND the smoothed RPM off the SAME window (one borrow
-            // of the contiguous slice): the slope feeds the allocator's
-            // velocity gate — only push power when the fan response to
-            // previous pushes has been heard (2026-07 fan-lag limit-cycle
-            // fix; see `SLOPE_GATE_RPM_S`); the ~5 s tail mean feeds the
-            // deadband / raise-gate / overshoot band checks (see
-            // `FAN_SMOOTH_N`, `allocator::RAISE_HOLD_RPM`). Fallback to the
-            // raw latest sample when the window is broken by an outage (NaN
-            // tail → `tail_mean` None) — conservative, today's value.
-            let fan_window = auto.fan_window.make_contiguous();
-            let fan_slope = fan_slope_rpm_s(fan_window);
-            let measured_fan_rpm =
-                tail_mean(fan_window, FAN_SMOOTH_N).unwrap_or_else(|| s.max_fan_rpm());
-            // No thermal model until the arbiter/budget integrator lands
-            // (fw-fanctrl-loop-j6s): there is no fitted surface left to
-            // invert to a target-RPM contour. Stub it degenerate everywhere
-            // — `Allocator::step` still raises the held point to the CPU
-            // floor before ever consulting the contour (floors win over
-            // everything), so a fully-degenerate contour just means "no
-            // candidate above the floor is known to be safe," and the step
-            // freezes there. The GPU floor is a *clock* floor and is
-            // enforced independently by the watts→clock PI's own
-            // `gpu_floor_mhz` clamp below, regardless of this target.
-            let contour: &dyn Fn(f64) -> Option<f64> = &|_pc: f64| None;
+            // GPU floor in watts, from the same clock→watts LUT the watts→clock
+            // PI already uses below (design §2.4: `gpu_floor_w` is the LUT's
+            // watts at `gpu_floor_mhz`); no entry at the floor clock → 0.0,
+            // matching the pre-existing "no LUT coverage" fallback elsewhere.
+            let gpu_floor_w = lut
+                .watts_for_clock(self.config.gpu_floor_mhz)
+                .unwrap_or(0.0);
             let (cpu_w, gpu_w) = auto.allocator.step(&AllocInput {
-                contour,
+                // TODO(fw-fanctrl-loop-j6s): placeholder until the single
+                // integrator (`control/budget.rs`, design §2.4) supplies the
+                // real budget; sum of both floors keeps the loop at its
+                // quietest legal point in the meantime.
+                budget_w: self.config.cpu_floor_w + gpu_floor_w,
                 demand,
-                floors: (self.config.cpu_floor_w, self.config.gpu_floor_mhz),
-                measured_fan_rpm,
-                fan_target_rpm: target_rpm,
-                fan_valid: s.fan_valid,
-                fan_slope_rpm_s: fan_slope,
+                floors: self.config.cpu_floor_w,
                 cpu_max_w: self.config.cpu_max_w,
                 gpu_max_w: self.config.gpu_max_w,
+                gpu_floor_w,
             });
             // Bumpless retarget: the PI keeps its trim + rate reference.
             auto.pid.set_target_w(gpu_w);
@@ -1137,16 +1085,11 @@ impl<R: Runner> Controller<R> {
                     },
                 }
             }
-            // Vetoed overshoot hold (2026-07-14 design §3): a Noted line on
-            // episode ENTRY, pushed BEFORE AutoAllocated so it claims the
-            // batch's Decision cause (apply_effects: first claim wins). A
-            // vetoed hold changes no status, so without the explicit Note
-            // the crest would never surface for session grading.
-            if auto.allocator.overshoot_settle_started() {
-                effects.push(Effect::Noted {
-                    cause: "auto:overshoot_settle",
-                });
-            }
+            // Vetoed overshoot hold (2026-07-14 design §3) no longer exists:
+            // fw-fanctrl-loop-zct's scalar-budget-split allocator (design
+            // §3.1) replaced the contour grid-search + overshoot-settle
+            // state machine with demand/split_budget/quantize/slew-clamp,
+            // which has no equivalent episode to gate or Note on.
             effects.push(Effect::AutoAllocated {
                 demand_cpu: demand.cpu_starved,
                 demand_gpu: demand.gpu_starved,
@@ -2853,7 +2796,7 @@ mod tests {
     fn auto_allocate_decision_carries_zero_demand_arbiter_defaults() {
         // The arbiter (design §2.5) isn't wired up yet: `AutoAllocated`'s
         // Task-4 fields (mode/error/budget_w/freeze) must still carry only
-        // their defaults through the stubbed-contour allocate step.
+        // their defaults through the scalar-budget-split allocate step.
         let runner = FakeRunner::new();
         let (mut ctl, _gpu_calls) = auto_controller_no_profile(&runner);
         ctl.on_command(Command::SetAuto(true));
@@ -3486,31 +3429,14 @@ mod tests {
     //
     // These were dropped alongside the adaptation-tier deletion even though
     // none of them exercise the KF/trust/cooldown/contour machinery: they
-    // cover the fan-slope estimator, the GPU watts->clock PI, command
-    // gating in Auto, plain Config persistence, and a real historical crash
-    // regression. Ported unchanged (or trivially, per the comments below)
-    // from the pre-refactor controller.rs.
-
-    #[test]
-    fn fan_slope_estimate_needs_full_valid_span() {
-        // Shorter than span+1 samples → None (insufficient evidence).
-        assert_eq!(fan_slope_rpm_s(&[1500.0; FAN_SLOPE_SPAN_S]), None);
-        // Flat 11-sample window → 0 RPM/s; a 100 RPM rise over the span →
-        // +10 RPM/s.
-        let mut w = vec![1500.0; FAN_SLOPE_SPAN_S + 1];
-        assert_eq!(fan_slope_rpm_s(&w), Some(0.0));
-        w[FAN_SLOPE_SPAN_S] = 1600.0;
-        assert_eq!(fan_slope_rpm_s(&w), Some(10.0));
-        // Only the span tail counts: older garbage (even NaN) is ignored.
-        let mut w = vec![f64::NAN; 5];
-        w.extend((0..=FAN_SLOPE_SPAN_S).map(|i| 1400.0 + 30.0 * i as f64));
-        assert_eq!(fan_slope_rpm_s(&w), Some(30.0));
-        // NaN inside the span (fan-invalid sample) → None: never estimate a
-        // slope across a sensor outage.
-        let mut w = vec![1500.0; FAN_SLOPE_SPAN_S + 1];
-        w[5] = f64::NAN;
-        assert_eq!(fan_slope_rpm_s(&w), None);
-    }
+    // cover the GPU watts->clock PI, command gating in Auto, plain Config
+    // persistence, and a real historical crash regression. Ported unchanged
+    // (or trivially, per the comments below) from the pre-refactor
+    // controller.rs. The fan-slope-estimator test that used to open this
+    // section is gone: fw-fanctrl-loop-zct's fix round 1
+    // (fw-fanctrl-loop-64a5f50) deleted `fan_slope_rpm_s` itself as
+    // genuinely dead code once the scalar-budget-split allocator dropped
+    // its only caller (`AllocInput::fan_slope_rpm_s`).
 
     #[test]
     fn out_of_range_config_floors_never_panic_auto() {

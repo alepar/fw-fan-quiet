@@ -3,6 +3,7 @@
 //! it as their synthetic load source.
 
 pub mod burner;
+pub mod fopdt;
 pub mod lut_sweep;
 pub mod runner;
 pub mod steady;

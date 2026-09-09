@@ -96,31 +96,17 @@ fn header_line(model: &Model) -> Line<'static> {
             model.fan_target_rpm
         )),
     ];
-    // Kalman bias (Auto mode; keeps the trim-era "trim" label — same role):
-    // informational, so dim — the loud version of this signal is the
-    // TargetUnreachable flag below.
-    if model.status.trim_rpm != 0.0 {
-        spans.push(Span::styled(
-            format!(" | trim {:+.0}rpm", model.status.trim_rpm),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    // Kalman gain (Auto mode): dim like the bias, shown only once it has
-    // moved off the identity — a learned GPU-slope correction is rare and
-    // worth a glance, a 1.00 would be noise.
-    if (model.status.gain - 1.0).abs() > 0.005 {
-        spans.push(Span::styled(
-            format!(" | gain x{:.2}", model.status.gain),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
+    // The Kalman trim/gain readout is removed: `ControlStatus` no longer
+    // carries `trim_rpm`/`gain` (Task 4's type surface). The new fields it
+    // gains in their place (`t_star_c`, `budget_w`, ...) are Task 15's
+    // header design, not this task's.
     // Severity-first render order: the single-line header has no wrap
     // (ratatui clips at the right edge), so an emergency tripping AFTER
     // milder flags must never be pushed out of view by them. The status
     // Vec itself keeps insertion order (telemetry/tests rely on it); only
     // the spans are sorted.
     let mut flags: Vec<StatusFlag> = model.status.flags.clone();
-    flags.sort_by_key(|f| flag_severity(*f));
+    flags.sort_by_key(|f| render_priority(*f));
     // With several flags competing for one row, drop the parenthetical
     // "(press ...)" hints so every flag NAME stays visible; a lone flag
     // keeps its full hint.
@@ -161,15 +147,26 @@ fn header_line(model: &Model) -> Line<'static> {
 
 /// Header render priority: lower sorts (and therefore renders) first, so
 /// the loudest flag is the one guaranteed to survive right-edge clipping.
-fn flag_severity(flag: StatusFlag) -> u8 {
+/// A strict per-flag order (unlike `controller::Severity`'s three coarse
+/// tiers, which the type surface's tests classify by but which alone can't
+/// break a tie between two Critical flags): full styling/ordering for the
+/// Task 4 flags is Task 15's header design, so they sort after every
+/// existing flag for now.
+fn render_priority(flag: StatusFlag) -> u8 {
     match flag {
         StatusFlag::ThermalEmergency => 0,
         StatusFlag::SensorLost => 1,
-        StatusFlag::ModelDistrust => 2,
-        StatusFlag::TargetUnreachable => 3,
-        StatusFlag::LimitNotSticking => 4,
-        StatusFlag::NotCalibrated => 5,
-        StatusFlag::Resumed => 6,
+        StatusFlag::TargetUnreachable => 2,
+        StatusFlag::LimitNotSticking => 3,
+        StatusFlag::NotCalibrated => 4,
+        StatusFlag::Resumed => 5,
+        StatusFlag::CurveInvalid => 6,
+        StatusFlag::EcMismatch => 7,
+        StatusFlag::FanctrlLost => 8,
+        StatusFlag::GpuHot => 9,
+        StatusFlag::NvmeHot => 10,
+        StatusFlag::ReadbackBlind => 11,
+        StatusFlag::SteepCurve => 12,
     }
 }
 
@@ -193,10 +190,6 @@ fn flag_span(flag: StatusFlag, with_hint: bool) -> Span<'static> {
         // shown the header would overflow a 120-col terminal ("check intake/
         // ambient" lives in the flag's doc + design notes).
         StatusFlag::TargetUnreachable => Span::styled("TARGET UNREACHABLE", red_bold),
-        // The model's predictions have been persistently wrong for 5+
-        // minutes: RLS frozen, trim at half gain (recalibrate if this
-        // persists — the hint lives in the flag's doc, not the header).
-        StatusFlag::ModelDistrust => Span::styled("MODEL DISTRUST", red_bold),
         // Watchdog emergencies: everything was released toward stock and
         // stays released until the user acknowledges (first actuating
         // press re-arms without executing; the second acts normally).
@@ -216,6 +209,15 @@ fn flag_span(flag: StatusFlag, with_hint: bool) -> Span<'static> {
             },
             red_bold,
         ),
+        // Plain placeholder spans for the Task 4 type surface's new flags:
+        // exhaustiveness only (styling/wording is Task 15's header design).
+        StatusFlag::FanctrlLost => Span::raw("FANCTRL LOST"),
+        StatusFlag::EcMismatch => Span::raw("EC MISMATCH"),
+        StatusFlag::SteepCurve => Span::raw("STEEP CURVE"),
+        StatusFlag::CurveInvalid => Span::raw("CURVE INVALID"),
+        StatusFlag::GpuHot => Span::raw("GPU HOT"),
+        StatusFlag::NvmeHot => Span::raw("NVME HOT"),
+        StatusFlag::ReadbackBlind => Span::raw("READBACK BLIND"),
     }
 }
 
@@ -582,7 +584,6 @@ mod tests {
             cpu_limit_w: Some(20.0),
             gpu_max_mhz: Some(1500),
             fan_target_rpm: 2500.0,
-            trim_rpm: 0.0,
             flags: vec![StatusFlag::LimitNotSticking, StatusFlag::Resumed],
             calib: None,
             ..ControlStatus::default()
@@ -621,7 +622,6 @@ mod tests {
             cpu_limit_w: Some(20.0),
             gpu_max_mhz: None,
             fan_target_rpm: 3000.0,
-            trim_rpm: 0.0,
             flags: vec![StatusFlag::LimitNotSticking],
             calib: None,
             ..ControlStatus::default()
@@ -645,7 +645,6 @@ mod tests {
             cpu_limit_w: None,
             gpu_max_mhz: None,
             fan_target_rpm: 3000.0,
-            trim_rpm: 0.0,
             flags: vec![StatusFlag::ThermalEmergency],
             calib: None,
             ..ControlStatus::default()
@@ -671,7 +670,6 @@ mod tests {
             cpu_limit_w: None,
             gpu_max_mhz: None,
             fan_target_rpm: 3000.0,
-            trim_rpm: 0.0,
             flags: vec![StatusFlag::SensorLost],
             calib: None,
             ..ControlStatus::default()
@@ -691,7 +689,7 @@ mod tests {
         use crate::control::ControlStatus;
         use crate::control::controller::{Mode, StatusFlag};
         // Worst case from the review: THERMAL EMERGENCY trips LAST, after
-        // Auto + trim + four other flags already fill the header. Without
+        // Auto + four other flags already fill the header. Without
         // severity-first ordering (and hint dropping) the emergency text
         // starts past column 120 and ratatui clips it invisible.
         let mut m = Model::new();
@@ -700,7 +698,6 @@ mod tests {
             cpu_limit_w: Some(17.0),
             gpu_max_mhz: Some(1653),
             fan_target_rpm: 3000.0,
-            trim_rpm: 400.0,
             flags: vec![
                 StatusFlag::Resumed,
                 StatusFlag::LimitNotSticking,
@@ -794,7 +791,6 @@ mod tests {
             cpu_limit_w: Some(17.0),
             gpu_max_mhz: Some(1653),
             fan_target_rpm: 3000.0,
-            trim_rpm: 0.0,
             flags: vec![],
             calib: None,
             ..ControlStatus::default()
@@ -813,95 +809,9 @@ mod tests {
         );
     }
 
-    // --- Task 26: trim + TargetUnreachable in the header ---
-
-    #[test]
-    fn header_shows_trim_dim_when_nonzero() {
-        use crate::control::ControlStatus;
-        use crate::control::controller::Mode;
-        let mut m = Model::new();
-        m.update(Event::Status(ControlStatus {
-            mode: Mode::Auto,
-            cpu_limit_w: Some(17.0),
-            gpu_max_mhz: Some(1653),
-            fan_target_rpm: 3000.0,
-            trim_rpm: 123.0,
-            flags: vec![],
-            calib: None,
-            ..ControlStatus::default()
-        }));
-        let terminal = draw(&m);
-        let header = row_text(&terminal, 0);
-        assert!(header.contains("trim +123rpm"), "header was: {header:?}");
-        let x = header.find("trim +123rpm").unwrap() as u16;
-        let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
-        assert_eq!(cell.fg, Color::DarkGray, "trim must render dim");
-
-        // Negative trim shows its sign too.
-        m.update(Event::Status(ControlStatus {
-            mode: Mode::Auto,
-            cpu_limit_w: Some(17.0),
-            gpu_max_mhz: Some(1653),
-            fan_target_rpm: 3000.0,
-            trim_rpm: -17.0,
-            flags: vec![],
-            calib: None,
-            ..ControlStatus::default()
-        }));
-        let header = row_text(&draw(&m), 0);
-        assert!(header.contains("trim -17rpm"), "header was: {header:?}");
-    }
-
-    #[test]
-    fn header_hides_trim_when_zero() {
-        // Default status has trim 0: no trim clutter in the header.
-        let header = row_text(&draw(&Model::new()), 0);
-        assert!(!header.contains("trim"), "header was: {header:?}");
-    }
-
-    #[test]
-    fn header_shows_gain_dim_when_off_identity() {
-        use crate::control::ControlStatus;
-        use crate::control::controller::Mode;
-        let mut m = Model::new();
-        m.update(Event::Status(ControlStatus {
-            mode: Mode::Auto,
-            cpu_limit_w: Some(17.0),
-            gpu_max_mhz: Some(1653),
-            fan_target_rpm: 3000.0,
-            gain: 1.12,
-            flags: vec![],
-            calib: None,
-            ..ControlStatus::default()
-        }));
-        let terminal = draw(&m);
-        let header = row_text(&terminal, 0);
-        assert!(header.contains("gain x1.12"), "header was: {header:?}");
-        let x = header.find("gain x1.12").unwrap() as u16;
-        let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
-        assert_eq!(cell.fg, Color::DarkGray, "gain must render dim");
-    }
-
-    #[test]
-    fn header_hides_gain_at_identity() {
-        // The default 1.0 gain (and anything that would DISPLAY as x1.00)
-        // is noise, not signal: hidden.
-        use crate::control::ControlStatus;
-        use crate::control::controller::Mode;
-        let mut m = Model::new();
-        m.update(Event::Status(ControlStatus {
-            mode: Mode::Auto,
-            cpu_limit_w: Some(17.0),
-            gpu_max_mhz: Some(1653),
-            fan_target_rpm: 3000.0,
-            gain: 1.002,
-            flags: vec![],
-            calib: None,
-            ..ControlStatus::default()
-        }));
-        let header = row_text(&draw(&m), 0);
-        assert!(!header.contains("gain"), "header was: {header:?}");
-    }
+    // --- Task 26: TargetUnreachable in the header ---
+    // (the trim/gain readout these tests used to also exercise is removed —
+    // Task 4 drops `trim_rpm`/`gain` from `ControlStatus`.)
 
     #[test]
     fn target_unreachable_flag_is_red_bold() {
@@ -914,7 +824,6 @@ mod tests {
             cpu_limit_w: Some(15.0),
             gpu_max_mhz: Some(1200),
             fan_target_rpm: 3000.0,
-            trim_rpm: 400.0,
             flags: vec![StatusFlag::TargetUnreachable],
             calib: None,
             ..ControlStatus::default()
@@ -924,38 +833,14 @@ mod tests {
         let x = header
             .find("TARGET UNREACHABLE")
             .expect("flag text present") as u16;
-        // The saturated trim shows alongside (the flag means "pinned at max").
-        assert!(header.contains("trim +400rpm"), "header was: {header:?}");
         let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
         assert_eq!(cell.fg, Color::Red);
         assert!(cell.modifier.contains(Modifier::BOLD));
     }
 
-    // --- Task 27: ModelDistrust in the header ---
-
-    #[test]
-    fn model_distrust_flag_is_red_bold() {
-        use crate::control::ControlStatus;
-        use crate::control::controller::{Mode, StatusFlag};
-        use ratatui::style::Modifier;
-        let mut m = Model::new();
-        m.update(Event::Status(ControlStatus {
-            mode: Mode::Auto,
-            cpu_limit_w: Some(17.0),
-            gpu_max_mhz: Some(1653),
-            fan_target_rpm: 3000.0,
-            trim_rpm: 200.0,
-            flags: vec![StatusFlag::ModelDistrust],
-            calib: None,
-            ..ControlStatus::default()
-        }));
-        let terminal = draw(&m);
-        let header = row_text(&terminal, 0);
-        let x = header.find("MODEL DISTRUST").expect("flag text present") as u16;
-        let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
-        assert_eq!(cell.fg, Color::Red);
-        assert!(cell.modifier.contains(Modifier::BOLD));
-    }
+    // Task 27's ModelDistrust flag is removed from the Task 4 type surface
+    // (`model_distrust_flag_is_red_bold` tested it here; StatusFlag no
+    // longer has that variant, so there is nothing left to render).
 
     #[test]
     fn not_calibrated_flag_renders_yellow_hint() {
@@ -967,7 +852,6 @@ mod tests {
             cpu_limit_w: None,
             gpu_max_mhz: None,
             fan_target_rpm: 3000.0,
-            trim_rpm: 0.0,
             flags: vec![StatusFlag::NotCalibrated],
             calib: None,
             ..ControlStatus::default()
@@ -1006,7 +890,6 @@ mod tests {
             cpu_limit_w: Some(30.0),
             gpu_max_mhz: Some(1950),
             fan_target_rpm: 3000.0,
-            trim_rpm: 0.0,
             flags: vec![],
             calib: Some(CalibProgressLite {
                 phase: "matrix".into(),
@@ -1059,7 +942,6 @@ mod tests {
             cpu_limit_w: None,
             gpu_max_mhz: None,
             fan_target_rpm: 3000.0,
-            trim_rpm: 0.0,
             flags: vec![],
             calib: Some(CalibProgressLite {
                 phase: "aborted".into(),
@@ -1087,7 +969,6 @@ mod tests {
             cpu_limit_w: Some(20.0),
             gpu_max_mhz: Some(1500),
             fan_target_rpm: 3000.0,
-            trim_rpm: 0.0,
             flags: vec![],
             calib: None,
             ..ControlStatus::default()
@@ -1103,7 +984,6 @@ mod tests {
             cpu_limit_w: Some(54.0),
             gpu_max_mhz: Some(3090),
             fan_target_rpm: 3000.0,
-            trim_rpm: 0.0,
             flags: vec![],
             calib: None,
             ..ControlStatus::default()

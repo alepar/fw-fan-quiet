@@ -171,6 +171,38 @@ impl Mode {
     }
 }
 
+/// Which loop (if any) currently owns actuation in Auto mode (design §2.5,
+/// the arbiter — `fwloop`, not yet wired here: this task only defines the
+/// type). `TempLoop` closes on the fw-fanctrl replica's temperature error
+/// (Mode A); `RpmLoop` falls back to the fan-RPM error when TempLoop's
+/// preconditions aren't met (Mode B); `Released` means neither loop has
+/// anything to close on and caps sit at stock.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LoopMode {
+    // Not yet produced outside tests — the arbiter that decides between
+    // them (design §2.5) is a later task; only `Released` (the default) is
+    // reachable through today's call sites.
+    #[allow(dead_code)]
+    TempLoop,
+    #[allow(dead_code)]
+    RpmLoop,
+    #[default]
+    Released,
+}
+
+/// Coarse severity tier for a [`StatusFlag`], ordered loudest-first so a
+/// derived `Ord`/`PartialOrd` sorts a flag list severity-first (declaration
+/// order IS the ranking: `Critical < Warning < Info`).
+// Classifies StatusFlag (used by its own tests); nothing outside tests
+// calls it yet — Task 15 wires it into the header.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    Critical,
+    Warning,
+    Info,
+}
+
 /// Active watchdog/status flags shown in the UI and telemetry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatusFlag {
@@ -188,12 +220,6 @@ pub enum StatusFlag {
     /// when the floor is hit instead of silently collapsing performance).
     /// Clears once the bias drops below [`TRIM_CLEAR_FRACTION`] of max.
     TargetUnreachable,
-    /// The trust monitor's verdict (Task 27): the corrected model's
-    /// steady-state residual EWMA has been over 300 RPM for 5+ minutes.
-    /// While set, KF updates are frozen ENTIRELY (design §1: suspect
-    /// evidence is rare and discrete; not worth half-weighting). Clears
-    /// when the EWMA recovers (steady evidence only) or on Auto exit.
-    ModelDistrust,
     /// The thermal watchdog tripped (3 consecutive samples at/over 95 °C
     /// Tctl or 87 °C GPU) and everything was released toward stock. REQUIRES
     /// MANUAL RE-ARM: never clears on its own — the first actuating command
@@ -206,6 +232,43 @@ pub enum StatusFlag {
     /// (design amendment, Task 7: a lost sensor must never let the watchdog
     /// go blind).
     SensorLost,
+    // The seven flags below are the Task 4 type surface's new additions:
+    // none is raised by any call site yet (the guards/arbiter that would
+    // raise them are later tasks), so each needs an explicit dead_code
+    // allow; their own coverage/severity tests still construct them.
+    /// The fw-fanctrl socket is absent or stale (design §2.5): TempLoop is
+    /// unavailable and the loop falls to RpmLoop. Informational while in
+    /// RpmLoop; clears when the socket returns.
+    #[allow(dead_code)]
+    FanctrlLost,
+    /// The controller's EC replica disagrees with fw-fanctrl's own `print
+    /// all` view for 3 consecutive scored views (design §2.6): TempLoop is
+    /// unavailable until 3 consecutive views agree again.
+    #[allow(dead_code)]
+    EcMismatch,
+    /// `slope_at(T*) > 2 %/°C` (design §2.7): the loop runs, but the
+    /// operating point sits on a steep segment of the fw-fanctrl curve.
+    /// Informational only.
+    #[allow(dead_code)]
+    SteepCurve,
+    /// A permanent loss of Mode A (unlike the transient [`Self::SteepCurve`],
+    /// this does not clear on its own) — a warning, not merely informational,
+    /// since it is a standing loss of the primary control loop rather than a
+    /// momentary steepness note.
+    #[allow(dead_code)]
+    CurveInvalid,
+    /// dGPU at/over its hot threshold (design §2.8, default 90 °C, exit
+    /// 85 °C): the GPU share is overridden down at each allocator tick.
+    #[allow(dead_code)]
+    GpuHot,
+    /// The NVMe `Composite` sensor is at/over its hot threshold (design
+    /// §2.8, default 80 °C). Reporting only — no control action.
+    #[allow(dead_code)]
+    NvmeHot,
+    /// Six consecutive `Unreadable`/`Unverifiable` actuator read-backs
+    /// (design §2.9): informational, cleared by the next `Verified`.
+    #[allow(dead_code)]
+    ReadbackBlind,
 }
 
 impl StatusFlag {
@@ -216,10 +279,40 @@ impl StatusFlag {
             StatusFlag::Resumed => "resumed",
             StatusFlag::NotCalibrated => "not_calibrated",
             StatusFlag::TargetUnreachable => "target_unreachable",
-            StatusFlag::ModelDistrust => "model_distrust",
             StatusFlag::ThermalEmergency => "thermal_emergency",
             StatusFlag::SensorLost => "sensor_lost",
+            StatusFlag::FanctrlLost => "fanctrl_lost",
+            StatusFlag::EcMismatch => "ec_mismatch",
+            StatusFlag::SteepCurve => "steep_curve",
+            StatusFlag::CurveInvalid => "curve_invalid",
+            StatusFlag::GpuHot => "gpu_hot",
+            StatusFlag::NvmeHot => "nvme_hot",
+            StatusFlag::ReadbackBlind => "readback_blind",
         }
+    }
+}
+
+/// Severity tier for every [`StatusFlag`] variant (exhaustive match: adding
+/// a variant without extending this fails the build rather than silently
+/// defaulting). UI ordering/styling is Task 15's job; this only classifies.
+/// Called only from its own tests today — no production call site wires
+/// flag classification into rendering yet.
+#[allow(dead_code)]
+pub fn flag_severity(flag: StatusFlag) -> Severity {
+    match flag {
+        StatusFlag::ThermalEmergency => Severity::Critical,
+        StatusFlag::SensorLost => Severity::Critical,
+        StatusFlag::TargetUnreachable => Severity::Critical,
+        StatusFlag::CurveInvalid => Severity::Warning,
+        StatusFlag::EcMismatch => Severity::Warning,
+        StatusFlag::FanctrlLost => Severity::Warning,
+        StatusFlag::GpuHot => Severity::Warning,
+        StatusFlag::LimitNotSticking => Severity::Warning,
+        StatusFlag::NotCalibrated => Severity::Warning,
+        StatusFlag::ReadbackBlind => Severity::Info,
+        StatusFlag::SteepCurve => Severity::Info,
+        StatusFlag::NvmeHot => Severity::Info,
+        StatusFlag::Resumed => Severity::Info,
     }
 }
 
@@ -243,21 +336,37 @@ pub struct ControlStatus {
     /// source of truth the controller allocates against.
     pub cpu_max_w: f64,
     pub gpu_max_w: f64,
-    /// Current Kalman BIAS (RPM) — the old trim's role and bounds (±400),
-    /// carried 1:1; nonzero only in Auto mode. Positive = fans persistently
-    /// over target at the commanded budget (the model under-predicts) =
-    /// budget cut; at equilibrium it equals the model's offset error at the
-    /// operating point (shown dim in the UI header). `TargetUnreachable`
-    /// keys off it pinning at +max, exactly as it keyed off the trim.
-    pub trim_rpm: f64,
-    /// Current Kalman gain (multiplier on the model's GPU-slope term); 1.0
-    /// outside Auto and until the filter moves it. Shown dim in the UI
-    /// header next to the trim/bias readout (Task 7 wires the display).
-    pub gain: f64,
     /// Currently active flags.
     pub flags: Vec<StatusFlag>,
     /// Calibration wizard progress; Some exactly while Calibrating.
     pub calib: Option<CalibProgressLite>,
+    /// Which loop the arbiter (design §2.5, `fwloop` — not yet wired here)
+    /// currently owns; `Released` outside Auto and until the arbiter is
+    /// wired in. Distinct from [`Mode`]: `Mode` is the controller's own
+    /// top-level state (Monitor/Manual/Calibrating/Auto), `LoopMode` is
+    /// which closed loop is regulating within Auto.
+    pub loop_mode: LoopMode,
+    /// TempLoop's target replica temperature (°C), Some only while the
+    /// arbiter has a live target (Task 15 renders it; this task only
+    /// carries the field).
+    pub t_star_c: Option<f64>,
+    /// The controller's live `EcAverage` moving-mean replica (design §2.6),
+    /// Some only while an Auto session has observed at least one sample.
+    pub ec_ma_c: Option<f64>,
+    /// Name of the sensor currently driving the fw-fanctrl argmax, Some
+    /// only while TempLoop is (or was last) controllable.
+    pub ec_argmax: Option<String>,
+    /// Last commanded fw-fanctrl duty step, Some only in TempLoop.
+    pub duty_cmd: Option<u8>,
+    /// The DutyRpmTable-snapped fan RPM the last commanded duty implies;
+    /// 0.0 outside TempLoop.
+    pub snapped_rpm: f64,
+    /// Name of the fw-fanctrl curve/strategy currently in force, Some only
+    /// once the loop has selected one.
+    pub strategy: Option<String>,
+    /// The single power budget the (not-yet-wired) integrator is holding;
+    /// 0.0 until the arbiter/budget machinery (a later task) drives it.
+    pub budget_w: f64,
 }
 
 /// Hand-written (not derived) so `fan_target_rpm` and the floors start at
@@ -275,10 +384,16 @@ impl Default for ControlStatus {
             gpu_floor_mhz: config.gpu_floor_mhz,
             cpu_max_w: config.cpu_max_w,
             gpu_max_w: config.gpu_max_w,
-            trim_rpm: 0.0,
-            gain: 1.0,
             flags: Vec::new(),
             calib: None,
+            loop_mode: LoopMode::default(),
+            t_star_c: None,
+            ec_ma_c: None,
+            ec_argmax: None,
+            duty_cmd: None,
+            snapped_rpm: 0.0,
+            strategy: None,
+            budget_w: 0.0,
         }
     }
 }
@@ -310,11 +425,19 @@ pub enum Effect {
         demand_gpu: f64,
         cpu_w: f64,
         gpu_w: f64,
+        /// Which loop produced this allocation (design §2.5's arbiter; not
+        /// yet wired here — `LoopMode::default()` until it is).
+        mode: LoopMode,
+        /// The loop's control error (°C for TempLoop, RPM for RpmLoop per
+        /// `mode`); 0.0 until the arbiter/error machinery lands.
+        error: f64,
+        /// The single power budget behind this allocation; 0.0 until the
+        /// budget integrator (a later task) drives it.
+        budget_w: f64,
+        /// Set when the integrator is frozen this tick and names why (design
+        /// §2.9's `Freeze` reasons); `None` while integrating normally.
+        freeze: Option<&'static str>,
     },
-    /// Periodic (60 s) Auto-mode snapshot of the LIVE model parameters —
-    /// its own Decision record (cause "auto:model_snapshot") carrying
-    /// a/b/e/c for offline controller-quality review.
-    ModelSnapshot { a: f64, b: f64, e: f64, c: f64 },
     /// A status flag transitioned (emitted on EVERY genuine add/remove,
     /// plan Task 14); the shell mirrors it into a standalone telemetry
     /// `Record::Flag` line IN ADDITION to the Decision record (whose
@@ -724,12 +847,10 @@ impl<R: Runner> Controller<R> {
                             "no GPU actuator this run: auto mode will shape the CPU only"
                         ),
                     }
-                    // Mirror the seeded correction into status immediately:
-                    // the header/telemetry must show the inherited bias and
-                    // gain from the first Status push, not from the first
-                    // KF update (which may be minutes away).
-                    self.status.trim_rpm = auto.kf.bias();
-                    self.status.gain = auto.kf.gain();
+                    // The seeded bias/gain no longer mirror into
+                    // `ControlStatus` (Task 4's type surface drops
+                    // trim_rpm/gain); telemetry/tests read them straight off
+                    // `self.auto.as_ref().unwrap().kf` instead.
                     self.auto = Some(auto);
                     self.status.mode = Mode::Auto;
                     // Any manual limits stay in force for <1 s: the first
@@ -968,6 +1089,14 @@ impl<R: Runner> Controller<R> {
             effects.push(Effect::StatusChanged {
                 cause: cause.unwrap_or("sample"),
             });
+        } else if let Some(cause) = cause {
+            // A cause fired (e.g. a KF adaptation or model snapshot) with
+            // no visible status delta — trim_rpm/gain no longer live on
+            // `status` (Task 4), so a KF-only sample can no longer make
+            // `self.status != before` true on its own. Still worth a
+            // telemetry Decision line (mirrors `on_calib_sample`'s same
+            // fallback below).
+            effects.push(Effect::Noted { cause });
         }
         effects
     }
@@ -1122,6 +1251,13 @@ impl<R: Runner> Controller<R> {
                 demand_gpu: demand.gpu_starved,
                 cpu_w,
                 gpu_w,
+                // The arbiter (design §2.5) isn't wired up yet — this
+                // adaptation-tier allocate step predates it, so the new
+                // fields carry only their Task 4 defaults.
+                mode: LoopMode::default(),
+                error: 0.0,
+                budget_w: 0.0,
+                freeze: None,
             });
             cause.get_or_insert("auto:allocate");
         }
@@ -1273,13 +1409,7 @@ impl<R: Runner> Controller<R> {
             if !auto.distrusted && auto.kf.update(now, measured, baseline, w) {
                 cause.get_or_insert("auto:kf");
             }
-            // Mirror unconditionally (update()'s bool conflates gated/
-            // rejected/unchanged; the mirror is idempotent when nothing
-            // moved and the status-diff machinery already dedupes).
-            self.status.trim_rpm = auto.kf.bias();
-            self.status.gain = auto.kf.gain();
         }
-        let distrusted = auto.distrusted;
         let offset = auto.kf.bias();
         // Model snapshot cadence check here (while `auto` is borrowed); the
         // effect is pushed below, after the flag edits release the borrow.
@@ -1290,15 +1420,11 @@ impl<R: Runner> Controller<R> {
             auto.last_snapshot = Some(s.t_mono);
         }
 
-        // ModelDistrust flag mirrors the trust verdict (transitions only).
-        let flagged = self.status.flags.contains(&StatusFlag::ModelDistrust);
-        if distrusted && !flagged {
-            self.add_flag(StatusFlag::ModelDistrust);
-            cause.get_or_insert("auto:distrust");
-        } else if !distrusted && flagged {
-            self.remove_flag(StatusFlag::ModelDistrust);
-            cause.get_or_insert("auto:distrust_cleared");
-        }
+        // The trust verdict (`auto.distrusted`) no longer mirrors into a
+        // StatusFlag — ModelDistrust is removed from the Task 4 type
+        // surface (its UI/telemetry visibility is Task 12/15's concern; the
+        // KF-freeze behavior above, which is what the adaptation tier's
+        // tests actually exercise, is unaffected).
 
         // Bias saturated at +max: even the maximum budget cut cannot reach
         // the target — surface it instead of silently losing performance
@@ -1314,16 +1440,17 @@ impl<R: Runner> Controller<R> {
             cause.get_or_insert("auto:kf");
         }
 
-        // Periodic model snapshot for offline review (own Decision record;
-        // see Effect::ModelSnapshot). Emitted from the first Auto sample —
-        // the baseline the later lines are read against.
+        // Periodic model snapshot for offline review (own Decision record).
+        // Emitted from the first Auto sample — the baseline the later lines
+        // are read against. `Effect::ModelSnapshot` is removed from the
+        // Task 4 type surface (it carried no plain type — a/b/e/c came from
+        // `ThermalModel`), so the cause alone travels on the effect and
+        // `apply_effects` reads the live model params straight off the
+        // controller when it sees this cause (values can't drift between
+        // push and consumption — same on_sample call).
         if snapshot_due {
-            let m = self.model.as_ref().expect("checked above");
-            effects.push(Effect::ModelSnapshot {
-                a: m.a,
-                b: m.b,
-                e: m.e,
-                c: m.c,
+            effects.push(Effect::Noted {
+                cause: "auto:model_snapshot",
             });
         }
     }
@@ -1590,12 +1717,9 @@ impl<R: Runner> Controller<R> {
         self.status.gpu_max_mhz = None;
         self.status.mode = Mode::Monitor;
         // KF + trust state live in AutoState (dropped by every Auto exit
-        // path before reaching here); mirror the resets into the visible
-        // status.
-        self.status.trim_rpm = 0.0;
-        self.status.gain = 1.0;
+        // path before reaching here); `status` no longer mirrors trim/gain
+        // (Task 4), so there is nothing left to reset there.
         self.remove_flag(StatusFlag::TargetUnreachable);
-        self.remove_flag(StatusFlag::ModelDistrust);
         self.remove_flag(StatusFlag::LimitNotSticking);
         self.stick_violations = 0;
         self.last_reassert = None;
@@ -1774,7 +1898,21 @@ fn apply_effects<R: Runner>(
     let mut flagged: Vec<(&'static str, bool)> = Vec::new();
     for effect in effects {
         match effect {
-            Effect::Reasserted { cause: c } | Effect::Noted { cause: c } => {
+            Effect::Reasserted { cause: c } => {
+                cause.get_or_insert(c);
+            }
+            Effect::Noted { cause: c } => {
+                // "auto:model_snapshot" carries no payload of its own
+                // (`Effect::ModelSnapshot` is removed from the Task 4 type
+                // surface); read the live model params straight off the
+                // controller instead — they can't have moved between this
+                // effect's push and this read, both within the same
+                // on_sample call.
+                if *c == "auto:model_snapshot"
+                    && let Some(m) = controller.model.as_ref()
+                {
+                    model_snapshot = Some((m.a, m.b, m.e, m.c));
+                }
                 cause.get_or_insert(c);
             }
             Effect::StatusChanged { cause: c } => {
@@ -1786,11 +1924,11 @@ fn apply_effects<R: Runner>(
                 demand_gpu,
                 cpu_w,
                 gpu_w,
+                ..
             } => {
                 auto_alloc = Some((*demand_cpu, *demand_gpu, *cpu_w, *gpu_w));
                 cause.get_or_insert("auto:allocate");
             }
-            Effect::ModelSnapshot { a, b, e, c } => model_snapshot = Some((*a, *b, *e, *c)),
             Effect::Flagged { flag, active } => flagged.push((flag, *active)),
             Effect::Quit => quit = true,
             Effect::CpuSet(_) | Effect::GpuSet(_) | Effect::Released => {}
@@ -1827,9 +1965,12 @@ fn apply_effects<R: Runner>(
             pi_target_w: alloc.map(|a| a.3),
             // Every Auto-mode decision carries the current trim (offline
             // analysis wants the trim context on allocate lines too);
-            // non-auto lines skip it to stay lean.
-            trim_rpm: (status.mode == Mode::Auto).then_some(status.trim_rpm),
-            gain: (status.mode == Mode::Auto).then_some(status.gain),
+            // non-auto lines skip it to stay lean. `ControlStatus` no
+            // longer carries trim_rpm/gain (Task 4), so read them straight
+            // off the live KF — `controller.auto` is Some exactly while
+            // Mode::Auto, giving the same gating the old status field did.
+            trim_rpm: controller.auto.as_ref().map(|a| a.kf.bias()),
+            gain: controller.auto.as_ref().map(|a| a.kf.gain()),
             model_a: model.map(|m| m.0),
             model_b: model.map(|m| m.1),
             model_e: model.map(|m| m.2),
@@ -1867,6 +2008,140 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    // --- Task 4: StatusFlag severity coverage ---
+
+    /// Hand-maintained (not derived) so a new `StatusFlag` variant left out
+    /// here is a silent test gap rather than a compile error — the
+    /// EXHAUSTIVE MATCH inside `flag_severity` is what actually forces every
+    /// variant to be classified; this list drives the coverage test below
+    /// over that same fixed set.
+    const ALL_STATUS_FLAGS: [StatusFlag; 13] = [
+        StatusFlag::LimitNotSticking,
+        StatusFlag::Resumed,
+        StatusFlag::NotCalibrated,
+        StatusFlag::TargetUnreachable,
+        StatusFlag::ThermalEmergency,
+        StatusFlag::SensorLost,
+        StatusFlag::FanctrlLost,
+        StatusFlag::EcMismatch,
+        StatusFlag::SteepCurve,
+        StatusFlag::CurveInvalid,
+        StatusFlag::GpuHot,
+        StatusFlag::NvmeHot,
+        StatusFlag::ReadbackBlind,
+    ];
+
+    #[test]
+    fn flag_severity_covers_every_flag() {
+        // NOTE: this cannot actually fail. `flag_severity`'s match has no
+        // wildcard arm, so the real coverage guarantee — every StatusFlag
+        // variant maps to a Severity — is enforced at COMPILE time (add a
+        // variant without extending the match and the build breaks); this
+        // loop only documents that guarantee against the hand-maintained
+        // list the brief asks for. Kept as a named anchor for that list
+        // rather than removed, since a future variant missing from
+        // `ALL_STATUS_FLAGS` (unlike one missing from the match) would
+        // compile silently.
+        for flag in ALL_STATUS_FLAGS {
+            let _ = flag_severity(flag);
+        }
+    }
+
+    #[test]
+    fn curve_invalid_is_warning_steep_curve_is_info_and_they_differ() {
+        // A permanent loss of Mode A (CurveInvalid) must not share the
+        // informational SteepCurve severity (brief, design §2.7/§2.8).
+        assert_eq!(flag_severity(StatusFlag::CurveInvalid), Severity::Warning);
+        assert_eq!(flag_severity(StatusFlag::SteepCurve), Severity::Info);
+        assert_ne!(
+            flag_severity(StatusFlag::CurveInvalid),
+            flag_severity(StatusFlag::SteepCurve)
+        );
+    }
+
+    // --- Task 4: ControlStatus's new field set ---
+
+    #[test]
+    fn control_status_carries_the_new_loop_fields() {
+        // Constructs every field the Task 4 type surface adds to
+        // ControlStatus and reads each back — a stray typo'd field name or
+        // wrong type here would fail to compile, and a wrong value read
+        // back would fail one of these asserts.
+        let cs = ControlStatus {
+            loop_mode: LoopMode::TempLoop,
+            t_star_c: Some(62.5),
+            ec_ma_c: Some(61.0),
+            ec_argmax: Some("cpu".to_string()),
+            duty_cmd: Some(7),
+            snapped_rpm: 3200.0,
+            strategy: Some("balanced".to_string()),
+            budget_w: 45.0,
+            ..ControlStatus::default()
+        };
+        assert_eq!(cs.loop_mode, LoopMode::TempLoop);
+        assert_eq!(cs.t_star_c, Some(62.5));
+        assert_eq!(cs.ec_ma_c, Some(61.0));
+        assert_eq!(cs.ec_argmax.as_deref(), Some("cpu"));
+        assert_eq!(cs.duty_cmd, Some(7));
+        assert_eq!(cs.snapped_rpm, 3200.0);
+        assert_eq!(cs.strategy.as_deref(), Some("balanced"));
+        assert_eq!(cs.budget_w, 45.0);
+    }
+
+    #[test]
+    fn control_status_default_has_no_loop_state_yet() {
+        // The arbiter isn't wired up in this task — a fresh status must
+        // read as "nothing decided yet", not as a stale TempLoop/RpmLoop.
+        let cs = ControlStatus::default();
+        assert_eq!(cs.loop_mode, LoopMode::Released);
+        assert_eq!(cs.t_star_c, None);
+        assert_eq!(cs.ec_ma_c, None);
+        assert_eq!(cs.ec_argmax, None);
+        assert_eq!(cs.duty_cmd, None);
+        assert_eq!(cs.snapped_rpm, 0.0);
+        assert_eq!(cs.strategy, None);
+        assert_eq!(cs.budget_w, 0.0);
+    }
+
+    // --- Task 4: Effect::AutoAllocated's new field set ---
+
+    #[test]
+    fn auto_allocated_carries_the_new_arbiter_fields() {
+        // Destructure by name (not `..` from a match) so a typo'd or
+        // missing field name fails to compile rather than being silently
+        // ignored by an `_` pattern.
+        let Effect::AutoAllocated {
+            demand_cpu,
+            demand_gpu,
+            cpu_w,
+            gpu_w,
+            mode,
+            error,
+            budget_w,
+            freeze,
+        } = (Effect::AutoAllocated {
+            demand_cpu: 20.0,
+            demand_gpu: 30.0,
+            cpu_w: 18.0,
+            gpu_w: 28.0,
+            mode: LoopMode::RpmLoop,
+            error: -4.5,
+            budget_w: 46.0,
+            freeze: Some("actuator_mismatch"),
+        })
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            (demand_cpu, demand_gpu, cpu_w, gpu_w),
+            (20.0, 30.0, 18.0, 28.0)
+        );
+        assert_eq!(mode, LoopMode::RpmLoop);
+        assert_eq!(error, -4.5);
+        assert_eq!(budget_w, 46.0);
+        assert_eq!(freeze, Some("actuator_mismatch"));
+    }
 
     /// Unique-per-test profile file fixture; caller removes the dir when done.
     fn profile_fixture(name: &str) -> (PathBuf, PathBuf) {
@@ -3640,8 +3915,16 @@ mod tests {
         for t in 0..=70 {
             let s = achieved_fan_at(&ctl, f64::from(t), 1700.0);
             ctl.on_sample(&s);
-            assert_eq!(ctl.status().trim_rpm, 0.0, "bias moved at t={t}");
-            assert_eq!(ctl.status().gain, 1.0, "gain moved at t={t}");
+            assert_eq!(
+                ctl.auto.as_ref().unwrap().kf.bias(),
+                0.0,
+                "bias moved at t={t}"
+            );
+            assert_eq!(
+                ctl.auto.as_ref().unwrap().kf.gain(),
+                1.0,
+                "gain moved at t={t}"
+            );
         }
         assert_eq!(
             ctl.auto.as_ref().unwrap().trust.ewma(),
@@ -3659,11 +3942,17 @@ mod tests {
         // the loose prior let the first gated sample slam gain to the 0.6
         // floor; the reject-whole box itself stays unit-tested in
         // kalman.rs).
-        let mut prev = (ctl.status().trim_rpm, ctl.status().gain);
+        let mut prev = (
+            ctl.auto.as_ref().unwrap().kf.bias(),
+            ctl.auto.as_ref().unwrap().kf.gain(),
+        );
         for t in 71..100 {
             let s = achieved_fan_at(&ctl, f64::from(t), 1700.0);
             ctl.on_sample(&s);
-            let cur = (ctl.status().trim_rpm, ctl.status().gain);
+            let cur = (
+                ctl.auto.as_ref().unwrap().kf.bias(),
+                ctl.auto.as_ref().unwrap().kf.gain(),
+            );
             assert!(
                 cur.0 <= prev.0,
                 "bias may only walk DOWN against under-target fans at t={t}"
@@ -3696,17 +3985,20 @@ mod tests {
         // corrections are still moving the plant, so the 120 s window
         // below carries ~3 updates of ≈ +2.4 RPM bias each.
         let m = fitted_model();
-        let before_bias = ctl.status().trim_rpm;
+        let before_bias = ctl.auto.as_ref().unwrap().kf.bias();
         for t in 100..220 {
             let pc = ctl.status().cpu_limit_w.unwrap();
             let pg = ctl.auto.as_ref().unwrap().gpu_target_w.unwrap();
-            let (bias, gain) = (ctl.status().trim_rpm, ctl.status().gain);
+            let (bias, gain) = (
+                ctl.auto.as_ref().unwrap().kf.bias(),
+                ctl.auto.as_ref().unwrap().kf.gain(),
+            );
             let w = (m.b + m.e * pc) * pg;
             let corrected = m.a * pc + m.c + bias + gain * w;
             let s = achieved_fan_at(&ctl, f64::from(t), corrected + 80.0);
             ctl.on_sample(&s);
         }
-        let bias = ctl.status().trim_rpm;
+        let bias = ctl.auto.as_ref().unwrap().kf.bias();
         assert!(
             bias > before_bias + 5.0,
             "KF must absorb the +80 offset once the hold is proven: \
@@ -3801,7 +4093,7 @@ mod tests {
             };
             ctl.on_sample(&s);
             assert!(
-                !ctl.status().flags.contains(&StatusFlag::ModelDistrust),
+                !ctl.auto.as_ref().unwrap().distrusted,
                 "false ModelDistrust at t={t} (the incident's failure #4)"
             );
             // The incident's exact failure mode stays closed even though
@@ -3821,15 +4113,17 @@ mod tests {
                     gpu_w: pg,
                 });
             }
-            if ctl.status().trim_rpm != prev_trim || ctl.status().gain != prev_gain {
+            if ctl.auto.as_ref().unwrap().kf.bias() != prev_trim
+                || ctl.auto.as_ref().unwrap().kf.gain() != prev_gain
+            {
                 assert!(
                     cooldown::cooldown_open(&mirror, f64::from(t)),
                     "adaptation consumed a mid-cycle sample at t={t} \
                      (commanded point not at rest for the full window)"
                 );
             }
-            prev_trim = ctl.status().trim_rpm;
-            prev_gain = ctl.status().gain;
+            prev_trim = ctl.auto.as_ref().unwrap().kf.bias();
+            prev_gain = ctl.auto.as_ref().unwrap().kf.gain();
             if t >= 700 {
                 tail_abs_err.push((rpm - TARGET).abs());
             }
@@ -3848,16 +4142,16 @@ mod tests {
             "adaptation must resume once the raise gate lets the loop rest"
         );
         assert!(
-            ctl.status().trim_rpm > 0.0,
+            ctl.auto.as_ref().unwrap().kf.bias() > 0.0,
             "the KF must learn the under-prediction: trim {}",
-            ctl.status().trim_rpm
+            ctl.auto.as_ref().unwrap().kf.bias()
         );
         // Gain stays inside the KF's tight prior — bias, not gain, carries a
         // pure additive offset; this only guards against a runaway.
         assert!(
-            (0.5..=2.0).contains(&ctl.status().gain),
+            (0.5..=2.0).contains(&ctl.auto.as_ref().unwrap().kf.gain()),
             "gain ran away: {}",
-            ctl.status().gain
+            ctl.auto.as_ref().unwrap().kf.gain()
         );
         // And the learning CONVERGES the loop onto target — the residual is
         // now far inside the deadband (≈16 RPM measured), not the field's
@@ -3887,8 +4181,8 @@ mod tests {
             let rpm = if t % 2 == 0 { 1500.0 } else { 1700.0 };
             ctl.on_sample(&busy_fan_at(f64::from(t), rpm));
         }
-        assert_eq!(ctl.status().trim_rpm, 0.0);
-        assert_eq!(ctl.status().gain, 1.0);
+        assert_eq!(ctl.auto.as_ref().unwrap().kf.bias(), 0.0);
+        assert_eq!(ctl.auto.as_ref().unwrap().kf.gain(), 1.0);
     }
 
     #[test]
@@ -3915,17 +4209,25 @@ mod tests {
                 ..achieved_fan_at(&ctl, f64::from(t), PINNED_PREDICT_RPM + 100.0)
             };
             ctl.on_sample(&s);
-            assert_eq!(ctl.status().trim_rpm, 0.0, "bias moved on invalid fan");
+            assert_eq!(
+                ctl.auto.as_ref().unwrap().kf.bias(),
+                0.0,
+                "bias moved on invalid fan"
+            );
         }
         for t in 26..45 {
             let s = achieved_fan_at(&ctl, f64::from(t), PINNED_PREDICT_RPM + 100.0);
             ctl.on_sample(&s);
-            assert_eq!(ctl.status().trim_rpm, 0.0, "tail spans the outage at t={t}");
+            assert_eq!(
+                ctl.auto.as_ref().unwrap().kf.bias(),
+                0.0,
+                "tail spans the outage at t={t}"
+            );
         }
         // 20 clean samples after the outage (t=26..=45): adapts again.
         let s = achieved_fan_at(&ctl, 45.0, PINNED_PREDICT_RPM + 100.0);
         ctl.on_sample(&s);
-        assert_ne!(ctl.status().trim_rpm, 0.0);
+        assert_ne!(ctl.auto.as_ref().unwrap().kf.bias(), 0.0);
     }
 
     #[test]
@@ -3956,9 +4258,9 @@ mod tests {
             apply_effects(&effects, &ctl, f64::from(t), &ui_tx, &telemetry);
         }
         assert!(
-            ctl.status().trim_rpm.abs() < 1e-9,
+            ctl.auto.as_ref().unwrap().kf.bias().abs() < 1e-9,
             "premise: zero innovation, bias = {}",
-            ctl.status().trim_rpm
+            ctl.auto.as_ref().unwrap().kf.bias()
         );
 
         // EC-style crest: +300 over target, constant. The allocator vetoes
@@ -3970,12 +4272,12 @@ mod tests {
             let effects = ctl.on_sample(&s);
             apply_effects(&effects, &ctl, f64::from(t), &ui_tx, &telemetry);
             assert!(
-                ctl.status().trim_rpm.abs() < 1e-9,
+                ctl.auto.as_ref().unwrap().kf.bias().abs() < 1e-9,
                 "KF ingested a vetoed crest at t={t}: bias = {}",
-                ctl.status().trim_rpm
+                ctl.auto.as_ref().unwrap().kf.bias()
             );
             assert!(
-                (ctl.status().gain - 1.0).abs() < 1e-9,
+                (ctl.auto.as_ref().unwrap().kf.gain() - 1.0).abs() < 1e-9,
                 "gain moved on a vetoed crest at t={t}"
             );
         }
@@ -3994,9 +4296,9 @@ mod tests {
             apply_effects(&effects, &ctl, f64::from(t), &ui_tx, &telemetry);
         }
         assert!(
-            ctl.status().trim_rpm > 1.0,
+            ctl.auto.as_ref().unwrap().kf.bias() > 1.0,
             "adaptation must resume once the crest clears: bias = {}",
-            ctl.status().trim_rpm
+            ctl.auto.as_ref().unwrap().kf.bias()
         );
 
         // Telemetry grading hook (design §3): the vetoed steps surface as
@@ -4098,7 +4400,10 @@ mod tests {
             let s = achieved_fan_at(ctl, f64::from(t), PINNED_PREDICT_RPM + 100.0);
             ctl.on_sample(&s);
         }
-        (ctl.status().trim_rpm, ctl.status().gain)
+        (
+            ctl.auto.as_ref().unwrap().kf.bias(),
+            ctl.auto.as_ref().unwrap().kf.gain(),
+        )
     }
 
     #[test]
@@ -4133,8 +4438,8 @@ mod tests {
         let runner2 = FakeRunner::new();
         let (mut ctl2, _g2) = pinned_op_controller_with_state(&runner2, saved, state_path.clone());
         ctl2.on_command(Command::SetAuto(true));
-        assert_eq!(ctl2.status().trim_rpm, learned);
-        assert_eq!(ctl2.status().gain, gain);
+        assert_eq!(ctl2.auto.as_ref().unwrap().kf.bias(), learned);
+        assert_eq!(ctl2.auto.as_ref().unwrap().kf.gain(), gain);
         let (learned2, _) = learn_some_bias(&mut ctl2);
         assert!(
             learned2 > learned,
@@ -4167,8 +4472,8 @@ mod tests {
         );
         ctl.on_command(Command::SetAuto(true));
         // Mirrored into status at entry, before any sample…
-        assert_eq!(ctl.status().trim_rpm, -120.0);
-        assert_eq!(ctl.status().gain, 1.1);
+        assert_eq!(ctl.auto.as_ref().unwrap().kf.bias(), -120.0);
+        assert_eq!(ctl.auto.as_ref().unwrap().kf.gain(), 1.1);
         // …and live in the filter the allocator's contour reads.
         let auto = ctl.auto.as_ref().unwrap();
         assert_eq!(auto.kf.bias(), -120.0);
@@ -4176,8 +4481,8 @@ mod tests {
         // A sample does not reset it (no adaptation yet: gate closed).
         let s = achieved_fan_at(&ctl, 0.0, PINNED_PREDICT_RPM);
         ctl.on_sample(&s);
-        assert_eq!(ctl.status().trim_rpm, -120.0);
-        assert_eq!(ctl.status().gain, 1.1);
+        assert_eq!(ctl.auto.as_ref().unwrap().kf.bias(), -120.0);
+        assert_eq!(ctl.auto.as_ref().unwrap().kf.gain(), 1.1);
     }
 
     #[test]
@@ -4206,8 +4511,8 @@ mod tests {
         }))]);
         // The next Auto entry seeds from the identity, not the stale pair.
         ctl.on_command(Command::SetAuto(true));
-        assert_eq!(ctl.status().trim_rpm, 0.0);
-        assert_eq!(ctl.status().gain, 1.0);
+        assert_eq!(ctl.auto.as_ref().unwrap().kf.bias(), 0.0);
+        assert_eq!(ctl.auto.as_ref().unwrap().kf.gain(), 1.0);
         // And an Auto exit re-writes identity + the new calibration stamp
         // (a stale-seed leak here would poison every later session).
         ctl.on_command(Command::SetAuto(false));
@@ -4236,7 +4541,7 @@ mod tests {
             let s = achieved_fan_at(&ctl, f64::from(t), PINNED_PREDICT_RPM);
             ctl.on_sample(&s);
         }
-        assert_eq!(ctl.status().trim_rpm, 0.0);
+        assert_eq!(ctl.auto.as_ref().unwrap().kf.bias(), 0.0);
 
         // Blocked intake: fans steady +500 RPM over the baseline
         // prediction while the 54 W floor leaves the allocator nothing to
@@ -4252,13 +4557,13 @@ mod tests {
             let s = achieved_fan_at(&ctl, f64::from(t), PINNED_PREDICT_RPM + 500.0);
             ctl.on_sample(&s);
         }
-        assert_eq!(ctl.status().trim_rpm, MAX_BIAS_AUTHORITY_RPM);
+        assert_eq!(ctl.auto.as_ref().unwrap().kf.bias(), MAX_BIAS_AUTHORITY_RPM);
         assert!(
             ctl.status().flags.contains(&StatusFlag::TargetUnreachable),
             "saturated +max must surface TargetUnreachable"
         );
         assert!(
-            !ctl.status().flags.contains(&StatusFlag::ModelDistrust),
+            !ctl.auto.as_ref().unwrap().distrusted,
             "the shrinking residual must not distrust the model"
         );
         // The KF corrects OUTSIDE the surface: a/b/e/c stay bit-identical
@@ -4275,16 +4580,16 @@ mod tests {
             ctl.on_sample(&s);
         }
         assert!(
-            ctl.status().trim_rpm < TRIM_CLEAR_FRACTION * MAX_BIAS_AUTHORITY_RPM,
+            ctl.auto.as_ref().unwrap().kf.bias() < TRIM_CLEAR_FRACTION * MAX_BIAS_AUTHORITY_RPM,
             "bias = {}",
-            ctl.status().trim_rpm
+            ctl.auto.as_ref().unwrap().kf.bias()
         );
         assert!(
             !ctl.status().flags.contains(&StatusFlag::TargetUnreachable),
             "flag must clear below 90% of max"
         );
         assert!(
-            !ctl.status().flags.contains(&StatusFlag::ModelDistrust),
+            !ctl.auto.as_ref().unwrap().distrusted,
             "recovery must not fire distrust either"
         );
     }
@@ -4306,26 +4611,29 @@ mod tests {
             let s = achieved_fan_at(&ctl, f64::from(t), PINNED_PREDICT_RPM + 100.0);
             ctl.on_sample(&s);
         }
-        let learned = ctl.status().trim_rpm;
+        let learned = ctl.auto.as_ref().unwrap().kf.bias();
         assert_ne!(learned, 0.0, "premise: bias accumulated");
 
-        // SetAuto(false): status mirrors reset while OUT of Auto (nothing
-        // is being corrected in Monitor)…
+        // SetAuto(false): AutoState (and its KF) drops whole while OUT of
+        // Auto (nothing is being corrected in Monitor)…
         ctl.on_command(Command::SetAuto(false));
-        assert_eq!(ctl.status().trim_rpm, 0.0);
-        assert_eq!(ctl.status().gain, 1.0);
+        assert!(ctl.auto.is_none());
 
         // …but re-entry seeds from the captured pair, live immediately.
         // The GATES are still fresh: a fresh steadiness window AND a fresh
         // cooldown ring — the re-entry allocation re-drains to the pinned
         // point (parks t=115), so no further adaptation before t=145.
         ctl.on_command(Command::SetAuto(true));
-        assert_eq!(ctl.status().trim_rpm, learned, "seed must carry over");
+        assert_eq!(
+            ctl.auto.as_ref().unwrap().kf.bias(),
+            learned,
+            "seed must carry over"
+        );
         for t in 100..145 {
             let s = achieved_fan_at(&ctl, f64::from(t), PINNED_PREDICT_RPM + 100.0);
             ctl.on_sample(&s);
             assert_eq!(
-                ctl.status().trim_rpm,
+                ctl.auto.as_ref().unwrap().kf.bias(),
                 learned,
                 "gates must hold the seeded state frozen after re-entry at t={t}"
             );
@@ -4335,19 +4643,18 @@ mod tests {
         let s = achieved_fan_at(&ctl, 145.0, PINNED_PREDICT_RPM + 100.0);
         ctl.on_sample(&s);
         assert!(
-            ctl.status().trim_rpm > learned,
+            ctl.auto.as_ref().unwrap().kf.bias() > learned,
             "update must build on the seed: {} vs {learned}",
-            ctl.status().trim_rpm
+            ctl.auto.as_ref().unwrap().kf.bias()
         );
 
-        // ReleaseAll is the other Auto exit: same mirror reset + capture.
+        // ReleaseAll is the other Auto exit: same drop-whole + capture.
         ctl.on_command(Command::ReleaseAll);
-        assert_eq!(ctl.status().trim_rpm, 0.0);
-        assert_eq!(ctl.status().gain, 1.0);
+        assert!(ctl.auto.is_none());
         assert_eq!(ctl.status().mode, Mode::Monitor);
         ctl.on_command(Command::SetAuto(true));
         assert!(
-            ctl.status().trim_rpm > learned,
+            ctl.auto.as_ref().unwrap().kf.bias() > learned,
             "ReleaseAll must capture too"
         );
     }
@@ -4361,14 +4668,14 @@ mod tests {
             let s = achieved_fan_at(&ctl, f64::from(t), PINNED_PREDICT_RPM + 100.0);
             ctl.on_sample(&s);
         }
-        let trim = ctl.status().trim_rpm;
+        let trim = ctl.auto.as_ref().unwrap().kf.bias();
         assert_ne!(trim, 0.0, "premise: bias accumulated");
 
         // Retargeting the fan goal does NOT reset the filter: the model's
         // offset error (what the bias measures) didn't change with the
         // user's target.
         ctl.on_command(Command::SetFanTarget(2500.0));
-        assert_eq!(ctl.status().trim_rpm, trim);
+        assert_eq!(ctl.auto.as_ref().unwrap().kf.bias(), trim);
         assert_eq!(ctl.status().mode, Mode::Auto);
     }
 
@@ -4479,10 +4786,10 @@ mod tests {
             let s = achieved_fan_at(&ctl, f64::from(t), PINNED_PREDICT_RPM + 500.0);
             ctl.on_sample(&s);
         }
-        let trim = ctl.status().trim_rpm;
+        let trim = ctl.auto.as_ref().unwrap().kf.bias();
         assert!(trim > 50.0, "premise: bias accumulated, got {trim}");
         assert_eq!(
-            ctl.status().gain,
+            ctl.auto.as_ref().unwrap().kf.gain(),
             1.0,
             "w = 0 at the pinned point: gain inert"
         );
@@ -4504,7 +4811,11 @@ mod tests {
             }
         }
         let gpu_w = last_gpu.expect("allocator ran");
-        assert_eq!(ctl.status().trim_rpm, trim, "bias frozen while unsteady");
+        assert_eq!(
+            ctl.auto.as_ref().unwrap().kf.bias(),
+            trim,
+            "bias frozen while unsteady"
+        );
 
         // The model is still calibrated, so both contours are exact:
         // uncorrected (4000 − 800 − 25·54)/20.4 ≈ 90.7 W; the corrected
@@ -4560,8 +4871,16 @@ mod tests {
             let s = achieved_fan_at(&ctl, f64::from(t), fan);
             ctl.on_sample(&s);
             if t < 80 {
-                assert_eq!(ctl.status().trim_rpm, 0.0, "wind-up adapted at t={t}");
-                assert_eq!(ctl.status().gain, 1.0, "wind-up adapted at t={t}");
+                assert_eq!(
+                    ctl.auto.as_ref().unwrap().kf.bias(),
+                    0.0,
+                    "wind-up adapted at t={t}"
+                );
+                assert_eq!(
+                    ctl.auto.as_ref().unwrap().kf.gain(),
+                    1.0,
+                    "wind-up adapted at t={t}"
+                );
             }
         }
         // Fans end inside the allocator's ±150 RPM band around the target.
@@ -4573,7 +4892,10 @@ mod tests {
         // weighted (a held operating point cannot fully separate them —
         // kalman.rs owns those dynamics); here the correction must be
         // engaged, in authority, and flag-free.
-        let (trim, gain) = (ctl.status().trim_rpm, ctl.status().gain);
+        let (trim, gain) = (
+            ctl.auto.as_ref().unwrap().kf.bias(),
+            ctl.auto.as_ref().unwrap().kf.gain(),
+        );
         assert!(trim.abs() < MAX_BIAS_AUTHORITY_RPM, "bias pinned: {trim}");
         assert!(trim != 0.0 || gain != 1.0, "KF never engaged");
         assert!(
@@ -4581,7 +4903,7 @@ mod tests {
             "an in-authority offset must not flag TargetUnreachable"
         );
         assert!(
-            !ctl.status().flags.contains(&StatusFlag::ModelDistrust),
+            !ctl.auto.as_ref().unwrap().distrusted,
             "the wind-up must not fire ModelDistrust (incident step 4)"
         );
     }
@@ -4616,12 +4938,12 @@ mod tests {
             ctl.on_sample(&s);
         }
         assert!(
-            ctl.status().flags.contains(&StatusFlag::ModelDistrust),
+            ctl.auto.as_ref().unwrap().distrusted,
             "trust must keep watching the model residual"
         );
         assert!(ctl.auto.as_ref().unwrap().trust.ewma() > DISTRUST_RPM);
         assert_eq!(
-            ctl.status().trim_rpm,
+            ctl.auto.as_ref().unwrap().kf.bias(),
             -MAX_BIAS_AUTHORITY_RPM,
             "the KF hands back what it can, bounded at −max"
         );
@@ -4671,16 +4993,20 @@ mod tests {
                 ..busy_fan_at(f64::from(t), fan)
             };
             ctl.on_sample(&s);
-            assert_eq!(ctl.status().trim_rpm, 0.0, "bias moved at t={t}");
+            assert_eq!(
+                ctl.auto.as_ref().unwrap().kf.bias(),
+                0.0,
+                "bias moved at t={t}"
+            );
         }
         // Premise: the budget genuinely outran the draw on the CPU leg.
         let limit = ctl.status().cpu_limit_w.unwrap();
         assert!(limit > 23.0 + 1e-9, "premise: limit walked, got {limit}");
         // Nothing was learned: no KF movement, no trust evidence, no flags.
-        assert_eq!(ctl.status().trim_rpm, 0.0);
-        assert_eq!(ctl.status().gain, 1.0);
+        assert_eq!(ctl.auto.as_ref().unwrap().kf.bias(), 0.0);
+        assert_eq!(ctl.auto.as_ref().unwrap().kf.gain(), 1.0);
         assert_eq!(ctl.auto.as_ref().unwrap().trust.ewma(), 0.0);
-        assert!(!ctl.status().flags.contains(&StatusFlag::ModelDistrust));
+        assert!(!ctl.auto.as_ref().unwrap().distrusted);
         assert!(!ctl.status().flags.contains(&StatusFlag::TargetUnreachable));
     }
 
@@ -4721,7 +5047,8 @@ mod tests {
                 s.gpu_w += dgpu;
                 ctl.on_sample(&s);
             }
-            ctl.status().trim_rpm != 0.0 || ctl.status().gain != 1.0
+            ctl.auto.as_ref().unwrap().kf.bias() != 0.0
+                || ctl.auto.as_ref().unwrap().kf.gain() != 1.0
         };
         // GPU margin: exactly target−5 is achieved, 1 W past is not.
         assert!(kf_moved(0.0, -5.0));
@@ -4752,7 +5079,11 @@ mod tests {
             let mut s = achieved_fan_at(&ctl, f64::from(t), PINNED_PREDICT_RPM + 100.0);
             s.cpu_pkg_w = 50.5;
             ctl.on_sample(&s);
-            assert_eq!(ctl.status().trim_rpm, 0.0, "bias moved at t={t}");
+            assert_eq!(
+                ctl.auto.as_ref().unwrap().kf.bias(),
+                0.0,
+                "bias moved at t={t}"
+            );
         }
         // Draw resumes at the commanded point, fans still over: the first
         // achieved sample (t=100) updates immediately, the next at t=120.
@@ -4761,14 +5092,14 @@ mod tests {
             let s = achieved_fan_at(&ctl, f64::from(t), PINNED_PREDICT_RPM + 100.0);
             ctl.on_sample(&s);
             if t == 100 {
-                at_100 = ctl.status().trim_rpm;
+                at_100 = ctl.auto.as_ref().unwrap().kf.bias();
             }
         }
         assert!(at_100 > 0.0, "first achieved sample must update: {at_100}");
         assert!(
-            ctl.status().trim_rpm > at_100,
+            ctl.auto.as_ref().unwrap().kf.bias() > at_100,
             "second update (t=120) must build on the first: {} vs {at_100}",
-            ctl.status().trim_rpm
+            ctl.auto.as_ref().unwrap().kf.bias()
         );
     }
 
@@ -4781,9 +5112,11 @@ mod tests {
     /// (An IN-authority offset can no longer distrust: the KF drives the
     /// residual under the threshold faster than the sustain — see
     /// persistent_residual_at_frozen_point_saturates_bias_and_flags_unreachable.)
-    /// Returns the t_mono of the first flagged sample; asserts the
-    /// transition emits its telemetry Flagged effect (the Decision cause
-    /// may legitimately be shadowed by a same-sample allocator step).
+    /// Returns the t_mono of the first sample where `auto.distrusted` turns
+    /// true. `ModelDistrust` is removed from the Task 4 type surface (no
+    /// `StatusFlag`, so no telemetry `Flagged` effect on this transition
+    /// any more) — the trust verdict itself, read straight off `AutoState`,
+    /// is what the adaptation tier's tests actually exercise.
     fn drive_to_distrust(ctl: &mut Controller<&FakeRunner>) -> u32 {
         ctl.on_command(Command::SetAuto(true));
         for t in 0..40 {
@@ -4792,12 +5125,8 @@ mod tests {
         }
         for t in 40..=900 {
             let s = achieved_fan_at(ctl, f64::from(t), PINNED_PREDICT_RPM + 750.0);
-            let effects = ctl.on_sample(&s);
-            if ctl.status().flags.contains(&StatusFlag::ModelDistrust) {
-                assert!(
-                    has_flagged(&effects, "model_distrust", true),
-                    "flag transition must emit its Flagged effect, got {effects:?}"
-                );
+            ctl.on_sample(&s);
+            if ctl.auto.as_ref().unwrap().distrusted {
                 return t;
             }
         }
@@ -4812,7 +5141,10 @@ mod tests {
         // By flag time (EWMA crossing + 300 s sustain) the bias has long
         // pinned: it reaches +400 within ~16 updates of the offset onset,
         // well inside the sustain window.
-        let (trim, gain) = (ctl.status().trim_rpm, ctl.status().gain);
+        let (trim, gain) = (
+            ctl.auto.as_ref().unwrap().kf.bias(),
+            ctl.auto.as_ref().unwrap().kf.gain(),
+        );
         assert_eq!(trim, MAX_BIAS_AUTHORITY_RPM);
 
         // Hold 200 more flat/steady/achieved samples of the same +750
@@ -4824,10 +5156,18 @@ mod tests {
         for t in flagged_at + 1..=flagged_at + 200 {
             let s = achieved_fan_at(&ctl, f64::from(t), PINNED_PREDICT_RPM + 750.0);
             ctl.on_sample(&s);
-            assert_eq!(ctl.status().trim_rpm, trim, "bias moved while distrusted");
-            assert_eq!(ctl.status().gain, gain, "gain moved while distrusted");
+            assert_eq!(
+                ctl.auto.as_ref().unwrap().kf.bias(),
+                trim,
+                "bias moved while distrusted"
+            );
+            assert_eq!(
+                ctl.auto.as_ref().unwrap().kf.gain(),
+                gain,
+                "gain moved while distrusted"
+            );
         }
-        assert!(ctl.status().flags.contains(&StatusFlag::ModelDistrust));
+        assert!(ctl.auto.as_ref().unwrap().distrusted);
 
         // The probe that BITES (design §1 "frozen ENTIRELY"; the old tier
         // kept integrating the trim at HALF gain here): fans 200 RPM
@@ -4845,15 +5185,19 @@ mod tests {
             let s = achieved_fan_at(&ctl, f64::from(t), PINNED_PREDICT_RPM + trim - 200.0);
             ctl.on_sample(&s);
             assert!(
-                ctl.status().flags.contains(&StatusFlag::ModelDistrust),
+                ctl.auto.as_ref().unwrap().distrusted,
                 "probe outlived the distrust flag at t={t}; shorten it"
             );
             assert_eq!(
-                ctl.status().trim_rpm,
+                ctl.auto.as_ref().unwrap().kf.bias(),
                 trim,
                 "bias absorbed a negative innovation while distrusted (t={t})"
             );
-            assert_eq!(ctl.status().gain, gain, "gain moved while distrusted");
+            assert_eq!(
+                ctl.auto.as_ref().unwrap().kf.gain(),
+                gain,
+                "gain moved while distrusted"
+            );
         }
 
         // Recovery: the plant falls back to what the CORRECTED model
@@ -4864,7 +5208,7 @@ mod tests {
         for _ in 0..200 {
             let s = achieved_fan_at(&ctl, f64::from(t), PINNED_PREDICT_RPM + trim);
             ctl.on_sample(&s);
-            if !ctl.status().flags.contains(&StatusFlag::ModelDistrust) {
+            if !ctl.auto.as_ref().unwrap().distrusted {
                 cleared_at = Some(t);
                 break;
             }
@@ -4882,9 +5226,9 @@ mod tests {
             ctl.on_sample(&s);
         }
         assert!(
-            ctl.status().trim_rpm < trim,
+            ctl.auto.as_ref().unwrap().kf.bias() < trim,
             "bias must walk off the clamp once trusted again: {}",
-            ctl.status().trim_rpm
+            ctl.auto.as_ref().unwrap().kf.bias()
         );
     }
 
@@ -4893,16 +5237,16 @@ mod tests {
         let runner = FakeRunner::new();
         let (mut ctl, _gpu_calls) = pinned_op_controller(&runner);
         drive_to_distrust(&mut ctl);
-        assert!(ctl.status().flags.contains(&StatusFlag::ModelDistrust));
+        assert!(ctl.auto.as_ref().unwrap().distrusted);
 
-        // Auto exit: the flag leaves the status with the mode…
+        // Auto exit: AutoState (trust monitor included) drops whole…
         ctl.on_command(Command::SetAuto(false));
         assert_eq!(ctl.status().mode, Mode::Monitor);
-        assert!(!ctl.status().flags.contains(&StatusFlag::ModelDistrust));
+        assert!(ctl.auto.is_none());
 
         // …and re-entry starts with FRESH trust (AutoState dropped whole).
         ctl.on_command(Command::SetAuto(true));
-        assert!(!ctl.status().flags.contains(&StatusFlag::ModelDistrust));
+        assert!(!ctl.auto.as_ref().unwrap().distrusted);
         let auto = ctl.auto.as_ref().unwrap();
         assert!(!auto.distrusted);
         assert_eq!(auto.trust.ewma(), 0.0);

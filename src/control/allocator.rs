@@ -229,7 +229,11 @@ impl Allocator {
     /// 2. Each axis's per-tick change from the previous commanded point is
     ///    bounded by [`UP_RATE_W`] / [`DOWN_RATE_W`] (asymmetric: slow
     ///    creep up, fast back-off).
-    /// 3. The rate-clamped value is quantised to [`GRID_STEP_W`].
+    /// 3. The rate-clamped value is quantised to [`GRID_STEP_W`], then
+    ///    re-clamped into the same rate bound: quantising can itself walk
+    ///    the value up to half a grid step past the bound just enforced in
+    ///    step 2, so it is pulled back inside before anything else touches
+    ///    it.
     /// 4. The (possibly just-raised) floor wins over both the slew clamp and
     ///    the quantisation: it is re-applied last, *unquantised*, so a
     ///    raised floor lifts its axis on this very step rather than waiting
@@ -262,20 +266,34 @@ impl Allocator {
             inp.gpu_max_w,
         );
 
-        // Quantize the rate-clamped value first, then re-apply the floor
-        // *without* re-quantizing: quantizing after the floor clamp can
+        // Quantize the rate-clamped value, then re-clamp the quantized
+        // result back into the same rate bound before finally re-applying
+        // the floor *without* re-quantizing.
+        //
+        // The re-clamp matters because rounding to the nearest GRID_STEP_W
+        // can itself walk the value up to half a grid step *outside* the
+        // bound that was just enforced (e.g. a rate-clamped 17.751 quantizes
+        // to 18.0, which is 0.249 W past a +2.0 W up-rate from a non-grid
+        // previous point like 15.751 — `gpu_floor_w` is an LUT-interpolated
+        // wattage and thus essentially always off-grid, and `cpu_floor_w` is
+        // a raw config value never grid-aligned by `Config::sanitized`, so
+        // this was not a rare corner case). Clamping again after quantizing
+        // pulls that drift back inside UP_RATE_W/DOWN_RATE_W.
+        //
+        // The floor is re-applied last, and unquantized, and *after* the
+        // second rate clamp — not folded into it — because the floor is a
+        // hard safety bound that must win even over the rate limit itself
+        // (a floor raised between steps has to lift its axis immediately,
+        // not wait out UP_RATE_W), and quantizing after the floor clamp can
         // round the result back down below a floor that is not itself a
         // multiple of GRID_STEP_W (e.g. a configured cpu_floor_w of 15.2),
-        // silently violating the "floors always met" invariant. Applying
-        // the floor last, unquantized, guarantees the output is never below
-        // it — at the cost of the output occasionally sitting off-grid by
-        // as much as half a grid step when a floor forces it there, which
-        // is the correct trade-off (the floor is a hard safety bound, the
-        // grid is just an actuator-friendliness nicety).
-        let cpu_w =
-            quantize(raw_cpu.clamp(prev.0 - DOWN_RATE_W, prev.0 + UP_RATE_W)).max(cpu_floor);
-        let gpu_w =
-            quantize(raw_gpu.clamp(prev.1 - DOWN_RATE_W, prev.1 + UP_RATE_W)).max(gpu_floor);
+        // silently violating the "floors always met" invariant.
+        let cpu_w = quantize(raw_cpu.clamp(prev.0 - DOWN_RATE_W, prev.0 + UP_RATE_W))
+            .clamp(prev.0 - DOWN_RATE_W, prev.0 + UP_RATE_W)
+            .max(cpu_floor);
+        let gpu_w = quantize(raw_gpu.clamp(prev.1 - DOWN_RATE_W, prev.1 + UP_RATE_W))
+            .clamp(prev.1 - DOWN_RATE_W, prev.1 + UP_RATE_W)
+            .max(gpu_floor);
 
         let out = (cpu_w, gpu_w);
         self.last = Some(out);
@@ -529,6 +547,84 @@ mod tests {
             gpu_w, 7.2,
             "gpu floor must be met exactly, not quantised down"
         );
+    }
+
+    #[test]
+    fn quantising_a_non_grid_prev_point_does_not_blow_the_up_rate() {
+        // Regression: quantising the rate-clamped value can itself round the
+        // result *outside* the bound the rate clamp just enforced, when the
+        // previous commanded point is off-grid. That happens whenever a
+        // floor *rise* outruns UP_RATE_W: the rate clamp caps the climb
+        // below the new floor, so the "floor always wins" override sets the
+        // commanded point to the floor exactly — off-grid, whatever the
+        // floor's own alignment (gpu_floor_w is always an LUT-interpolated
+        // wattage, and cpu_floor_w is never grid-aligned by
+        // `Config::sanitized`, so this is routine, not a rare corner case).
+        // The next tick that wants to climb further then saturates the rate
+        // clamp again, and pre-fix, quantize(prev + UP_RATE_W) rounded up
+        // past prev + UP_RATE_W by up to half a grid step (e.g. prev =
+        // 15.751 -> bound 17.751 -> quantize 18.0: a 2.249 W delta against
+        // the 2.0 W cap).
+        let mut alloc = Allocator::new();
+
+        // Step 1: seed both axes at a grid-aligned (0, 0) start.
+        let (cpu0, gpu0) = alloc.step(&AllocInput {
+            budget_w: 0.0,
+            demand: D_EQUAL,
+            floors: 0.0,
+            cpu_max_w: 54.0,
+            gpu_max_w: 100.0,
+            gpu_floor_w: 0.0,
+        });
+        assert_eq!((cpu0, gpu0), (0.0, 0.0), "premise: seeded at the floors");
+
+        // Step 2: both floors jump up by more than UP_RATE_W in one tick
+        // (15.751 and 8.251 are both legal, non-grid-aligned values). The
+        // rate clamp caps the raw climb at 0 + UP_RATE_W = 2.0, well below
+        // either new floor, so the floor override must fire and land each
+        // axis exactly on its (off-grid) floor.
+        let (cpu1, gpu1) = alloc.step(&AllocInput {
+            budget_w: 15.751 + 8.251, // remainder 0: raw == floor on each axis
+            demand: D_EQUAL,
+            floors: 15.751,
+            cpu_max_w: 54.0,
+            gpu_max_w: 100.0,
+            gpu_floor_w: 8.251,
+        });
+        assert_eq!(
+            (cpu1, gpu1),
+            (15.751, 8.251),
+            "premise: a floor rise that outruns UP_RATE_W lands exactly on the (off-grid) floor"
+        );
+
+        // Step 3: floors hold, but demand is large enough to saturate the
+        // up-rate clamp on both axes from this off-grid previous point.
+        let (cpu2, gpu2) = alloc.step(&AllocInput {
+            budget_w: 100.0,
+            demand: D_EQUAL,
+            floors: 15.751,
+            cpu_max_w: 54.0,
+            gpu_max_w: 100.0,
+            gpu_floor_w: 8.251,
+        });
+        assert!(
+            cpu2 - cpu1 <= UP_RATE_W + 1e-9,
+            "cpu step-3 delta {} exceeds UP_RATE_W {} from non-grid prev {}",
+            cpu2 - cpu1,
+            UP_RATE_W,
+            cpu1
+        );
+        assert!(
+            gpu2 - gpu1 <= UP_RATE_W + 1e-9,
+            "gpu step-3 delta {} exceeds UP_RATE_W {} from non-grid prev {}",
+            gpu2 - gpu1,
+            UP_RATE_W,
+            gpu1
+        );
+        // Exact expected values: quantize(prev + UP_RATE_W) re-clamped back
+        // down to prev + UP_RATE_W (18.0 -> 17.751, 10.5 -> 10.251).
+        assert_eq!(cpu2, cpu1 + UP_RATE_W);
+        assert_eq!(gpu2, gpu1 + UP_RATE_W);
     }
 
     // ---- Allocator::step: grid quantisation -------------------------------

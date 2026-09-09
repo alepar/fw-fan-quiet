@@ -1402,11 +1402,12 @@ impl<R: Runner> Controller<R> {
     /// Write LUT + calibration stamp to the state file. Called from
     /// [`exit_auto_and_persist`](Self::exit_auto_and_persist) only — never
     /// per-update (no disk churn). Save failure is warned, not fatal: the
-    /// in-memory state still carries the session. `model`/`adapt_bias`/
-    /// `adapt_gain` are no longer tracked by the controller (the adaptation
-    /// tier is gone); `PersistedState::default()` fills them with their
-    /// identity values until `fw-fanctrl-loop-dsh` drops the fields from the
-    /// schema itself.
+    /// in-memory state still carries the session. The controller does not
+    /// yet own `loop_gains`, `duty_rpm_table` or `warm_start` (that wiring
+    /// is `fw-fanctrl-loop-438`/warm-start + refinement hooks), so
+    /// `PersistedState::default()` fills them here — `duty_rpm_table` at its
+    /// seeded default, the other two empty/`None` — until that task threads
+    /// live copies through.
     fn save_persisted_state(&self) {
         let state = PersistedState {
             lut: self.lut.clone(),
@@ -2682,11 +2683,10 @@ mod tests {
         assert!(ctl.burner.is_none());
         assert_eq!(ctl.status().cpu_limit_w, None);
 
-        // The state file exists, parses and carries the fitted model + LUT;
-        // the controller kept them, so Auto mode can start right away.
+        // The state file exists, parses and carries the LUT (PersistedState
+        // no longer carries a model field, fw-fanctrl-loop-dsh); the
+        // controller kept it, so Auto mode can start right away.
         let saved = PersistedState::load(&state_path);
-        let model = saved.model.expect("model persisted");
-        assert!((model.a - 25.0).abs() < 0.05 * 25.0, "a = {}", model.a);
         assert_eq!(saved.lut.expect("lut persisted").len(), 10);
         saved
             .calibrated_at
@@ -2708,7 +2708,6 @@ mod tests {
         let mut lut = ClockWattsLut::new();
         lut.insert(2000, 60.0);
         let persisted = PersistedState {
-            model: None,
             lut: Some(lut.clone()),
             calibrated_at: None,
             ..PersistedState::default()

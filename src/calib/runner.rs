@@ -487,7 +487,6 @@ impl CalibRunner {
                     max_residual,
                 });
                 effects.push(RunnerEffect::SaveState(Box::new(PersistedState {
-                    model: Some(model),
                     lut: self.lut.clone(),
                     calibrated_at: Some(unix_secs_string()),
                     ..PersistedState::default()
@@ -771,7 +770,9 @@ mod tests {
         assert!((c - C).abs() < 0.05 * C, "c = {c}");
         assert!(max_residual < 200.0, "max_residual = {max_residual}");
 
-        // SaveState carries the model, the swept LUT and a timestamp.
+        // SaveState carries the swept LUT and a timestamp (the fitted model
+        // coefficients themselves are asserted above via RunnerEffect::Fitted
+        // — PersistedState no longer carries a model field, fw-fanctrl-loop-dsh).
         let saved: Vec<&PersistedState> = all
             .iter()
             .filter_map(|e| match e {
@@ -780,8 +781,6 @@ mod tests {
             })
             .collect();
         assert_eq!(saved.len(), 1);
-        let model = saved[0].model.as_ref().expect("model persisted");
-        assert!((model.a - A).abs() < 0.05 * A);
         let lut = saved[0].lut.as_ref().expect("lut persisted");
         assert_eq!(lut.len(), 10);
         assert_eq!(lut.watts_for_clock(3090), Some(103.0));

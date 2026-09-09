@@ -5,4 +5,4 @@ One row per spec: date · title · link · one-line summary · status · tags. E
 
 | Date | Title | Link | Summary | Status | Tags |
 |---|---|---|---|---|---|
-| 2026-09-07 | Closing the loop on fw-fanctrl | [2026-09-07-fw-fanctrl-loop-design.md](2026-09-07-fw-fanctrl-loop-design.md) | Replace the learned power→RPM model with one PI on fw-fanctrl's input temperature (RPM fallback), delete Kalman/thermal-model/trust/cooldown and the calibration matrix | designed (coverage 2/2 rounds, 23 leaves) | fw-fanctrl-loop, control, root |
+| 2026-09-07 | Closing the loop on fw-fanctrl | [2026-09-07-fw-fanctrl-loop-design.md](2026-09-07-fw-fanctrl-loop-design.md) | Replace the learned power→RPM model with one PI on fw-fanctrl's input temperature (RPM fallback), delete Kalman/thermal-model/trust/cooldown and the calibration matrix | implemented | fw-fanctrl-loop, control, root |

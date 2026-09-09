@@ -3488,4 +3488,283 @@ mod tests {
 
         fs::remove_dir_all(&dir).unwrap();
     }
+
+    // --- Restored tier-independent tests (fw-fanctrl-loop-24s fix round 1) ---
+    //
+    // These were dropped alongside the adaptation-tier deletion even though
+    // none of them exercise the KF/trust/cooldown/contour machinery: they
+    // cover the fan-slope estimator, the GPU watts->clock PI, command
+    // gating in Auto, plain Config persistence, and a real historical crash
+    // regression. Ported unchanged (or trivially, per the comments below)
+    // from the pre-refactor controller.rs.
+
+    #[test]
+    fn fan_slope_estimate_needs_full_valid_span() {
+        // Shorter than span+1 samples → None (insufficient evidence).
+        assert_eq!(fan_slope_rpm_s(&[1500.0; FAN_SLOPE_SPAN_S]), None);
+        // Flat 11-sample window → 0 RPM/s; a 100 RPM rise over the span →
+        // +10 RPM/s.
+        let mut w = vec![1500.0; FAN_SLOPE_SPAN_S + 1];
+        assert_eq!(fan_slope_rpm_s(&w), Some(0.0));
+        w[FAN_SLOPE_SPAN_S] = 1600.0;
+        assert_eq!(fan_slope_rpm_s(&w), Some(10.0));
+        // Only the span tail counts: older garbage (even NaN) is ignored.
+        let mut w = vec![f64::NAN; 5];
+        w.extend((0..=FAN_SLOPE_SPAN_S).map(|i| 1400.0 + 30.0 * i as f64));
+        assert_eq!(fan_slope_rpm_s(&w), Some(30.0));
+        // NaN inside the span (fan-invalid sample) → None: never estimate a
+        // slope across a sensor outage.
+        let mut w = vec![1500.0; FAN_SLOPE_SPAN_S + 1];
+        w[5] = f64::NAN;
+        assert_eq!(fan_slope_rpm_s(&w), None);
+    }
+
+    #[test]
+    fn out_of_range_config_floors_never_panic_auto() {
+        // Reviewer-confirmed crash pre-fix: gpu_floor_mhz > 3090 made the
+        // PI's f64::clamp (min > max) panic on the first Auto tick, and
+        // cpu_floor_w > 54 tripped the allocator's floor debug_assert.
+        // Controller::new sanitizes (as does Config::load for file configs).
+        let runner = FakeRunner::new();
+        let config = Config {
+            cpu_floor_w: 99.0,
+            gpu_floor_mhz: 4000,
+            ..Config::default()
+        };
+        let (mut ctl, _gpu_calls) = auto_controller(
+            &runner,
+            PathBuf::from("/nonexistent/platform_profile"),
+            config,
+        );
+        ctl.on_command(Command::SetAuto(true));
+        for t in [0.0, 1.0, 2.0, 5.0] {
+            ctl.on_sample(&busy_at(t)); // panicked here before the fix
+        }
+        // Floors landed clamped to the hardware envelope.
+        assert_eq!(ctl.status().cpu_limit_w, Some(54.0));
+        assert_eq!(ctl.status().gpu_max_mhz, Some(3090));
+    }
+
+    #[test]
+    fn manual_and_calibration_commands_rejected_in_auto() {
+        let runner = FakeRunner::new();
+        let (mut ctl, gpu_calls) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        ctl.on_sample(&busy_at(0.0));
+        let cpu_calls_before = ryzenadj_calls(&runner).len();
+        let gpu_calls_before = gpu_sets(&gpu_calls).len();
+
+        for cmd in [Command::SetCpuW(40.0), Command::SetGpuMaxClock(3000)] {
+            let effects = ctl.on_command(cmd);
+            assert!(effects.is_empty(), "{cmd:?} must be rejected: {effects:?}");
+        }
+        let effects = ctl.on_command(Command::StartCalibration);
+        assert!(effects.is_empty(), "got {effects:?}");
+        assert_eq!(ctl.status().mode, Mode::Auto);
+        assert!(ctl.status().calib.is_none());
+        assert_eq!(ryzenadj_calls(&runner).len(), cpu_calls_before);
+        assert_eq!(gpu_sets(&gpu_calls).len(), gpu_calls_before);
+
+        // SetFanTarget stays allowed: it retargets the contour live.
+        ctl.on_command(Command::SetFanTarget(2500.0));
+        assert_eq!(ctl.status().fan_target_rpm, 2500.0);
+        assert_eq!(ctl.status().mode, Mode::Auto);
+    }
+
+    #[test]
+    fn fan_invalid_freezes_allocator_but_pi_keeps_working() {
+        let runner = FakeRunner::new();
+        let (mut ctl, gpu_calls) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+
+        let invalid_fan_at = |t: f64| Sample {
+            fan_valid: false,
+            ..busy_at(t)
+        };
+        // First step: frozen at the conservative start — a lost fan sensor
+        // must never raise power. The one initial command applies it.
+        let effects = ctl.on_sample(&invalid_fan_at(0.0));
+        assert_eq!(alloc_of(&effects), Some((15.0, 30.0)));
+        assert_eq!(ryzenadj_calls(&runner), vec![expected_args(15_000)]);
+
+        // Later allocator steps stay frozen: no new CPU command...
+        let effects = ctl.on_sample(&invalid_fan_at(5.0));
+        assert_eq!(alloc_of(&effects), Some((15.0, 30.0)));
+        assert_eq!(
+            ryzenadj_calls(&runner).len(),
+            1,
+            "frozen: no 5 s re-command"
+        );
+
+        // ...besides the 10 s reassert, which keeps defending what is applied.
+        let effects = ctl.on_sample(&invalid_fan_at(10.1));
+        assert!(has_reassert(&effects, "reassert"), "got {effects:?}");
+        assert_eq!(ryzenadj_calls(&runner).len(), 2);
+        assert_eq!(ctl.status().cpu_limit_w, Some(15.0));
+
+        // The PI runs off the GPU WATTS sensor, not the fan: it kept driving
+        // the clock toward the 30 W target the whole time.
+        assert!(
+            !gpu_sets(&gpu_calls).is_empty(),
+            "PI must keep working off gpu_w while the fan is lost"
+        );
+        // FF(30)=1200; error 20 W wants +700 of correction, delivered in
+        // rate-limited steps: 1600 (t=0), 1705 (t=5), 1810 (t=10.1).
+        assert_eq!(ctl.status().gpu_max_mhz, Some(1810));
+    }
+
+    #[test]
+    fn gpu_pi_seeded_from_applied_lock_at_entry() {
+        let runner = FakeRunner::new();
+        let (mut ctl, gpu_calls) = auto_controller_no_profile(&runner);
+        // A manual lock is in force when Auto starts.
+        ctl.on_command(Command::SetGpuMaxClock(1500));
+        assert_eq!(ctl.status().gpu_max_mhz, Some(1500), "premise");
+        ctl.on_command(Command::SetAuto(true));
+
+        ctl.on_sample(&busy_at(0.0));
+        let sets = gpu_sets(&gpu_calls);
+        assert_eq!(sets[0], 1500, "the manual lock");
+        let first_pi = sets[1];
+        assert!(
+            first_pi.abs_diff(1500) <= 105,
+            "first PI command ({first_pi} MHz) jumped >105 MHz from the applied 1500"
+        );
+        // Concretely: with the contour stubbed degenerate (Task 12), the
+        // allocator's first step always holds at CONSERVATIVE_START (30 W
+        // GPU target, unlike the pre-refactor fitted-model contour, which
+        // could climb off it on the very first step) — FF(30)=1200 + the
+        // fresh-integrator correction lands the desired clock at 1600,
+        // inside the ±105 MHz window from the seeded 1500, so the rate
+        // limit doesn't even bind. (Corroborated by
+        // `fan_invalid_freezes_allocator_but_pi_keeps_working`'s identical
+        // unseeded first step, which lands on the same 1600 MHz.)
+        assert_eq!(first_pi, 1600);
+    }
+
+    #[test]
+    fn pi_rate_reference_tracks_hardware_on_failed_gpu_set() {
+        let runner = FakeRunner::new();
+        let gpu = FakeGpu::new();
+        let gpu_calls = gpu.calls();
+        let gpu_failures = gpu.failures();
+        let mut ctl = Controller::new(
+            RestoreGuard::new(
+                &runner,
+                Some(cpu_actuator(
+                    &runner,
+                    PathBuf::from("/nonexistent/platform_profile"),
+                )),
+                Some(Box::new(gpu)),
+                None,
+            ),
+            calibrated(),
+            PathBuf::from("/nonexistent/state.json"),
+            Config::default(),
+            PathBuf::from("/nonexistent/config.toml"),
+        );
+        ctl.on_command(Command::SetGpuMaxClock(1500));
+        ctl.on_command(Command::SetAuto(true)); // PI seeded from applied 1500
+
+        // The first PI command (1605, rate-limited from 1500) FAILS: the
+        // hardware still holds 1500, so status must not move and the failed
+        // attempt must not become the rate reference.
+        *gpu_failures.lock().unwrap() = 1;
+        ctl.on_sample(&busy_at(0.0));
+        assert_eq!(ctl.status().gpu_max_mhz, Some(1500));
+        assert_eq!(gpu_sets(&gpu_calls), vec![1500], "only the manual lock");
+
+        // Next tick: the retry must rate-limit from the APPLIED 1500 (→ 1605
+        // again), not from the failed 1605 intent (which would allow 1710).
+        ctl.on_sample(&busy_at(1.0));
+        assert_eq!(gpu_sets(&gpu_calls), vec![1500, 1605]);
+        assert_eq!(ctl.status().gpu_max_mhz, Some(1605));
+    }
+
+    #[test]
+    fn set_fan_target_persists_config_on_change_only() {
+        let runner = FakeRunner::new();
+        let dir = std::env::temp_dir().join(format!(
+            "bazerame-controller-test-{}-fan-persist",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        let mut ctl: Controller<&FakeRunner> = Controller::new(
+            RestoreGuard::new(&runner, None, None, None),
+            PersistedState::default(),
+            PathBuf::from("/nonexistent/state.json"),
+            Config::default(),
+            config_path.clone(),
+        );
+
+        ctl.on_command(Command::SetFanTarget(2500.0));
+        assert_eq!(Config::load(&config_path).fan_target_rpm, 2500.0);
+
+        // Unchanged target (e.g. a key held at the clamp bound): no re-save.
+        fs::remove_file(&config_path).unwrap();
+        ctl.on_command(Command::SetFanTarget(2500.0));
+        assert!(
+            !config_path.exists(),
+            "an unchanged target must not spam config saves"
+        );
+
+        // A real change saves again, preserving the other fields.
+        ctl.on_command(Command::SetFanTarget(2000.0));
+        let saved = Config::load(&config_path);
+        assert_eq!(saved.fan_target_rpm, 2000.0);
+        assert_eq!(saved.cpu_floor_w, Config::default().cpu_floor_w);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn config_fast_limit_reaches_ryzenadj() {
+        let runner = FakeRunner::new();
+        let config = Config {
+            fast_limit_mw: 60_000,
+            ..Config::default()
+        };
+        let mut ctl: Controller<&FakeRunner> = Controller::new(
+            RestoreGuard::new(
+                &runner,
+                Some(cpu_actuator(
+                    &runner,
+                    PathBuf::from("/nonexistent/platform_profile"),
+                )),
+                None,
+                None,
+            ),
+            PersistedState::default(),
+            PathBuf::from("/nonexistent/state.json"),
+            config,
+            PathBuf::from("/nonexistent/config.toml"),
+        );
+        ctl.on_command(Command::SetCpuW(20.0));
+        assert_eq!(
+            ryzenadj_calls(&runner),
+            vec![vec![
+                "--stapm-limit=20000".to_string(),
+                "--slow-limit=20000".to_string(),
+                "--fast-limit=60000".to_string(),
+            ]]
+        );
+    }
+
+    #[test]
+    fn config_seeds_status_fan_target() {
+        let runner = FakeRunner::new();
+        let config = Config {
+            fan_target_rpm: 2200.0,
+            ..Config::default()
+        };
+        let ctl: Controller<&FakeRunner> = Controller::new(
+            RestoreGuard::new(&runner, None, None, None),
+            PersistedState::default(),
+            PathBuf::from("/nonexistent/state.json"),
+            config,
+            PathBuf::from("/nonexistent/config.toml"),
+        );
+        assert_eq!(ctl.status().fan_target_rpm, 2200.0);
+    }
 }

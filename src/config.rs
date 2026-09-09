@@ -17,6 +17,10 @@ use crate::control::guards::{GPU_HOT_C_DEFAULT, NVME_HOT_C_DEFAULT};
 /// grid-search and the manual-mode clamps would degenerate.
 const CPU_MAX_W_FLOOR: f64 = 10.0;
 
+/// Default fw-fanctrl `AF_UNIX` command socket (design doc §2.1 / research
+/// doc §"The socket").
+const DEFAULT_FANCTRL_SOCKET: &str = "/run/fw-fanctrl/.fw-fanctrl.commands.sock";
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -58,6 +62,10 @@ pub struct Config {
     /// LED matrix wattage display (`[leds]` table). Optional feature; its own
     /// `enabled` flag defaults on but a missing/failed module just stays dark.
     pub leds: LedConfig,
+    /// `AF_UNIX` socket path for the fw-fanctrl client (design doc §2.1).
+    /// This binary never writes to it — see `fanctrl::client`'s read-only
+    /// `PrintCommand`.
+    pub fanctrl_socket: PathBuf,
 }
 
 impl Default for Config {
@@ -72,6 +80,7 @@ impl Default for Config {
             gpu_hot_c: GPU_HOT_C_DEFAULT,
             nvme_hot_c: NVME_HOT_C_DEFAULT,
             leds: LedConfig::default(),
+            fanctrl_socket: PathBuf::from(DEFAULT_FANCTRL_SOCKET),
         }
     }
 }
@@ -272,9 +281,33 @@ mod tests {
                 cpu_flip_watts: false,
                 gpu_flip_watts: true,
             },
+            fanctrl_socket: PathBuf::from("/run/fw-fanctrl/custom.sock"),
         };
         config.save(&path).unwrap();
         assert_eq!(Config::load(&path), config);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fanctrl_socket_defaults_and_round_trips() {
+        assert_eq!(
+            Config::default().fanctrl_socket,
+            PathBuf::from("/run/fw-fanctrl/.fw-fanctrl.commands.sock")
+        );
+
+        let dir = fixture_dir("fanctrl-socket");
+        let path = dir.join("config.toml");
+        fs::write(&path, "fanctrl_socket = \"/tmp/alt.sock\"\n").unwrap();
+        let config = Config::load(&path);
+        assert_eq!(config.fanctrl_socket, PathBuf::from("/tmp/alt.sock"));
+        // A file that doesn't name the key at all still gets the default —
+        // this is the exact shape a legacy config.toml predating this key
+        // is in.
+        fs::write(&path, "fan_target_rpm = 2500\n").unwrap();
+        assert_eq!(
+            Config::load(&path).fanctrl_socket,
+            Config::default().fanctrl_socket
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

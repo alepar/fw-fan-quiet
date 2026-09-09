@@ -22,7 +22,7 @@ use crate::actuators::WriteVerdict;
 use crate::actuators::cmd::Runner;
 use crate::actuators::guard::RestoreGuard;
 use crate::calib::burner::Burner;
-use crate::calib::runner::{CalibRunner, RunnerEffect};
+use crate::calib::runner::{CalibContext, CalibRunner, RunnerEffect};
 use crate::config::Config;
 use crate::control::allocator::{self, AllocInput, Allocator};
 use crate::control::gpu_pid::GpuPid;
@@ -1145,7 +1145,9 @@ impl<R: Runner> Controller<R> {
     fn on_calib_sample(&mut self, s: &Sample) -> Vec<Effect> {
         let before = self.status.clone();
         let runner_effects = match self.calib.as_mut() {
-            Some(runner) => runner.on_sample(s),
+            // CalibContext::default() until fw-fanctrl-loop-438 wires the
+            // real arbiter/budget-integrator signals through.
+            Some(runner) => runner.on_sample(s, &CalibContext::default()),
             None => {
                 // Defensive: mode says Calibrating but no runner; recover.
                 tracing::warn!("Calibrating mode without a runner; returning to Monitor");
@@ -1182,7 +1184,7 @@ impl<R: Runner> Controller<R> {
         /// final batch is releases + PointRecorded + Fitted + Finished).
         fn rank(cause: &str) -> u8 {
             match cause {
-                "calib:failed" => 5,
+                "calib:skipped" => 5,
                 "calib:fitted" => 4,
                 "calib:finished" => 3,
                 "calib:point_recorded" => 2,
@@ -1198,19 +1200,10 @@ impl<R: Runner> Controller<R> {
         let mut ended = false;
         for effect in effects {
             match effect {
-                RunnerEffect::SetCpuW(w) => match self.guard.cpu.as_ref() {
-                    None => tracing::warn!("calib: no CPU actuator; SetCpuW({w}) skipped"),
-                    // fw-fanctrl-loop-j6s: see the SetCpuW comment in
-                    // on_command -- same non-Verified-as-failure mapping.
-                    Some(cpu) => match cpu.set_sustained_mw((w * 1000.0).round() as u32) {
-                        WriteVerdict::Verified(clamped_w) => {
-                            self.status.cpu_limit_w = Some(clamped_w);
-                        }
-                        verdict => {
-                            tracing::warn!("calib: SetCpuW({w}) not verified: {verdict:?}");
-                        }
-                    },
-                },
+                // fw-fanctrl-loop-438 wires this through split_budget/the
+                // integrator; until then the step test's requested power is
+                // ignored (see the on_calib_sample call site's own note).
+                RunnerEffect::SetBudget(_) => {}
                 RunnerEffect::SetGpuMaxClock(mhz) => match self.guard.gpu.as_mut() {
                     None => tracing::warn!("calib: no GPU actuator; SetGpuMaxClock({mhz}) skipped"),
                     Some(gpu) => match gpu.set_max_clock(mhz) {
@@ -1252,18 +1245,13 @@ impl<R: Runner> Controller<R> {
                     tracing::info!("calib: {phase} point {idx} recorded: {detail}");
                     raise(&mut cause, "calib:point_recorded");
                 }
-                RunnerEffect::Fitted {
-                    a,
-                    b,
-                    e,
-                    c,
-                    max_residual,
-                } => {
-                    tracing::info!(
-                        "calib: fitted a={a:.2} b={b:.2} e={e:.3} c={c:.0} \
-                         (max residual {max_residual:.0} RPM)"
-                    );
+                RunnerEffect::Fitted { gains, fitted_at } => {
+                    tracing::info!("calib: step-test fitted {gains:?} at t_mono={fitted_at}");
                     raise(&mut cause, "calib:fitted");
+                }
+                RunnerEffect::Noted(reason) => {
+                    tracing::info!("calib: step test skipped: {reason}");
+                    raise(&mut cause, "calib:skipped");
                 }
                 RunnerEffect::SaveState(state) => {
                     self.lut = state.lut.clone();
@@ -1281,11 +1269,6 @@ impl<R: Runner> Controller<R> {
                             self.state_path.display()
                         ),
                     }
-                }
-                RunnerEffect::Failed(msg) => {
-                    tracing::warn!("calibration failed: {msg}");
-                    raise(&mut cause, "calib:failed");
-                    ended = true;
                 }
                 RunnerEffect::Finished => {
                     raise(&mut cause, "calib:finished");
@@ -2331,9 +2314,7 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    // --- Task 22: calibration integration ---
-
-    use crate::calib::runner::MATRIX_POINTS;
+    // --- Task 18/22: calibration integration ---
 
     /// Sweep-phase sample: GPU pinned at `clock` drawing clock/30 watts.
     fn sweep_pinned(clock: u32) -> Sample {
@@ -2353,24 +2334,20 @@ mod tests {
         }
     }
 
-    /// The sample a well-behaved system produces on matrix point `idx`
-    /// (measured CPU 2 W under the commanded limit; fans from a synthetic
-    /// affine surface so every point settles).
-    fn matrix_point_sample(idx: usize) -> Sample {
-        let (cpu_t, gpu_t) = MATRIX_POINTS[idx];
-        let cpu = if cpu_t > 5.0 { cpu_t - 2.0 } else { 4.0 };
-        let (gpu, util) = if gpu_t > 0.0 {
-            (gpu_t, 97.0)
-        } else {
-            (10.0, 3.0)
-        };
+    /// A step-test settle-phase sample. The controller's `on_calib_sample`
+    /// call site always hands the runner `CalibContext::default()` this
+    /// task (fw-fanctrl-loop-438 wires the real arbiter/budget signals
+    /// through) — `fanctrl_active` is therefore always false, so any drive
+    /// through the controller settles never and times out at the 5-minute
+    /// cap. That is exactly what these tests exercise: burner/actuator
+    /// bookkeeping around a step test the controller cannot yet complete.
+    fn settle_sample() -> Sample {
         Sample {
-            cpu_pkg_w: cpu,
-            gpu_w: gpu,
+            cpu_pkg_w: 10.0,
+            gpu_w: 5.0,
             gpu_w_valid: true,
-            gpu_util_pct: util,
-            gpu_mhz_valid: true,
-            fan1_rpm: 25.0 * cpu + 15.0 * gpu + 0.1 * cpu * gpu + 800.0,
+            gpu_util_pct: 3.0,
+            fan1_rpm: 3000.0,
             fan_valid: true,
             cpu_temp_c: 60.0,
             cpu_temp_valid: true,
@@ -2385,26 +2362,26 @@ mod tests {
             for _ in 0..60 {
                 ctl.on_sample(&sweep_pinned(clock));
                 let calib = ctl.status().calib.as_ref().expect("calibrating");
-                if calib.phase != "lut sweep" || calib.step > i {
+                if calib.phase != "lut" || calib.step > i {
                     break;
                 }
             }
         }
         let calib = ctl.status().calib.as_ref().expect("calibrating");
-        assert_eq!(calib.phase, "matrix", "sweep must finish: {calib:?}");
+        assert_eq!(calib.phase, "step", "sweep must finish: {calib:?}");
     }
 
-    /// Drive matrix point `idx` to its recording through the controller.
-    fn drive_matrix_point(ctl: &mut Controller<&FakeRunner>, idx: usize) {
+    /// Drive `settle_sample()`s through the controller until the step test
+    /// gives up (5-minute settle cap under the always-default `CalibContext`)
+    /// and calibration finishes.
+    fn drive_step_test_to_skip(ctl: &mut Controller<&FakeRunner>) {
         for _ in 0..300 {
-            ctl.on_sample(&matrix_point_sample(idx));
-            match ctl.status().calib.as_ref() {
-                None => return, // calibration finished after the last point
-                Some(calib) if calib.step > idx => return,
-                Some(_) => {}
+            ctl.on_sample(&settle_sample());
+            if ctl.status().calib.is_none() {
+                return;
             }
         }
-        panic!("matrix point {idx} never recorded through the controller");
+        panic!("step test never concluded through the controller");
     }
 
     #[test]
@@ -2426,7 +2403,7 @@ mod tests {
         assert_eq!(status_changes(&effects), 1);
         assert_eq!(ctl.status().mode, Mode::Calibrating);
         let calib = ctl.status().calib.as_ref().expect("wizard progress set");
-        assert_eq!(calib.phase, "lut sweep");
+        assert_eq!(calib.phase, "lut");
         assert_eq!(calib.total, 10);
         // The sweep's first clock lock was attempted (no GPU actuator in
         // tests: warned no-op, gpu_max_mhz stays None).
@@ -2458,61 +2435,53 @@ mod tests {
     }
 
     #[test]
-    fn calibration_effects_drive_actuators_and_burner() {
+    fn step_test_starts_the_burner_on_entry_and_stops_it_on_skip() {
         let runner = FakeRunner::new();
         let (dir, path) = profile_fixture("calib-actuators");
         let mut ctl = controller(&runner, path);
         ctl.on_command(Command::StartCalibration);
         drive_sweep(&mut ctl);
-        // Point 0 (idle/idle): no burner, no ryzenadj set.
-        assert!(ctl.burner.is_none());
-        assert!(ryzenadj_calls(&runner).is_empty());
-        drive_matrix_point(&mut ctl, 0);
-
-        // Point 1 (15 W): ryzenadj commanded with the matrix wattage and the
-        // burner is running.
-        assert_eq!(ryzenadj_calls(&runner), vec![expected_args(15_000)]);
-        assert!(ctl.burner.is_some(), "burner must run for a loaded point");
-        assert_eq!(ctl.status().cpu_limit_w, Some(15.0));
-        drive_matrix_point(&mut ctl, 1);
-
-        // Point 2 (30 W): re-commanded.
-        assert_eq!(
-            ryzenadj_calls(&runner),
-            vec![expected_args(15_000), expected_args(30_000)]
+        // The burner starts unconditionally on step-test entry, before any
+        // gate is ever checked (the ordering fact design §3.3 turns on).
+        assert!(
+            ctl.burner.is_some(),
+            "burner must start as soon as the sweep hands off"
         );
+        // SetBudget is ignored this task (fw-fanctrl-loop-438 wires it): no
+        // CPU limit is ever commanded during the step test here.
+        assert!(ryzenadj_calls(&runner).is_empty());
+
+        drive_step_test_to_skip(&mut ctl);
+        assert!(ctl.burner.is_none(), "burner must stop once the step skips");
+        assert_eq!(ctl.status().mode, Mode::Monitor);
 
         fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn repeated_needs_load_nags_are_noted_for_telemetry() {
+    fn repeated_sweep_needs_load_nags_are_noted_for_telemetry() {
         let runner = FakeRunner::new();
         let (dir, path) = profile_fixture("calib-nag");
         let mut ctl = controller(&runner, path);
         ctl.on_command(Command::StartCalibration);
-        drive_sweep(&mut ctl);
-        for idx in 0..4 {
-            drive_matrix_point(&mut ctl, idx);
-        }
-        // Point 4 wants 35 GPU W; the GPU sits idle. First nag flips
-        // needs_load: a StatusChanged Decision.
-        let stalled = Sample {
-            cpu_pkg_w: 4.0,
-            gpu_w: 10.0,
+        // GPU idle throughout: the sweep's first clock never pins. First
+        // nag flips needs_load: a StatusChanged Decision.
+        let idle = Sample {
+            gpu_util_pct: 5.0,
+            gpu_sm_mhz: 300.0,
+            gpu_w: 15.0,
             gpu_w_valid: true,
-            gpu_util_pct: 3.0,
             gpu_mhz_valid: true,
-            fan1_rpm: 1000.0,
+            fan1_rpm: 1500.0,
             fan_valid: true,
             cpu_temp_c: 60.0,
             cpu_temp_valid: true,
             ..Sample::default()
         };
         for _ in 0..9 {
-            assert!(ctl.on_sample(&stalled).is_empty());
+            assert!(ctl.on_sample(&idle).is_empty());
         }
-        let effects = ctl.on_sample(&stalled);
+        let effects = ctl.on_sample(&idle);
         assert_eq!(
             effects,
             vec![Effect::StatusChanged {
@@ -2523,9 +2492,9 @@ mod tests {
         // still surface as telemetry-only notes, so offline analysis sees
         // the full nag history.
         for _ in 0..9 {
-            assert!(ctl.on_sample(&stalled).is_empty());
+            assert!(ctl.on_sample(&idle).is_empty());
         }
-        let effects = ctl.on_sample(&stalled);
+        let effects = ctl.on_sample(&idle);
         assert_eq!(
             effects,
             vec![Effect::Noted {
@@ -2543,9 +2512,10 @@ mod tests {
         let mut ctl = controller(&runner, path.clone());
         ctl.on_command(Command::StartCalibration);
         drive_sweep(&mut ctl);
-        drive_matrix_point(&mut ctl, 0);
-        drive_matrix_point(&mut ctl, 1); // burner + 30 W limit now active
-        assert!(ctl.burner.is_some());
+        assert!(ctl.burner.is_some(), "burner running during the step test");
+        for _ in 0..10 {
+            ctl.on_sample(&settle_sample());
+        }
 
         let effects = ctl.on_command(Command::AbortCalibration);
         assert_eq!(status_changes(&effects), 1);
@@ -2572,8 +2542,9 @@ mod tests {
         let mut ctl = controller(&runner, path.clone());
         ctl.on_command(Command::StartCalibration);
         drive_sweep(&mut ctl);
-        drive_matrix_point(&mut ctl, 0);
-        drive_matrix_point(&mut ctl, 1); // burner + limit active
+        for _ in 0..10 {
+            ctl.on_sample(&settle_sample()); // burner active mid-settle
+        }
 
         let effects = ctl.on_command(Command::Quit);
         assert_eq!(effects, vec![Effect::Quit]);
@@ -2595,7 +2566,7 @@ mod tests {
     }
 
     #[test]
-    fn full_calibration_persists_state_and_keeps_lut() {
+    fn full_calibration_persists_the_lut_with_no_gains_when_the_step_test_skips() {
         let runner = FakeRunner::new();
         let (dir, profile) = profile_fixture("calib-full");
         let state_path = dir.join("state.json");
@@ -2616,9 +2587,7 @@ mod tests {
 
         ctl.on_command(Command::StartCalibration);
         drive_sweep(&mut ctl);
-        for idx in 0..MATRIX_POINTS.len() {
-            drive_matrix_point(&mut ctl, idx);
-        }
+        drive_step_test_to_skip(&mut ctl);
 
         // Finished: back to Monitor, wizard gone, everything released.
         assert_eq!(ctl.status().mode, Mode::Monitor);
@@ -2629,8 +2598,11 @@ mod tests {
         // The state file exists, parses and carries the LUT (PersistedState
         // no longer carries a model field, fw-fanctrl-loop-dsh); the
         // controller kept it, so Auto mode can start right away.
+        // `loop_gains` stays None: with `CalibContext::default()` the step
+        // test's settle gate never clears, so it skips and keeps defaults.
         let saved = PersistedState::load(&state_path);
         assert_eq!(saved.lut.expect("lut persisted").len(), 10);
+        assert_eq!(saved.loop_gains, None);
         saved
             .calibrated_at
             .expect("calibrated_at set")
@@ -3029,9 +3001,10 @@ mod tests {
         let mut ctl = controller(&runner, path.clone());
         ctl.on_command(Command::StartCalibration);
         drive_sweep(&mut ctl);
-        drive_matrix_point(&mut ctl, 0);
-        drive_matrix_point(&mut ctl, 1); // burner + 30 W limit now active
-        assert!(ctl.burner.is_some(), "premise: loaded matrix point");
+        for _ in 0..10 {
+            ctl.on_sample(&settle_sample()); // burner active mid-settle
+        }
+        assert!(ctl.burner.is_some(), "premise: burner running mid-settle");
 
         ctl.on_sample(&overheat_at(1000.0));
         ctl.on_sample(&overheat_at(1001.0));

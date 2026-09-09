@@ -10,7 +10,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::types::Sample;
 
 /// Bumped whenever the line format changes; stamped into the run_start line.
-const SCHEMA_VERSION: u32 = 1;
+/// 2 (Task 15, design §3.5): the `sample` line gains `ec_max`/`ec_argmax`/
+/// `ec_ma`/`nvme_c`/`fanctrl_speed`/`fanctrl_active`/`strategy`; the
+/// `decision` line drops `trim_rpm`/`gain`/`model_*` (the adaptation tier
+/// is gone, design §4) and gains `t_star`/`budget_w`/`freeze`.
+const SCHEMA_VERSION: u32 = 2;
 /// Flush at least once every this many records...
 const FLUSH_EVERY_RECORDS: u32 = 10;
 /// ...and no less often than this, so a quiet log still hits disk.
@@ -27,11 +31,38 @@ const MAX_NAME_ATTEMPTS: u32 = 10;
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Record<'a> {
-    Sample(&'a Sample),
-    /// One status-flag transition (thermal_emergency, sensor_lost,
-    /// limit_not_sticking, resumed, not_calibrated, target_unreachable,
-    /// model_distrust): emitted by the controller shell alongside the
-    /// Decision record, so offline analysis gets a greppable per-flag
+    /// One 1 Hz sensor snapshot. `sample`'s own fields flatten straight
+    /// onto this line (its `ec`/`fanctrl`/`fanctrl_freshness` fields stay
+    /// `#[serde(skip)]`ped on `Sample` itself — `Instant` isn't
+    /// serializable and the raw structs aren't the wire shape design §3.5
+    /// wants); the seven fields below re-surface exactly the columns §3.5
+    /// asks for, flattened out of `sample.ec`/`sample.fanctrl`/
+    /// `sample.nvme_temp_c`. Build with [`Record::sample`] rather than the
+    /// struct literal directly.
+    Sample {
+        #[serde(flatten)]
+        sample: &'a Sample,
+        /// `sample.ec`'s replica max reading (design §2.2), °C.
+        ec_max: Option<i32>,
+        /// `sample.ec`'s argmax sensor label.
+        ec_argmax: Option<&'a str>,
+        /// The controller's live EC boxcar moving average (design §2.6).
+        /// Stateful and owned by the controller, not `Sample` — the
+        /// caller supplies it (see [`Record::sample`]).
+        ec_ma: Option<f64>,
+        /// `sample.nvme_temp_c`, under the design §3.5 column name.
+        nvme_c: Option<f64>,
+        /// `sample.fanctrl`'s reported fan duty, percent.
+        fanctrl_speed: Option<u8>,
+        /// `sample.fanctrl`'s `active` flag (design §2.5: `false` means
+        /// the EC's own curve, not fw-fanctrl, is driving the fans).
+        fanctrl_active: Option<bool>,
+        /// `sample.fanctrl`'s resolved strategy name.
+        strategy: Option<&'a str>,
+    },
+    /// One status-flag transition (any [`crate::control::controller::StatusFlag`],
+    /// by its `as_str()` name): emitted by the controller shell alongside
+    /// the Decision record, so offline analysis gets a greppable per-flag
     /// stream (Decision lines carry the full flag list, not the transition).
     Flag {
         t_mono: f64,
@@ -63,31 +94,44 @@ pub enum Record<'a> {
         alloc_gpu_w: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pi_target_w: Option<f64>,
-        /// Current Kalman bias (RPM; the field keeps the historical "trim"
-        /// name so offline tooling reads old and new sessions alike);
-        /// carried on every Auto-mode decision (cause "auto:kf" marks the
-        /// updates), None otherwise.
+        /// TempLoop's target replica temperature, °C (design §2.5);
+        /// mirrors `ControlStatus.t_star_c`. Some only while the arbiter
+        /// has a live target.
         #[serde(skip_serializing_if = "Option::is_none")]
-        trim_rpm: Option<f64>,
-        /// Current Kalman gain (multiplier on the model's GPU-slope term),
-        /// carried on every Auto-mode decision alongside `trim_rpm` so the
-        /// two learned states are reviewable as one trajectory offline.
-        /// None (skipped) outside Auto.
+        t_star: Option<f64>,
+        /// The single power budget the integrator is holding, watts
+        /// (design §2.4); mirrors `ControlStatus.budget_w`. Unlike the
+        /// `Option` fields above this is always carried (0.0 before the
+        /// integrator is wired in / outside Auto), matching
+        /// `fan_target_rpm`'s always-present treatment.
+        budget_w: f64,
+        /// Which [`crate::control::budget::Freeze`] reason (by its debug
+        /// name) is holding the integrator's `u` this tick, `None` when it
+        /// is running unfrozen.
         #[serde(skip_serializing_if = "Option::is_none")]
-        gain: Option<f64>,
-        /// Thermal-model parameters, carried ONLY on the periodic Auto-mode
-        /// "auto:model_snapshot" decisions (every 60 s): per-line params
-        /// would be too heavy, one snapshot a minute keeps the online-RLS
-        /// trajectory reviewable offline. None (skipped) everywhere else.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        model_a: Option<f64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        model_b: Option<f64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        model_e: Option<f64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        model_c: Option<f64>,
+        freeze: Option<String>,
     },
+}
+
+impl<'a> Record<'a> {
+    /// Builds a `sample` telemetry line from a sensor snapshot plus the
+    /// controller's live EC boxcar average (design §3.5's `ec_ma` column).
+    /// `ec_ma` is threaded in by the caller rather than read off `sample`
+    /// because `EcAverage` is stateful and owned by the controller (design
+    /// §2.6, `sensors::ec` module docs) — a single `Sample` never carries
+    /// it. Every other new column derives straight from `sample` itself.
+    pub fn sample(sample: &'a Sample, ec_ma: Option<f64>) -> Self {
+        Record::Sample {
+            sample,
+            ec_max: sample.ec.as_ref().map(|e| e.max_c),
+            ec_argmax: sample.ec.as_ref().map(|e| e.argmax.as_str()),
+            ec_ma,
+            nvme_c: sample.nvme_temp_c,
+            fanctrl_speed: sample.fanctrl.as_ref().map(|v| v.speed_pct),
+            fanctrl_active: sample.fanctrl.as_ref().map(|v| v.active),
+            strategy: sample.fanctrl.as_ref().map(|v| v.strategy.as_str()),
+        }
+    }
 }
 
 /// First line of every file: anchors the monotonic axis to wall clock and
@@ -301,8 +345,8 @@ mod tests {
     fn roundtrip_records() {
         let dir = fixture_dir("roundtrip");
         let mut t = Telemetry::open(&dir).unwrap();
-        t.log(&Record::Sample(&sample_at(1.0)));
-        t.log(&Record::Sample(&sample_at(2.0)));
+        t.log(&Record::sample(&sample_at(1.0), None));
+        t.log(&Record::sample(&sample_at(2.0), None));
         t.log(&Record::Flag {
             t_mono: 3.0,
             flag: "resumed".into(),
@@ -321,12 +365,9 @@ mod tests {
             alloc_cpu_w: None,
             alloc_gpu_w: None,
             pi_target_w: None,
-            trim_rpm: None,
-            gain: None,
-            model_a: None,
-            model_b: None,
-            model_e: None,
-            model_c: None,
+            t_star: None,
+            budget_w: 0.0,
+            freeze: None,
         });
         t.flush();
 
@@ -345,7 +386,7 @@ mod tests {
             start["t_wall"].as_f64().unwrap() > 1.5e9,
             "t_wall must be real unix seconds"
         );
-        assert_eq!(start["schema_version"], 1);
+        assert_eq!(start["schema_version"], 2);
 
         let first: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(first["kind"], "sample");
@@ -380,22 +421,152 @@ mod tests {
             "alloc_cpu_w",
             "alloc_gpu_w",
             "pi_target_w",
-            "trim_rpm",
-            "gain",
-            "model_a",
-            "model_b",
-            "model_e",
-            "model_c",
+            "t_star",
+            "freeze",
         ] {
             assert!(
                 decision.get(key).is_none(),
                 "{key} must be skipped when None: {decision}"
             );
         }
+        // budget_w is NOT an Option field: it always serializes.
+        assert_eq!(decision["budget_w"], 0.0);
         assert!(
             decision["t_wall"].as_f64().unwrap() > 1.5e9,
             "decision lines carry a top-level wall-clock stamp"
         );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Task 15 (design §3.5): the `sample` line's seven new columns, each
+    /// derived from a populated `Sample` (`ec`, `nvme_temp_c`, `fanctrl`)
+    /// plus the caller-supplied `ec_ma`. A value the record could actually
+    /// fail to carry (a real EC reading, a real `FanctrlView`) — not a
+    /// `Sample::default()`, which would let every field trivially pass at
+    /// `null`.
+    #[test]
+    fn sample_line_carries_the_new_sensor_columns() {
+        use crate::fanctrl::client::FanctrlView;
+        use crate::test_support::fixtures;
+        use std::time::Instant;
+
+        let dir = fixture_dir("sample-new-columns");
+        let ec = crate::sensors::ec::EcReading::read(&fixtures::path("hwmon/cros_ec_load"))
+            .expect("fixture must yield a reading");
+        let expected_max = ec.max_c;
+        let expected_argmax = ec.argmax.as_str().to_string();
+        let sample = Sample {
+            ec: Some(ec),
+            nvme_temp_c: Some(63.5),
+            fanctrl: Some(FanctrlView {
+                strategy: "quiet16".into(),
+                active: true,
+                speed_pct: 42,
+                temperature: 75.0,
+                ma_temperature: 74.2,
+                ma_interval: 60,
+                curve: vec![(0.0, 15), (95.0, 100)],
+                observed_at: Instant::now(),
+                all_observed_at: Some(Instant::now()),
+            }),
+            ..Sample::default()
+        };
+
+        let mut t = Telemetry::open(&dir).unwrap();
+        t.log(&Record::sample(&sample, Some(70.8)));
+        t.flush();
+
+        let contents = fs::read_to_string(t.path()).unwrap();
+        let line: serde_json::Value = serde_json::from_str(contents.lines().nth(1).unwrap())
+            .expect("line 1 is the sample record");
+        assert_eq!(line["ec_max"], expected_max);
+        assert_eq!(line["ec_argmax"], expected_argmax);
+        assert_eq!(line["ec_ma"], 70.8);
+        assert_eq!(line["nvme_c"], 63.5);
+        assert_eq!(line["fanctrl_speed"], 42);
+        assert_eq!(line["fanctrl_active"], true);
+        assert_eq!(line["strategy"], "quiet16");
+        // The raw sub-structs stay off the wire; only the flattened
+        // columns above surface them.
+        assert!(line.get("ec").is_none());
+        assert!(line.get("fanctrl").is_none());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A `Sample::default()` has no EC/fanctrl/NVMe reading at all: every
+    /// new column must come back `null`, not panic or fabricate a value.
+    #[test]
+    fn sample_line_new_columns_are_null_without_a_reading() {
+        let dir = fixture_dir("sample-new-columns-absent");
+        let mut t = Telemetry::open(&dir).unwrap();
+        t.log(&Record::sample(&sample_at(1.0), None));
+        t.flush();
+
+        let contents = fs::read_to_string(t.path()).unwrap();
+        let line: serde_json::Value = serde_json::from_str(contents.lines().nth(1).unwrap())
+            .expect("line 1 is the sample record");
+        for key in [
+            "ec_max",
+            "ec_argmax",
+            "ec_ma",
+            "nvme_c",
+            "fanctrl_speed",
+            "fanctrl_active",
+            "strategy",
+        ] {
+            assert!(
+                line[key].is_null(),
+                "{key} must be null without a reading: {line}"
+            );
+        }
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Task 15 acceptance criterion, verbatim: the decision line carries
+    /// every new field and contains NONE of the removed adaptation-tier
+    /// ones — checked by substring on the raw JSON text, not only by
+    /// struct shape (a struct that no longer HAS a `trim_rpm` field always
+    /// "lacks" it trivially; this catches a field merely renamed back in,
+    /// or a stray value smuggled into `cause`/a flag string).
+    #[test]
+    fn decision_line_drops_adaptation_tier_fields_and_carries_the_new_ones() {
+        let dir = fixture_dir("decision-new-fields");
+        let mut t = Telemetry::open(&dir).unwrap();
+        t.log(&Record::Decision {
+            t_mono: 10.0,
+            mode: "auto".into(),
+            cpu_limit_w: Some(30.0),
+            gpu_max_mhz: Some(1950),
+            fan_target_rpm: 3000.0,
+            cause: "auto:allocate".into(),
+            flags: vec![],
+            demand_cpu: None,
+            demand_gpu: None,
+            alloc_cpu_w: None,
+            alloc_gpu_w: None,
+            pi_target_w: None,
+            t_star: Some(71.5),
+            budget_w: 68.0,
+            freeze: Some("demand_limited".into()),
+        });
+        t.flush();
+
+        let contents = fs::read_to_string(t.path()).unwrap();
+        let raw = contents.lines().nth(1).unwrap();
+        assert!(!raw.contains("trim_rpm"), "raw line: {raw}");
+        assert!(!raw.contains("\"gain\""), "raw line: {raw}");
+        assert!(!raw.contains("model_a"), "raw line: {raw}");
+        assert!(!raw.contains("model_b"), "raw line: {raw}");
+        assert!(!raw.contains("model_e"), "raw line: {raw}");
+        assert!(!raw.contains("model_c"), "raw line: {raw}");
+
+        let line: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(line["t_star"], 71.5);
+        assert_eq!(line["budget_w"], 68.0);
+        assert_eq!(line["freeze"], "demand_limited");
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -462,12 +633,12 @@ mod tests {
     fn log_survives_unlinked_file() {
         let dir = fixture_dir("file-gone");
         let mut t = Telemetry::open(&dir).unwrap();
-        t.log(&Record::Sample(&sample_at(0.0)));
+        t.log(&Record::sample(&sample_at(0.0), None));
         fs::remove_dir_all(&dir).unwrap();
 
         // 20 records force flushes past the deleted file; must not panic.
         for i in 1..=20 {
-            t.log(&Record::Sample(&sample_at(f64::from(i))));
+            t.log(&Record::sample(&sample_at(f64::from(i)), None));
         }
         t.flush();
     }
@@ -483,7 +654,7 @@ mod tests {
 
         let mut t = Telemetry::from_parts(file, path);
         for i in 0..20 {
-            t.log(&Record::Sample(&sample_at(f64::from(i))));
+            t.log(&Record::sample(&sample_at(f64::from(i)), None));
         }
         assert!(
             t.warned,
@@ -499,7 +670,7 @@ mod tests {
         let dir = fixture_dir("flush-policy");
         let mut t = Telemetry::open(&dir).unwrap();
         for i in 0..10 {
-            t.log(&Record::Sample(&sample_at(f64::from(i))));
+            t.log(&Record::sample(&sample_at(f64::from(i)), None));
         }
         // No explicit flush: the 10-record policy must have flushed already
         // (run_start header + 10 records).

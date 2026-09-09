@@ -357,7 +357,11 @@ fn run(
                 'events: while let Some(ev) = next {
                     if let Event::Sample(s) = &ev {
                         if let Some(t) = telemetry::lock(telemetry).as_mut() {
-                            t.log(&Record::Sample(s));
+                            // `ec_ma` (design §3.5) is the controller's own
+                            // live EC boxcar average, not part of `Sample`
+                            // (Task 15) -- the model's echoed status is the
+                            // freshest copy this loop has of it.
+                            t.log(&Record::sample(s, model.status.ec_ma_c));
                         }
                     }
                     for c in model.update(ev) {

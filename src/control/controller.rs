@@ -1681,15 +1681,9 @@ fn apply_effects<R: Runner>(
         alloc_gpu_w: alloc.map(|a| a.3),
         // The allocator's gpu_w IS the PI target (set_target_w).
         pi_target_w: alloc.map(|a| a.3),
-        // The adaptation tier (Kalman trim/gain, model snapshot) is gone —
-        // these fields are no longer ever populated, and stay None until a
-        // later task retires them from `Record::Decision` itself.
-        trim_rpm: None,
-        gain: None,
-        model_a: None,
-        model_b: None,
-        model_e: None,
-        model_c: None,
+        t_star: status.t_star_c,
+        budget_w: status.budget_w,
+        freeze: None,
     };
     if cause.is_some() || !flagged.is_empty() {
         if let Some(t) = telemetry::lock(telemetry).as_mut() {

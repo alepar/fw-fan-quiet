@@ -163,6 +163,45 @@ applied-power back-calculation stops the integrator winding meanwhile. The plant
 EC-autofan mode carrying the measured staircase (fwloop.16) and fwloop.17 gains an authority run
 covering both the flat and the steep segment.
 
+## super-roast design iteration 2 (2026-09-08)
+
+Report: `2026-09-08-fw-fanctrl-loop-roast-design-2.md`. Verdict **Blocking (12 confirmed)**, no
+qualifier: 9 scouts (the `regression` lens added), 0 dead, 39 raw → 18 deduped, 17 panels + 1
+spot check, judge completion 100 %, 0 beyond either cap, 0 escalations.
+`delta vs prior: 7 new confirmed (2 Blocking) · 0 carried (0 Blocking) · 18 resolved · 5
+regressed (0 Blocking)`.
+
+**The loop's thrash exit fired** — Blocking went 1 → 2, which is not a shrink — so the run
+paused for the user, who chose to apply everything and spend the third (capped) round.
+
+**Both new Blocking findings were second-order damage from iteration 1's own R1 fix**, and both
+are now fixed by replacing that mechanism rather than patching it:
+- The back-calculation toward measured draw was **ungated**, so it stopped being anti-windup and
+  became a tracker: equilibrium `u = draw + Kc·e`, meaning every lull dragged the cap onto the
+  lull's consumption and starved the next onset for minutes while the integrator recharged at a
+  few watts per minute.
+- It compared the **combined sum**, so any structurally undrawn component (the GPU floor share
+  with the dGPU unpowered) was a permanent gap the loop tried to close by lowering `u` until the
+  CPU sat pinned at its floor — in a quadrant neither §2.7 rule names.
+
+Resolution: **there is no back-calculation toward the draw at all.** §2.4 now specifies a
+per-axis `Freeze::DemandLimited` — hold `u` when *every* axis draws more than `DEMAND_MARGIN_W`
+below its own cap, keep integrating when any axis is at its cap. Clamping back-calculation
+against the bounds is unchanged. That fixes the original wind-up without the collapse, and makes
+the undrawn-share case inert.
+
+Other 10 applied: R3 reconciliation scored at 1 Hz in the controller (the arbiter owns the
+counters' meaning, not their sampling) plus an `unreconciled` reason; R4 `Decision.slope` is an
+`Option` with a `0.25×` fallback when no curve is resolved; R5 Mode B's numeric defaults derived
+and stated (`kc_w_per_rpm = 0.0028`, `ti_rpm_s = 35`); R6 the `θ_eff` substitution restricted to
+the raw-domain defaults so the calibration fit stops counting the boxcar twice; R7 the two stale
+`effective_target`/NVMe-boost references deleted; R8 `at_upper_bound_for` added to fwloop.10's
+`ArbiterInput` with a `high`-reason acceptance case; R9 §2.9 no longer re-seeds the integrator on
+a `Verified` (it calls `resync_error` and unfreezes, leaving `u` alone); R10 socket `Absent` and
+`active: false` recognised as one plant regime (`ExecStopPost --autofanctrl`) with a graded run;
+R11 the NVMe read moved off the 1 Hz sampler thread to the 30 s poller; R12 a rejected curve gets
+its own warning-severity `CURVE INVALID` flag and a `curve_valid` arbiter input.
+
 **Bonus validation from the same probe:** under `quiet16` at EC max 75 °C the curve gives duty 31
 and the fans ran 2649 RPM against the seeded table's interpolated 2638 — under 0.5 % error, so
 the shipped duty→RPM seed is sound and refinement really is a refinement rather than a

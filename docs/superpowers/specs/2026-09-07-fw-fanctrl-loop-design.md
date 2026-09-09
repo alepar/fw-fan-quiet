@@ -1,7 +1,9 @@
 # Closing the loop on fw-fanctrl (no learned thermal model)
 
 **Date:** 2026-09-07
-**Status:** draft (root spec of a `super-design` run, no-beads mode)
+**Status:** designed — 2 coverage rounds + 3 super-roast iterations applied
+**Tracker:** beads epic `fw-fanctrl-loop-6ma` (24 tasks, imported from the table below;
+the table stays the human-readable source of truth for task content)
 **Input:** `docs/research/05-fw-fanctrl-loop.md` (verified research notes), prior designs in
 `docs/plans/` (2026-07-03 base design, 2026-07-09 Kalman adaptation, 2026-07-10 raise gate,
 2026-07-14 drain veto).

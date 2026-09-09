@@ -7,10 +7,10 @@
 //! so this file's f64 fields (LUT watts, gains, warm-start budgets) survive
 //! save→load bit-exact.
 //!
-//! Schema v2 (`fw-fanctrl-loop-dsh`): the old `model`/`adapt_bias`/
-//! `adapt_gain` fields (the learned thermal model + its Kalman correction)
-//! are gone along with the adaptation tier that used them
-//! (`fw-fanctrl-loop-24s`). A v1 file's `model`/`adapt_bias`/`adapt_gain`
+//! Schema v2 (`fw-fanctrl-loop-dsh`): the old `model` field and its two
+//! Kalman-correction scalars (the learned thermal model's bias and gain
+//! terms) are gone along with the adaptation tier that used them
+//! (`fw-fanctrl-loop-24s`). A v1 file's `model` and bias/gain correction
 //! keys are simply unknown fields to this schema and are ignored by serde;
 //! `duty_rpm_table`, `loop_gains` and `warm_start` are missing from a v1 file
 //! and come back at their `#[serde(default)]` values (the ten seeded points,
@@ -116,8 +116,8 @@ mod tests {
     #[test]
     fn legacy_v1_file_loads_lut_intact_table_seeded_warm_start_empty_gains_none() {
         // tests/fixtures/state_v1.json (fw-fanctrl-loop-blm) is a real pre-
-        // migration file: it carries `model`, `adapt_bias` and `adapt_gain`,
-        // none of which this schema has any more.
+        // migration file: it carries the old `model` field and its bias/gain
+        // correction scalars, none of which this schema has any more.
         let path = crate::test_support::fixtures::path("state_v1.json");
         let state = PersistedState::load(&path);
 

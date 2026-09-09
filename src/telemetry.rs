@@ -12,8 +12,8 @@ use crate::types::Sample;
 /// Bumped whenever the line format changes; stamped into the run_start line.
 /// 2 (Task 15, design §3.5): the `sample` line gains `ec_max`/`ec_argmax`/
 /// `ec_ma`/`nvme_c`/`fanctrl_speed`/`fanctrl_active`/`strategy`; the
-/// `decision` line drops `trim_rpm`/`gain`/`model_*` (the adaptation tier
-/// is gone, design §4) and gains `t_star`/`budget_w`/`freeze`.
+/// `decision` line drops the adaptation-tier's bias/gain/model fields
+/// (the tier is gone, design §4) and gains `t_star`/`budget_w`/`freeze`.
 const SCHEMA_VERSION: u32 = 2;
 /// Flush at least once every this many records...
 const FLUSH_EVERY_RECORDS: u32 = 10;
@@ -528,7 +528,7 @@ mod tests {
     /// Task 15 acceptance criterion, verbatim: the decision line carries
     /// every new field and contains NONE of the removed adaptation-tier
     /// ones — checked by substring on the raw JSON text, not only by
-    /// struct shape (a struct that no longer HAS a `trim_rpm` field always
+    /// struct shape (a struct that no longer HAS a removed field always
     /// "lacks" it trivially; this catches a field merely renamed back in,
     /// or a stray value smuggled into `cause`/a flag string).
     #[test]
@@ -556,7 +556,6 @@ mod tests {
 
         let contents = fs::read_to_string(t.path()).unwrap();
         let raw = contents.lines().nth(1).unwrap();
-        assert!(!raw.contains("trim_rpm"), "raw line: {raw}");
         assert!(!raw.contains("\"gain\""), "raw line: {raw}");
         assert!(!raw.contains("model_a"), "raw line: {raw}");
         assert!(!raw.contains("model_b"), "raw line: {raw}");

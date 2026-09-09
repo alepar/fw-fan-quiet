@@ -94,6 +94,42 @@ controller's adaptation tier no longer exist.
   `smu_module.rs` already enforces for writes, so read-back shares it.
 - `nvidia-smi` reports `power.limit` N/A and `enforced.power.limit` 100 W; we control locked
   clocks, not power, so the GPU read-back is the measured SM clock under load.
+- **Measured 2026-09-09, `DEMAND_MARGIN_W` per axis (§2.4's anti-windup spike, `fwloop.24`,
+  bead `fw-fanctrl-loop-9it`).** Method: command a sustained cap, drive a load, sample
+  commanded-vs-drawn power at the 5 s allocator cadence for 7 ticks after a settle window, at
+  several cap levels and load compositions.
+  - **CPU: unloaded `ryzen_smu` and left it unloaded for the duration** (the precondition above
+    — `ryzenadj --info` needs it unloaded; unloading and immediately reloading, as a prior
+    attempt did, restores the broken precondition before `ryzenadj` runs). With `ryzen_smu`
+    unloaded, `sudo ryzenadj --stapm-limit=<mw> --slow-limit=<mw> --fast-limit=53000` plus
+    `stress-ng --cpu 24` (24-thread AVX matrixprod, full saturation) at 20 W and 35 W caps:
+    `PPT VALUE SLOW` (drawn) tracked `PPT LIMIT SLOW` (commanded) within 0.005–0.08 W across all
+    14 samples, RAPL `energy_uj` (root, `/sys/class/powercap/intel-rapl:0`) cross-validated to
+    within 0.01 W of the same commanded value over the sampling window. The same ≤ 0.08 W noise
+    floor held under lighter, genuinely cap-bound loads too (2-thread `stress-ng`, a single
+    15%-duty-cycled thread, and ordinary desktop background load, all at the 35 W cap — this
+    machine's live desktop background draw turned out to already sit above 35 W, so those
+    "light" loads were still cap-bound, not demand-limited, on this run). A genuine
+    demand-limited gap was measured directly instead: at a 54 W cap (near-unconstrained) with
+    only ordinary desktop background load, drawn power settled to 36.8 W (RAPL) — a 17.2 W gap.
+    **`DEMAND_MARGIN_W_CPU = 2.0 W`** — ~25x the measured noise floor, ~8x below the smallest
+    measured genuine gap. Module state was restored (`modprobe ryzen_smu`) and stock CPU limits
+    reasserted (platform-profile toggle) after the measurement; no stray load processes were
+    left running.
+  - **GPU:** `nvidia-smi -lgc 210,1500` (applied clock read back 1492 MHz) with a `glxgears`
+    fill/geometry-bound proxy load at 95–100% reported utilization: `power.draw` settled 13.50 →
+    13.39 W over 7 ticks, a 0.11 W spread. **Limitation, stated because this number is used as a
+    margin:** `glxgears` is fill/geometry-bound, not compute-bound (unlocked, it draws only
+    24.7 W of the card's 100 W limit at 97–100% reported utilization), so this spread likely
+    understates the noise floor a real compute-bound game workload would show; a heavier
+    generator (`glmark2`/`vkmark`/CUDA) was not available on this machine (same
+    "Limitation, stated because the numbers are used as a plant" pattern as the EC autofan curve
+    fact above). A genuine demand gap was measured directly at the same lock: idle (no
+    artificial load) settled to 7.27 W vs the proxy-loaded 13.4 W above — a 6.1 W gap.
+    **`DEMAND_MARGIN_W_GPU = 3.0 W`** — ~27x the measured noise floor (proportionally larger
+    than the CPU margin's ratio, since the GPU noise-floor number itself is the weaker
+    measurement) and about half the smallest measured genuine gap. The clock lock was released
+    (`nvidia-smi -rgc`) after the measurement.
 
 ## 1. Architecture
 
@@ -315,16 +351,18 @@ controllers on one measurement benign. Never add a second integrator on the same
   at `cpu_max_w + gpu_max_w` so the next load onset runs uncapped through the whole dead time.
   The old design's conservative start and model contour covered this; they are deleted.
 
-  **This spec does not state the replacement rule, on purpose.** Three prose revisions of it were
-  each confirmed Blocking by an independent adversarial panel, and each failure was introduced by
-  the previous fix — a back-calculation toward the draw that turned out to be a tracker, then a
-  freeze that turned out to latch. That is a signal the rule cannot be settled by writing more
-  prose about it. `fwloop.24` builds a throwaway harness (the `Budget`, a first-order thermal
-  plant, a demand model) and **measures** the candidates against every scenario the three review
-  rounds named, then writes the winner and its constants back into this section before the
-  controller is wired.
+  **This spec did not originally state the replacement rule, on purpose.** Three prose revisions
+  of it were each confirmed Blocking by an independent adversarial panel, and each failure was
+  introduced by the previous fix — a back-calculation toward the draw that turned out to be a
+  tracker, then a freeze that turned out to latch. That was a signal the rule could not be
+  settled by writing more prose about it. `fwloop.24` (bead `fw-fanctrl-loop-9it`) built a
+  throwaway harness (the real `Budget`, a first-order thermal plant driven by **actual drawn
+  watts** rather than commanded `u`, a demand model, and the real `allocator::split_budget`) and
+  **measured** four candidate rules against every scenario the three review rounds named. What
+  follows is the result: the rule this section now states normatively, and — below the fixed
+  invariants — the measurements and the sweep that justify it.
 
-  What **is** fixed, and what the spike may not violate:
+  What **is** fixed, and what the decided rule below must not violate (unchanged by the spike):
   - **Anti-windup is directional.** Accumulation may be halted only in the direction that
     deepens the condition — the standard conditional-integration form. A rule that also blocks
     integration in the *recovering* direction can self-latch, which is exactly how revision three
@@ -341,12 +379,117 @@ controllers on one measurement benign. Never add a second integrator on the same
     telemetry, so a loop that is deliberately not integrating is distinguishable from one that is
     converged.
 
-  Open for the spike to decide and record: the predicate itself; whether the per-axis comparison
-  uses the pre- or post-guard-override cap; `DEMAND_MARGIN_W` per axis, derived from the measured
-  spread between commanded and drawn power on each actuator rather than assumed; hysteresis,
-  dwell or debounce on entering and leaving; whether leaving calls `resync_error`; and whether a
-  `GPU HOT` episode freezes the integrator or hands the discarded GPU watts to the CPU axis
-  inside `split_budget`.
+  #### The decided rule (settled 2026-09-09 by `fwloop.24`, `src/control/spike_antiwindup.rs`)
+
+  **Per axis, `ConditionalHysteresis`.** Every allocator tick, for each axis `i` independently:
+
+  ```text
+  demand_limited(i) := cap_i > floor_i + ε   AND   (cap_i − draw_i) > DEMAND_MARGIN_W(i)
+  ```
+
+  `cap_i` is the axis's **post-guard-override** commanded cap for this tick — the value
+  `split_budget` actually produced after `gpu_share_override` (§2.8) has been applied to
+  `gpu_max_w`, not a hypothetical pre-override value. There is only one cap an axis is ever
+  actually offered in a given tick; comparing draw against anything else would compare it against
+  power that was never really available. `floor_i` is that axis's own configured floor
+  (`cpu_floor_w`, or the LUT's watts at `gpu_floor_mhz`) — **not** zero and **not** a
+  powered/unpowered flag. The `cap_i > floor_i + ε` guard is the load-bearing half of "judge each
+  axis separately": it is what excludes an axis that was never offered headroom above its floor
+  (a structurally-undrawn GPU sits with `cap == floor` every tick, since `split_budget`'s
+  demand-proportional split gives a zero-demand axis nothing beyond its floor) from ever
+  registering as "wasting unused headroom" — see the sweep's dedicated predicate tests below for
+  why a naive per-axis check *without* this guard, or a sum-of-axes check, both fail this exact
+  case.
+
+  The **halt** applied to the integrator each tick is `any(demand_limited(i) for i in {cpu, gpu})
+  AND error_sign > 0` (`error_sign` = `sign(e_c)`, the *current* tick's Mode A/B error before this
+  tick's step) — one axis's condition is enough to gate the shared scalar `u`, but only in the
+  deepening direction; `Budget::step`'s existing `Freeze::DemandLimited` handling already applies
+  that gate correctly (see `src/control/budget.rs`, unchanged by this task).
+
+  **Hysteresis: `HYSTERESIS_DWELL_TICKS = 2`** (10 s at the 5 s allocator cadence), applied
+  per-axis, symmetric on entering and leaving. A candidate's raw per-tick verdict must persist for
+  2 consecutive ticks before the effective (debounced) state changes. 10 s is short relative to
+  `Ti = 35` s, so it costs negligible recovery latency, but the sweep's scenario 7 (draw held
+  right at the margin, ±noise) shows it cuts hysteresis-state chatter from 81 raw transitions to
+  29 over a 100-tick window — worth having; `Conditional` (no hysteresis) is not the chosen rule.
+
+  **`DEMAND_MARGIN_W` (§Facts has the full measurement):**
+  - CPU: **2.0 W**. `ryzenadj --info`'s `PPT VALUE SLOW` (drawn) against `PPT LIMIT SLOW`
+    (commanded) tracked within ≤ 0.08 W across four cap-bound load compositions, RAPL
+    `energy_uj`-cross-validated to ≤ 0.01 W at the two heaviest; a genuine demand-limited gap,
+    measured directly, was 17.2 W. 2.0 W is ~25x the noise floor and ~8x below the smallest
+    measured genuine gap.
+  - GPU: **3.0 W**. NVML `power.draw` at a 1500 MHz clock lock, `glxgears` proxy load: 0.11 W
+    spread; a genuine idle-vs-loaded gap at the same lock, measured directly, was 6.1 W. 3.0 W is
+    ~27x the noise floor and about half the smallest measured genuine gap — a larger margin
+    relative to its own noise floor than the CPU's, because the GPU noise-floor number itself
+    rests on a weaker (fill/geometry-bound, not compute-bound) proxy load; §Facts states that
+    limitation explicitly.
+
+  **Leaving the hold does not need a bespoke resync rule.** `Budget::step`'s existing generic
+  "leaving any freeze" resync (`kind_switched || leaving_freeze`, in `src/control/budget.rs`,
+  already implemented and untouched by this task) already fires exactly once whenever a
+  `DemandLimited` tick is followed by a non-halted one, because `step` treats every
+  `Some(freeze) -> None` transition uniformly. No new special case is required or was added.
+
+  **`GPU HOT` does not freeze the integrator.** `Guards::gpu_share_override` (§2.8) already
+  ratchets the GPU's effective `gpu_max_w` down toward its floor at `DOWN_RATE_W`/tick while hot;
+  feeding that ratcheted value into `split_budget` as `gpu_max_w` is enough on its own —
+  `split_budget`'s existing surplus-reassignment (an axis's rejected `cpu_over`/`gpu_over` flows
+  to the other axis) automatically hands the GPU's shrinking share to the CPU axis, with no new
+  mechanism. The demand-limited predicate above, evaluated against the resulting post-override
+  `cap_i`, then behaves correctly on its own: neither axis shows a spurious gap during a HOT
+  episode (confirmed by the sweep's scenario 6), so there is nothing for a `Budget`-level freeze
+  to add.
+
+  #### The sweep (candidate x scenario, `cargo test control::spike_antiwindup -- --nocapture`)
+
+  Four candidates: `NoHalt` (baseline, no demand-limited halt at all — only the existing
+  clamp+back-calc anti-windup), `Conditional` (the rule above, no hysteresis), the decided
+  `ConditionalHysteresis`, and `CombinedSum` (directional, but judged on `Σdraw` vs `Σcap` rather
+  than per axis — kept in the sweep specifically to demonstrate why the "judge each axis
+  separately" invariant above is fixed, not optional). All four wrap the real `Budget`; the
+  thermal plant is τ 35 s / θ 20 s / K 0.8 °C/W (§5), driven by **actual drawn watts**.
+
+  | Scenario | NoHalt | Conditional | **ConditionalHysteresis (chosen)** | CombinedSum |
+  |---|---|---|---|---|
+  | 1 idle wind-up then load onset | **overshoots target by 14.0 °C-equiv** (windup) | holds, 0 overshoot | **holds, 0 overshoot** | holds, 0 overshoot |
+  | 2 lull mid-session | **self-latches** (never recovers within the graded window) | recovers | **recovers** | recovers |
+  | 3 warm-start, lighter load, EC above T* | holds | holds | **holds** | holds |
+  | 4 mid-session target drop | holds | holds | **holds** | holds |
+  | 5 structurally undrawn axis (dGPU unpowered) | holds | holds | **holds** | holds, but measurably worse than per-axis (see note) |
+  | 6 GPU HOT, CPU at its own cap | holds (identical across all four — no differentiation expected, see below) | holds | **holds** | holds |
+  | 7 oscillation around the margin | holds (never triggers a halt in this configuration) | holds, **81 hysteresis-state transitions** | **holds, 29 transitions** | holds (never triggers a halt in this configuration) |
+
+  No candidate ever pulled `u` toward the draw in any cell (`cap_tracking` false throughout —
+  `Budget::step`'s clamp-only back-calculation held in every run, as it must).
+
+  **Scenario 5 note.** On this machine's specific measured `DEMAND_MARGIN_W` values, the GPU's
+  structural floor share (5 W in the harness) sits close enough to `margin_sum` (2.0 + 3.0 = 5.0
+  W) that `CombinedSum`'s closed-loop degradation versus per-axis is small in this configuration
+  (mean settled error 0.063 °C-equiv vs 0.060 for both per-axis variants) rather than the more
+  dramatic "CPU pinned at its floor" failure the invariant's reasoning describes — that failure
+  is real and structural,
+  not scenario-configuration-dependent, and is demonstrated directly (not just via this one
+  closed-loop run) by two predicate-level tests in `spike_antiwindup.rs`:
+  `per_axis_predicate_excludes_an_axis_pinned_at_its_floor` and
+  `combined_sum_predicate_mis_flags_a_perfectly_tracked_cpu_next_to_a_pinned_gpu_floor` (the
+  latter uses a deliberately larger floor than this harness's own 5 W specifically to make the
+  point unambiguously, since the closed-loop run alone would understate it here).
+
+  **Scenario 6 note.** All four candidates are identical because the scenario's target is
+  reachable within `cpu_max_w + gpu_floor_w` even at the GPU's fully-ratcheted-down cap during the
+  HOT episode (by construction — a target *not* reachable there would conflate the guard's own,
+  expected, ceiling reduction with an anti-windup defect, which is not what this scenario tests).
+  The identical result across candidates is itself the finding: none of them add a spurious extra
+  hold on top of the guard's already-correct behavior.
+
+  The harness (real `Budget`, thermal plant, demand model, the four `Rule` variants, the seven
+  scenarios as data, and the predicate-level tests) is **kept** as a `#[cfg(test)]` fixture
+  (`src/control/spike_antiwindup.rs`, declared in `src/control/mod.rs`) rather than deleted: it is
+  the only place the decided rule and its constants are exercised against every named scenario
+  together, and it stays green as a regression on both.
 
 ### 2.5 `control/mode.rs` — arbiter (new)
 

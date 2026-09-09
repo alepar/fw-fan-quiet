@@ -18,6 +18,7 @@ use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender, never, select};
 
+use crate::actuators::WriteVerdict;
 use crate::actuators::cmd::Runner;
 use crate::actuators::guard::RestoreGuard;
 use crate::calib::burner::Burner;
@@ -724,9 +725,12 @@ impl<R: Runner> Controller<R> {
             Command::SetCpuW(w) => {
                 match self.guard.cpu.as_ref() {
                     None => tracing::warn!("no CPU actuator this run; ignoring SetCpuW({w})"),
+                    // fw-fanctrl-loop-j6s: non-Verified verdicts (Mismatch/
+                    // Unreadable/Unverifiable) are mapped to today's plain
+                    // write-failure behaviour -- the freeze/flag/reassert/
+                    // three-strike wiring lands there, not here.
                     Some(cpu) => match cpu.set_sustained_mw((w * 1000.0).round() as u32) {
-                        Ok(clamped_mw) => {
-                            let clamped_w = f64::from(clamped_mw) / 1000.0;
+                        WriteVerdict::Verified(clamped_w) => {
                             self.status.cpu_limit_w = Some(clamped_w);
                             self.status.mode = Mode::Manual;
                             // Fresh command = fresh assert: any violation
@@ -734,7 +738,11 @@ impl<R: Runner> Controller<R> {
                             self.stick_violations = 0;
                             effects.push(Effect::CpuSet(clamped_w));
                         }
-                        Err(e) => tracing::warn!("SetCpuW({w}) failed, status unchanged: {e}"),
+                        verdict => {
+                            tracing::warn!(
+                                "SetCpuW({w}) not verified, status unchanged: {verdict:?}"
+                            );
+                        }
                     },
                 }
                 "command:set_cpu_w"
@@ -1219,9 +1227,10 @@ impl<R: Runner> Controller<R> {
                     None => {
                         tracing::warn!("auto: no CPU actuator; allocation {cpu_w} W not applied");
                     }
+                    // fw-fanctrl-loop-j6s: see the SetCpuW comment above --
+                    // same non-Verified-as-failure mapping applies here.
                     Some(cpu) => match cpu.set_sustained_mw((cpu_w * 1000.0).round() as u32) {
-                        Ok(clamped_mw) => {
-                            let clamped_w = f64::from(clamped_mw) / 1000.0;
+                        WriteVerdict::Verified(clamped_w) => {
                             self.status.cpu_limit_w = Some(clamped_w);
                             // A violation streak measured against the OLD
                             // limit is stale evidence: the fresh allocation
@@ -1230,8 +1239,10 @@ impl<R: Runner> Controller<R> {
                             self.stick_violations = 0;
                             effects.push(Effect::CpuSet(clamped_w));
                         }
-                        Err(e) => {
-                            tracing::warn!("auto: CPU allocation ({cpu_w} W) failed: {e}");
+                        verdict => {
+                            tracing::warn!(
+                                "auto: CPU allocation ({cpu_w} W) not verified: {verdict:?}"
+                            );
                         }
                     },
                 }
@@ -1515,11 +1526,15 @@ impl<R: Runner> Controller<R> {
             match effect {
                 RunnerEffect::SetCpuW(w) => match self.guard.cpu.as_ref() {
                     None => tracing::warn!("calib: no CPU actuator; SetCpuW({w}) skipped"),
+                    // fw-fanctrl-loop-j6s: see the SetCpuW comment in
+                    // on_command -- same non-Verified-as-failure mapping.
                     Some(cpu) => match cpu.set_sustained_mw((w * 1000.0).round() as u32) {
-                        Ok(clamped_mw) => {
-                            self.status.cpu_limit_w = Some(f64::from(clamped_mw) / 1000.0);
+                        WriteVerdict::Verified(clamped_w) => {
+                            self.status.cpu_limit_w = Some(clamped_w);
                         }
-                        Err(e) => tracing::warn!("calib: SetCpuW({w}) failed: {e}"),
+                        verdict => {
+                            tracing::warn!("calib: SetCpuW({w}) not verified: {verdict:?}");
+                        }
                     },
                 },
                 RunnerEffect::SetGpuMaxClock(mhz) => match self.guard.gpu.as_mut() {
@@ -1750,9 +1765,15 @@ impl<R: Runner> Controller<R> {
         let mut all_ok = true;
         if let (Some(w), Some(cpu)) = (self.status.cpu_limit_w, self.guard.cpu.as_ref()) {
             any = true;
-            if let Err(e) = cpu.set_sustained_mw((w * 1000.0).round() as u32) {
+            // fw-fanctrl-loop-j6s: see the SetCpuW comment in on_command --
+            // same non-Verified-as-failure mapping; `all_ok` still only
+            // tracks whether the reassert attempt landed, same as before.
+            if !matches!(
+                cpu.set_sustained_mw((w * 1000.0).round() as u32),
+                WriteVerdict::Verified(_)
+            ) {
                 all_ok = false;
-                tracing::warn!("reassert: CPU limit ({w} W) failed: {e}");
+                tracing::warn!("reassert: CPU limit ({w} W) not verified");
             }
         }
         if let Some(mhz) = self.status.gpu_max_mhz {
@@ -2184,11 +2205,15 @@ mod tests {
         controller(runner, PathBuf::from("/nonexistent/platform_profile"))
     }
 
+    /// The commanded (write) `ryzenadj` calls only -- excludes the `--info`
+    /// read-back calls that `CpuActuator::set_sustained_mw` now makes after
+    /// every write (design §2.9, fw-fanctrl-loop-jpg): existing tests using
+    /// this helper assert "what did we command", which read-back is not.
     fn ryzenadj_calls(runner: &FakeRunner) -> Vec<Vec<String>> {
         runner
             .calls()
             .into_iter()
-            .filter(|(prog, _)| prog == "ryzenadj")
+            .filter(|(prog, args)| prog == "ryzenadj" && !(args.len() == 1 && args[0] == "--info"))
             .map(|(_, args)| args)
             .collect()
     }

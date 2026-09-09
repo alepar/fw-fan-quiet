@@ -1109,16 +1109,11 @@ impl<R: Runner> Controller<R> {
                     },
                 }
             }
-            // Vetoed overshoot hold (2026-07-14 design §3): a Noted line on
-            // episode ENTRY, pushed BEFORE AutoAllocated so it claims the
-            // batch's Decision cause (apply_effects: first claim wins). A
-            // vetoed hold changes no status, so without the explicit Note
-            // the crest would never surface for session grading.
-            if auto.allocator.overshoot_settle_started() {
-                effects.push(Effect::Noted {
-                    cause: "auto:overshoot_settle",
-                });
-            }
+            // Vetoed overshoot hold (2026-07-14 design §3) no longer exists:
+            // fw-fanctrl-loop-zct's scalar-budget-split allocator (design
+            // §3.1) replaced the contour grid-search + overshoot-settle
+            // state machine with demand/split_budget/quantize/slew-clamp,
+            // which has no equivalent episode to gate or Note on.
             effects.push(Effect::AutoAllocated {
                 demand_cpu: demand.cpu_starved,
                 demand_gpu: demand.gpu_starved,

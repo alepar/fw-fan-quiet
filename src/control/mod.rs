@@ -4,6 +4,7 @@
 //! reasserts, watchdog flags and `ControlStatus` updates.
 
 pub mod allocator;
+pub mod budget;
 pub mod controller;
 pub mod cooldown;
 pub mod gpu_pid;

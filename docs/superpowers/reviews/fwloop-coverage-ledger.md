@@ -202,6 +202,48 @@ a `Verified` (it calls `resync_error` and unfreezes, leaving `u` alone); R10 soc
 R11 the NVMe read moved off the 1 Hz sampler thread to the 30 s poller; R12 a rejected curve gets
 its own warning-severity `CURVE INVALID` flag and a `curve_valid` arbiter input.
 
+## super-roast design iteration 3 (2026-09-08, the cap)
+
+Report: `2026-09-08-fw-fanctrl-loop-roast-design-3.md`. Verdict **Blocking (9 confirmed)**, no
+qualifier: 9 scouts, 0 dead, 38 raw → 15 deduped, 12 panels + 3 spot checks, judge completion
+100 %, 0 beyond either cap, 0 escalations. `delta vs prior: 7 new confirmed (2 Blocking) · 0
+carried · 11 resolved · 2 regressed (0 Blocking)`.
+
+**The cap was reached with Blocking still open, and the pattern is the finding.** Blocking went
+1 → 2 → 2, and all four Blocking findings from rounds 2 and 3 are failures of the *same* §2.4
+anti-windup mechanism, each introduced by the previous round's fix:
+
+| Round | Rule written | What the next round found |
+|---|---|---|
+| 1 | back-calculate `u` toward measured draw | it is a tracker, not anti-windup: cap collapses onto the lull draw |
+| 2 | per-axis `Freeze::DemandLimited` | direction-blind: it also blocks the descent that recovers, so it self-latches |
+| 3 | — | — |
+
+Round 3's second Blocking finding was the tail of the round-2 sweep: §2.5 and §2.8 still cited
+the deleted back-calculation as the reason not to freeze during `GPU HOT`, and underneath the
+stale text sat a real hole (the override drives the GPU cap onto the draw, so with the CPU at
+its own cap a naive "any axis at cap ⇒ integrate" rule winds against discarded watts).
+
+**User decision: stop designing this in prose — promote it to a spike (new `fwloop.24`).** Three
+prose revisions each read as defensible and each was wrong in a way only adversarial review
+caught; the mechanism needs a simulator, not a fourth paragraph. §2.4 now fixes only the
+*invariants* — anti-windup is directional and may halt only the deepening direction; never pull
+`u` toward the draw; judge per axis; any hold is visible — and hands the predicate, the margins,
+the hysteresis, the cap definition and the `GPU HOT` interaction to the spike, which measures
+candidates against every scenario the three rounds named and writes the winner back into §2.4.
+`fwloop.12` is blocked by it, so the loop cannot be wired before the rule exists.
+
+The other 7 applied: the `GPU HOT` / `active: false` stale back-calculation citations swept;
+`DEMAND_MARGIN_W` derivation and hysteresis folded into the spike; the NVMe read moved to its
+**own** thread (the round-2 fix had relocated the stall onto the poller that owns the 15 s
+`print speed` staleness rule, where a 60 s admin stall would fake a socket outage); §3.3 step 3's
+`θ_eff` double-count deleted (round 2 fixed §2.4 and fwloop.21's body but left step 3 verbatim);
+all four NVML thermal specs recorded with T.Limit-margin keying moved to §6; Mode B's gain
+schedule forced to the `0.25×` clamp under `active: false`/`absent`, where `slope_at(T*)`
+describes a curve that is not the plant; and §Facts now states the EC staircase's measured
+limitation (the plateau is solid, the steep segment is thin and its rising branch and hysteresis
+are unmeasured).
+
 **Bonus validation from the same probe:** under `quiet16` at EC max 75 °C the curve gives duty 31
 and the fans ran 2649 RPM against the seeded table's interpolated 2638 — under 0.5 % error, so
 the shipped duty→RPM seed is sound and refinement really is a refinement rather than a

@@ -1,3 +1,6 @@
 sudo.txt
 target/
 *.log
+
+# super-code per-epic integration and task worktrees
+.worktrees/

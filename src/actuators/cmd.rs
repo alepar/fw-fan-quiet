@@ -36,11 +36,22 @@ pub mod test_support {
     use std::process::Output;
 
     /// Records invocations and returns scripted results. When the script
-    /// queue is empty, returns success with empty stdout (exit code 0).
+    /// queue is empty, returns success with empty stdout (exit code 0) --
+    /// EXCEPT for `ryzenadj --info` immediately after a `ryzenadj
+    /// --stapm-limit=...` write, which instead synthesizes a read-back
+    /// table that agrees with what was just written (see
+    /// `synthesize_ryzenadj_info`). Read-back verification (design §2.9)
+    /// means every `CpuActuator::set_sustained_mw` call now makes TWO
+    /// runner calls; without this default, every pre-existing test built
+    /// against the single-call write (the whole suite predates read-back)
+    /// would need to start scripting a matching `--info` reply by hand. A
+    /// test that needs `Mismatch`/`Unreadable` still scripts the queue
+    /// explicitly -- that takes priority (FIFO) over this default.
     #[derive(Default)]
     pub struct FakeRunner {
         calls: RefCell<Vec<(String, Vec<String>)>>,
         results: RefCell<VecDeque<io::Result<Output>>>,
+        last_ryzenadj_write: RefCell<Option<Vec<String>>>,
     }
 
     impl FakeRunner {
@@ -61,15 +72,53 @@ pub mod test_support {
 
     impl Runner for FakeRunner {
         fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
-            self.calls.borrow_mut().push((
-                program.to_string(),
-                args.iter().map(|a| a.to_string()).collect(),
-            ));
-            self.results
+            let args_owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            self.calls
                 .borrow_mut()
-                .pop_front()
-                .unwrap_or_else(|| Ok(output_with_code(0)))
+                .push((program.to_string(), args_owned.clone()));
+            if let Some(result) = self.results.borrow_mut().pop_front() {
+                return result;
+            }
+            if program == "ryzenadj" {
+                if args.len() == 1 && args[0] == "--info" {
+                    if let Some(last_write) = self.last_ryzenadj_write.borrow().as_deref() {
+                        return Ok(synthesize_ryzenadj_info(last_write));
+                    }
+                } else {
+                    *self.last_ryzenadj_write.borrow_mut() = Some(args_owned);
+                }
+            }
+            Ok(output_with_code(0))
         }
+    }
+
+    /// Build a `ryzenadj --info`-shaped `Output` reporting STAPM/slow/fast
+    /// exactly as commanded by `write_args` (a `ryzenadj --stapm-limit=<mw>
+    /// --slow-limit=<mw> --fast-limit=<mw>` argument list) -- the read-back
+    /// agrees with the write by construction, so it verifies. Any flag not
+    /// present in `write_args` reports 0 W.
+    fn synthesize_ryzenadj_info(write_args: &[String]) -> Output {
+        let watts_for = |flag: &str| -> f64 {
+            write_args
+                .iter()
+                .find_map(|a| a.strip_prefix(flag))
+                .and_then(|v| v.parse::<u32>().ok())
+                .map(|mw| f64::from(mw) / 1000.0)
+                .unwrap_or(0.0)
+        };
+        let stapm_w = watts_for("--stapm-limit=");
+        let slow_w = watts_for("--slow-limit=");
+        let fast_w = watts_for("--fast-limit=");
+        let stdout = format!(
+            "|        Name         |   Value   |     Parameter      |\n\
+             |---------------------|-----------|--------------------|\n\
+             | STAPM LIMIT         |{stapm_w:>11.3}| stapm-limit        |\n\
+             | PPT LIMIT FAST      |{fast_w:>11.3}| fast-limit         |\n\
+             | PPT LIMIT SLOW      |{slow_w:>11.3}| slow-limit         |\n"
+        );
+        let mut out = output_with_code(0);
+        out.stdout = stdout.into_bytes();
+        out
     }
 
     /// An `Output` with the given exit code and empty stdout/stderr.

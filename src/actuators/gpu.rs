@@ -9,6 +9,8 @@
 use nvml_wrapper::Nvml;
 use nvml_wrapper::enums::device::GpuLockedClocksSetting;
 
+use super::WriteVerdict;
+
 /// Hardware clock floor on this RTX 5070 Laptop (min supported graphics
 /// clock); used as the lock's min so idle clocks stay free to drop.
 const MIN_LOCK_MHZ: u32 = 210;
@@ -23,6 +25,72 @@ const DEVICE_INDEX: u32 = 0;
 /// ~7.5 MHz bins on its own; we don't need to.
 pub fn clamp_gpu_clock(mhz: u32) -> u32 {
     mhz.clamp(MIN_MAX_CLOCK_MHZ, MAX_MAX_CLOCK_MHZ)
+}
+
+/// Utilisation floor (design §2.9): below this, load isn't heavy enough to
+/// trust the SM-clock read-back either way.
+const VERIFY_UTIL_FLOOR_PCT: f64 = 90.0;
+/// LUT-sweep pin-rule slack (design §2.9, reused from the calibration
+/// sweep): the pinned clock may run this many MHz above the locked ceiling
+/// before it counts as a violation.
+const VERIFY_CLOCK_SLACK_MHZ: u32 = 30;
+/// Consecutive violating samples before a `Mismatch` is scored (design
+/// §2.9's "over 3 samples" — matches the LUT sweep's own pin rule; a lone
+/// over-clock sample is normal boost-clock noise at the pin edge).
+const VERIFY_STRIKES: u32 = 3;
+
+/// GPU lock read-back verification (design §2.9): there is no NVML read of
+/// the applied lock itself, so verification is indirect -- while the GPU is
+/// under load (`gpu_util` above the floor), the measured SM clock must stay
+/// at or below `locked + slack`. One state machine per locked value; the
+/// controller call site that constructs and drives this is Task 19's
+/// (`fw-fanctrl-loop-j6s`) -- this type is a standalone, fully unit-tested
+/// building block until then.
+#[derive(Debug, Clone, Copy)]
+pub struct GpuLockVerifier {
+    locked_mhz: u32,
+    violation_streak: u32,
+}
+
+impl GpuLockVerifier {
+    /// New verifier for a lock just commanded at `locked_mhz`.
+    pub fn new(locked_mhz: u32) -> Self {
+        Self {
+            locked_mhz,
+            violation_streak: 0,
+        }
+    }
+
+    /// Score one sample against the LUT-sweep pin rule. Below the
+    /// utilisation floor: `Unverifiable` (not a failure — there isn't
+    /// enough load to trust the reading), and the streak resets (a lull
+    /// tells us nothing about whether the NEXT loaded sample would still
+    /// violate). At/above the floor: `Verified` when the clock stays within
+    /// `locked + slack`; a single overshoot only counts a strike
+    /// (`Unverifiable` while the streak is building) — only
+    /// `VERIFY_STRIKES` CONSECUTIVE overshoots score a `Mismatch`, naming
+    /// the pinned clock.
+    pub fn verify_lock(&mut self, gpu_util: f64, gpu_sm_mhz: u32) -> WriteVerdict {
+        if gpu_util <= VERIFY_UTIL_FLOOR_PCT {
+            self.violation_streak = 0;
+            return WriteVerdict::Unverifiable;
+        }
+        let ceiling = self.locked_mhz + VERIFY_CLOCK_SLACK_MHZ;
+        if gpu_sm_mhz <= ceiling {
+            self.violation_streak = 0;
+            return WriteVerdict::Verified(f64::from(gpu_sm_mhz));
+        }
+        self.violation_streak += 1;
+        if self.violation_streak >= VERIFY_STRIKES {
+            WriteVerdict::Mismatch {
+                field: "gpu_sm_mhz",
+                commanded: f64::from(ceiling),
+                read: f64::from(gpu_sm_mhz),
+            }
+        } else {
+            WriteVerdict::Unverifiable
+        }
+    }
 }
 
 /// Actuation seam for the GPU clock lock (Task 25): the real [`GpuActuator`]
@@ -221,6 +289,93 @@ mod tests {
         assert_eq!(clamp_gpu_clock(1500), 1500);
         assert_eq!(clamp_gpu_clock(1000), 1000);
         assert_eq!(clamp_gpu_clock(3090), 3090);
+    }
+
+    /// Step 5 (TDD): below the 90% utilisation floor, `Unverifiable` --
+    /// regardless of how far over the pin the reported clock is.
+    #[test]
+    fn below_util_floor_is_unverifiable_even_when_clock_is_wildly_over() {
+        let mut v = GpuLockVerifier::new(2000);
+        assert_eq!(v.verify_lock(89.9, 5000), WriteVerdict::Unverifiable);
+        assert_eq!(v.verify_lock(0.0, 5000), WriteVerdict::Unverifiable);
+        assert_eq!(v.verify_lock(90.0, 5000), WriteVerdict::Unverifiable);
+    }
+
+    /// Above the floor and within `locked + 30`: `Verified`.
+    #[test]
+    fn above_util_floor_within_slack_is_verified() {
+        let mut v = GpuLockVerifier::new(2000);
+        assert_eq!(v.verify_lock(95.0, 2000), WriteVerdict::Verified(2000.0));
+        assert_eq!(v.verify_lock(95.0, 2030), WriteVerdict::Verified(2030.0));
+    }
+
+    /// Mismatch requires 3 CONSECUTIVE over-pin samples, not 1 or 2 -- a
+    /// wrong implementation that scored on the first (or second) violation
+    /// would fail these two assertions before the loop ever reaches 3.
+    #[test]
+    fn mismatch_only_fires_on_the_third_consecutive_overshoot() {
+        let mut v = GpuLockVerifier::new(2000); // ceiling 2030
+        assert_eq!(
+            v.verify_lock(95.0, 2031),
+            WriteVerdict::Unverifiable,
+            "1st consecutive overshoot must not yet be Mismatch"
+        );
+        assert_eq!(
+            v.verify_lock(95.0, 2031),
+            WriteVerdict::Unverifiable,
+            "2nd consecutive overshoot must not yet be Mismatch"
+        );
+        assert_eq!(
+            v.verify_lock(95.0, 2031),
+            WriteVerdict::Mismatch {
+                field: "gpu_sm_mhz",
+                commanded: 2030.0,
+                read: 2031.0,
+            },
+            "3rd consecutive overshoot must score Mismatch"
+        );
+    }
+
+    /// A compliant sample between overshoots resets the streak: 2 + 2 never
+    /// reaches 3.
+    #[test]
+    fn a_compliant_sample_resets_the_overshoot_streak() {
+        let mut v = GpuLockVerifier::new(2000);
+        assert_eq!(v.verify_lock(95.0, 2031), WriteVerdict::Unverifiable);
+        assert_eq!(v.verify_lock(95.0, 2031), WriteVerdict::Unverifiable);
+        assert_eq!(v.verify_lock(95.0, 2000), WriteVerdict::Verified(2000.0));
+        // Streak reset: this is only the first overshoot again.
+        assert_eq!(v.verify_lock(95.0, 2031), WriteVerdict::Unverifiable);
+    }
+
+    /// A below-floor sample between overshoots also resets the streak (an
+    /// unloaded lull tells us nothing about whether the NEXT loaded sample
+    /// would still violate).
+    #[test]
+    fn a_below_floor_sample_resets_the_overshoot_streak() {
+        let mut v = GpuLockVerifier::new(2000);
+        assert_eq!(v.verify_lock(95.0, 2031), WriteVerdict::Unverifiable);
+        assert_eq!(v.verify_lock(95.0, 2031), WriteVerdict::Unverifiable);
+        assert_eq!(v.verify_lock(10.0, 2031), WriteVerdict::Unverifiable); // resets
+        assert_eq!(
+            v.verify_lock(95.0, 2031),
+            WriteVerdict::Unverifiable,
+            "1st since the reset"
+        );
+        assert_eq!(
+            v.verify_lock(95.0, 2031),
+            WriteVerdict::Unverifiable,
+            "2nd since the reset"
+        );
+        assert_eq!(
+            v.verify_lock(95.0, 2031),
+            WriteVerdict::Mismatch {
+                field: "gpu_sm_mhz",
+                commanded: 2030.0,
+                read: 2031.0,
+            },
+            "3rd since the reset"
+        );
     }
 
     /// Manual smoke check against the real GPU: exercises NVML init and the

@@ -6,6 +6,7 @@ mod calib;
 mod config;
 mod control;
 mod event;
+mod fanctrl;
 mod led;
 mod logging;
 mod model;

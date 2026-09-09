@@ -5665,6 +5665,96 @@ mod tests {
     }
 
     #[test]
+    fn an_on_ac_change_re_keys_without_reseeding_the_budget() {
+        // Same shape as the strategy-change case above, but the LAST tick
+        // flips `on_ac` (false -> true) instead of strategy. `WarmStart::
+        // key` includes `on_ac`, so an AC-unplug/replug tick must re-key
+        // exactly like a strategy change: no reseed, the tick's delta is
+        // the ordinary PI increment.
+        let base_runner = FakeRunner::new();
+        let (mut base, _g1) = auto_controller_no_profile(&base_runner);
+        base.on_command(Command::SetAuto(true));
+
+        let rekey_runner = FakeRunner::new();
+        let (mut rekey, _g2) = auto_controller_no_profile(&rekey_runner);
+        rekey
+            .warm_start
+            .insert(WarmStart::key("quiet16", 36, true), 999.0);
+        rekey.on_command(Command::SetAuto(true));
+
+        for i in 0..3u64 {
+            let t = i as f64 * ALLOC_PERIOD_S;
+            base.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
+            rekey.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
+        }
+        assert_eq!(
+            base.status().budget_w,
+            rekey.status().budget_w,
+            "premise: identical trajectory so far"
+        );
+
+        let t = 3.0 * ALLOC_PERIOD_S;
+        base.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
+        rekey.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, true));
+
+        assert_eq!(
+            base.status().budget_w,
+            rekey.status().budget_w,
+            "an on_ac change must re-key without touching u"
+        );
+    }
+
+    #[test]
+    fn a_snapped_duty_change_re_keys_without_reseeding_the_budget() {
+        // Same shape again, but the LAST tick's `SetFanTarget` moves the fan
+        // target from the default 3000 RPM (snaps to duty 36) to 3380 RPM
+        // (the table's exact seeded point for duty 40) — the allocator
+        // recomputes `target_duty` from `fan_target_rpm` every ALLOC_PERIOD_S
+        // tick, so this re-keys `WarmStart::key` on its `target_duty`
+        // component, not strategy or on_ac. Same rule (§2.4): no reseed.
+        let base_runner = FakeRunner::new();
+        let (mut base, _g1) = auto_controller_no_profile(&base_runner);
+        base.on_command(Command::SetAuto(true));
+
+        let rekey_runner = FakeRunner::new();
+        let (mut rekey, _g2) = auto_controller_no_profile(&rekey_runner);
+        rekey
+            .warm_start
+            .insert(WarmStart::key("quiet16", 40, false), 999.0);
+        rekey.on_command(Command::SetAuto(true));
+
+        for i in 0..3u64 {
+            let t = i as f64 * ALLOC_PERIOD_S;
+            base.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
+            rekey.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
+        }
+        assert_eq!(
+            base.status().budget_w,
+            rekey.status().budget_w,
+            "premise: identical trajectory so far"
+        );
+
+        rekey.on_command(Command::SetFanTarget(3380.0));
+        assert_eq!(
+            rekey
+                .duty_rpm_table
+                .duty_for_rpm(rekey.status().fan_target_rpm),
+            40,
+            "premise: the new fan target snaps to a different tread"
+        );
+
+        let t = 3.0 * ALLOC_PERIOD_S;
+        base.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
+        rekey.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
+
+        assert_eq!(
+            base.status().budget_w,
+            rekey.status().budget_w,
+            "a snapped target_duty change must re-key without touching u"
+        );
+    }
+
+    #[test]
     fn reengaging_from_released_seeds_from_the_warm_start_when_a_key_matches() {
         // `budget_seeded` resets to `false` on the tick `LoopMode`
         // transitions INTO `Released` (`handle_mode_transition`), and the

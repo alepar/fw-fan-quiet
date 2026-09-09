@@ -54,7 +54,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crate::actuators::cmd::test_support::FakeRunner;
+use crate::actuators::cmd::test_support::{queue_ryzenadj_readback, FakeRunner};
 use crate::actuators::cpu::CpuActuator;
 use crate::actuators::gpu::test_support::FakeGpu;
 use crate::actuators::guard::RestoreGuard;
@@ -456,6 +456,10 @@ struct TraceRow {
     fanctrl_ma_c: Option<f64>,
     flags: Vec<StatusFlag>,
     cpu_pkg_w: f64,
+    /// `ControlStatus::cpu_limit_w` -- `None` iff the CPU actuator is
+    /// currently released to stock (a 3-strike verdict release, or not yet
+    /// engaged), used by the fault-matrix mismatch/release tests below.
+    cpu_limit_w: Option<f64>,
     gpu_max_mhz: Option<u32>,
     effects: Vec<Effect>,
 }
@@ -553,6 +557,7 @@ fn run_ticks<R: crate::actuators::cmd::Runner>(
             fanctrl_ma_c: sample.fanctrl.as_ref().map(|v| v.ma_temperature),
             flags: after.flags.clone(),
             cpu_pkg_w: sample.cpu_pkg_w,
+            cpu_limit_w: after.cpu_limit_w,
             gpu_max_mhz: after.gpu_max_mhz,
             effects,
         });
@@ -1000,6 +1005,7 @@ fn run_ticks_perturbed<R: crate::actuators::cmd::Runner>(
             fanctrl_ma_c: sample.fanctrl.as_ref().map(|v| v.ma_temperature),
             flags: after.flags.clone(),
             cpu_pkg_w: sample.cpu_pkg_w,
+            cpu_limit_w: after.cpu_limit_w,
             gpu_max_mhz: after.gpu_max_mhz,
             effects,
         });
@@ -1300,6 +1306,7 @@ fn a_non_monotone_curve_keeps_rpmloop_at_the_quarter_gain_clamp_with_curve_inval
             fanctrl_ma_c: sample.fanctrl.as_ref().map(|v| v.ma_temperature),
             flags: after.flags.clone(),
             cpu_pkg_w: sample.cpu_pkg_w,
+            cpu_limit_w: after.cpu_limit_w,
             gpu_max_mhz: after.gpu_max_mhz,
             effects,
         });
@@ -1886,6 +1893,90 @@ fn a_sub_floor_target_raises_target_unreachable_low() {
     );
 }
 
+/// Feasibility (design §2.7: "T* < ambient + FEASIBLE_MARGIN_C(5)"), the
+/// THIRD of `mirror_decision`'s (fw-fanctrl-loop-a5j) three affected
+/// paths (infeasible target, low bound-hold, low sub-floor) -- distinct
+/// from both: T* itself resolves fine off the curve (a normal,
+/// TempLoop-achievable `fan_target_rpm`), but an uncontrolled channel
+/// (`ThermalPlant`'s scriptable `ambient`/`charger`) is set far above
+/// anything quiet16's curve could ever ask for, so T* can never clear
+/// `max_unc + 5`. `core_ok` (§2.5) requires `feasible_ok`, so the arbiter
+/// holds the loop in RpmLoop forever -- RpmLoop has no such requirement
+/// and tracks the achievable RPM target just fine, same as any other
+/// RpmLoop baseline.
+#[test]
+fn an_infeasible_target_never_promotes_past_rpmloop_and_tracks_rpm_without_relay() {
+    let fan_target_rpm = 6000.0; // clamps to the duty table's own ceiling (85) -- see the steep-curve test
+    let config = Config { fan_target_rpm, ..Config::default() };
+    let runner = FakeRunner::new();
+    let (mut ctl, _state_path, _gpu) =
+        build_controller(&runner, "infeasible-target", config.clone(), None, false);
+    let mut plant = ChainedPlant::new("quiet16", QUIET16_POINTS.to_vec(), MA_INTERVAL, AMBIENT_C, 1)
+        .expect("valid curve");
+    // Raise the uncontrolled ambient/charger channels ABOVE quiet16's own
+    // T* for this target (so it can never clear `max_unc + 5`) but stay
+    // BELOW the load-driven controllable channel's own real steady state --
+    // `ec.max_c` is the ARGMAX across ALL channels (`sensors::ec`), so
+    // pushing ambient/charger past the controllable channel would make
+    // fw-fanctrl's OWN emulated duty (and therefore the physical fan) track
+    // the uncontrolled channel instead of the real one, breaking RpmLoop's
+    // actuation path entirely -- a different, unwanted failure mode, not
+    // the one this test is about.
+    plant.thermal_mut().set_ambient_charger(90.0, 88.0);
+    ctl.on_command(Command::SetAuto(true));
+    let trace = run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, 900, load_step_script);
+
+    println!(
+        "[infeasible] t_star_end={:?} last mode={:?} last rpm={:.1} budget_w={:.2}",
+        trace.last().t_star_c,
+        trace.last().mode,
+        trace.last().rpm,
+        trace.last().budget_w
+    );
+    // The brief's own bar for this scenario is feasibility gating TempLoop,
+    // not a band-residency number (that is the BASELINE runs' own bar,
+    // spelled out separately) -- so this only asserts what §2.7 actually
+    // promises: held out of TempLoop, and no hunting while held there.
+    // (`errors` stays essentially flat near one steady value the whole
+    // settled tail below -- the static ambient override this scenario
+    // needs to construct a genuine feasibility gap at all is a much
+    // stiffer RPM-tracking scenario than a real ambient ever is, so RpmLoop
+    // converging slowly here is expected, not evidence of a defect.)
+    assert!(
+        trace.rows.iter().skip(SETTLE_TICKS).all(|r| r.mode == LoopMode::RpmLoop),
+        "an infeasible T* must hold the loop in RpmLoop forever, never TempLoop"
+    );
+    let errors = trace.rpm_errors(rpmloop_snapped_target(fan_target_rpm));
+    let relay = detect_relay(&errors[SETTLE_TICKS..], 150.0);
+    println!("[infeasible] relay={relay:?}");
+    assert!(!relay.is_relay(), "an infeasible T* held off TempLoop must not itself cause hunting: {relay:?}");
+    assert_only_expected_runner_calls(&runner);
+}
+
+/// KNOWN PRODUCT DEFECT (fw-fanctrl-loop-a5j) -- see
+/// `active_false_below_flat_band_raises_target_unreachable_low_within_60s`'s
+/// doc for the full finding; this is the infeasible-target path's instance
+/// of the same gap (`Decision.flags` carries `TargetUnreachable` here too,
+/// `ControlStatus.flags` still never does).
+#[test]
+#[ignore = "known defect fw-fanctrl-loop-a5j: mirror_decision never syncs TargetUnreachable"]
+fn an_infeasible_target_raises_target_unreachable() {
+    let fan_target_rpm = 6000.0;
+    let config = Config { fan_target_rpm, ..Config::default() };
+    let runner = FakeRunner::new();
+    let (mut ctl, _state_path, _gpu) =
+        build_controller(&runner, "infeasible-target-tu", config.clone(), None, false);
+    let mut plant = ChainedPlant::new("quiet16", QUIET16_POINTS.to_vec(), MA_INTERVAL, AMBIENT_C, 1)
+        .expect("valid curve");
+    plant.thermal_mut().set_ambient_charger(90.0, 88.0);
+    ctl.on_command(Command::SetAuto(true));
+    let trace = run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, 900, load_step_script);
+    assert!(
+        trace.last().flags.contains(&StatusFlag::TargetUnreachable),
+        "an infeasible T* (below ambient+5) must raise TARGET UNREACHABLE"
+    );
+}
+
 #[test]
 fn a_dgpu_unpowered_run_raises_no_gpu_hot_and_never_commands_a_gpu_clock() {
     let fan_target_rpm = 1900.0;
@@ -2154,9 +2245,131 @@ fn configuration_coverage_checklist_2_strategies_3_modes_dgpu_on_off_default_vs_
 }
 
 // =====================================================================
-// Faults (a representative subset -- see the task report for the full
-// coverage map and the items not attempted)
+// Faults (task 22 review round 1: the run list's remaining items, added
+// on top of the original NVMe-hot/steep-curve/resumed-edge trio -- see the
+// task report's fix-round log for what each one needed and why)
 // =====================================================================
+
+/// The "high" counterpart of `a_sub_floor_target_raises_target_unreachable_low`
+/// (design §2.7's OTHER bound-hold path, `at_upper_bound_for` this time):
+/// T* clamps to quiet16's curve ceiling (95C, duty 100) for ANY
+/// `fan_target_rpm` past the table's own top -- the existing steep-curve
+/// scenario already proves that ceiling IS reachable at the default power
+/// budget, so genuinely UNREACHABLE-high needs the budget's own `hi` capped
+/// well under what 95C actually costs (`t_ss = 40 + 0.8*W`; 95C needs
+/// ~69W), not just an extreme target. `gpu_max_w: 15` is pinned exactly to
+/// the test LUT's `gpu_floor_mhz` wattage (`Allocator::step`'s own
+/// `debug_assert` requires `gpu_floor_w <= gpu_max_w`) -- harmless
+/// thermally, since the dGPU stays unpowered (`gpu_temp_c: None`) all run,
+/// so only `cpu_max_w` ever actually draws. `hi = cpu_max_w(30) +
+/// gpu_max_w(15) = 45` clears `lo = cpu_floor_w(15) + gpu_floor_w(15) = 30`
+/// while capping the reachable steady state at ~76C, well short of 95C --
+/// `u` must pin at `hi` and never catch up.
+///
+/// KNOWN PRODUCT DEFECT (fw-fanctrl-loop-a5j) -- see
+/// `active_false_below_flat_band_raises_target_unreachable_low_within_60s`'s
+/// doc for the full finding (`mirror_decision` drops `TargetUnreachable`
+/// for ALL THREE trigger paths, not just the low ones); this is the
+/// high-bound-hold path's instance of the same gap.
+#[test]
+#[ignore = "known defect fw-fanctrl-loop-a5j: mirror_decision never syncs TargetUnreachable"]
+fn a_high_unreachable_target_pins_at_the_upper_bound_and_raises_target_unreachable_high() {
+    let fan_target_rpm = 50_000.0; // past the table's own ceiling either way
+    let config = Config { fan_target_rpm, cpu_max_w: 30.0, gpu_max_w: 15.0, ..Config::default() };
+    let runner = FakeRunner::new();
+    let (mut ctl, _state_path, _gpu) =
+        build_controller(&runner, "high-unreachable", config.clone(), None, false);
+    let mut plant = ChainedPlant::new("quiet16", QUIET16_POINTS.to_vec(), MA_INTERVAL, AMBIENT_C, 1)
+        .expect("valid curve");
+    ctl.on_command(Command::SetAuto(true));
+    let trace = run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, 900, load_step_script);
+
+    let hi = config.cpu_max_w + config.gpu_max_w;
+    let last = trace.last();
+    println!(
+        "[high-unreachable] u_end={:.2} hi={hi:.2} t_star_end={:?} flags_end={:?}",
+        last.budget_w, last.t_star_c, last.flags
+    );
+    assert!(
+        (last.budget_w - hi).abs() < 1.0,
+        "an unreachable-high target must pin `u` at `hi`: got {:.2}, hi {hi:.2}",
+        last.budget_w
+    );
+    assert!(
+        trace.last().flags.contains(&StatusFlag::TargetUnreachable),
+        "an unreachable-high target held at the ceiling for 60s+ must raise TARGET UNREACHABLE (high)"
+    );
+    assert_only_expected_runner_calls(&runner);
+}
+
+/// The brief's literal "5 min `GPU HOT` episode at the 90C threshold" run.
+///
+/// KNOWN PRODUCT DEFECT (fw-fanctrl-loop-a78) -- see
+/// `a_dgpu_powered_and_hot_30_min_run_stays_in_temploop_with_no_ec_mismatch`'s
+/// doc, right above, for the full finding: `watchdog::GPU_TRIP_C` (87C,
+/// hard emergency release) sits BELOW `guards::GPU_HOT_C_DEFAULT` (90C,
+/// the soft guard this run is meant to exercise), so there is no
+/// `gpu_temp_c` that reaches 90C without the hard watchdog releasing
+/// everything first. `#[ignore]`d (not deleted, not narrowed to a
+/// below-watchdog temperature like the sibling test above) so this stays
+/// the literal brief-shaped regression, ready to flip green the moment
+/// fw-fanctrl-loop-a78 lands.
+#[test]
+#[ignore = "known defect fw-fanctrl-loop-a78: GPU_TRIP_C (87C) fires before GPU_HOT_C_DEFAULT (90C) is ever reachable"]
+fn a_5min_gpu_hot_episode_at_90c_raises_the_flag_with_no_post_episode_overshoot() {
+    let fan_target_rpm = 1900.0;
+    let config = Config { fan_target_rpm, ..Config::default() };
+    let runner = FakeRunner::new();
+    let (mut ctl, _state_path, _gpu) =
+        build_controller(&runner, "gpu-hot-90c", config.clone(), None, false);
+    let mut plant = ChainedPlant::new("quiet16", QUIET16_POINTS.to_vec(), MA_INTERVAL, AMBIENT_C, 1)
+        .expect("valid curve");
+    ctl.on_command(Command::SetAuto(true));
+
+    let mut hot_window = 0u64;
+    let trace = run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, SETTLE_TICKS as u64 + 900, |t, _plant, script| {
+        load_step_script(t, _plant, script);
+        script.gpu_util_pct = 20.0;
+        // A 5-minute episode at the 90C soft-guard threshold, once settled.
+        if (SETTLE_TICKS as u64..SETTLE_TICKS as u64 + 300).contains(&t) {
+            script.gpu_temp_c = Some(90.0);
+            hot_window += 1;
+        } else {
+            script.gpu_temp_c = Some(86.0); // sensed but below both thresholds otherwise
+        }
+    });
+    assert_eq!(hot_window, 300, "test premise: the 90C episode must actually have been scripted");
+
+    println!(
+        "[gpu-hot-90c] any GpuHot={} last flags={:?}",
+        trace.any_flag(StatusFlag::GpuHot),
+        trace.last().flags
+    );
+    assert!(
+        trace.any_flag(StatusFlag::GpuHot),
+        "a 5-minute 90C episode must raise GPU HOT"
+    );
+
+    // Post-episode: no lingering overshoot above the +/-150 RPM band.
+    let post_episode = &trace.rows[(SETTLE_TICKS + 300)..];
+    let errors: Vec<f64> = post_episode
+        .iter()
+        .map(|r| {
+            let target = if r.snapped_rpm > 0.0 { r.snapped_rpm } else { fan_target_rpm };
+            r.rpm - target
+        })
+        .collect();
+    let relay = detect_relay(&errors, 150.0);
+    println!("[gpu-hot-90c] post-episode relay: {relay:?}");
+    assert!(!relay.is_relay(), "no post-episode relay: {relay:?}");
+    let residency = band_residency_pct(&errors, 150.0);
+    println!("[gpu-hot-90c] post-episode residency: {residency:.1}%");
+    assert!(
+        residency >= 90.0,
+        "no post-episode overshoot above 150 RPM: residency {residency:.1}%"
+    );
+    assert_only_expected_runner_calls(&runner);
+}
 
 #[test]
 fn an_nvme_hot_episode_raises_the_flag_while_the_rpm_trace_is_unaffected() {
@@ -2241,10 +2454,486 @@ fn a_steep_curve_segment_raises_steep_curve_without_relay() {
     assert_only_expected_runner_calls(&runner);
 }
 
+/// Queues one full CONFIRMED CPU `Mismatch` (design §2.9's "re-read once
+/// before scoring": `run_budget_and_allocate` discards the first verdict's
+/// value and only scores the SECOND call's result whenever the first was
+/// itself a `Mismatch`), i.e. two full write+read-back cycles. `0.1 W` on
+/// PPT LIMIT SLOW disagrees with anything this suite could plausibly
+/// command (the actuator's whole legal range is `[10, 54]` W) -- same
+/// technique, and same constant, as controller.rs's own
+/// `queue_confirmed_cpu_mismatch` (a private helper there this module
+/// cannot import, so it is reproduced here).
+fn queue_confirmed_cpu_mismatch(runner: &FakeRunner) {
+    for _ in 0..2 {
+        queue_ryzenadj_readback(runner, 0.1, 53.0, 0.0);
+    }
+}
+
+/// The `Effect::Noted { cause }` this suite's fault-matrix mismatch tests
+/// key off, at a given tick's row.
+fn has_noted(trace: &Trace, t: u64, cause: &str) -> bool {
+    trace.rows[(t - 1) as usize]
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::Noted { cause: c } if *c == cause))
+}
+
+/// Three consecutive confirmed CPU `Mismatch`es release to stock with the
+/// flag held (design §2.9), and a later `Verified` re-engages the actuator
+/// without a step -- controller-level, through the REAL write path
+/// (`CpuActuator::set_sustained_mw` via a scripted `FakeRunner`), driven by
+/// `ChainedPlant`/`run_ticks` like every other run in this suite (unlike
+/// controller.rs's own version of this same acceptance criterion, which
+/// feeds hand-built `Sample`s directly).
+///
+/// **Landing the scripted queue on the exact due ticks.** The allocate/
+/// write cadence (`ALLOC_PERIOD_S = 5`) fires on `run_ticks`'s very first
+/// tick (t=1) regardless of mode (RpmLoop already commands a CPU limit
+/// before TempLoop's own entry hysteresis clears), then every 5 ticks
+/// after: t=1, 6, 11, .... `reassert_actuators` (the OTHER path that can
+/// call the CPU actuator, `REASSERT_PERIOD_S = 10`) fires independently
+/// every 10 ticks from that same t=1 baseline -- t=11, 21, 31, ... -- so it
+/// coincides with every OTHER due tick. This does NOT need avoiding: a
+/// periodic reassert calls `set_sustained_mw` for its own telemetry
+/// (`all_ok`/`Reasserted`) but never feeds its verdict into
+/// `VerdictState::observe` (verified directly against `reassert_actuators`'s
+/// own body, `src/control/controller.rs`), so a reassert landing on the
+/// SAME tick as a scripted mismatch just drains the (by-then-empty) queue
+/// into `FakeRunner`'s ordinary auto-agreeing default and is otherwise
+/// inert -- it cannot reset or interfere with `mismatch_streak`. The three
+/// strikes below land at t=1, 6, 11 (t=11 also a reassert tick, left
+/// unscripted on purpose to prove that).
 #[test]
-fn a_resumed_edge_mid_run_clears_windows_and_writes_no_warm_start_across_the_gap() {
+fn three_consecutive_confirmed_cpu_mismatches_release_to_stock_then_a_later_verified_recovers() {
     let fan_target_rpm = 1900.0;
     let config = Config { fan_target_rpm, ..Config::default() };
+    let runner = FakeRunner::new();
+    let (mut ctl, _state_path, _gpu) =
+        build_controller(&runner, "three-strike-release", config.clone(), None, false);
+    let mut plant = ChainedPlant::new("quiet16", QUIET16_POINTS.to_vec(), MA_INTERVAL, AMBIENT_C, 1)
+        .expect("valid curve");
+    ctl.on_command(Command::SetAuto(true));
+
+    let trace = run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, 30, |t, plant, script| {
+        load_step_script(t, plant, script);
+        if t == 1 || t == 6 || t == 11 {
+            queue_confirmed_cpu_mismatch(&runner);
+        }
+        // t=16 onward: queue left empty on purpose -- FakeRunner's ordinary
+        // auto-agreeing default verifies it, proving recovery through the
+        // REAL write path, not a hand-picked scripted agreement.
+    });
+
+    assert!(has_noted(&trace, 1, "auto:cpu_mismatch"), "t=1 must carry the first confirmed Mismatch");
+    assert!(
+        trace.rows[0].flags.contains(&StatusFlag::LimitNotSticking),
+        "LimitNotSticking must be raised the same tick the first mismatch is confirmed"
+    );
+
+    assert!(has_noted(&trace, 6, "auto:cpu_mismatch"), "t=6 must carry the second confirmed Mismatch");
+
+    assert!(has_noted(&trace, 11, "auto:cpu_released"), "the third confirmed Mismatch (t=11) must release to stock");
+    assert_eq!(
+        trace.rows[10].cpu_limit_w, None,
+        "a released actuator must read back as released (no live commanded limit)"
+    );
+    assert!(
+        trace.rows[10].flags.contains(&StatusFlag::LimitNotSticking),
+        "LimitNotSticking must still be held on the release tick"
+    );
+
+    assert!(has_noted(&trace, 16, "auto:cpu_verdict_recovered"), "a later Verified (t=16) must recover");
+    assert!(
+        trace.rows[15].cpu_limit_w.is_some(),
+        "recovery must re-engage the actuator (a live commanded limit again)"
+    );
+    assert!(
+        !trace.rows[15].flags.contains(&StatusFlag::LimitNotSticking),
+        "LimitNotSticking must clear once recovered"
+    );
+
+    assert_only_expected_runner_calls(&runner);
+}
+
+/// A SINGLE confirmed CPU `Mismatch` freezes the budget's NEXT tick (design
+/// §2.9's "freeze ... on the same tick" is the write's own immediate
+/// reassert + flag, not a same-tick `Budget` freeze -- structurally
+/// impossible, since the freeze decision for tick N happens before tick
+/// N's own write produces its verdict) and recovers on the very next due
+/// tick once the queue runs dry -- distinct from the three-strike release
+/// above (this episode never reaches strike 2).
+#[test]
+fn a_single_confirmed_cpu_mismatch_freezes_the_next_ticks_budget_then_recovers() {
+    let fan_target_rpm = 1900.0;
+    let config = Config { fan_target_rpm, ..Config::default() };
+    let runner = FakeRunner::new();
+    let (mut ctl, _state_path, _gpu) =
+        build_controller(&runner, "single-mismatch-freeze", config.clone(), None, false);
+    let mut plant = ChainedPlant::new("quiet16", QUIET16_POINTS.to_vec(), MA_INTERVAL, AMBIENT_C, 1)
+        .expect("valid curve");
+    ctl.on_command(Command::SetAuto(true));
+
+    let trace = run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, 20, |t, plant, script| {
+        load_step_script(t, plant, script);
+        if t == 1 {
+            queue_confirmed_cpu_mismatch(&runner);
+        }
+        // t=6 onward: queue empty -- auto-agreeing default recovers it.
+    });
+
+    assert!(has_noted(&trace, 1, "auto:cpu_mismatch"), "t=1 must carry the single confirmed Mismatch");
+    assert!(
+        trace.rows[0].flags.contains(&StatusFlag::LimitNotSticking),
+        "LimitNotSticking must be raised the same tick the mismatch is confirmed"
+    );
+    let freeze_at_6 = trace.rows[5]
+        .effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::AutoAllocated { freeze, .. } => Some(*freeze),
+            _ => None,
+        })
+        .flatten();
+    assert_eq!(
+        freeze_at_6,
+        Some("actuator_mismatch"),
+        "the in-progress mismatch episode must freeze the NEXT due tick's budget: {freeze_at_6:?}"
+    );
+
+    assert!(has_noted(&trace, 6, "auto:cpu_verdict_recovered"), "the very next due tick (t=6) must recover");
+    assert!(
+        trace.rows[5].cpu_limit_w.is_some(),
+        "recovery must re-engage the actuator (a live commanded limit again)"
+    );
+    assert!(
+        !trace.rows[5].flags.contains(&StatusFlag::LimitNotSticking),
+        "LimitNotSticking must clear once recovered"
+    );
+
+    assert_only_expected_runner_calls(&runner);
+}
+
+/// A candidate `Mismatch` within `ON_AC_EDGE_SUPPRESS_S` (3 ticks) of an
+/// `on_ac` edge is dropped outright -- not scored at all, no re-read, no
+/// flag, no streak progress (design §2.9's "suppressed for 3 ticks", the
+/// exact scenario `VerdictState`'s own unit test
+/// (`verdictstate_suppressed_mismatch_near_an_on_ac_edge_is_never_scored`)
+/// exercises directly on the type; this is its controller-level,
+/// `ChainedPlant`-driven counterpart) -- contrasted against the SAME
+/// scripted mismatch well clear of any edge, which DOES land, proving the
+/// suppression is scoped to the edge, not a permanently broken mismatch
+/// path.
+#[test]
+fn a_mismatch_within_the_on_ac_edge_window_is_suppressed_then_a_later_one_off_the_edge_lands() {
+    let fan_target_rpm = 1900.0;
+    let config = Config { fan_target_rpm, ..Config::default() };
+    let runner = FakeRunner::new();
+    let (mut ctl, _state_path, _gpu) =
+        build_controller(&runner, "on-ac-suppressed-mismatch", config.clone(), None, false);
+    let mut plant = ChainedPlant::new("quiet16", QUIET16_POINTS.to_vec(), MA_INTERVAL, AMBIENT_C, 1)
+        .expect("valid curve");
+    ctl.on_command(Command::SetAuto(true));
+
+    // Landing the write on the exact ticks under test needs `need_write`
+    // (`status.cpu_limit_w != Some(cpu_w)`) forced true at each of them,
+    // not left to the allocator's own natural cadence: with a cold-start
+    // load step, `cpu_w` is grid-quantized and can sit UNCHANGED across
+    // several consecutive 5 s due ticks (confirmed empirically while
+    // writing this test), so a due tick picked by clock alone can land on
+    // a tick with nothing to write at all. A CONFIRMED Mismatch never
+    // updates `cpu_limit_w` (only `Verified` does), so t=1's own
+    // (unrelated) confirmed Mismatch keeps it `None` -- and every
+    // following due tick's `need_write` forced true -- for as long as
+    // every one of those due ticks ALSO stays a Mismatch (a `Verified`
+    // anywhere in between would re-arm `cpu_limit_w` and reopen the same
+    // timing problem). t=1's own Mismatch is otherwise irrelevant to what
+    // this test checks (the on_ac edge/suppression) and is documented
+    // here so it isn't mistaken for part of the scenario under test.
+    let trace = run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, 15, |t, plant, script| {
+        load_step_script(t, plant, script);
+        // t=1..5 stay on `TickScript::default()`'s `on_ac: true` (no edge
+        // is possible on t=1 regardless -- `last_on_ac` starts `None`, so
+        // the edge check needs a genuine PRIOR reading to compare against
+        // first). t=6 flips it: a real edge.
+        if t >= 6 {
+            script.on_ac = false;
+        }
+        match t {
+            1 => queue_confirmed_cpu_mismatch(&runner), // priming: see doc above
+            6 => {
+                // The edge itself, right on a due tick:
+                // `on_ac_suppress_until = 6 + 3 = 9`. Suppressed candidate:
+                // only ONE write+read-back attempt is made at all (suppress
+                // skips the re-read retry), so only one pair belongs in the
+                // queue.
+                queue_ryzenadj_readback(&runner, 0.1, 53.0, 0.0);
+            }
+            11 => {
+                // Well clear of the edge (11 - 6 = 5s > ON_AC_EDGE_SUPPRESS_S
+                // = 3s): the SAME disagreeing table, fully confirmed.
+                queue_confirmed_cpu_mismatch(&runner);
+            }
+            _ => {}
+        }
+    });
+
+    assert!(has_noted(&trace, 1, "auto:cpu_mismatch"), "test premise: the t=1 priming Mismatch must land");
+
+    assert!(
+        !has_noted(&trace, 6, "auto:cpu_mismatch"),
+        "a mismatch scored inside the on_ac suppression window must never land"
+    );
+    assert!(
+        trace.rows[5].cpu_limit_w.is_none(),
+        "a suppressed candidate is dropped, not scored -- it must not (re-)release either"
+    );
+
+    assert!(
+        has_noted(&trace, 11, "auto:cpu_mismatch"),
+        "the SAME scripted disagreement, well clear of the edge, must be scored"
+    );
+
+    assert_only_expected_runner_calls(&runner);
+}
+
+/// Reconciliation A -> B -> A with reseed (design §2.6): three consecutive
+/// scored views that DISAGREE latch `EC MISMATCH` (A -> B); three more
+/// consecutive scored views that MATCH clear it again AND re-seed
+/// `ec_ma_c` from `view.ma_temperature` (`reseed_ma`) -- back to A. The
+/// mismatch is engineered through the SAME upstream quirk
+/// `TickScript::sensor_read_failed` exists to reproduce
+/// (`test_support::plant`'s own module doc: "a hardcoded 50C injected on a
+/// scripted sensor-read failure ... the whole reason EC MISMATCH exists"):
+/// a single-tick failure exactly on a `print all` poll boundary
+/// (`ALL_POLL_EVERY_TICKS = 30`) sets that ONE view's `temperature` to the
+/// hardcoded 50C while the real EC (`ec.max_c`, an unrelated read straight
+/// off `ThermalPlant`) stays at its real steady value --
+/// `MISMATCH_ABS_DIFF_C = 1.0` makes any real steady-state temperature a
+/// guaranteed mismatch. Run well past `SETTLE_TICKS` first so the real EC
+/// is steady (`replica_slope_5s_c_per_s` near zero, under the §2.6
+/// skip-for-slewing threshold), so every poll below is genuinely SCORED,
+/// never skipped (skipping is the NEXT test's own scenario).
+/// A scored view skipped because the replica was slewing (design §2.6:
+/// `input.replica_slope_5s_c_per_s >= SKIP_SLOPE_C_PER_S(0.5)` skips
+/// reconciliation scoring for that view entirely -- neither a match nor a
+/// mismatch, and critically `self.reconciled` (which starts `false`,
+/// unobservable directly, but GATES TempLoop reachability alongside the
+/// generic entry-hysteresis streak in the SAME row-table condition,
+/// `mode.rs`'s `reconciliation_ok = self.reconciled && !self.ec_mismatch`)
+/// is not set. That makes "how long TempLoop takes to first engage" an
+/// observable proxy for "was the covering view scored or skipped": a
+/// `print all` poll only happens every `ALL_POLL_EVERY_TICKS=30` ticks, so
+/// a skipped poll delays reachability by a full 30 s, not a handful of
+/// ticks.
+///
+/// A genuinely fast, sustained CPU draw from t=1 (bypassing the usual
+/// controller-fed-back cap -- this scenario is about the PLANT's own
+/// thermal slope, not about how fast the allocator ramps) makes the real
+/// EC's climb steep enough, right as the dead-time (`theta=20s`) ends, to
+/// still exceed `SKIP_SLOPE_C_PER_S` at the first AND second polls
+/// (t=30, t=60) -- both skipped -- decaying below it only by the third
+/// (t=90). A gentler, still-fully-saturated draw decays below the
+/// threshold well before the very first poll, so nothing is ever skipped.
+/// Both numbers below were found empirically (a throwaway probe while
+/// writing this test, not kept, same precedent as `SETTLE_TICKS`) and are
+/// asserted at a comfortable margin from the transition, not pinned to its
+/// exact edge.
+#[test]
+fn a_scored_view_skipped_for_replica_slewing_delays_temploop_entry_by_a_full_poll() {
+    let fan_target_rpm = 1900.0;
+    let config = Config { fan_target_rpm, ..Config::default() };
+
+    let run_with_sustained_draw = |tag: &str, draw_w: f64| {
+        let runner = FakeRunner::new();
+        let (mut ctl, _state_path, _gpu) = build_controller(&runner, tag, config.clone(), None, false);
+        let mut plant = ChainedPlant::new("quiet16", QUIET16_POINTS.to_vec(), MA_INTERVAL, AMBIENT_C, 1)
+            .expect("valid curve");
+        ctl.on_command(Command::SetAuto(true));
+        let trace = run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, 90, |_t, _plant, script| {
+            // A constant, fully demand-saturated draw independent of
+            // whatever the controller itself commands -- see the doc
+            // comment above for why.
+            script.cpu_cap_w = draw_w;
+            script.cpu_demand_frac = 1.0;
+            script.cpu_util_pct = 100.0;
+            script.on_ac = true;
+        });
+        assert_only_expected_runner_calls(&runner);
+        trace
+    };
+
+    // Gentle (20 W): decayed below the skip threshold well before the
+    // FIRST poll (t=30) -- that view is scored, `reconciled` sets, and
+    // TempLoop engages the moment entry-hysteresis alone clears (t=33).
+    let gentle = run_with_sustained_draw("slew-gentle", 20.0);
+    println!(
+        "[replica-slewing] gentle(20W): mode@30={:?} mode@33={:?}",
+        gentle.rows[29].mode, gentle.rows[32].mode
+    );
+    assert_eq!(
+        gentle.rows[32].mode,
+        LoopMode::TempLoop,
+        "a gentle, non-slewing draw must reach TempLoop as soon as entry-hysteresis alone allows (t=33)"
+    );
+
+    // Steep (65 W): still slewing at BOTH the first (t=30) and second
+    // (t=60) polls -- both skipped, `reconciled` never sets until the
+    // third (t=90), which is when TempLoop finally engages, a full extra
+    // 30 s poll cycle later than a clean entry, despite core_ok (entry
+    // hysteresis, argmax, curve validity, freshness) having been
+    // satisfied continuously since well before t=60 either way.
+    let steep = run_with_sustained_draw("slew-steep", 65.0);
+    println!(
+        "[replica-slewing] steep(65W): mode@33={:?} mode@60={:?} mode@63={:?} mode@90={:?}",
+        steep.rows[32].mode, steep.rows[59].mode, steep.rows[62].mode, steep.rows[89].mode
+    );
+    assert_eq!(
+        steep.rows[62].mode,
+        LoopMode::RpmLoop,
+        "a steeply slewing replica must still be held out of TempLoop 3 ticks past the SECOND poll (t=63) \
+         -- both t=30 and t=60's views skipped, not scored"
+    );
+    assert_eq!(
+        steep.rows[89].mode,
+        LoopMode::TempLoop,
+        "TempLoop must finally engage at the THIRD poll (t=90) once the replica has decayed below the \
+         skip-for-slewing threshold"
+    );
+}
+
+#[test]
+fn reconciliation_a_to_b_to_a_clears_ec_mismatch_and_reseeds_ec_ma() {
+    let fan_target_rpm = 1900.0;
+    let config = Config { fan_target_rpm, ..Config::default() };
+    let runner = FakeRunner::new();
+    let (mut ctl, _state_path, _gpu) =
+        build_controller(&runner, "reconciliation-a-b-a", config.clone(), None, false);
+    let mut plant = ChainedPlant::new("quiet16", QUIET16_POINTS.to_vec(), MA_INTERVAL, AMBIENT_C, 1)
+        .expect("valid curve");
+    ctl.on_command(Command::SetAuto(true));
+
+    // `print all` polls at multiples of 30 (`ALL_POLL_EVERY_TICKS`);
+    // SETTLE_TICKS=600 is itself a poll boundary, so the three mismatched
+    // polls (630, 660, 690) and the three matching ones that follow (720,
+    // 750, 780) are all comfortably past settling.
+    let mismatch_polls = [630u64, 660, 690];
+    let trace = run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, 800, |t, plant, script| {
+        load_step_script(t, plant, script);
+        if mismatch_polls.contains(&t) {
+            script.sensor_read_failed = true;
+        }
+        // t=720, 750, 780 (and every other poll) stay on the real reading
+        // -- genuine matches, driving the 3-consecutive-match clear.
+    });
+
+    println!(
+        "[reconciliation-a-b-a] flags at t=689/690/779/780: {:?} / {:?} / {:?} / {:?}",
+        trace.rows[688].flags, trace.rows[689].flags, trace.rows[778].flags, trace.rows[779].flags
+    );
+    assert!(
+        !trace.rows[628].flags.contains(&StatusFlag::EcMismatch),
+        "state A (before the first mismatched poll): EC MISMATCH must be clear"
+    );
+    assert!(
+        !trace.rows[688].flags.contains(&StatusFlag::EcMismatch),
+        "only 2 of 3 mismatched polls scored so far (t=689): EC MISMATCH must not have latched yet"
+    );
+    assert!(
+        trace.rows[689].flags.contains(&StatusFlag::EcMismatch),
+        "state B: the THIRD consecutive mismatched poll (t=690) must latch EC MISMATCH"
+    );
+    assert!(
+        trace.rows[719].flags.contains(&StatusFlag::EcMismatch),
+        "EC MISMATCH must stay latched between the mismatch and match poll clusters"
+    );
+    assert!(
+        trace.rows[778].flags.contains(&StatusFlag::EcMismatch),
+        "only 2 of 3 matching polls scored so far (t=779): EC MISMATCH must still be held"
+    );
+    assert!(
+        !trace.rows[779].flags.contains(&StatusFlag::EcMismatch),
+        "state A again: the THIRD consecutive matching poll (t=780) must clear EC MISMATCH"
+    );
+
+    // The reseed itself (`reseed_ma`, §2.6): `ec_ma_c` snaps to
+    // `view.ma_temperature` on the SAME tick EC MISMATCH clears, not
+    // merely converges toward it over time.
+    let reseeded_row = &trace.rows[779];
+    let ec_ma = reseeded_row.ec_ma_c.expect("ec_ma_c must be populated by t=780");
+    let view_ma = reseeded_row.fanctrl_ma_c.expect("t=780 is a poll tick: must carry a fresh view");
+    println!("[reconciliation-a-b-a] on the reseed tick: ec_ma_c={ec_ma:.3} view.ma_temperature={view_ma:.3}");
+    assert!(
+        (ec_ma - view_ma).abs() < 0.01,
+        "reseed_ma must snap ec_ma_c to view.ma_temperature exactly on the clearing tick: \
+         ec_ma_c={ec_ma:.3}, view.ma_temperature={view_ma:.3}"
+    );
+
+    assert_only_expected_runner_calls(&runner);
+    assert_ec_ma_tracks_emulator(&trace, 1.0);
+}
+
+/// KNOWN PRODUCT DEFECT (fw-fanctrl-loop-hwg, filed while writing this fix
+/// round, out of this task's `filesTouched`): `Controller::on_sample`'s
+/// resume branch clears `auto.fan_window`/`ec_avg`/`ec_ma`/
+/// `ec_slope_window`/`ec_seeded` on a `resumed` sample but never touches
+/// `auto.steady_window` (or `auto.steady_key`) -- contradicting the design
+/// doc verbatim (`docs/superpowers/specs/2026-09-07-fw-fanctrl-loop-design.md`,
+/// fwloop.9/fwloop.12's acceptance criteria and the §2.2 test-plan line, ALL
+/// three of which say "clears ... the steady window", not just the boxcar).
+/// `#[ignore]`d (not deleted, not weakened back to the pre-fix-round
+/// version) so this stays ready to flip green the moment fw-fanctrl-loop-hwg
+/// lands.
+#[test]
+#[ignore = "known defect fw-fanctrl-loop-hwg: AutoState::steady_window is never cleared on a resumed sample"]
+fn a_resumed_edge_mid_run_clears_windows_and_writes_no_warm_start_across_the_gap() {
+    // Task 22 review round 1: the original version of this test ran only
+    // 100 pre-resume ticks -- far short of STEADY_WINDOW_N=40 CONSECUTIVE
+    // qualifying samples regardless of the resume, so it would have passed
+    // even if the resume cleared nothing at all (the finding this fix round
+    // was asked to address). Fixed by a NEAR-MISS + CONTROL design instead:
+    // empirically (via a throwaway bisection while writing this fix -- not
+    // kept, per this suite's own "temporary debug instrumentation, removed"
+    // precedent for `SETTLE_TICKS`) an uninterrupted `load_step_script`
+    // run's steady window completes (first non-empty `warm_start` on a
+    // forced save) at EXACTLY tick 539 for this config/curve/seed: empty at
+    // 538, populated at 539. Rewriting the test this way is what SURFACED
+    // fw-fanctrl-loop-hwg above: the rewritten assertion below fails
+    // (`warm_start` IS populated, at essentially the control's own
+    // converged value) -- proof the pre-suspend window's ~39/40 progress
+    // survived the resume intact rather than being cleared, exactly the
+    // stale-evidence risk the design doc calls out. So:
+    // - CONTROL: run 549 ticks straight through, no resume -- `warm_start`
+    //   must be populated (539 < 549, comfortable margin past completion).
+    // - TEST: run only 538 ticks (one shy of completion, window
+    //   genuinely mid-flight, not yet written), then a resumed sample,
+    //   then 10 MORE ordinary ticks (549 total elapsed, matching the
+    //   control) -- 11 post-resume samples total, far short of a FRESH
+    //   window's own 40. If the resume had cleared nothing, the very next
+    //   sample after the resume (tick 539 overall) would be the same one
+    //   that completes the control's window, and by tick 549 `warm_start`
+    //   would be populated same as the control. It is not -- because the
+    //   gap specifically prevented the write that was one sample away.
+    let fan_target_rpm = 1900.0;
+    let config = Config { fan_target_rpm, ..Config::default() };
+
+    // Control: no resume, 549 ticks straight through.
+    let control_runner = FakeRunner::new();
+    let (mut control_ctl, control_state_path, _gpu) =
+        build_controller(&control_runner, "resumed-edge-control", config.clone(), None, false);
+    let mut control_plant = ChainedPlant::new("quiet16", QUIET16_POINTS.to_vec(), MA_INTERVAL, AMBIENT_C, 1)
+        .expect("valid curve");
+    control_ctl.on_command(Command::SetAuto(true));
+    run_ticks(&mut control_plant, &mut control_ctl, None, config.cpu_floor_w, 549, load_step_script);
+    control_ctl.on_command(Command::SetAuto(false));
+    let control_loaded = PersistedState::load(&control_state_path);
+    println!("[resumed-edge] control (no resume, 549 ticks) warm_start: {:?}", control_loaded.warm_start);
+    assert!(
+        !control_loaded.warm_start.is_empty(),
+        "test premise: an uninterrupted 549-tick run must have a completed steady window by now"
+    );
+
+    // Test: 538 ticks (one shy of completion), a resumed sample, then 10
+    // more ordinary ticks -- 549 elapsed total, matching the control.
     let runner = FakeRunner::new();
     let (mut ctl, state_path, _gpu) =
         build_controller(&runner, "resumed-edge", config.clone(), None, false);
@@ -2252,15 +2941,7 @@ fn a_resumed_edge_mid_run_clears_windows_and_writes_no_warm_start_across_the_gap
         .expect("valid curve");
     ctl.on_command(Command::SetAuto(true));
 
-    // Converge, then a resumed edge, then immediately force a state save --
-    // if the steady window survived the gap (wrongly), a warm-start point
-    // from the STALE pre-suspend window could already have been recorded.
-    // Short enough that a steady window (STEADY_WINDOW_N=40 CONSECUTIVE
-    // qualifying samples, off both budget bounds) cannot possibly have
-    // completed yet -- this test is about the gap PREVENTING a warm-start
-    // write that would otherwise land soon after, not about clearing one
-    // already recorded.
-    run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, 100, load_step_script);
+    run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, 538, load_step_script);
     let pre_resume_flags = ctl.status().flags.clone();
     assert!(
         !pre_resume_flags.contains(&StatusFlag::Resumed),
@@ -2276,15 +2957,21 @@ fn a_resumed_edge_mid_run_clears_windows_and_writes_no_warm_start_across_the_gap
         "a resumed sample must raise the Resumed flag"
     );
 
-    // Immediately after the gap (before STEADY_WINDOW_N=40 fresh samples
-    // could possibly have re-accumulated), force a save: the window must
-    // have been cleared by the resume, not carried over.
+    // 10 more ordinary ticks -- 11 post-resume samples total (538 + 1 +
+    // 10 = 549), far short of a fresh window's own STEADY_WINDOW_N=40.
+    run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, 10, load_step_script);
+
     ctl.on_command(Command::SetAuto(false));
     let loaded = PersistedState::load(&state_path);
-    println!("[resumed-edge] warm_start after an immediate post-resume save: {:?}", loaded.warm_start);
+    println!(
+        "[resumed-edge] test (resumed at t=539, 549 ticks total) warm_start: {:?}",
+        loaded.warm_start
+    );
     assert!(
         loaded.warm_start.is_empty(),
-        "no warm-start point may be written across a resume gap (the pre-suspend window must have been cleared)"
+        "no warm-start point may be written across a resume gap: by the SAME elapsed tick count \
+         (549) the control (no resume) already has one, so the gap -- not merely running out of \
+         time -- is what prevented it here"
     );
     assert_only_expected_runner_calls(&runner);
 }

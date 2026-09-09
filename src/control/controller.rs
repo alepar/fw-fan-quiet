@@ -83,10 +83,6 @@ pub const DEFAULT_FAN_TARGET_RPM: f64 = 3000.0;
 /// enough that Mode B's error tracks a real fan-speed change within a few
 /// seconds, long enough to reject single-sample tach noise.
 const FAN_SMOOTH_N: usize = 5;
-/// Default dGPU-hot guard threshold, °C (design §2.8).
-const GPU_HOT_C_DEFAULT: f64 = crate::control::guards::GPU_HOT_C_DEFAULT;
-/// Default NVMe-hot guard threshold, °C (design §2.8).
-const NVME_HOT_C_DEFAULT: f64 = crate::control::guards::NVME_HOT_C_DEFAULT;
 /// Consecutive scored `Mismatch` verdicts (after the one re-read) before an
 /// actuator releases to stock with its flag held (design §2.9).
 const MISMATCH_RELEASE_STRIKES: u8 = 3;
@@ -186,8 +182,11 @@ pub enum LoopMode {
 /// Coarse severity tier for a [`StatusFlag`], ordered loudest-first so a
 /// derived `Ord`/`PartialOrd` sorts a flag list severity-first (declaration
 /// order IS the ranking: `Critical < Warning < Info`).
-// Classifies StatusFlag (used by its own tests); nothing outside tests
-// calls it yet — Task 15 wires it into the header.
+// Classifies StatusFlag (used by its own tests); ui/view.rs ended up with
+// its own separate ranking/styling scheme instead (Task 15) -- deliberately
+// diverging from this one on NvmeHot (see ui/view.rs's own doc comment) --
+// so `flag_severity` stays unused outside its own tests by design, not by
+// omission. Kept as the design's own classification and exercised directly.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
@@ -225,42 +224,35 @@ pub enum StatusFlag {
     /// (design amendment, Task 7: a lost sensor must never let the watchdog
     /// go blind).
     SensorLost,
-    // The seven flags below are the Task 4 type surface's new additions:
-    // none is raised by any call site yet (the guards/arbiter that would
-    // raise them are later tasks), so each needs an explicit dead_code
-    // allow; their own coverage/severity tests still construct them.
+    // The seven flags below were the Task 4 type surface's new additions;
+    // all seven are now raised in production (control/mode.rs's Arbiter and
+    // control/guards.rs's Guards, synced into ControlStatus by
+    // mirror_decision/sync_bool_flag in this file).
     /// The fw-fanctrl socket is absent or stale (design §2.5): TempLoop is
     /// unavailable and the loop falls to RpmLoop. Informational while in
     /// RpmLoop; clears when the socket returns.
-    #[allow(dead_code)]
     FanctrlLost,
     /// The controller's EC replica disagrees with fw-fanctrl's own `print
     /// all` view for 3 consecutive scored views (design §2.6): TempLoop is
     /// unavailable until 3 consecutive views agree again.
-    #[allow(dead_code)]
     EcMismatch,
     /// `slope_at(T*) > 2 %/°C` (design §2.7): the loop runs, but the
     /// operating point sits on a steep segment of the fw-fanctrl curve.
     /// Informational only.
-    #[allow(dead_code)]
     SteepCurve,
     /// A permanent loss of Mode A (unlike the transient [`Self::SteepCurve`],
     /// this does not clear on its own) — a warning, not merely informational,
     /// since it is a standing loss of the primary control loop rather than a
     /// momentary steepness note.
-    #[allow(dead_code)]
     CurveInvalid,
     /// dGPU at/over its hot threshold (design §2.8, default 90 °C, exit
     /// 85 °C): the GPU share is overridden down at each allocator tick.
-    #[allow(dead_code)]
     GpuHot,
     /// The NVMe `Composite` sensor is at/over its hot threshold (design
     /// §2.8, default 80 °C). Reporting only — no control action.
-    #[allow(dead_code)]
     NvmeHot,
     /// Six consecutive `Unreadable`/`Unverifiable` actuator read-backs
     /// (design §2.9): informational, cleared by the next `Verified`.
-    #[allow(dead_code)]
     ReadbackBlind,
 }
 
@@ -287,9 +279,10 @@ impl StatusFlag {
 
 /// Severity tier for every [`StatusFlag`] variant (exhaustive match: adding
 /// a variant without extending this fails the build rather than silently
-/// defaulting). UI ordering/styling is Task 15's job; this only classifies.
-/// Called only from its own tests today — no production call site wires
-/// flag classification into rendering yet.
+/// defaulting). Called only from its own tests: `ui/view.rs` ships its own
+/// ranking/styling instead (Task 15), deliberately diverging on `NvmeHot`
+/// (see `Severity`'s own doc comment above) — this stays as the design's
+/// classification, exercised directly.
 #[allow(dead_code)]
 pub fn flag_severity(flag: StatusFlag) -> Severity {
     match flag {
@@ -652,7 +645,16 @@ struct AutoState {
 }
 
 impl AutoState {
-    fn new(gains: &LoopGains) -> Self {
+    /// `gpu_hot_c`/`nvme_hot_c` come from the live `Config` (integration
+    /// sweep, fw-fanctrl-loop-nsc): this constructor used to hard-code
+    /// `Guards::new(GPU_HOT_C_DEFAULT, NVME_HOT_C_DEFAULT)`, so an edited
+    /// `gpu_hot_c`/`nvme_hot_c` in `config.toml` had zero effect on the
+    /// actual guard thresholds — the two keys round-tripped through
+    /// `Config::load`/`save` and appeared on `ControlStatus`/the config
+    /// fixture tests, but the value driving `Guards::step`'s hysteresis was
+    /// always the compiled-in default, invisible on this machine only
+    /// because that default equals the shipped default.
+    fn new(gains: &LoopGains, gpu_hot_c: f64, nvme_hot_c: f64) -> Self {
         Self {
             pid: GpuPid::new(),
             allocator: Allocator::new(),
@@ -665,7 +667,7 @@ impl AutoState {
             ec_ma: None,
             gpu_verifier_mhz: None,
             ec_slope_window: std::collections::VecDeque::new(),
-            guards: Guards::new(GPU_HOT_C_DEFAULT, NVME_HOT_C_DEFAULT),
+            guards: Guards::new(gpu_hot_c, nvme_hot_c),
             cpu_verdict: VerdictState::default(),
             gpu_verdict: VerdictState::default(),
             gpu_verifier: None,
@@ -1063,7 +1065,8 @@ impl<R: Runner> Controller<R> {
                 } else {
                     self.remove_flag(StatusFlag::NotCalibrated);
                     let gains = self.loop_gains.unwrap_or_default();
-                    let mut auto = AutoState::new(&gains);
+                    let mut auto =
+                        AutoState::new(&gains, self.config.gpu_hot_c, self.config.nvme_hot_c);
                     match self.guard.gpu.as_ref() {
                         // Carried-over review decision: with a GPU lock
                         // applied right now (e.g. entering from Manual),
@@ -1236,6 +1239,16 @@ impl<R: Runner> Controller<R> {
                 // THIS sample's own view (if any) re-seeds it immediately,
                 // exactly like a fresh auto entry.
                 auto.ec_seeded = false;
+                // fw-fanctrl-loop-hwg (integration sweep, fw-fanctrl-loop-nsc):
+                // the steady-window detector's own accumulated RPM samples
+                // are exactly as stale across a suspend as the fan/EC
+                // windows above -- design §2.2 names it explicitly ("clears
+                // ... the steady window"). Left uncleared, a window that was
+                // one sample from completing pre-suspend would complete on
+                // the very next post-resume sample and write a warm-start/
+                // refinement entry from readings spanning the gap.
+                auto.steady_window.clear();
+                auto.steady_key = None;
             }
             cause.get_or_insert("resume");
         } else if self.resumed_until.is_some_and(|until| s.t_mono >= until) {
@@ -1670,6 +1683,13 @@ impl<R: Runner> Controller<R> {
             StatusFlag::SteepCurve,
             StatusFlag::CurveInvalid,
             StatusFlag::SensorLost,
+            // fw-fanctrl-loop-a5j (integration sweep, fw-fanctrl-loop-nsc):
+            // the Arbiter computes and returns this in Decision.flags for
+            // all three §2.7 unreachable-target cases, but it was missing
+            // from this sync list, so it could never reach ControlStatus
+            // (and therefore the UI/telemetry) regardless of how long `u`
+            // sat at a bound.
+            StatusFlag::TargetUnreachable,
         ] {
             self.sync_bool_flag(flag, decision.flags.contains(&flag));
         }
@@ -6167,6 +6187,47 @@ mod tests {
     /// actually consuming whatever cap it's handed (never idle) -- the
     /// scenario where a bug (e.g. judging demand against a stale
     /// pre-override cap) would show up as a false halt.
+    /// Regression (integration sweep, fw-fanctrl-loop-nsc): `AutoState::new`
+    /// used to hard-code `Guards::new(GPU_HOT_C_DEFAULT, NVME_HOT_C_DEFAULT)`
+    /// regardless of the live `Config`, so `gpu_hot_c`/`nvme_hot_c` were
+    /// config keys that round-tripped through `Config::load`/`save` and
+    /// appeared on `ControlStatus` but never actually reached the guards
+    /// that are supposed to act on them. Both thresholds are set here WELL
+    /// BELOW the compiled-in defaults (90/80): a temperature that would
+    /// leave the DEFAULTS cold must trip THESE configured, lower ones.
+    #[test]
+    fn gpu_and_nvme_hot_thresholds_come_from_the_live_config_not_the_compiled_defaults() {
+        let runner = FakeRunner::new();
+        let config = Config { gpu_hot_c: 50.0, nvme_hot_c: 40.0, ..Config::default() };
+        let (mut ctl, _gpu) = auto_controller(
+            &runner,
+            PathBuf::from("/nonexistent/platform_profile"),
+            config,
+        );
+        ctl.on_command(Command::SetAuto(true));
+        let s = Sample {
+            gpu_temp_valid: true,
+            gpu_temp_c: 60.0, // below GPU_HOT_C_DEFAULT (90), above the configured 50
+            nvme_temp_c: Some(45.0), // below NVME_HOT_C_DEFAULT (80), above the configured 40
+            cpu_temp_valid: true,
+            cpu_temp_c: 60.0,
+            ..busy_at(ALLOC_PERIOD_S)
+        };
+        ctl.on_sample(&s);
+        assert!(
+            ctl.status().flags.contains(&StatusFlag::GpuHot),
+            "60C must trip a configured 50C gpu_hot_c threshold even though it's \
+             well under the compiled-in 90C default: {:?}",
+            ctl.status().flags
+        );
+        assert!(
+            ctl.status().flags.contains(&StatusFlag::NvmeHot),
+            "45C must trip a configured 40C nvme_hot_c threshold even though it's \
+             well under the compiled-in 80C default: {:?}",
+            ctl.status().flags
+        );
+    }
+
     #[test]
     fn gpu_hot_episode_ratchets_the_cap_without_spuriously_triggering_demand_limited() {
         let runner = FakeRunner::new();

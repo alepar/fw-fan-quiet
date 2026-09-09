@@ -238,6 +238,15 @@ impl Budget {
 
     /// Loads new gains for future ticks. Does not touch `u`, `v`, `e_prev`
     /// or dwell — a gain change alone is not a setpoint jump.
+    ///
+    /// No production call site today (integration sweep, `fw-fanctrl-loop-nsc`):
+    /// gains only ever change via a landed calibration fit, and calibration
+    /// only ever runs from `Mode::Monitor` (never while an `AutoState`/
+    /// `Budget` exists to mutate), so the fitted gains simply become the
+    /// `LoopGains` the *next* `Budget::new` on auto entry reads — this
+    /// method exists for that possible future (a live gains edit that must
+    /// not disturb `u`) and is exercised directly by its own unit test.
+    #[allow(dead_code)]
     pub fn set_gains(&mut self, gains: &LoopGains) {
         self.gains = *gains;
     }

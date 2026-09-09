@@ -154,9 +154,50 @@ controllers on one measurement benign. Never add a second integrator on the same
   curve validity as an input and falls to RpmLoop.
   - `duty_at(t: f64) -> u8`
   - `tread(d: u8) -> Option<(t_lo, t_hi)>`: the maximal temperature interval where
-    `duty_at(t) == d`; `None` when no temperature yields exactly `d` (the target then snaps to
-    the nearest reachable duty, see 2.3).
-  - `t_star(d) = (t_lo + t_hi) / 2`.
+    `duty_at(t) == d`, computed by **the same rule at every duty** — `min_duty`/`max_duty` (the
+    curve's own floor/ceiling) get no special case. `None` when no temperature yields exactly
+    `d` (the target then snaps to the nearest reachable duty, see 2.3).
+    **Endpoint semantics (settled here; was a deferred minor on Task 1, `fw-fanctrl-loop-9dv`,
+    never signed off before Task 16, `fw-fanctrl-loop-iym`, merged as its first consumer —
+    `fw-fanctrl-loop-nez` closes the gap):** the interval is unbounded in principle at the
+    curve's own floor and ceiling — fw-fanctrl would report that duty at any arbitrarily
+    low/high temperature past the curve's own defined domain — but `tread` is **the unbounded
+    interval intersected with the curve's own domain**, `[points.first().0, points.last().0]`,
+    never left open with a `NEG_INFINITY`/`INFINITY` endpoint. Concretely:
+    - **Where the curve defines a genuine flat run at that extreme** (both `quiet16` and
+      `cool16` have one at their floor: 0→55 °C at duty 15, 0→50 °C at duty 20), the
+      intersection is a real, finite, non-empty interval — same shape as any interior duty's
+      tread, just clamped at the domain edge instead of a neighbouring point. T* lands inside
+      it and Mode A runs there exactly as it would anywhere else: **the quietest reachable
+      target keeps the temperature loop**, it does not permanently fall to RpmLoop.
+    - **Where the extreme duty is attained only instantaneously, at a single defining point with
+      no flat run** (both curves' *ceiling*: quiet16 and cool16 each reach their top duty only
+      at their very last point), the intersection is empty and `tread` returns `None` for that
+      exact duty. This is not by itself `TARGET UNREACHABLE`: 2.3's `nearest_tread` already
+      snaps a duty with no tread of its own to the nearest one that has one, and the immediately
+      adjacent duty always does (one integer step is a small enough temperature step that the
+      curve attains it over a real, if narrow, interval) — so a target sitting exactly on such a
+      ceiling still resolves to a finite T* one duty in (quiet16's 100 resolves via 99, T* ≈
+      94.9 °C), and Mode A keeps running there too, not just at the floor.
+    - The two ends are **not required to behave identically, and for both of this design's own
+      curves do not** — a flat lead-in and an instantaneous ceiling are different curve shapes,
+      not an arbitrary per-end special case. It is one rule (intersect with the domain) applied
+      uniformly; the asymmetric *outcome* is a fact about `quiet16`/`cool16`, not about `tread`.
+      A hypothetical curve with a flat run at its ceiling too (e.g. an extra point repeating the
+      max duty) would get a finite ceiling tread from the same rule, no code change required.
+    - `slope_at(t_star)` stays meaningful in both cases above: whenever `t_star` is `Some`, it
+      lies inside `[points.first().0, points.last().0]` by construction (never on the flat
+      clamp, where `slope_at` is defined as `0`), so `STEEP CURVE` is judged on the same real
+      segment slope as any interior duty — never coerced by an out-of-domain 0.
+    - The §2.7 "unreachable from above" bound-hold rule is unaffected either way: it reads
+      `Budget::at_upper_bound_for()` and the tick's `error_sign` directly, never `t_star`, so it
+      fires exactly as before regardless of which duty's tread ends up backing T* at the
+      ceiling.
+    - Net effect on the curve/arbiter seam (`fw-fanctrl-loop-nez`): `tread`/`t_star` can no
+      longer return a non-finite value for **any** duty in `[min_duty, max_duty]`, on either
+      curve, at any point — the velocity-form PI (2.4) never again sees an infinite error.
+  - `t_star(d) = (t_lo + t_hi) / 2` — always finite when `tread(d)` is `Some`, by the above;
+    `None` exactly when `tread(d)` is `None`.
   - `slope_at(t) -> f64` in %/°C (the segment's slope; 0 on the flat clamps).
 
 ### 2.2 `sensors/ec.rs` — fw-fanctrl sensor replica (new)

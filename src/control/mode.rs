@@ -347,6 +347,18 @@ impl Arbiter {
                 match curve.nearest_tread(input.target_duty) {
                     Some(d) => {
                         if let Some(ts) = curve.t_star(d) {
+                            // Regression guard for fw-fanctrl-loop-nez
+                            // (§2.1): `Curve::tread`/`t_star` must never
+                            // hand this seam a non-finite setpoint — a
+                            // later curve change that reintroduced an
+                            // unbounded tread would otherwise silently
+                            // hand `Budget` an infinite error and NaN it
+                            // out on the very next tick.
+                            debug_assert!(
+                                ts.is_finite(),
+                                "curve.t_star({d}) = {ts} is not finite; §2.1 requires \
+                                 tread/t_star to never return a non-finite value"
+                            );
                             t_star = Some(ts);
                             slope = Some(curve.slope_at(ts));
                         }
@@ -814,14 +826,16 @@ mod tests {
 
     #[test]
     fn infeasible_target_yields_target_unreachable_and_clears_after_60s() {
-        // ambient at 58C, cpu at 20C so argmax stays controllable; target
-        // duty 15 -> T* sits on the quiet16 flat lead-in, well below
-        // ambient + 5.
-        let ec = ec_reading(&[("ambient_f75303@4d", 58.0), ("cpu@4c", 20.0)]);
-        let low_target_view = view(QUIET16, 20.0, 20.0);
+        // ambient at 61C (argmax; cpu at 20C stays controllable) and an
+        // interior target duty of 21 -> T*=65.5 (quiet16's tread(21) is
+        // (65, 66), see curve.rs's own test); 65.5 < 61 + 5, so this is
+        // genuinely infeasible per §2.7's feasibility rule, not an accident
+        // of an unbounded tread.
+        let ec = ec_reading(&[("ambient_f75303@4d", 61.0), ("cpu@4c", 20.0)]);
+        let infeasible_target_view = view(QUIET16, 20.0, 20.0);
         let mut a = Arbiter::new();
-        let mut input = happy_input(&low_target_view, &ec);
-        input.target_duty = 15; // flat clamp -> tread is (-inf, 55): t_star... see below
+        let mut input = happy_input(&infeasible_target_view, &ec);
+        input.target_duty = 21;
         input.view_changed = true;
 
         let d = a.decide(&input);
@@ -839,7 +853,7 @@ mod tests {
         // Feed feasible ticks; the flag must still be present before 12
         // ticks (60s) and gone at/after 12.
         let ok_ec = ec_reading(&[("ambient_f75303@4d", 10.0), ("cpu@4c", 60.0)]);
-        let mut ok_input = happy_input(&low_target_view, &ok_ec);
+        let mut ok_input = happy_input(&infeasible_target_view, &ok_ec);
         ok_input.target_duty = 31; // a tread whose T*=80 clears 10+5 easily
         for i in 0..11 {
             let d = a.decide(&ok_input);
@@ -1084,5 +1098,90 @@ mod tests {
             d3.t_star, d1.t_star,
             "the edited tread moves T* for the same target duty"
         );
+    }
+
+    // ---- 14. curve/arbiter seam: t_star must never be ±inf (fw-fanctrl-loop-nez) ----
+
+    #[test]
+    fn arbiter_keeps_u_finite_at_floor_and_ceiling_duty() {
+        // Reproduces the defect directly: before the fix, quiet16's floor
+        // (15) and ceiling (100) duty both resolve T* to NEG_INFINITY /
+        // INFINITY; feeding that straight into a real Budget as a Temp
+        // error makes `u` NaN on the second tick (inf - inf), and it stays
+        // NaN forever. After the fix, T* is finite at both ends (the floor
+        // via its own tread, the ceiling via `nearest_tread`'s snap to
+        // duty 99), so `u` stays finite throughout.
+        use crate::control::budget::{Budget, LoopError, LoopGains};
+
+        let v = view(QUIET16, 75.0, 75.0);
+        let ec = happy_ec();
+
+        for &target in &[15u8, 100u8] {
+            let mut a = Arbiter::new();
+            let mut budget = Budget::new(&LoopGains::default());
+            budget.set_bounds(10.0, 60.0);
+            let mut input = happy_input(&v, &ec);
+            input.target_duty = target;
+
+            for tick in 1..=5 {
+                let d = a.decide(&input);
+                let ts = d
+                    .t_star
+                    .unwrap_or_else(|| panic!("duty {target} tick {tick}: t_star is None"));
+                let u = budget.step(LoopError::Temp { e_c: ts }, None);
+                assert!(
+                    u.is_finite(),
+                    "duty {target} tick {tick}: u = {u} is not finite (t_star was {ts})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ceiling_target_unreachable_high_after_60s_pinned_at_the_upper_bound() {
+        // §2.7's "unreachable from above" rule reads Budget's own dwell
+        // timer and the tick's error_sign directly, not T* — so it must
+        // keep working at the curve's literal ceiling duty exactly like
+        // anywhere else, now that T* there resolves to a finite value
+        // instead of poisoning the integrator with NaN.
+        use crate::control::budget::{Budget, LoopError, LoopGains};
+
+        // A real Budget, driven by an error that keeps calling for more
+        // heat every tick, actually saturates at `hi` and stays there.
+        let mut budget = Budget::new(&LoopGains::default());
+        budget.set_bounds(10.0, 60.0);
+        for _ in 0..12 {
+            let u = budget.step(LoopError::Temp { e_c: 1000.0 }, None);
+            assert_eq!(
+                u, 60.0,
+                "u must be pinned at hi while the error keeps calling for more heat"
+            );
+        }
+        let dwell = budget.at_upper_bound_for();
+        assert!(dwell >= Duration::from_secs(60), "dwell: {dwell:?}");
+
+        let v = view(QUIET16, 75.0, 75.0);
+        let ec = happy_ec();
+        let mut a = Arbiter::new();
+        let mut input = happy_input(&v, &ec);
+        input.target_duty = 100; // curve ceiling
+        input.at_upper_bound_for = dwell;
+        input.error_sign = 1.0; // still calling for more heat
+
+        let d = a.decide(&input);
+        assert!(
+            d.flags.contains(&StatusFlag::TargetUnreachable),
+            "{:?}",
+            d.flags
+        );
+        assert!(
+            d.reasons.iter().any(|r| r.contains("held at ceiling")),
+            "{:?}",
+            d.reasons
+        );
+        // And the seam itself: even at the literal ceiling duty, T*
+        // resolved to a finite value (§2.1's nearest_tread fallback), not
+        // None/±inf.
+        assert!(d.t_star.is_some_and(f64::is_finite), "{:?}", d.t_star);
     }
 }

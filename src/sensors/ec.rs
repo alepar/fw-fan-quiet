@@ -210,11 +210,24 @@ impl EcAverage {
     /// full window of `interval` samples on its own. False before either
     /// has happened — a mean read at that point averages fewer than a full
     /// window and callers should not trust it as one.
+    ///
+    /// No production call site today (integration sweep, `fw-fanctrl-loop-nsc`):
+    /// the controller achieves the same "don't trust an underfilled mean"
+    /// invariant a different way — it calls `reseed` itself on the very
+    /// first sample of every engagement that carries a fw-fanctrl view
+    /// (`Controller`'s own `ec_seeded` latch, before any `push`), so by the
+    /// time `ec_avg.push` is ever read as `ec_ma` the boxcar has already
+    /// been seeded. `is_seeded`/`sample_count` remain here as the design's
+    /// own owned API surface for `EcAverage` (§2.2/§2.6) and are exercised
+    /// directly by this module's own tests.
+    #[allow(dead_code)]
     pub fn is_seeded(&self) -> bool {
         self.seeded
     }
 
-    /// Retained sample count (`<= interval`).
+    /// Retained sample count (`<= interval`). See [`Self::is_seeded`] for
+    /// why this has no production call site today.
+    #[allow(dead_code)]
     pub fn sample_count(&self) -> usize {
         self.buffer.len()
     }

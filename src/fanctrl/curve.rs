@@ -83,6 +83,13 @@ impl Curve {
     /// The continuous (pre-truncation) interpolated duty at `t`, flat-clamped
     /// outside `[first.0, last.0]`. Internal: `duty_at` truncates this;
     /// `tread`'s search inverts it.
+    ///
+    /// No production call site today (integration sweep, `fw-fanctrl-loop-nsc`):
+    /// only `duty_at` calls it, and `duty_at` has the same note (this
+    /// direction — temperature to duty — is fw-fanctrl's own job; the
+    /// controller only ever runs the inverse via `tread`/`t_star`). Covered
+    /// directly by `Curve`'s own tests.
+    #[allow(dead_code)]
     fn continuous_duty_at(&self, t: f64) -> f64 {
         let first = self.points[0];
         let last = self.points[self.points.len() - 1];
@@ -114,6 +121,16 @@ impl Curve {
     /// fw-fanctrl's own forward direction: temperature -> commanded duty.
     /// `int()` truncation, matching `FanController.py` (verified on cool16:
     /// `T_eff` 51.8 -> 21, not 22).
+    ///
+    /// No production call site today (integration sweep, `fw-fanctrl-loop-nsc`):
+    /// the controller only ever runs the *inverse* direction
+    /// (`tread`/`t_star`, duty -> temperature) since fw-fanctrl itself
+    /// already commands the forward direction and this client only reads
+    /// its output. `duty_at`'s consumers are this module's own tests and
+    /// the `FanctrlEmulator` test plant (`fw-fanctrl-loop-iym`, cfg(test)),
+    /// which stands in for the real fw-fanctrl daemon and therefore does
+    /// need the forward direction.
+    #[allow(dead_code)]
     pub fn duty_at(&self, t: f64) -> u8 {
         // continuous_duty_at is always within [0, 100] (points are u8), so
         // this cast neither truncates a huge magnitude nor needs a manual

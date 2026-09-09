@@ -944,3 +944,102 @@ the acceptance grades the shipping loop; fwloop.23 is the terminal join.
 ## Post-Implementation Notes
 
 *As this design is implemented and iterated on — bug fixes, adjustments, anything that diverged from the assumptions above — append a dated note here, whether or not a formal debugging skill was used.*
+
+### 2026-09-09 — Integration sweep (`fw-fanctrl-loop-nsc`)
+
+Root integration task, run on the merged tree after all 22 leaf tasks (plus the
+`fwloop.24` anti-windup spike). Three jobs, per the bead:
+
+**(1) Main flows walked end to end**, new `src/integration_tests.rs`
+(`main_flow` module), one continuous session on a single `state.json`:
+`SetAuto(true)` from a fresh, LUT-only persisted state → drives a real
+`ChainedPlant` into `TempLoop` → a scripted socket death → `RpmLoop` +
+`FANCTRL LOST` → socket revival → recovery to `TempLoop` → `SetAuto(false)` →
+`StartCalibration` (a real LUT sweep through the controller, then a real
+step test against a *second* `ChainedPlant` — physically simulated, not the
+FOPDT math directly like `control::sim_tests`'s own calibration test) → a
+landed fit (`calibrated_at`/`loop_gains` both persisted, gains verified
+non-default) → a simulated **daemon restart**: a brand-new `Controller`
+built from `PersistedState::load` off the same `state.json` path, exactly
+`main.rs`'s own startup sequence, confirming the LUT clears `NOT CALIBRATED`
+on the new instance and a non-empty `warm_start` seeds `u` above the floor
+sum on its very first tick. Test:
+`engage_walk_calibrate_and_restart_reloads_warm_start_table_and_gains`.
+
+**(2) Unwired-sweep checklist** — all five enumerations, each written as an
+exhaustive destructure/match in `src/integration_tests.rs`'s `wiring_sweep`
+module (`every_config_key_is_read_somewhere`,
+`every_status_flag_is_raised_and_rendered`,
+`every_telemetry_field_is_populated`, `every_effect_variant_is_applied`,
+`every_calib_context_field_originates_from_live_data`), so a field or
+variant added later fails that module to compile until it is named. Result:
+**zero open items.** The sweep found three real gaps, all fixed inline
+(small — each a one-call-site wiring miss, not a redesign):
+
+- `AutoState::new` hard-coded `Guards::new(GPU_HOT_C_DEFAULT,
+  NVME_HOT_C_DEFAULT)` regardless of the live `Config` — `gpu_hot_c`/
+  `nvme_hot_c` round-tripped through `Config::load`/`save` and appeared on
+  `ControlStatus`, but a user-edited threshold had **zero effect** on the
+  actual guard behavior, invisible only because the defaults matched.
+  Fixed: `AutoState::new` now takes `(gpu_hot_c, nvme_hot_c)` from
+  `self.config` at Auto entry. Regression test:
+  `control::controller::tests::gpu_and_nvme_hot_thresholds_come_from_the_live_config_not_the_compiled_defaults`.
+- `StatusFlag::TargetUnreachable` was computed correctly by
+  `mode::Arbiter::decide` for all three §2.7 cases but never reached
+  `ControlStatus.flags`: `mirror_decision`'s sync list named five of the six
+  `Decision`-sourced flags and dropped this one. Already caught and filed as
+  `fw-fanctrl-loop-a5j` by the `fw-fanctrl-loop-cm7` fix round (with four
+  regression tests left `#[ignore]`d against it); fixed here by adding the
+  flag to the sync list, and all four tests un-ignored and passing. Bead
+  closed.
+- `Controller::on_sample`'s resume branch cleared the fan window and EC
+  boxcar on a `resumed` sample but never `AutoState::steady_window`/
+  `steady_key`, contradicting §2.2's "clears ... the steady window" verbatim
+  — a pre-suspend window one sample from completing could complete on the
+  very next post-resume sample from readings spanning the gap. Already
+  caught and filed as `fw-fanctrl-loop-hwg` by the same fix round; fixed
+  here by clearing both fields too, and the regression test un-ignored.
+  Bead closed.
+
+One gap surfaced by the sweep is **not** fixed inline — it is a genuine
+tuning/design tension, not a wiring miss, and stays a filed blocker:
+`fw-fanctrl-loop-a78` (GPU_TRIP_C, the hard-watchdog GPU emergency
+threshold, sits at 87 °C — the card's own documented normal sustained-load
+parking point — which is *below* `GPU_HOT_C_DEFAULT` (90 °C), so there is no
+GPU temperature at which the soft guard can ever ratchet the share down
+before the hard watchdog emergency-releases everything and demands a manual
+re-arm). Its regression test stays `#[ignore]`d pending that decision.
+
+Every `Effect`/`CalibContext`/telemetry-field claim in `wiring_sweep`'s
+comments was verified against the source while writing this sweep (file/
+function cited inline); none needed a code change.
+
+**(3) The three integration tests no per-task test covered** — `real_types`
+module: `sampler_to_controller_to_telemetry_line_with_real_types` (the real,
+non-fake `Sampler::with_paths`/`Sampler::sample()` — not
+`test_support::plant`'s synthetic `Sample` — into a real `Controller` into a
+real `Telemetry`/`Record::sample` JSONL line, read back and parsed);
+`config_fanctrl_socket_flows_into_real_poller_construction` (`Config` →
+`UnixFanctrlClient` → `FanctrlPoller::new`, the exact chain `main.rs` builds);
+`full_manual_mode_on_command_on_sample_session_on_the_fakes` (`SetFloors` →
+`SetCpuW` → a live sample → `ReleaseAll` → `Quit`, the manual-control path
+none of the Auto/calibration-focused suites exercise end to end).
+
+**Also fixed while sweeping** (small, `src/**`, not called out by name
+above): four `clippy::needless_range_loop`/type-complexity/`ptr_arg`/
+too-many-arguments findings in `control::sim_tests` (pre-existing, blocking
+`cargo clippy -D warnings`); `fanctrl::client::parse_print_all` duplicated
+`resolve_curve`'s own strategy-curve lookup instead of calling it (now
+shared, one source of truth); five stale `#[allow(dead_code)]`/comments
+across `control::guards`, `control::controller` (the `StatusFlag`/`Severity`
+surface) left over from before `fwloop.12` wired the guards module in,
+removed or corrected to say what is actually true now; `Budget::set_gains`,
+`Curve::duty_at`/`continuous_duty_at` and `EcAverage::is_seeded`/
+`sample_count` are genuinely unused outside their own tests and
+`FanctrlEmulator`/cfg(test) consumers by design — annotated with a comment
+explaining why, matching the codebase's own established convention, rather
+than force an artificial call site.
+
+**Acceptance:** `cargo test` — 630 passed, 0 failed, 3 ignored (2 need real
+NVIDIA hardware, 1 is the filed `fw-fanctrl-loop-a78` design-tension
+blocker); `cargo clippy --all-targets -- -D warnings` — clean.

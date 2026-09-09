@@ -250,9 +250,7 @@ mod grader_tests {
     fn a_3_alternation_trace_at_a_short_period_is_caught() {
         let mut errors = vec![0.0; 200];
         for &(start, sign) in &[(20usize, 1.0), (40, -1.0), (60, 1.0)] {
-            for i in start..start + 3 {
-                errors[i] = sign * 300.0;
-            }
+            errors[start..start + 3].fill(sign * 300.0);
         }
         let report = detect_relay(&errors, 150.0);
         assert_eq!(report.excursion_count, 3);
@@ -271,9 +269,7 @@ mod grader_tests {
         // Wide, irregular gaps (10, then 400 samples) -- nothing like the
         // short-period test above.
         for &(start, sign) in &[(5usize, 1.0), (15, -1.0), (415, 1.0)] {
-            for i in start..start + 2 {
-                errors[i] = sign * 300.0;
-            }
+            errors[start..start + 2].fill(sign * 300.0);
         }
         let report = detect_relay(&errors, 150.0);
         assert_eq!(report.excursion_count, 3);
@@ -295,9 +291,7 @@ mod grader_tests {
     fn two_same_side_excursions_do_not_alternate() {
         let mut errors = vec![0.0; 100];
         for start in [10usize, 50] {
-            for i in start..start + 3 {
-                errors[i] = 300.0;
-            }
+            errors[start..start + 3].fill(300.0);
         }
         let report = detect_relay(&errors, 150.0);
         assert_eq!(report.excursion_count, 2);
@@ -310,9 +304,7 @@ mod grader_tests {
     fn two_alternating_excursions_are_not_yet_a_relay() {
         let mut errors = vec![0.0; 100];
         for &(start, sign) in &[(10usize, 1.0), (30, -1.0)] {
-            for i in start..start + 3 {
-                errors[i] = sign * 300.0;
-            }
+            errors[start..start + 3].fill(sign * 300.0);
         }
         let report = detect_relay(&errors, 150.0);
         assert_eq!(report.max_alternating_run, 2);
@@ -389,17 +381,17 @@ fn gpu_watts_lut() -> ClockWattsLut {
 /// Returns the controller, its real (`--state-file`-shaped) state path (for
 /// [`assert_steady_window_recorded`]) and the GPU call log handle when
 /// `with_gpu`.
+/// Shared GPU-call log handle, as handed back by [`build_controller`] when
+/// `with_gpu` is set.
+type GpuCallLog = std::sync::Arc<std::sync::Mutex<Vec<crate::actuators::gpu::test_support::GpuCall>>>;
+
 fn build_controller<'r>(
     runner: &'r FakeRunner,
     tag: &str,
     config: Config,
     gains: Option<LoopGains>,
     with_gpu: bool,
-) -> (
-    Controller<&'r FakeRunner>,
-    PathBuf,
-    Option<std::sync::Arc<std::sync::Mutex<Vec<crate::actuators::gpu::test_support::GpuCall>>>>,
-) {
+) -> (Controller<&'r FakeRunner>, PathBuf, Option<GpuCallLog>) {
     let profile_path = temp_profile_path(tag);
     let mut cpu = CpuActuator::new(runner, profile_path);
     cpu.toggle_delay = std::time::Duration::from_millis(1);
@@ -612,7 +604,7 @@ fn assert_ec_ma_tracks_emulator(trace: &Trace, tol_c: f64) {
 /// exits Auto).
 fn assert_steady_window_recorded<R: crate::actuators::cmd::Runner>(
     ctl: &mut Controller<R>,
-    state_path: &PathBuf,
+    state_path: &std::path::Path,
 ) {
     ctl.on_command(Command::SetAuto(false));
     let loaded = PersistedState::load(state_path);
@@ -826,6 +818,17 @@ struct PerturbedPlant {
     force_uncontrollable_argmax: bool,
 }
 
+/// The plant-perturbation knobs `PerturbedPlant::new` applies on top of the
+/// built-in K/theta/tau, grouped so the constructor stays under clippy's
+/// too-many-arguments bar. See `PerturbedPlant`'s field docs for what each
+/// one does.
+struct Perturbation {
+    k_factor: f64,
+    extra_theta_ticks: usize,
+    extra_tau_s: f64,
+    force_uncontrollable_argmax: bool,
+}
+
 impl PerturbedPlant {
     fn new(
         strategy: impl Into<String>,
@@ -833,11 +836,14 @@ impl PerturbedPlant {
         ma_interval: u32,
         ambient_base_c: f64,
         fan_seed: u32,
-        k_factor: f64,
-        extra_theta_ticks: usize,
-        extra_tau_s: f64,
-        force_uncontrollable_argmax: bool,
+        perturbation: Perturbation,
     ) -> Self {
+        let Perturbation {
+            k_factor,
+            extra_theta_ticks,
+            extra_tau_s,
+            force_uncontrollable_argmax,
+        } = perturbation;
         PerturbedPlant {
             emulator: FanctrlEmulator::new(strategy, points, ma_interval).expect("valid curve"),
             thermal: ThermalPlant::new(ambient_base_c),
@@ -1049,10 +1055,12 @@ fn run_robustness(tag: &str, points: &[(f64, u8)], strategy: &str, force_rpmloop
         MA_INTERVAL,
         ROBUSTNESS_AMBIENT_C,
         1,
-        0.5,  // K -50%
-        10,   // theta +50% (10 extra ticks on top of the built-in 20s)
-        17.5, // tau +50% extra lag
-        force_rpmloop,
+        Perturbation {
+            k_factor: 0.5,          // K -50%
+            extra_theta_ticks: 10,  // theta +50% (10 extra ticks on top of the built-in 20s)
+            extra_tau_s: 17.5,      // tau +50% extra lag
+            force_uncontrollable_argmax: force_rpmloop,
+        },
     );
     ctl.on_command(Command::SetAuto(true));
     assert_eq!(ctl.status().mode, Mode::Auto);
@@ -1405,25 +1413,19 @@ fn active_false_below_flat_band_with_socket_absent_behaves_identically_plus_fanc
     run_active_false_authority("active-false-authority-absent", true);
 }
 
-/// KNOWN PRODUCT DEFECT (fw-fanctrl-loop-a5j, filed while writing this
-/// suite, out of this task's `filesTouched`): `Controller::mirror_decision`
-/// syncs exactly five `Decision.flags` variants into `ControlStatus.flags`
+/// Was a KNOWN PRODUCT DEFECT (fw-fanctrl-loop-a5j): `Controller::mirror_decision`
+/// synced only five `Decision.flags` variants into `ControlStatus.flags`
 /// (FanctrlLost, EcMismatch, SteepCurve, CurveInvalid, SensorLost) --
-/// `StatusFlag::TargetUnreachable` is missing from that list, even though
+/// `StatusFlag::TargetUnreachable` was missing from that list, even though
 /// `mode::Arbiter::decide` correctly computes and returns it for all three
 /// design §2.7 cases (verified directly against `mode.rs`'s own passing
 /// unit tests, e.g. `low_reason_from_subfloor_duty_and_from_60s_at_the_lower_bound`,
 /// and against an isolated `Budget` fed the exact (error, freeze) sequence
-/// this scenario produces, which correctly reaches `at_lower_bound_for()
-/// >= 60s`). The result: TARGET UNREACHABLE can never appear in
-/// `ControlStatus.flags` in production, regardless of scenario -- a fully
-/// implemented, fully unit-tested flag that is completely dead at the
-/// controller level. `#[ignore]`d (not deleted) so this regression test is
-/// > ready to flip green the moment fw-fanctrl-loop-a5j lands; every OTHER
-/// > assertion this scenario makes (floor-parking, no windup, no hunting,
-/// > FanctrlLost) already passes today in the test above.
+/// this scenario produces, which correctly reaches an `at_lower_bound_for`
+/// of 60 seconds or more). Fixed inline by the integration sweep
+/// (fw-fanctrl-loop-nsc): `mirror_decision` now syncs `TargetUnreachable`
+/// too; this test un-ignored as its proof.
 #[test]
-#[ignore = "known defect fw-fanctrl-loop-a5j: mirror_decision never syncs TargetUnreachable"]
 fn active_false_below_flat_band_raises_target_unreachable_low_within_60s() {
     let fan_target_rpm = 3000.0;
     let config = Config { fan_target_rpm, ..Config::default() };
@@ -1871,12 +1873,11 @@ fn a_sub_floor_target_holds_the_floor_without_relay() {
     assert_only_expected_runner_calls(&runner);
 }
 
-/// KNOWN PRODUCT DEFECT (fw-fanctrl-loop-a5j) -- see
+/// Was KNOWN PRODUCT DEFECT fw-fanctrl-loop-a5j (see
 /// `active_false_below_flat_band_raises_target_unreachable_low_within_60s`'s
-/// doc for the full finding; this is the low-subfloor path's instance of
-/// the same gap.
+/// doc for the full finding); this is the low-subfloor path's instance of
+/// the same gap, now fixed and un-ignored alongside it.
 #[test]
-#[ignore = "known defect fw-fanctrl-loop-a5j: mirror_decision never syncs TargetUnreachable"]
 fn a_sub_floor_target_raises_target_unreachable_low() {
     let fan_target_rpm = 500.0;
     let config = Config { fan_target_rpm, ..Config::default() };
@@ -1953,13 +1954,11 @@ fn an_infeasible_target_never_promotes_past_rpmloop_and_tracks_rpm_without_relay
     assert_only_expected_runner_calls(&runner);
 }
 
-/// KNOWN PRODUCT DEFECT (fw-fanctrl-loop-a5j) -- see
+/// Was KNOWN PRODUCT DEFECT fw-fanctrl-loop-a5j (see
 /// `active_false_below_flat_band_raises_target_unreachable_low_within_60s`'s
-/// doc for the full finding; this is the infeasible-target path's instance
-/// of the same gap (`Decision.flags` carries `TargetUnreachable` here too,
-/// `ControlStatus.flags` still never does).
+/// doc for the full finding); this is the infeasible-target path's instance
+/// of the same gap, now fixed and un-ignored alongside it.
 #[test]
-#[ignore = "known defect fw-fanctrl-loop-a5j: mirror_decision never syncs TargetUnreachable"]
 fn an_infeasible_target_raises_target_unreachable() {
     let fan_target_rpm = 6000.0;
     let config = Config { fan_target_rpm, ..Config::default() };
@@ -2266,13 +2265,13 @@ fn configuration_coverage_checklist_2_strategies_3_modes_dgpu_on_off_default_vs_
 /// while capping the reachable steady state at ~76C, well short of 95C --
 /// `u` must pin at `hi` and never catch up.
 ///
-/// KNOWN PRODUCT DEFECT (fw-fanctrl-loop-a5j) -- see
+/// Was KNOWN PRODUCT DEFECT fw-fanctrl-loop-a5j (see
 /// `active_false_below_flat_band_raises_target_unreachable_low_within_60s`'s
-/// doc for the full finding (`mirror_decision` drops `TargetUnreachable`
+/// doc for the full finding -- `mirror_decision` dropped `TargetUnreachable`
 /// for ALL THREE trigger paths, not just the low ones); this is the
-/// high-bound-hold path's instance of the same gap.
+/// high-bound-hold path's instance of the same gap, now fixed and
+/// un-ignored alongside it.
 #[test]
-#[ignore = "known defect fw-fanctrl-loop-a5j: mirror_decision never syncs TargetUnreachable"]
 fn a_high_unreachable_target_pins_at_the_upper_bound_and_raises_target_unreachable_high() {
     let fan_target_rpm = 50_000.0; // past the table's own ceiling either way
     let config = Config { fan_target_rpm, cpu_max_w: 30.0, gpu_max_w: 15.0, ..Config::default() };
@@ -2872,19 +2871,16 @@ fn reconciliation_a_to_b_to_a_clears_ec_mismatch_and_reseeds_ec_ma() {
     assert_ec_ma_tracks_emulator(&trace, 1.0);
 }
 
-/// KNOWN PRODUCT DEFECT (fw-fanctrl-loop-hwg, filed while writing this fix
-/// round, out of this task's `filesTouched`): `Controller::on_sample`'s
-/// resume branch clears `auto.fan_window`/`ec_avg`/`ec_ma`/
-/// `ec_slope_window`/`ec_seeded` on a `resumed` sample but never touches
+/// Was a KNOWN PRODUCT DEFECT (fw-fanctrl-loop-hwg): `Controller::on_sample`'s
+/// resume branch cleared `auto.fan_window`/`ec_avg`/`ec_ma`/
+/// `ec_slope_window`/`ec_seeded` on a `resumed` sample but never touched
 /// `auto.steady_window` (or `auto.steady_key`) -- contradicting the design
 /// doc verbatim (`docs/superpowers/specs/2026-09-07-fw-fanctrl-loop-design.md`,
 /// fwloop.9/fwloop.12's acceptance criteria and the §2.2 test-plan line, ALL
 /// three of which say "clears ... the steady window", not just the boxcar).
-/// `#[ignore]`d (not deleted, not weakened back to the pre-fix-round
-/// version) so this stays ready to flip green the moment fw-fanctrl-loop-hwg
-/// lands.
+/// Fixed inline by the integration sweep (fw-fanctrl-loop-nsc): the resume
+/// branch now also clears both fields; this test un-ignored as its proof.
 #[test]
-#[ignore = "known defect fw-fanctrl-loop-hwg: AutoState::steady_window is never cleared on a resumed sample"]
 fn a_resumed_edge_mid_run_clears_windows_and_writes_no_warm_start_across_the_gap() {
     // Task 22 review round 1: the original version of this test ran only
     // 100 pre-resume ticks -- far short of STEADY_WINDOW_N=40 CONSECUTIVE

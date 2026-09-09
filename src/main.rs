@@ -7,6 +7,8 @@ mod config;
 mod control;
 mod event;
 mod fanctrl;
+#[cfg(test)]
+mod integration_tests;
 mod led;
 mod logging;
 mod model;

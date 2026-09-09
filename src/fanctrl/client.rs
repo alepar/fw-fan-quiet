@@ -258,23 +258,18 @@ pub fn resolve_curve(print_all_json: &str, strategy: &str) -> Vec<(f64, u8)> {
 fn parse_print_all(json: &str) -> Result<ParsedAll, FanctrlError> {
     let parsed: PrintAllResponse =
         serde_json::from_str(json).map_err(|e| FanctrlError::Other(e.to_string()))?;
-    let strategy_entry = parsed.configuration.data.strategies.get(&parsed.strategy);
-    let (ma_interval, curve) = match strategy_entry {
-        Some(entry) => (
-            entry.moving_average_interval,
-            entry
-                .speed_curve
-                .iter()
-                .map(|p| (p.temp, p.speed))
-                .collect(),
-        ),
-        None => {
-            return Err(FanctrlError::Other(format!(
-                "print all names active strategy {:?}, which is not in its own strategies map",
-                parsed.strategy
-            )));
-        }
+    let Some(entry) = parsed.configuration.data.strategies.get(&parsed.strategy) else {
+        return Err(FanctrlError::Other(format!(
+            "print all names active strategy {:?}, which is not in its own strategies map",
+            parsed.strategy
+        )));
     };
+    let ma_interval = entry.moving_average_interval;
+    // Single source of truth for "strategy name -> curve points" (design
+    // §2.1): this production path and every direct `resolve_curve` caller
+    // share the same lookup instead of a second copy of the
+    // `speedCurve` mapping drifting from it.
+    let curve = resolve_curve(json, &parsed.strategy);
     Ok(ParsedAll {
         strategy: parsed.strategy,
         active: parsed.active,

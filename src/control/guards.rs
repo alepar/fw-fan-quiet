@@ -34,7 +34,6 @@ pub const GPU_HOT_C_DEFAULT: f64 = 90.0;
 /// Reporting-only threshold — see the module docs.
 pub const NVME_HOT_C_DEFAULT: f64 = 80.0;
 /// Hysteresis band shared by both guards: exit = enter − this.
-#[allow(dead_code)] // consumed once `hysteresis` is reachable from the controller (fwloop.12)
 const HYSTERESIS_C: f64 = 5.0;
 
 /// Per-tick guard flags. Deliberately only these two `bool`s: the NVMe guard
@@ -42,7 +41,6 @@ const HYSTERESIS_C: f64 = 5.0;
 /// allocator's GPU share by [`gpu_share_override`], not carried through this
 /// struct — there is no target or budget field here, ever.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // this task lands the module standalone; fwloop.12 wires it into the controller
 pub struct GuardState {
     pub gpu_hot: bool,
     pub nvme_hot: bool,
@@ -51,7 +49,6 @@ pub struct GuardState {
 /// dGPU + NVMe thermal guards (§2.8). Owns each axis's hysteresis state (the
 /// previous tick's hot/not-hot) so [`Guards::step`] only needs this tick's
 /// readings.
-#[allow(dead_code)] // this task lands the module standalone; fwloop.12 wires it into the controller
 pub struct Guards {
     gpu_hot_c: f64,
     nvme_hot_c: f64,
@@ -62,7 +59,6 @@ pub struct Guards {
 impl Guards {
     /// New guards with the given enter thresholds (°C, exit = enter − 5);
     /// both axes start cold.
-    #[allow(dead_code)] // exercised by this module's own tests; fwloop.12 is the real caller
     pub fn new(gpu_hot_c: f64, nvme_hot_c: f64) -> Self {
         Guards {
             gpu_hot_c,
@@ -75,7 +71,6 @@ impl Guards {
     /// Advance both guards one tick and return the resulting flags. `None`
     /// means that sensor's reading is unavailable this tick: the guard goes
     /// inactive and any hot state clears, regardless of the last reading.
-    #[allow(dead_code)] // exercised by this module's own tests; fwloop.12 is the real caller
     pub fn step(&mut self, gpu_temp_c: Option<f64>, nvme_temp_c: Option<f64>) -> GuardState {
         self.gpu_hot = hysteresis(self.gpu_hot, gpu_temp_c, self.gpu_hot_c);
         self.nvme_hot = hysteresis(self.nvme_hot, nvme_temp_c, self.nvme_hot_c);
@@ -89,7 +84,6 @@ impl Guards {
 /// One axis of enter/exit hysteresis: enters (`true`) once `temp_c` reaches
 /// `enter_c`, stays hot through the band, and clears at `enter_c −
 /// HYSTERESIS_C`. `None` always returns `false`, regardless of `was_hot`.
-#[allow(dead_code)] // exercised via Guards::step in this module's own tests
 fn hysteresis(was_hot: bool, temp_c: Option<f64>, enter_c: f64) -> bool {
     let Some(t) = temp_c else {
         return false;
@@ -106,7 +100,6 @@ fn hysteresis(was_hot: bool, temp_c: Option<f64>, enter_c: f64) -> bool {
 /// dGPU share override while `gpu_hot` (§2.8): ratchets the GPU's allocator
 /// share down from the present draw at `DOWN_RATE_W` per allocator tick,
 /// never below `gpu_floor_w`.
-#[allow(dead_code)] // exercised by this module's own tests; fwloop.12 is the real caller
 pub fn gpu_share_override(current_gpu_w: f64, gpu_floor_w: f64) -> f64 {
     (current_gpu_w - DOWN_RATE_W).max(gpu_floor_w)
 }

@@ -122,10 +122,12 @@ impl Curve {
         self.continuous_duty_at(t) as u8
     }
 
-    /// Smallest `t` with `continuous_duty_at(t) >= y`, given `y` is strictly
-    /// between this curve's min and max duty (the only range `tread` calls
-    /// this for — the boundary duties are handled by `tread` itself via the
-    /// unbounded flat clamp, never by searching).
+    /// Smallest `t` with `continuous_duty_at(t) >= y`. `tread` calls this
+    /// with `y` equal to a duty in `[min_duty, max_duty]` (the tread's near
+    /// bound) and with `y` one more than that (its far bound) — so `y` can
+    /// legitimately reach `max_duty + 1`, one past anything the curve ever
+    /// attains; see the fallback below, which is exactly what makes that
+    /// call meaningful rather than unreachable.
     fn first_t_reaching(&self, y: f64) -> f64 {
         for w in self.points.windows(2) {
             let (t0, d0) = w[0];
@@ -146,40 +148,50 @@ impl Curve {
                 return t0 + frac * (t1 - t0);
             }
         }
-        // y > max_duty: never reached inside the point list. Callers only
-        // pass y in a range this curve attains, so this is unreachable in
-        // practice; the last point is the only sane fallback.
+        // y > max_duty: the curve never attains it. This is not a caller
+        // bug — it is exactly the far-bound call for a duty at (or one
+        // below) `max_duty`, per the doc comment above. §2.1's "maximal
+        // interval" is bounded by the curve's own domain at that duty, and
+        // the domain's own edge (the last point) is precisely the right
+        // value to report: `tread` compares this against its near bound
+        // and folds an equal/degenerate result to `None` itself, so this
+        // fallback only has to be `>=` any real near bound, never a sentinel.
         self.points[self.points.len() - 1].0
     }
 
-    /// The maximal temperature interval where `duty_at(t) == d`
-    /// (design doc §2.1). `None` when `d` is outside `[min_duty, max_duty]`
-    /// *or* when the curve jumps clean over `d` (a vertical, same-temperature
-    /// duty step) — the "skipped integer" `nearest_tread` snaps around.
+    /// The maximal temperature interval where `duty_at(t) == d` (design doc
+    /// §2.1), computed by the **same rule at every duty** — `min_duty()`/
+    /// `max_duty()` (the curve's own floor/ceiling) get no special case.
+    /// `None` when `d` is outside `[min_duty, max_duty]`, when the curve
+    /// jumps clean over `d` (a vertical, same-temperature duty step) — the
+    /// "skipped integer" `nearest_tread` snaps around — *or*, per §2.1's
+    /// settled endpoint semantics, when `d` is the floor/ceiling duty and
+    /// the curve attains it only at a single defining point with no flat
+    /// run on that side (true of both `quiet16` and `cool16` at their
+    /// ceiling: each reaches its top duty only at its very last point).
     ///
-    /// At the curve's own floor and ceiling duty the flat clamp genuinely
-    /// has no far bound (fw-fanctrl would report that duty at any
-    /// arbitrarily low/high temperature), so those two treads are returned
-    /// with a `NEG_INFINITY`/`INFINITY` endpoint rather than an arbitrary
-    /// cutoff — literally "maximal", per the design text. Callers that need
-    /// a finite setpoint (e.g. `t_star` on the curve's floor duty) must
-    /// account for that; this task only owns the curve model, not the loop
-    /// that consumes it.
+    /// The interval is unbounded in principle at the curve's own floor or
+    /// ceiling — fw-fanctrl reports that duty at any arbitrarily low/high
+    /// temperature past the curve's own domain — but this module's domain
+    /// ends at `points.first().0`/`points.last().0`, and §2.1 now says the
+    /// tread is that unbounded interval **intersected with the curve's own
+    /// domain**, never left open. Where the curve defines a genuine flat
+    /// run at that extreme (both `quiet16` and `cool16` at their floor),
+    /// the intersection is a real, finite, non-empty interval, same shape
+    /// as any interior duty. Where the extreme is attained only
+    /// instantaneously (both curves at their ceiling), the intersection is
+    /// empty and this returns `None` — but that is not itself an error:
+    /// `nearest_tread` (§2.3) already snaps a duty with no tread of its own
+    /// to the nearest one that has one, so a target sitting exactly on such
+    /// a ceiling still resolves to a finite T* one duty in. Either way, no
+    /// caller downstream of `tread`/`t_star` can be handed a non-finite
+    /// temperature again.
     pub fn tread(&self, d: u8) -> Option<(f64, f64)> {
-        let (lo_bound, hi_bound) = (self.min_duty(), self.max_duty());
-        if d < lo_bound || d > hi_bound {
+        if d < self.min_duty() || d > self.max_duty() {
             return None;
         }
-        let t_lo = if d == lo_bound {
-            f64::NEG_INFINITY
-        } else {
-            self.first_t_reaching(d as f64)
-        };
-        let t_hi = if d == hi_bound {
-            f64::INFINITY
-        } else {
-            self.first_t_reaching(d as f64 + 1.0)
-        };
+        let t_lo = self.first_t_reaching(d as f64);
+        let t_hi = self.first_t_reaching(d as f64 + 1.0);
         if t_lo >= t_hi {
             None
         } else {
@@ -188,7 +200,9 @@ impl Curve {
     }
 
     /// Centre of `tread(d)` — the setpoint a target duty resolves to.
-    /// `None` exactly when `tread(d)` is `None`.
+    /// `None` exactly when `tread(d)` is `None`; whenever it is `Some`,
+    /// both of `tread`'s endpoints are finite (§2.1), so this is too —
+    /// `t_star` is never `±inf`.
     pub fn t_star(&self, d: u8) -> Option<f64> {
         self.tread(d).map(|(lo, hi)| (lo + hi) / 2.0)
     }
@@ -372,17 +386,21 @@ mod tests {
         // point: duty stays 15 (truncated) until the continuous value hits
         // 16, at 55 + 1/0.6 = 56.6667. Floor duty: unbounded below.
         let (lo, hi) = c.tread(15).unwrap();
-        assert_eq!(lo, f64::NEG_INFINITY);
+        assert_eq!(lo, 0.0); // clamped to quiet16's own first point (§2.1):
+        // a genuine flat lead-in (0->55 at duty 15), so the floor tread is
+        // finite, not the old NEG_INFINITY.
         assert!((hi - 56.666_666_666_666_67).abs() < 1e-9, "got {hi}");
 
         // duty 21 is hit exactly at t=65 (a defining point); the next
         // segment (65->75, slope 1.0 %/°C) reaches 22 at t=66.
         assert_eq!(c.tread(21), Some((65.0, 66.0)));
 
-        // Ceiling duty (100): unbounded above.
-        let (lo, hi) = c.tread(100).unwrap();
-        assert_eq!(hi, f64::INFINITY);
-        assert_eq!(lo, 95.0); // continuous value first reaches 100 at t=95
+        // Ceiling duty (100): attained only at the single last point
+        // (95,100), no flat run — §2.1's "single instantaneous point" case,
+        // so `tread` itself has nothing to report (see
+        // `nearest_tread_snaps_the_ceiling_to_the_adjacent_duty` for what
+        // actually resolves a target sitting on it).
+        assert_eq!(c.tread(100), None);
     }
 
     #[test]
@@ -391,7 +409,7 @@ mod tests {
         // Flat lead-in 0->50 at duty 20; rising into 60 at 1.0 %/°C reaches
         // 21 at t=51.
         let (lo, hi) = c.tread(20).unwrap();
-        assert_eq!(lo, f64::NEG_INFINITY);
+        assert_eq!(lo, 0.0); // clamped to cool16's own first point (§2.1)
         assert_eq!(hi, 51.0);
 
         // 60->70 rises 30->42 (1.2 %/°C): duty 30 at t=60 exactly, reaches
@@ -400,9 +418,9 @@ mod tests {
         assert_eq!(lo, 60.0);
         assert!((hi - 60.833_333_333_333_34).abs() < 1e-9, "got {hi}");
 
-        let (lo, hi) = c.tread(100).unwrap();
-        assert_eq!(lo, 85.0);
-        assert_eq!(hi, f64::INFINITY);
+        // Ceiling duty (100): same "single instantaneous point" case as
+        // quiet16 — attained only at the last point (85,100), no flat run.
+        assert_eq!(c.tread(100), None);
     }
 
     #[test]
@@ -465,7 +483,20 @@ mod tests {
     fn nearest_tread_returns_self_when_reachable() {
         let c = quiet16();
         assert_eq!(c.nearest_tread(21), Some(21));
-        assert_eq!(c.nearest_tread(100), Some(100));
+    }
+
+    #[test]
+    fn nearest_tread_snaps_the_ceiling_to_the_adjacent_duty() {
+        // Neither curve's max duty has a tread of its own (§2.1: attained
+        // only at a single point, no flat run) — this is the existing
+        // "skipped integer" fallback (§2.3) absorbing the new empty-ceiling
+        // case, not new logic. Both curves' 99 has a (narrow but real)
+        // tread just below the ceiling, so that's what a target of 100
+        // resolves to.
+        assert_eq!(quiet16().tread(100), None);
+        assert_eq!(quiet16().nearest_tread(100), Some(99));
+        assert_eq!(cool16().tread(100), None);
+        assert_eq!(cool16().nearest_tread(100), Some(99));
     }
 
     #[test]
@@ -492,5 +523,49 @@ mod tests {
         assert_eq!(c.nearest_tread(17), Some(20));
         // 12 is closer to 10 (distance 2) than to 20 (distance 8).
         assert_eq!(c.nearest_tread(12), Some(10));
+    }
+
+    // ---- fw-fanctrl-loop-nez: the curve/arbiter seam — no ±inf tread ----
+
+    #[test]
+    fn tread_at_min_and_max_duty_matches_the_decided_semantics() {
+        // §2.1: the floor/ceiling get no special case — computed the same
+        // way as every other duty. Both curves define a genuine flat
+        // lead-in at their floor, so the floor tread is finite and starts
+        // exactly at the curve's own first point; both attain their
+        // ceiling duty only at a single defining point (no flat run), so
+        // the ceiling tread is empty.
+        for c in [quiet16(), cool16()] {
+            let lo_d = c.min_duty();
+            let hi_d = c.max_duty();
+            let (t_lo, t_hi) = c.tread(lo_d).expect("floor tread must be Some");
+            assert_eq!(
+                t_lo, c.points[0].0,
+                "floor tread must start at the curve's first point"
+            );
+            assert!(
+                t_hi.is_finite() && t_hi > t_lo,
+                "floor tread must be finite and non-empty"
+            );
+            assert_eq!(
+                c.tread(hi_d),
+                None,
+                "ceiling tread must be empty (no flat run there)"
+            );
+        }
+    }
+
+    #[test]
+    fn t_star_is_none_or_finite_across_the_whole_duty_range() {
+        // Standing invariant (fw-fanctrl-loop-nez): no future curve edit
+        // can reintroduce a ±inf T* without this failing, on either test
+        // curve, at every duty the curve reports.
+        for c in [quiet16(), cool16()] {
+            for d in c.min_duty()..=c.max_duty() {
+                if let Some(ts) = c.t_star(d) {
+                    assert!(ts.is_finite(), "t_star({d}) = {ts} is not finite");
+                }
+            }
+        }
     }
 }

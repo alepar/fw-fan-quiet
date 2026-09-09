@@ -1,54 +1,47 @@
 //! Calibration state persistence (JSON, `/var/lib/bazerame-fans/state.json`
-//! in production, `--state-file` overridable). Holds the fitted thermal model
-//! and the GPU clock→watts LUT so a reboot skips recalibration. Loading NEVER
-//! crashes: missing or corrupt state just means "not calibrated yet".
-//! Cargo.toml enables serde_json's `float_roundtrip` so the model's f64
-//! parameters survive save→load bit-exact.
+//! in production, `--state-file` overridable). Holds the GPU clock→watts
+//! LUT, the fitted loop PI gains, the duty↔RPM table and the warm-start
+//! budget seeds so a reboot skips recalibration and resumes near its last
+//! working point. Loading NEVER crashes: missing or corrupt state just means
+//! "not calibrated yet". Cargo.toml enables serde_json's `float_roundtrip`
+//! so this file's f64 fields (LUT watts, gains, warm-start budgets) survive
+//! save→load bit-exact.
+//!
+//! Schema v2 (`fw-fanctrl-loop-dsh`): the old `model`/`adapt_bias`/
+//! `adapt_gain` fields (the learned thermal model + its Kalman correction)
+//! are gone along with the adaptation tier that used them
+//! (`fw-fanctrl-loop-24s`). A v1 file's `model`/`adapt_bias`/`adapt_gain`
+//! keys are simply unknown fields to this schema and are ignored by serde;
+//! `duty_rpm_table`, `loop_gains` and `warm_start` are missing from a v1 file
+//! and come back at their `#[serde(default)]` values (the ten seeded points,
+//! `None` and empty respectively) via `PersistedState`'s own `Default`.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::config::write_atomic;
+use crate::control::budget::LoopGains;
 use crate::control::lut::ClockWattsLut;
-use crate::control::thermal_model::ThermalModel;
+use crate::fanctrl::table::DutyRpmTable;
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct PersistedState {
-    /// Fitted thermal model; None until calibration has run.
-    pub model: Option<ThermalModel>,
     /// GPU clock→watts LUT from the calibration sweep.
     pub lut: Option<ClockWattsLut>,
     /// When calibration finished, as a unix-seconds string.
     pub calibrated_at: Option<String>,
-    /// Persisted Kalman bias (RPM offset added to the model's `c`); the
-    /// covariance is deliberately NOT persisted (fresh prior each session,
-    /// mirroring `ThermalModel`'s serde-skipped `P`). Defaults to the
-    /// identity correction so a pre-v2 or fresh state file adapts from zero.
-    #[serde(default)]
-    pub adapt_bias: f64,
-    /// Persisted Kalman gain (multiplier on the model's GPU-slope term).
-    /// Defaults to 1.0 (identity). Reset to `[0, 1]` whenever a new
-    /// calibration lands (a fresh surface invalidates old corrections).
-    #[serde(default = "default_gain")]
-    pub adapt_gain: f64,
-}
-
-fn default_gain() -> f64 {
-    1.0
-}
-
-impl Default for PersistedState {
-    fn default() -> Self {
-        Self {
-            model: None,
-            lut: None,
-            calibrated_at: None,
-            adapt_bias: 0.0,
-            // Same source of truth as the field-level serde default: the
-            // legacy-file path and the fresh-start path must never diverge.
-            adapt_gain: default_gain(),
-        }
-    }
+    /// Fitted PI gains for both loop legs (design §2.4), from the FOPDT
+    /// step-test fit. `None` until a step test has landed; `Budget::new`
+    /// falls back to `LoopGains::default()` in that case.
+    pub loop_gains: Option<LoopGains>,
+    /// Duty↔RPM lookup (design §2.3), passively refined by the controller.
+    /// Its own `Default`/serde default is the ten seeded points, so a
+    /// legacy file predating this field loads the seed unchanged.
+    pub duty_rpm_table: DutyRpmTable,
+    /// Warm-start budget seeds, keyed by `WarmStart::key` (design §2.4).
+    /// Empty on a legacy or fresh file.
+    pub warm_start: BTreeMap<String, f64>,
 }
 
 impl PersistedState {
@@ -92,7 +85,6 @@ impl PersistedState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::thermal_model::CalibPoint;
     use std::fs;
     use std::path::PathBuf;
 
@@ -104,26 +96,6 @@ mod tests {
         dir
     }
 
-    /// A real model fit from 5 synthetic points on rpm = 25pc + 15pg
-    /// + 0.1·pc·pg + 800 (2×2 grid + center: full-rank for the bilinear fit).
-    fn fitted_model() -> ThermalModel {
-        let points: Vec<CalibPoint> = [
-            (5.0, 0.0),
-            (45.0, 0.0),
-            (5.0, 100.0),
-            (45.0, 100.0),
-            (20.0, 40.0),
-        ]
-        .iter()
-        .map(|&(pc, pg)| CalibPoint {
-            cpu_w: pc,
-            gpu_w: pg,
-            rpm: 25.0 * pc + 15.0 * pg + 0.1 * pc * pg + 800.0,
-        })
-        .collect();
-        ThermalModel::fit_batch(&points).unwrap()
-    }
-
     fn lut3() -> ClockWattsLut {
         let mut lut = ClockWattsLut::new();
         lut.insert(1200, 30.0);
@@ -132,28 +104,73 @@ mod tests {
         lut
     }
 
+    fn gains() -> LoopGains {
+        LoopGains {
+            kc_w_per_c: 0.31,
+            ti_s: 42.0,
+            kc_w_per_rpm: 0.0041,
+            ti_rpm_s: 28.0,
+        }
+    }
+
     #[test]
-    fn roundtrip_model_and_lut_behave_identically_after_reload() {
-        let dir = fixture_dir("roundtrip");
+    fn legacy_v1_file_loads_lut_intact_table_seeded_warm_start_empty_gains_none() {
+        // tests/fixtures/state_v1.json (fw-fanctrl-loop-blm) is a real pre-
+        // migration file: it carries `model`, `adapt_bias` and `adapt_gain`,
+        // none of which this schema has any more.
+        let path = crate::test_support::fixtures::path("state_v1.json");
+        let state = PersistedState::load(&path);
+
+        let lut = state.lut.as_ref().expect("lut persisted in the fixture");
+        assert_eq!(lut.len(), 10, "fixture's LUT has 10 swept points");
+        // Spot-check both ends of the sweep survived unknown-key tolerant
+        // deserialization intact (not just "some value").
+        assert_eq!(lut.watts_for_clock(1177), Some(39.36073333333333));
+        assert_eq!(lut.watts_for_clock(2618), Some(99.89833333333333));
+
+        assert_eq!(
+            state.duty_rpm_table,
+            DutyRpmTable::default(),
+            "a v1 file predates duty_rpm_table: it must come back as the ten seeded points"
+        );
+        assert!(
+            state.warm_start.is_empty(),
+            "a v1 file predates warm_start: it must come back empty"
+        );
+        assert_eq!(
+            state.loop_gains, None,
+            "a v1 file predates loop_gains: it must come back None"
+        );
+        assert_eq!(state.calibrated_at, Some("1783230048".to_string()));
+    }
+
+    #[test]
+    fn new_schema_round_trips_populated_warm_start_and_gains() {
+        let dir = fixture_dir("roundtrip-v2");
         let path = dir.join("state.json");
+        let mut table = DutyRpmTable::default();
+        table.refine(30, 2600.0); // differs from the untouched seed
+        let mut warm_start = BTreeMap::new();
+        warm_start.insert("quiet16|30|ac".to_string(), 45.5);
+        warm_start.insert("cool16|20|bat".to_string(), 12.0);
         let state = PersistedState {
-            model: Some(fitted_model()),
             lut: Some(lut3()),
             calibrated_at: Some("1751500000".to_string()),
-            ..PersistedState::default()
+            loop_gains: Some(gains()),
+            duty_rpm_table: table,
+            warm_start,
         };
+
         state.save(&path).unwrap();
         let back = PersistedState::load(&path);
+
         assert_eq!(back, state);
-        // Behavioral equivalence, not just field equality: the reloaded model
-        // predicts the same RPM and the reloaded LUT inverts the same clocks.
-        let (model, back_model) = (state.model.unwrap(), back.model.unwrap());
-        for (pc, pg) in [(10.0, 20.0), (30.0, 65.0), (45.0, 100.0)] {
-            assert_eq!(back_model.predict(pc, pg), model.predict(pc, pg));
-        }
-        let (lut, back_lut) = (state.lut.unwrap(), back.lut.unwrap());
+        // Behavioral equivalence for the LUT, not just field equality.
         for w in [10.0, 45.0, 60.0, 120.0] {
-            assert_eq!(back_lut.clock_for_watts(w), lut.clock_for_watts(w));
+            assert_eq!(
+                back.lut.as_ref().unwrap().clock_for_watts(w),
+                state.lut.as_ref().unwrap().clock_for_watts(w)
+            );
         }
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -163,7 +180,10 @@ mod tests {
         let dir = fixture_dir("missing");
         let state = PersistedState::load(&dir.join("nope.json"));
         assert_eq!(state, PersistedState::default());
-        assert!(state.model.is_none());
+        assert!(state.lut.is_none());
+        assert_eq!(state.duty_rpm_table, DutyRpmTable::default());
+        assert!(state.warm_start.is_empty());
+        assert_eq!(state.loop_gains, None);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -192,28 +212,6 @@ mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         assert_eq!(names, vec!["state.json".to_string()]);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn adapt_state_roundtrips_and_defaults_to_identity() {
-        // A pre-v2 state file has no adapt fields: serde(default) must load them
-        // as the identity correction (bias 0, gain 1), never panic.
-        let legacy = r#"{ "model": null, "lut": null, "calibrated_at": null }"#;
-        let s: PersistedState = serde_json::from_str(legacy).unwrap();
-        assert_eq!(s.adapt_bias, 0.0);
-        assert_eq!(s.adapt_gain, 1.0);
-
-        // And a written pair survives the roundtrip.
-        let dir = fixture_dir("adapt");
-        let path = dir.join("state.json");
-        let saved = PersistedState {
-            adapt_bias: -137.0,
-            adapt_gain: 1.15,
-            ..PersistedState::default()
-        };
-        saved.save(&path).unwrap();
-        assert_eq!(PersistedState::load(&path), saved);
         fs::remove_dir_all(&dir).unwrap();
     }
 

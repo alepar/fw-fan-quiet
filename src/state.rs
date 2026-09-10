@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::config::write_atomic;
-use crate::control::budget::LoopGains;
+use crate::control::budget::{LoopGains, WarmStart};
 use crate::control::lut::ClockWattsLut;
 use crate::fanctrl::table::DutyRpmTable;
 
@@ -84,7 +84,12 @@ impl PersistedState {
     ///   `f64::clamp(lo + margin, hi - margin)` with `min > max`;
     /// - `loop_gains` with a zero/negative/non-finite integral time makes
     ///   `Budget::step` divide by zero and drives the commanded budget
-    ///   permanently to NaN.
+    ///   permanently to NaN;
+    /// - a `lut` with a non-finite watts entry feeds `Budget::set_bounds`'s
+    ///   `f64::clamp` a non-finite bound, which panics, and one whose clocks
+    ///   are out of order or duplicated silently mis-answers both lookups;
+    /// - a non-finite `warm_start` value seeds `u`/`v` to NaN, which the
+    ///   velocity-form update never recovers from.
     ///
     /// Each invalid field is dropped back to its "not calibrated" value with
     /// a warning — never a panic, per this module's "Loading NEVER crashes"
@@ -106,6 +111,26 @@ impl PersistedState {
                  falling back to the default gains (uncalibrated)"
             );
             self.loop_gains = None;
+        }
+        if let Some(lut) = &self.lut
+            && !lut.is_valid()
+        {
+            tracing::warn!(
+                "state lut ({} points) is empty, has a non-finite or negative \
+                 watts entry, or its clocks are not strictly increasing; \
+                 discarding it (uncalibrated, recalibration required)",
+                lut.len()
+            );
+            self.lut = None;
+        }
+        let dropped = WarmStart::drop_non_finite(&mut self.warm_start);
+        if !dropped.is_empty() {
+            tracing::warn!(
+                "state warm_start has {} non-finite seed(s) ({}); dropping \
+                 them, those keys start cold",
+                dropped.len(),
+                dropped.join(", ")
+            );
         }
         self
     }
@@ -363,5 +388,92 @@ mod tests {
         let state = load_json("gains-kept", json);
         assert_eq!(state.loop_gains, Some(gains()));
         assert_eq!(state.duty_rpm_table, DutyRpmTable::default());
+    }
+
+    // --- finding 4: the other two fields (lut, warm_start) ----------------
+    //
+    // On non-finite values reaching `load`: they cannot, on this crate's
+    // serde_json configuration. `float_roundtrip` (Cargo.toml:17) swaps in
+    // the lossless float parser, which returns `Error("number out of
+    // range")` for `1e400`/`1e309`/`1.8e308` rather than saturating to
+    // `inf`, and `to_string` writes a non-finite f64 as `null`, which
+    // deserializes back as a type error — so an infinity can neither be
+    // written by `save` nor read by `load`; both routes land in the
+    // "corrupt state, starting uncalibrated" branch instead. The finiteness
+    // half of each guard is therefore defense-in-depth against a future
+    // parser/feature change, and is pinned where it can actually be
+    // exercised — `ClockWattsLut::is_valid` and `WarmStart::drop_non_finite`
+    // unit tests, which build the bad values in Rust. What a hand edit CAN
+    // produce is well-formed JSON with the values in the wrong order; that
+    // is what the load-path tests below drive.
+
+    #[test]
+    fn out_of_order_lut_clocks_discard_the_lut() {
+        // `insert` keeps points sorted and unique by mhz; `watts_for_clock`
+        // `binary_search_by_key`s on that and `clock_for_watts` scans
+        // `windows(2)` assuming ascending clocks, so a hand-edited
+        // descending pair silently mis-answers both — and a wrong watts
+        // answer is what sets `Budget`'s bounds.
+        let state = load_json(
+            "unsorted-lut",
+            r#"{ "lut": { "points": [[2800, 100.0], [1200, 30.0]] } }"#,
+        );
+        assert_eq!(state.lut, None, "out-of-order clocks discard the LUT");
+    }
+
+    #[test]
+    fn duplicate_or_empty_lut_points_discard_the_lut() {
+        let dup = load_json(
+            "dup-lut",
+            r#"{ "lut": { "points": [[1200, 30.0], [1200, 40.0]] } }"#,
+        );
+        assert_eq!(dup.lut, None, "duplicate clocks discard the LUT");
+
+        // An empty points array is not "a calibration with no points", it is
+        // "not calibrated" — every lookup on it returns None anyway.
+        let empty = load_json("empty-lut", r#"{ "lut": { "points": [] } }"#);
+        assert_eq!(empty.lut, None, "an empty LUT is not a calibration");
+    }
+
+    #[test]
+    fn a_negative_lut_watts_entry_discards_the_lut() {
+        // Negative watts are physically impossible from the sweep and would
+        // drag `set_bounds`' `lo` below `cpu_floor_w`.
+        let state = load_json(
+            "negative-lut",
+            r#"{ "lut": { "points": [[1200, 30.0], [2000, -60.0]] } }"#,
+        );
+        assert_eq!(state.lut, None, "a negative watts entry discards the LUT");
+    }
+
+    #[test]
+    fn a_valid_lut_and_warm_start_survive_verbatim() {
+        // The guards must not eat good calibration data.
+        let state = load_json(
+            "lut-kept",
+            r#"{ "lut": { "points": [[1200, 30.0], [2000, 60.0], [2800, 100.0]] },
+                 "warm_start": { "quiet16:30:ac": 45.5, "cool16:20:batt": 12.0 },
+                 "duty_rpm_table": { "points": {} } }"#,
+        );
+        assert_eq!(state.lut, Some(lut3()));
+        assert_eq!(state.lut.as_ref().unwrap().clock_for_watts(45.0), Some(1600));
+        assert_eq!(state.warm_start.len(), 2);
+        assert_eq!(state.warm_start.get("quiet16:30:ac"), Some(&45.5));
+        // ...and each field is judged on its own: the empty table falls back
+        // without taking the good LUT or warm start down with it.
+        assert_eq!(state.duty_rpm_table, DutyRpmTable::default());
+    }
+
+    #[test]
+    fn a_measured_dip_in_the_watts_column_is_not_treated_as_corruption() {
+        // The LUT's documented invariant is ascending *clocks*, not
+        // monotone watts: real sweeps dip and `clock_for_watts` handles it
+        // conservatively. The guard must not throw such a sweep away.
+        let state = load_json(
+            "dip-lut",
+            r#"{ "lut": { "points": [[1200, 60.0], [2000, 50.0], [2800, 100.0]] } }"#,
+        );
+        let lut = state.lut.expect("a dipping sweep is valid data");
+        assert_eq!(lut.clock_for_watts(55.0), Some(2080));
     }
 }

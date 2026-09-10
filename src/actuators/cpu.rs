@@ -6,6 +6,7 @@
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use super::WriteVerdict;
@@ -27,6 +28,11 @@ const DEFAULT_FAST_LIMIT_MW: u32 = 53_000;
 /// `Verified`. STAPM is excluded from this check entirely — written but not
 /// required to verify (reported to fail silently on this SoC).
 const MISMATCH_TOLERANCE_W: f64 = 0.5;
+/// Dwell for the SECOND profile toggle when the first one's read-back shows
+/// the commanded cap still in force (field 2026-09-10: a 200 ms toggle
+/// issued within a second of a cap write left a 17 W slow limit behind; a
+/// manual toggle with a 1 s dwell restored stock).
+const RESTORE_RETRY_DWELL: Duration = Duration::from_secs(1);
 
 /// The three `ryzenadj --info` table rows this actuator verifies against
 /// (design §2.9), parsed as watts. `None` when a row is missing from the
@@ -77,6 +83,11 @@ pub struct CpuActuator<R: Runner> {
     /// Pause between the profile toggle writes so firmware registers both.
     /// pub(crate) so guard tests can shorten it.
     pub(crate) toggle_delay: Duration,
+    /// The last sustained limit this actuator successfully wrote (mW), `0`
+    /// when none / already restored. `restore_stock` reads the hardware
+    /// back against it: a restore is only believed once the slow limit has
+    /// LEFT that value.
+    last_commanded_mw: AtomicU32,
 }
 
 impl<R: Runner> CpuActuator<R> {
@@ -87,6 +98,7 @@ impl<R: Runner> CpuActuator<R> {
             max_sustained_mw: MAX_SUSTAINED_MW,
             profile_path,
             toggle_delay: Duration::from_millis(200),
+            last_commanded_mw: AtomicU32::new(0),
         }
     }
 
@@ -126,7 +138,30 @@ impl<R: Runner> CpuActuator<R> {
                 return WriteVerdict::Unreadable;
             }
         }
+        self.last_commanded_mw.store(mw, Ordering::Relaxed);
         self.verify_write(mw)
+    }
+
+    /// Run `ryzenadj --info` and parse its table; `None` when the call fails
+    /// or cannot be spawned (the `ryzen_smu`-loaded precondition) — the
+    /// shared "Unreadable" case.
+    fn read_info_table(&self) -> Option<InfoTable> {
+        let output = match self.runner.run("ryzenadj", &["--info"]) {
+            Ok(output) if output.status.success() => output,
+            Ok(output) => {
+                tracing::warn!(
+                    "ryzenadj --info failed ({}): {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!("ryzenadj --info could not run: {e}");
+                return None;
+            }
+        };
+        Some(parse_info_table(&String::from_utf8_lossy(&output.stdout)))
     }
 
     /// Run `ryzenadj --info` and score its read-back against the
@@ -136,22 +171,9 @@ impl<R: Runner> CpuActuator<R> {
     /// module-load precondition from being read as a hardware fault. STAPM
     /// is parsed but never checked: written, not required to verify.
     fn verify_write(&self, commanded_mw: u32) -> WriteVerdict {
-        let output = match self.runner.run("ryzenadj", &["--info"]) {
-            Ok(output) if output.status.success() => output,
-            Ok(output) => {
-                tracing::warn!(
-                    "ryzenadj --info failed ({}): {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-                return WriteVerdict::Unreadable;
-            }
-            Err(e) => {
-                tracing::warn!("ryzenadj --info could not run: {e}");
-                return WriteVerdict::Unreadable;
-            }
+        let Some(table) = self.read_info_table() else {
+            return WriteVerdict::Unreadable;
         };
-        let table = parse_info_table(&String::from_utf8_lossy(&output.stdout));
         let (Some(slow_w), Some(fast_w)) = (table.ppt_limit_slow_w, table.ppt_limit_fast_w) else {
             return WriteVerdict::Unreadable;
         };
@@ -177,7 +199,59 @@ impl<R: Runner> CpuActuator<R> {
     /// Restore stock CPU limits by toggling the platform profile: firmware
     /// reasserts its own limits on a profile change. Reads the current
     /// profile, writes a different one, waits, writes the original back.
+    ///
+    /// Then READS BACK (field 2026-09-10): a toggle issued within a second
+    /// of a cap write left the cap in force while this logged success. If
+    /// a cap was ever written and the slow limit still reads that value
+    /// after the toggle, toggle again with [`RESTORE_RETRY_DWELL`]; if it
+    /// STILL reads the cap, return an error naming the value so every
+    /// caller logs it — a cap that survives a restore is the one outcome
+    /// the design promises never to leave behind. A blind read-back
+    /// (`--info` unavailable) is not a failure: nothing can be verified.
+    /// (A commanded cap that happens to equal stock costs one spurious
+    /// retry and error line; it never leaves a cap behind.)
     pub fn restore_stock(&self) -> io::Result<()> {
+        self.toggle_profile(self.toggle_delay)?;
+        let commanded_mw = self.last_commanded_mw.load(Ordering::Relaxed);
+        if commanded_mw == 0 {
+            return Ok(());
+        }
+        let commanded_w = f64::from(commanded_mw) / 1000.0;
+        let still_capped = |slow_w: f64| (slow_w - commanded_w).abs() <= MISMATCH_TOLERANCE_W;
+        match self.read_info_table().and_then(|t| t.ppt_limit_slow_w) {
+            None => {
+                tracing::debug!("stock restore read-back blind (ryzenadj --info unavailable)");
+                self.last_commanded_mw.store(0, Ordering::Relaxed);
+                Ok(())
+            }
+            Some(slow_w) if !still_capped(slow_w) => {
+                tracing::info!("stock restore verified: slow limit now {slow_w} W");
+                self.last_commanded_mw.store(0, Ordering::Relaxed);
+                Ok(())
+            }
+            Some(slow_w) => {
+                tracing::warn!(
+                    "stock restore did not take: slow limit still {slow_w} W (commanded \
+                     {commanded_w} W); toggling again with a {RESTORE_RETRY_DWELL:?} dwell"
+                );
+                self.toggle_profile(RESTORE_RETRY_DWELL)?;
+                match self.read_info_table().and_then(|t| t.ppt_limit_slow_w) {
+                    Some(slow_w) if still_capped(slow_w) => Err(io::Error::other(format!(
+                        "stock CPU limits did not restore: slow limit still {slow_w} W after two \
+                         platform-profile toggles (commanded {commanded_w} W)"
+                    ))),
+                    _ => {
+                        self.last_commanded_mw.store(0, Ordering::Relaxed);
+                        Ok(())
+                    }
+                }
+            }
+        }
+    }
+
+    /// One profile round trip: read the current profile, write a different
+    /// one, wait `dwell`, write the original back.
+    fn toggle_profile(&self, dwell: Duration) -> io::Result<()> {
         let original = std::fs::read_to_string(&self.profile_path)?;
         let original = original.trim();
         // A same-value write would be a no-op the firmware may ignore, so
@@ -191,7 +265,7 @@ impl<R: Runner> CpuActuator<R> {
         // stock limits on *any* profile change, so dying here leaves stock
         // power limits with only the user's profile preference lost.
         std::fs::write(&self.profile_path, intermediate)?;
-        std::thread::sleep(self.toggle_delay);
+        std::thread::sleep(dwell);
         std::fs::write(&self.profile_path, original)?;
         tracing::info!("restored stock CPU limits via platform profile toggle ({original})");
         Ok(())
@@ -498,6 +572,68 @@ mod tests {
         cpu.restore_stock().unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "low-power");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Field 2026-09-10: the first toggle's read-back still shows the cap;
+    /// a second toggle (longer dwell) clears it. Ok, and every `--info`
+    /// read happened (verify, read-back, read-back).
+    #[test]
+    fn restore_reads_back_and_retries_once_when_the_cap_survives() {
+        let (dir, path) = profile_fixture("restore-retry", "balanced\n");
+        let runner = FakeRunner::new();
+        runner.push_result(Ok(output_with_code(0))); // the 17 W write
+        runner.push_result(Ok(info_output(&info_table_text(17.0, 53.0, 17.0)))); // verify
+        runner.push_result(Ok(info_output(&info_table_text(17.0, 53.0, 17.0)))); // still capped
+        runner.push_result(Ok(info_output(&info_table_text(45.0, 65.0, 45.3)))); // restored
+        let mut cpu = CpuActuator::new(runner, path.clone());
+        cpu.toggle_delay = Duration::from_millis(1);
+        assert_eq!(cpu.set_sustained_mw(17_000), WriteVerdict::Verified(17.0));
+
+        cpu.restore_stock().unwrap();
+
+        let infos = cpu
+            .runner
+            .calls()
+            .iter()
+            .filter(|(_, a)| a == &vec!["--info".to_string()])
+            .count();
+        assert_eq!(infos, 3, "verify + two restore read-backs");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "balanced");
+        // A restored actuator does not read back again on the next restore.
+        cpu.restore_stock().unwrap();
+        assert_eq!(cpu.runner.calls().len(), 4, "no further --info without a new write");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The cap survives BOTH toggles: the error names the surviving value so
+    /// every caller's `warn!` carries it.
+    #[test]
+    fn restore_reports_a_cap_that_survives_two_toggles() {
+        let (dir, path) = profile_fixture("restore-stuck", "balanced\n");
+        let runner = FakeRunner::new();
+        runner.push_result(Ok(output_with_code(0)));
+        runner.push_result(Ok(info_output(&info_table_text(17.0, 53.0, 17.0))));
+        runner.push_result(Ok(info_output(&info_table_text(17.0, 53.0, 17.0))));
+        runner.push_result(Ok(info_output(&info_table_text(17.0, 53.0, 17.0))));
+        let mut cpu = CpuActuator::new(runner, path.clone());
+        cpu.toggle_delay = Duration::from_millis(1);
+        cpu.set_sustained_mw(17_000);
+
+        let err = cpu.restore_stock().unwrap_err();
+
+        assert!(err.to_string().contains("17 W"), "{err}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "balanced");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// No cap was ever written: nothing to verify against, no `--info`.
+    #[test]
+    fn restore_without_a_prior_write_does_not_read_back() {
+        let (dir, path) = profile_fixture("restore-blind", "balanced\n");
+        let cpu = fast_actuator(path);
+        cpu.restore_stock().unwrap();
+        assert!(cpu.runner.calls().is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 

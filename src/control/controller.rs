@@ -2023,7 +2023,12 @@ impl<R: Runner> Controller<R> {
         // (`AutoAllocated` below), but nothing is written; `Freeze::Released`
         // already held `u` above, so re-commanding here would just fight
         // the hand-off `handle_mode_transition` already performed.
-        let need_write = decision.mode != LoopMode::Released
+        // `shutting_down()` is re-checked HERE, not only at the top of
+        // `on_sample`: the untimed NVML call in `reassert_actuators` runs
+        // earlier in this same sample, and the flag can flip while it is in
+        // flight (roast-pr-3: the fence missed the primary Auto CPU write).
+        let need_write = !self.shutting_down()
+            && decision.mode != LoopMode::Released
             && (self.status.cpu_limit_w != Some(cpu_w)
                 || self.auto.as_ref().expect("in auto").cpu_verdict.released);
         if need_write {
@@ -2586,6 +2591,22 @@ impl<R: Runner> Controller<R> {
                 RunnerEffect::SaveState(state) => {
                     self.lut = state.lut.clone();
                     self.calibrated_at = state.calibrated_at.clone();
+                    // The cross-field floor clamp ran at construction against
+                    // the PERSISTED lut — `None` on the first-calibration
+                    // path, where it is a no-op. Now that a lut exists, re-run
+                    // it (roast-pr-3 Blocking): otherwise an unaffordable
+                    // `gpu_floor_mhz` survives, `budget_bounds` inverts the
+                    // moment this lut lands, and the fallback pins the budget
+                    // at the cap for the rest of the session.
+                    let clamped = self.config.clone().with_lut_floor_clamp(self.lut.as_ref());
+                    if clamped != self.config {
+                        self.config = clamped;
+                        self.status.cpu_floor_w = self.config.cpu_floor_w;
+                        self.status.gpu_floor_mhz = self.config.gpu_floor_mhz;
+                        if let Err(e) = self.config.save(&self.config_path) {
+                            tracing::warn!("config save after lut floor clamp failed: {e}");
+                        }
+                    }
                     // The runner's own `PersistedState` carries only what it
                     // owns (`lut`/`calibrated_at`/`loop_gains`); its
                     // `duty_rpm_table`/`warm_start` are bare defaults
@@ -3417,6 +3438,73 @@ mod tests {
             1,
             "an actuator write landed after shutdown began: {:?}",
             ryzenadj_calls(&runner)
+        );
+    }
+
+    /// roast-pr-3: the fence at the top of `on_sample` is not enough. The
+    /// resume reassert's GPU `set_max_clock` (untimed NVML in production)
+    /// runs earlier in the SAME sample as the allocator's CPU write, and
+    /// main can raise `shutdown` while it is in flight — the primary Auto
+    /// CPU write must re-check the flag itself. Modelled with a FakeGpu that
+    /// raises the flag from inside `set_max_clock`. Fails before the fix
+    /// with the allocator overwriting the cap the reassert just re-issued.
+    #[test]
+    fn a_shutdown_raised_mid_sample_fences_the_auto_cpu_write() {
+        let runner = FakeRunner::new();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut gpu = FakeGpu::new();
+        gpu.raise_on_set(Arc::clone(&shutdown));
+        let gpu_calls = gpu.calls();
+        let mut ctl = Controller::new(
+            RestoreGuard::new(
+                &runner,
+                Some(cpu_actuator(
+                    &runner,
+                    PathBuf::from("/nonexistent/platform_profile"),
+                )),
+                Some(Box::new(gpu)),
+                None,
+            ),
+            calibrated(),
+            PathBuf::from("/nonexistent/state.json"),
+            Config::default(),
+            PathBuf::from("/nonexistent/config.toml"),
+        );
+        ctl.set_shutdown_flag(Arc::clone(&shutdown));
+
+        // Manual caps in force, then the reassert baseline pinned at t=0.
+        ctl.on_command(Command::SetCpuW(20.0));
+        ctl.on_command(Command::SetGpuMaxClock(2000));
+        shutdown.store(false, Ordering::Relaxed); // the manual set raised it
+        ctl.on_sample(&sample_at(0.0));
+        assert_eq!(ctl.status().cpu_limit_w, Some(20.0), "premise: manual cap in force");
+        let gpu_sets_before = gpu_calls.lock().unwrap().len();
+
+        // Enter Auto. Its FIRST allocation lands on the next sample, which
+        // reports a RESUME: the resume reassert (CPU 20 re-write, then the
+        // GPU re-set that raises `shutdown` mid-sample) runs BEFORE the
+        // allocator, whose floor allocation (15 W != 20 W) wants a write.
+        // (The periodic reassert runs AFTER the allocator, so it cannot
+        // model this race; the resume path is the one that can.)
+        ctl.on_command(Command::SetAuto(true));
+        shutdown.store(false, Ordering::Relaxed);
+        ctl.on_sample(&Sample {
+            resumed: true,
+            ..busy_at(REASSERT_PERIOD_S)
+        });
+
+        assert!(
+            gpu_calls.lock().unwrap().len() > gpu_sets_before,
+            "premise: the reassert re-set the GPU on this sample"
+        );
+        assert!(
+            shutdown.load(Ordering::Relaxed),
+            "premise: that GPU set raised the flag mid-sample"
+        );
+        assert_eq!(
+            ctl.status().cpu_limit_w,
+            Some(20.0),
+            "the allocator wrote a new CPU cap after shutdown was raised mid-sample"
         );
     }
 
@@ -5004,6 +5092,54 @@ mod tests {
             "budget {} must stay under the cap {hi}",
             ctl.status().budget_w
         );
+    }
+
+    /// roast-pr-3 Blocking: the cross-field floor clamp ran only at
+    /// construction (against the persisted lut — `None` on a first run) and
+    /// on `SetFloors`. A lut landing at `RunnerEffect::SaveState` therefore
+    /// left an unaffordable configured floor in place, `budget_bounds`
+    /// inverted, and the fallback pinned the budget at the cap. Fails before
+    /// the fix on the `lo < hi` assertion.
+    #[test]
+    fn a_lut_landing_at_save_state_re_clamps_an_unaffordable_gpu_floor() {
+        let runner = FakeRunner::new();
+        let gpu = FakeGpu::new();
+        // hi = 54 + 20 = 74 W; a 2800 MHz floor costs 100 W on the test lut,
+        // so lo would be 115 W > hi. No persisted lut: construction's clamp
+        // has nothing to clamp against and must leave the floor alone.
+        let config = Config {
+            gpu_floor_mhz: 2800,
+            gpu_max_w: 20.0,
+            ..Config::default()
+        }
+        .sanitized();
+        let mut ctl = Controller::new(
+            RestoreGuard::new(
+                &runner,
+                Some(cpu_actuator(
+                    &runner,
+                    PathBuf::from("/nonexistent/platform_profile"),
+                )),
+                Some(Box::new(gpu)),
+                None,
+            ),
+            PersistedState::default(),
+            PathBuf::from("/nonexistent/state.json"),
+            config,
+            PathBuf::from("/nonexistent/config.toml"),
+        );
+        assert_eq!(ctl.status().gpu_floor_mhz, 2800, "premise: no lut, floor untouched");
+
+        ctl.apply_calib_effects(vec![RunnerEffect::SaveState(Box::new(calibrated()))], None);
+
+        let floor = ctl.status().gpu_floor_mhz;
+        assert!(
+            floor < 2800,
+            "the landed lut must re-clamp the unaffordable floor, got {floor} MHz"
+        );
+        let (lo, hi) = ctl.budget_bounds();
+        assert!(lo < hi, "budget bounds must be ordered after SaveState, got ({lo}, {hi})");
+        assert_eq!(hi, 74.0, "the operator's power cap is never raised");
     }
 
     #[test]

@@ -261,6 +261,7 @@ fn main() -> Result<()> {
     // fails and it eprintln!s the error, which PANICS (dead stderr) - during
     // unwind that is a double panic -> SIGABRT before any hardware restore
     // can run (observed on-machine as SIGABRT via coredumpctl).
+    let controller_joined;
     let init_result = ratatui::try_init();
     let result = match init_result {
         Ok(terminal) => {
@@ -275,7 +276,7 @@ fn main() -> Result<()> {
             let result = run(&mut terminal, &ui_rx, &cmd_tx, &telemetry, &term_flag);
             // Hardware restore BEFORE any terminal I/O (see ORDER above).
             shutdown.store(true, Ordering::Relaxed);
-            quit_and_join_controller(cmd_tx, ctl);
+            controller_joined = quit_and_join_controller(cmd_tx, ctl);
             // try_restore, NOT restore(): restore() reports failure via
             // eprintln!, which itself panics when stderr is a dead tty (e.g.
             // the terminal hung up). Verified on-machine via pty-hangup repro.
@@ -289,7 +290,7 @@ fn main() -> Result<()> {
         }
         Err(e) => {
             shutdown.store(true, Ordering::Relaxed);
-            quit_and_join_controller(cmd_tx, ctl);
+            controller_joined = quit_and_join_controller(cmd_tx, ctl);
             Err(color_eyre::eyre::eyre!(e).wrap_err("cannot initialize terminal UI"))
         }
     };
@@ -297,25 +298,41 @@ fn main() -> Result<()> {
     if let Some(t) = telemetry::lock(&telemetry).as_mut() {
         t.flush();
     }
-    if sampler.join().is_err() {
-        tracing::error!("sampler thread panicked");
-    }
-    // The fanctrl/NVMe poller threads: `shutdown` is already set above, so
-    // both are already exiting (or exited) by the time we get here; this is
-    // just reaping them, same as the sampler join above.
-    if fanctrl_poller_thread.join().is_err() {
-        tracing::error!("fanctrl poller thread panicked");
-    }
-    if nvme_poller_thread.join().is_err() {
-        tracing::error!("nvme poller thread panicked");
-    }
+    // The sampler and poller threads: `shutdown` is already set above, so
+    // all are already exiting (or exited) by the time we get here; this is
+    // just reaping them. UNLESS the controller join timed out (roast-pr-3):
+    // the wedge that bound exists for is an untimed driver call, and the
+    // sampler makes the same NVML calls — an unbounded join here would then
+    // block main forever BEFORE `_final_restore` drops, making the bounded
+    // controller join's documented fallback unreachable. On that path the
+    // reaps are bounded too; the threads own nothing needing cleanup once
+    // shutdown began, and process exit reclaims them.
+    let reap = |name: &str, handle: std::thread::JoinHandle<()>| {
+        let outcome = if controller_joined {
+            match handle.join() {
+                Ok(()) => JoinOutcome::Joined,
+                Err(_) => JoinOutcome::Panicked,
+            }
+        } else {
+            join_with_timeout(handle, DETACHED_REAP_TIMEOUT)
+        };
+        match outcome {
+            JoinOutcome::Joined => {}
+            JoinOutcome::Panicked => tracing::error!("{name} thread panicked"),
+            JoinOutcome::TimedOut => tracing::error!(
+                "{name} thread did not exit within {DETACHED_REAP_TIMEOUT:?} after a \
+                 timed-out controller join; detaching it so hardware restore can run"
+            ),
+        }
+    };
+    reap("sampler", sampler);
+    reap("fanctrl poller", fanctrl_poller_thread);
+    reap("nvme poller", nvme_poller_thread);
     // After the sampler: it held the only live led_sample sender, so its exit
     // disconnects the LED channel, letting that thread blank the panels and
     // return. A no-op when the feature was inert (`led` is None).
     if let Some(led) = led {
-        if led.join().is_err() {
-            tracing::error!("led thread panicked");
-        }
+        reap("led", led);
     }
     // The input thread stays blocked in crossterm::event::read(). A
     // poll(100ms)+shutdown-flag loop would let it exit cleanly, but detaching
@@ -345,6 +362,11 @@ const CONTROLLER_JOIN_MARGIN: Duration = Duration::from_secs(5);
 /// with no timeout of its own", and now that is true.
 const CONTROLLER_JOIN_TIMEOUT: Duration =
     Duration::from_secs(5 * cmd::RUN_TIMEOUT.as_secs() + CONTROLLER_JOIN_MARGIN.as_secs());
+
+/// How long each sampler/poller reap waits AFTER a timed-out controller
+/// join. One sample period plus the NVMe poll's own bound is plenty for a
+/// healthy thread; a wedged one is detached (roast-pr-3).
+const DETACHED_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Outcome of [`join_with_timeout`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -389,17 +411,27 @@ fn join_with_timeout(handle: std::thread::JoinHandle<()>, timeout: Duration) -> 
 /// leave the terminal in raw mode with no cursor for as long as the process
 /// lives. On expiry we log and continue; `FinalRestore`'s `Drop` and the
 /// controller's own disconnect path are still there to restore the hardware.
-fn quit_and_join_controller(cmd_tx: Sender<Command>, ctl: std::thread::JoinHandle<()>) {
+///
+/// Returns whether the controller actually finished (joined or panicked);
+/// `false` means it is still running somewhere and every later join must be
+/// bounded too, or `FinalRestore` is never reached.
+fn quit_and_join_controller(cmd_tx: Sender<Command>, ctl: std::thread::JoinHandle<()>) -> bool {
     if cmd_tx.send(Command::Quit).is_err() {
         tracing::warn!("controller already gone at shutdown");
     }
     match join_with_timeout(ctl, CONTROLLER_JOIN_TIMEOUT) {
-        JoinOutcome::Joined => {}
-        JoinOutcome::Panicked => tracing::error!("controller thread panicked"),
-        JoinOutcome::TimedOut => tracing::error!(
-            "controller thread did not finish restoring within {CONTROLLER_JOIN_TIMEOUT:?}; \
-             continuing shutdown so the terminal is restored"
-        ),
+        JoinOutcome::Joined => true,
+        JoinOutcome::Panicked => {
+            tracing::error!("controller thread panicked");
+            true
+        }
+        JoinOutcome::TimedOut => {
+            tracing::error!(
+                "controller thread did not finish restoring within {CONTROLLER_JOIN_TIMEOUT:?}; \
+                 continuing shutdown so the terminal is restored"
+            );
+            false
+        }
     }
 }
 

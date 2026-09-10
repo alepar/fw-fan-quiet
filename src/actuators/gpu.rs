@@ -211,11 +211,20 @@ pub mod test_support {
         calls: Arc<Mutex<Vec<GpuCall>>>,
         fail_sets: Arc<Mutex<usize>>,
         resumed_count: Arc<Mutex<usize>>,
+        /// Raised on every successful `set_max_clock`, when armed: lets a
+        /// test model a flag flipping WHILE the (real-world untimed) NVML
+        /// call is in flight — e.g. main's `shutdown` racing a sample.
+        raise_on_set: Option<Arc<std::sync::atomic::AtomicBool>>,
     }
 
     impl FakeGpu {
         pub fn new() -> Self {
             Self::default()
+        }
+
+        /// Arm the mid-call flag raise (see `raise_on_set`).
+        pub fn raise_on_set(&mut self, flag: Arc<std::sync::atomic::AtomicBool>) {
+            self.raise_on_set = Some(flag);
         }
 
         /// Shared handle to the call log (clone it before boxing the fake).
@@ -249,6 +258,9 @@ pub mod test_support {
             let clamped = clamp_gpu_clock(mhz);
             self.applied = Some(clamped);
             self.calls.lock().unwrap().push(GpuCall::Set(clamped));
+            if let Some(flag) = &self.raise_on_set {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             Ok(())
         }
 

@@ -55,6 +55,13 @@ const REASSERT_PERIOD_S: f64 = 10.0;
 /// Auto-mode allocator cadence (design §3: retarget the CPU/GPU split every
 /// 5 s; the GPU PI runs every sample in between).
 const ALLOC_PERIOD_S: f64 = 5.0;
+/// The sampler's own cadence (`sensors::sampler`'s 1 Hz tick), i.e. how
+/// often `on_sample` — and therefore `Arbiter::decide` — is called. Handed
+/// to the arbiter on every call so its spec-stated wall-clock hysteresis
+/// durations (§2.5's 15 s entry, §2.7's 60 s feasible-again clear) come out
+/// right at the cadence they are actually driven at, rather than at the 5 s
+/// allocator cadence their tick counts were once derived against.
+const SAMPLE_PERIOD_S: f64 = 1.0;
 /// A sample must exceed the CPU limit by this margin to count as a
 /// stickiness violation (RAPL vs STAPM accounting slack).
 const STICKINESS_MARGIN_W: f64 = 5.0;
@@ -799,6 +806,30 @@ fn loop_error_value(err: LoopError) -> f64 {
     }
 }
 
+/// Three-way sign of a loop error: `1.0` when it calls for more budget,
+/// `-1.0` when it calls for less, and `0.0` when it calls for neither —
+/// which is exactly what `f64::signum` will not do, since it returns `1.0`
+/// for `+0.0` (and `-1.0` for `-0.0`, `NaN` for `NaN`).
+///
+/// Both consumers read this as a direction, not a magnitude, and both treat
+/// "no direction" as the neutral case: `Budget::set_demand_state` never
+/// halts unless `error_sign > 0.0`, and §2.7's `TARGET UNREACHABLE (high)`
+/// rule fires only on `error_sign > 0.0`. Deriving the sign with `signum`
+/// reported "calling for more budget" for an error of exactly zero — a
+/// reachable steady state, and the same value used for an error that could
+/// not be computed at all — arming both rules in the case the code intends
+/// to be neutral (roast-pr-1 finding 5).
+fn sign3(x: f64) -> f64 {
+    if x > 0.0 {
+        1.0
+    } else if x < 0.0 {
+        -1.0
+    } else {
+        // Exactly zero (either sign) or NaN: no direction.
+        0.0
+    }
+}
+
 /// Telemetry string for a `Budget::Freeze` reason (design §2.9's
 /// `AutoAllocated.freeze` field).
 fn freeze_str(f: BudgetFreeze) -> &'static str {
@@ -1524,6 +1555,7 @@ impl<R: Runner> Controller<R> {
                 curve_valid,
                 replica_slope_5s_c_per_s,
                 view_to_sample_gap_s,
+                sample_period_s: SAMPLE_PERIOD_S,
             };
             auto.arbiter.decide(&input)
         };
@@ -1557,7 +1589,7 @@ impl<R: Runner> Controller<R> {
         // and detect the mode transition (Noted, Released hand-off).
         if let Some(err) = self.compute_loop_error(decision.mode, decision.t_star) {
             let auto = self.auto.as_mut().expect("checked above");
-            auto.last_error_sign = loop_error_value(err).signum();
+            auto.last_error_sign = sign3(loop_error_value(err));
         }
         self.handle_mode_transition(s, decision.mode, effects);
 
@@ -1846,7 +1878,10 @@ impl<R: Runner> Controller<R> {
         // This tick's loop error (design §2.4).
         let err_opt = self.compute_loop_error(decision.mode, decision.t_star);
         let err = err_opt.unwrap_or(LoopError::Temp { e_c: 0.0 });
-        let error_sign = err_opt.map(loop_error_value).unwrap_or(0.0).signum();
+        // `sign3`, never `signum`: an error of exactly zero, or one that
+        // could not be computed at all (`unwrap_or(0.0)`), must not arm the
+        // demand-limited halt (roast-pr-1 finding 5).
+        let error_sign = sign3(err_opt.map(loop_error_value).unwrap_or(0.0));
 
         // Freeze priority: `Released` (hard hold) > an in-progress actuator
         // mismatch episode (hard hold, judged against the state as of
@@ -2296,6 +2331,7 @@ impl<R: Runner> Controller<R> {
                     curve_valid,
                     replica_slope_5s_c_per_s,
                     view_to_sample_gap_s,
+                    sample_period_s: SAMPLE_PERIOD_S,
                 })
                 .ec_mismatch
             })
@@ -5245,19 +5281,74 @@ mod tests {
             fanctrl: Some(view),
             fanctrl_freshness: Freshness::Fresh,
             fanctrl_view_changed: true,
+            // A healthy machine reports a valid, cool Tctl. Required now
+            // that TempLoop entry takes 15 samples (§2.5's 15 s at the 1 Hz
+            // sample cadence, roast-pr-1 finding 6): without it the
+            // sensor-lost watchdog trips mid-climb and releases everything
+            // before the loop can ever engage.
+            cpu_temp_c: 60.0,
+            cpu_temp_valid: true,
             ..Sample::default()
         }
     }
 
-    /// Drives `n` (>= 3) `temploop_sample`s through `ctl`, one per second
-    /// starting at `t0`, and returns the last call's effects. `ENTRY_HYSTERESIS_TICKS`
-    /// (3, `control::mode`) means TempLoop engages on the 3rd call.
+    /// Drives `n` `temploop_sample`s through `ctl`, one per second starting
+    /// at `t0`, and returns the last call's effects. `control::mode`'s entry
+    /// hysteresis is `ENTRY_HYSTERESIS_S` (15 s, §2.5) of held conditions,
+    /// and these samples are one second apart, so TempLoop engages on the
+    /// 15th call — see `TEMPLOOP_ENTRY_SAMPLES`.
+    /// `decide` calls at the controller's real 1 Hz cadence that TempLoop
+    /// entry takes — derived from the spec's wall clock, never a literal, so
+    /// a cadence change can never silently rescale it (roast-pr-1 finding
+    /// 6). 15 at 1 Hz.
+    fn temploop_entry_samples() -> u32 {
+        crate::control::mode::ticks_for(crate::control::mode::ENTRY_HYSTERESIS_S, SAMPLE_PERIOD_S)
+    }
+
     fn drive_temploop(ctl: &mut Controller<&FakeRunner>, t0: f64, n: u32) -> Vec<Effect> {
         let mut last = Vec::new();
         for i in 0..n {
             last = ctl.on_sample(&temploop_sample(t0 + f64::from(i), 75.0, 74.0, TEMP_CURVE));
         }
         last
+    }
+
+    /// roast-pr-1 finding 6, at the cadence that actually matters: the
+    /// controller calls `Arbiter::decide` once per 1 Hz sample, so §2.5's
+    /// "3 consecutive ticks (15 s)" of entry hysteresis must take 15
+    /// samples here — not the 3 it took while `mode.rs` held a literal tick
+    /// count derived against the 5 s allocator cadence. Every sample below
+    /// is TempLoop-eligible, so the ONLY thing keeping the loop out is the
+    /// hysteresis clock. Fails on the old constant: TempLoop engaged at
+    /// t=2 (3 s).
+    #[test]
+    fn temploop_entry_takes_the_spec_15_seconds_at_the_1_hz_sample_cadence() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+
+        let entry = temploop_entry_samples();
+        assert_eq!(
+            f64::from(entry) * SAMPLE_PERIOD_S,
+            crate::control::mode::ENTRY_HYSTERESIS_S,
+            "premise: {entry} samples at {SAMPLE_PERIOD_S}s is exactly §2.5's 15 s"
+        );
+
+        for i in 0..entry - 1 {
+            drive_temploop(&mut ctl, f64::from(i), 1);
+            assert_eq!(
+                ctl.status().loop_mode,
+                LoopMode::RpmLoop,
+                "sample {i} (t={i}s): only {}s of held conditions, short of the spec's 15 s",
+                i + 1
+            );
+        }
+        drive_temploop(&mut ctl, f64::from(entry - 1), 1);
+        assert_eq!(
+            ctl.status().loop_mode,
+            LoopMode::TempLoop,
+            "TempLoop engages once the conditions have held for the spec's 15 s"
+        );
     }
 
     #[test]
@@ -5279,15 +5370,17 @@ mod tests {
             .t_star(target_duty)
             .expect("36 has a real tread on TEMP_CURVE");
 
-        // TempLoop's own entry hysteresis (mode.rs's ENTRY_HYSTERESIS_TICKS
-        // = 3) engages by the 3rd sample, but the budget/allocate step only
-        // runs on the 5 s allocator cadence — drive through the NEXT due
-        // tick (t=5, the 6th sample) so there is a fresh `AutoAllocated`
-        // reflecting the already-engaged TempLoop.
-        drive_temploop(&mut ctl, 0.0, 5);
+        // TempLoop's own entry hysteresis (mode.rs's ENTRY_HYSTERESIS_S =
+        // 15 s, which at this 1 Hz sample cadence is 15 samples) engages on
+        // the 15th sample, but the budget/allocate step only runs on the 5 s
+        // allocator cadence — drive through the NEXT due tick (t=15) so
+        // there is a fresh `AutoAllocated` reflecting the already-engaged
+        // TempLoop.
+        let entry = temploop_entry_samples();
+        drive_temploop(&mut ctl, 0.0, entry);
         assert_eq!(ctl.status().loop_mode, LoopMode::TempLoop);
         assert_eq!(ctl.status().t_star_c, Some(expected_t_star));
-        let effects = drive_temploop(&mut ctl, 5.0, 1);
+        let effects = drive_temploop(&mut ctl, f64::from(entry), 1);
         let (mode, error, budget_w, _) = effects
             .iter()
             .find_map(|e| match e {
@@ -5742,6 +5835,142 @@ mod tests {
         );
     }
 
+    /// The helper both `error_sign` derivations now share (roast-pr-1
+    /// finding 5). Every one of these cases except the two nonzero ones
+    /// disagrees with `f64::signum`, which is the whole point.
+    #[test]
+    fn sign3_is_neutral_on_zero_and_nan_unlike_signum() {
+        assert_eq!(sign3(2.5), 1.0);
+        assert_eq!(sign3(-2.5), -1.0);
+        assert_eq!(sign3(0.0), 0.0, "+0.0: signum says 1.0");
+        assert_eq!(sign3(-0.0), 0.0, "-0.0: signum says -1.0");
+        assert_eq!(sign3(f64::NAN), 0.0, "NaN: signum says NaN");
+        assert_eq!(sign3(f64::INFINITY), 1.0);
+        assert_eq!(sign3(f64::NEG_INFINITY), -1.0);
+    }
+
+    /// roast-pr-1 finding 5, consumer 1: the demand-limited halt.
+    /// `Budget::set_demand_state` documents "`error_sign <= 0.0` is already
+    /// the recovering direction and is never halted here", but the sign was
+    /// derived with `f64::signum`, which returns `1.0` for `+0.0` — so a
+    /// loop sitting exactly on target (a reachable steady state, and the
+    /// same 0.0 the site substitutes when the error is not computable at
+    /// all) armed the halt. Falsifiable: put `.signum()` back at the
+    /// `run_budget_and_allocate` derivation and the final assertion fails.
+    #[test]
+    fn an_exactly_zero_loop_error_does_not_arm_the_demand_limited_halt() {
+        // RpmLoop's setpoint for the default 3000 RPM fan target: duty 36,
+        // whose table entry is exactly 3030 RPM — so a fan held there gives
+        // `e_rpm` of exactly 0.0, not merely a small one.
+        let on_target = DutyRpmTable::default().rpm_for_duty(36);
+        assert_eq!(on_target, 3030.0, "premise: the on-target RPM is exact");
+
+        // Both runs warm-start `u` at 90 W, well clear of the floor sum
+        // (cpu_floor_w 15 + the LUT's 30 W at gpu_floor_mhz): each axis'
+        // cap is then above its own floor with `rpm_view_sample` drawing no
+        // watts at all, which is exactly the demand-limited condition. The
+        // ONLY difference between the runs is the loop error's sign.
+        let run = |fan_rpm: f64| {
+            let runner = FakeRunner::new();
+            let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
+            ctl.warm_start
+                .insert(WarmStart::key("quiet16", 36, false), 90.0);
+            ctl.on_command(Command::SetAuto(true));
+            let mut last = Vec::new();
+            for i in 0..6u32 {
+                last = ctl.on_sample(&rpm_view_sample(
+                    f64::from(i) * ALLOC_PERIOD_S,
+                    fan_rpm,
+                    "quiet16",
+                    36,
+                    false,
+                ));
+            }
+            last.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::AutoAllocated {
+                        freeze: Some("demand_limited"),
+                        ..
+                    }
+                )
+            })
+        };
+
+        assert!(
+            run(3000.0),
+            "premise: below target (error calling for MORE budget) with zero draw, the halt arms"
+        );
+        assert!(
+            !run(on_target),
+            "an exactly-zero error calls for neither direction, so the same starved axes must \
+             NOT halt the integrator (budget.rs: `error_sign <= 0.0` is never halted)"
+        );
+    }
+
+    /// roast-pr-1 finding 5, consumer 2: §2.7's `TARGET UNREACHABLE (high)`
+    /// rule (`mode.rs`: `at_upper_bound_for >= 60 s && error_sign > 0.0`),
+    /// fed by `AutoState::last_error_sign`. Same `signum` defect: a loop
+    /// parked exactly on target reported "still calling for more heat" and
+    /// so raised the flag after 60 s at the ceiling. Falsifiable: restore
+    /// `.signum()` at the `last_error_sign` derivation and the on-target run
+    /// below starts raising the flag too.
+    #[test]
+    fn an_exactly_zero_loop_error_does_not_arm_the_high_unreachable_rule() {
+        // Degenerate bounds pin `u` at the ceiling from the first step:
+        // `lo` is `cpu_floor_w` + the LUT's watts at `gpu_floor_mhz`
+        // (15 + 30 = 45) and `hi` is `cpu_max_w + gpu_max_w`, so 15 + 30
+        // makes them equal and every step dwells at the upper bound.
+        let degenerate = || Config {
+            cpu_floor_w: 15.0,
+            cpu_max_w: 15.0,
+            gpu_max_w: 30.0,
+            ..Config::default()
+        };
+        // 14 allocator steps at 5 s each is 70 s of dwell — comfortably past
+        // mode.rs's 60 s `BOUND_HOLD`, and not pinned to its exact edge.
+        let run = |fan_rpm: f64| {
+            let runner = FakeRunner::new();
+            let (mut ctl, _gpu) = auto_controller(
+                &runner,
+                PathBuf::from("/nonexistent/platform_profile"),
+                degenerate(),
+            );
+            ctl.on_command(Command::SetAuto(true));
+            for i in 0..14u32 {
+                ctl.on_sample(&rpm_view_sample(
+                    f64::from(i) * ALLOC_PERIOD_S,
+                    fan_rpm,
+                    "quiet16",
+                    36,
+                    false,
+                ));
+            }
+            let st = ctl.status();
+            (
+                st.budget_w,
+                st.flags.contains(&StatusFlag::TargetUnreachable),
+            )
+        };
+
+        let on_target = DutyRpmTable::default().rpm_for_duty(36);
+        let (u_below, flag_below) = run(3000.0);
+        assert_eq!(u_below, 45.0, "premise: u is pinned at the ceiling");
+        assert!(
+            flag_below,
+            "premise: held at the ceiling for 60 s with the error still calling for more heat, \
+             the `high` rule fires — so this harness really does arm it"
+        );
+
+        let (u_on, flag_on) = run(on_target);
+        assert_eq!(u_on, 45.0, "premise: same pinned ceiling, same dwell");
+        assert!(
+            !flag_on,
+            "an exactly-zero error is not `calling for more heat`, so the same 70 s at the \
+             ceiling must NOT raise TARGET UNREACHABLE (high)"
+        );
+    }
+
     #[test]
     fn a_snapped_duty_change_re_keys_without_reseeding_the_budget() {
         // Same shape again, but the LAST tick's `SetFanTarget` moves the fan
@@ -6083,8 +6312,8 @@ mod tests {
         // sample regardless of mode, and `mode` is already RpmLoop (not
         // Released) from t=0 onward (fan_valid is true from the first
         // sample) -- so the first WRITE attempt is at t=0, not after
-        // TempLoop's own entry hysteresis (ENTRY_HYSTERESIS_TICKS = 3,
-        // engaging by t=2) finishes. Due ticks thereafter land every 5 s:
+        // TempLoop's own entry hysteresis (ENTRY_HYSTERESIS_S = 15 s, so 15
+        // samples at 1 Hz, engaging by t=14) finishes. Due ticks thereafter land every 5 s:
         // t=0, 5, 10, 15, 20. Script three confirmed mismatches for the
         // three due ticks that follow (t=0, 5, 10 --
         // MISMATCH_RELEASE_STRIKES = 3), then leave the queue empty for

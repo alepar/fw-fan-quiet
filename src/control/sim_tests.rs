@@ -2754,16 +2754,25 @@ fn a_scored_view_skipped_for_replica_slewing_delays_temploop_entry_by_a_full_pol
 
     // Gentle (20 W): decayed below the skip threshold well before the
     // FIRST poll (t=30) -- that view is scored, `reconciled` sets, and
-    // TempLoop engages the moment entry-hysteresis alone clears (t=33).
+    // TempLoop engages the moment entry-hysteresis alone clears. `core_ok`
+    // itself cannot hold before that first `print all` view (no view => no
+    // `active`, no curve), so the streak starts at t=30 and the entry lands
+    // one full `ENTRY_HYSTERESIS_S` later -- t=45 at the controller's 1 Hz
+    // cadence (roast-pr-1 finding 6: this used to be t=33 because the 15 s
+    // hysteresis was a literal 3-tick count derived against the 5 s
+    // allocator cadence and so ran 5x fast at 1 Hz).
+    let entry_tick =
+        30 + crate::control::mode::ticks_for(crate::control::mode::ENTRY_HYSTERESIS_S, 1.0) as usize;
     let gentle = run_with_sustained_draw("slew-gentle", 20.0);
     println!(
-        "[replica-slewing] gentle(20W): mode@30={:?} mode@33={:?}",
-        gentle.rows[29].mode, gentle.rows[32].mode
+        "[replica-slewing] gentle(20W): mode@30={:?} mode@{entry_tick}={:?}",
+        gentle.rows[29].mode,
+        gentle.rows[entry_tick - 1].mode
     );
     assert_eq!(
-        gentle.rows[32].mode,
+        gentle.rows[entry_tick - 1].mode,
         LoopMode::TempLoop,
-        "a gentle, non-slewing draw must reach TempLoop as soon as entry-hysteresis alone allows (t=33)"
+        "a gentle, non-slewing draw must reach TempLoop as soon as entry-hysteresis alone allows (t={entry_tick})"
     );
 
     // Steep (65 W): still slewing at BOTH the first (t=30) and second

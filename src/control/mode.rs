@@ -6,28 +6,38 @@
 //!
 //! # Two clocks, one call
 //!
-//! [`Arbiter::decide`] is the single entry point, called once per allocator
-//! tick (5 s, [`crate::control::budget::PI_PERIOD_S`]). All of this
-//! module's tick-counted state (entry hysteresis, the argmax debounce, the
-//! feasible-again clear) counts *calls* to `decide`, not wall-clock time —
-//! exactly how [`crate::control::budget::Budget`]'s bound-dwell timers work,
-//! and for the same reason: the caller's cadence is the tick, so there is
-//! no need for an injected clock to make the counters deterministic in
-//! tests.
+//! [`Arbiter::decide`] is the single entry point, called once per **sample**
+//! (1 Hz — the controller reconciles on every sample, §2.6, not on the 5 s
+//! allocator tick). All of this module's counted state still counts *calls*
+//! to `decide`, never wall-clock time, so the counters stay deterministic
+//! in tests with no injected clock; what the caller supplies instead is its
+//! own cadence, [`ArbiterInput::sample_period_s`], and every counter the
+//! spec states in **seconds** ([`ENTRY_HYSTERESIS_S`], [`FEASIBLE_CLEAR_S`])
+//! is converted to a call count against it by [`ticks_for`]. That is the
+//! fix for fw-fanctrl-loop roast-pr-1 finding 6: these two were literal
+//! tick counts derived against the 5 s cadence (3 and 12) while `decide`
+//! had already been moved to 1 Hz, so entry hysteresis and the
+//! feasible-again clear ran 5x faster than §2.5/§2.7 specify (15 s -> 3 s,
+//! 60 s -> 12 s).
+//!
+//! [`ARGMAX_DEBOUNCE_TICKS`] is deliberately *not* converted: the design doc
+//! specifies it in samples ("it must fail for 3 consecutive **samples**"),
+//! not in seconds, because it debounces integer-rounding noise on the
+//! readings themselves rather than timing a physical settle.
 //!
 //! Reconciliation (§2.6) is scored on a *different*, coarser cadence (once
 //! per fresh `print all` view, roughly every 30 s) than the mode table is
-//! evaluated (every 5 s tick). `ArbiterInput::view_changed` is how the
-//! controller (a later task) tells this call whether it is carrying a fresh
-//! view worth scoring; when it does, `decide` scores it before evaluating
-//! the table, so the two cadences share one call site without either
-//! starving the other of updates.
+//! evaluated (every sample). `ArbiterInput::view_changed` is how the
+//! controller tells this call whether it is carrying a fresh view worth
+//! scoring; when it does, `decide` scores it before evaluating the table,
+//! so the two cadences share one call site without either starving the
+//! other of updates.
 //!
 //! # Entry hysteresis is layered, not monolithic
 //!
 //! The row table's own conditions (freshness, `active`, EC validity, curve
 //! validity, feasibility, the debounced argmax check) form `core_ok`; a
-//! generic counter requires `core_ok` for [`ENTRY_HYSTERESIS_TICKS`]
+//! generic counter requires `core_ok` for [`ENTRY_HYSTERESIS_S`] worth of
 //! *consecutive* calls before TempLoop is reachable at all — this is what
 //! makes a clean, nothing-ever-wrong Auto engagement take 15 s to close the
 //! loop, per §2.5.
@@ -52,10 +62,12 @@ use crate::fanctrl::client::{FanctrlView, Freshness};
 use crate::fanctrl::curve::Curve;
 use crate::sensors::ec::EcReading;
 
-/// Consecutive `decide` calls a row's own conditions (`core_ok`, below) must
-/// hold before the arbiter switches **into** it. Exit is immediate: dropping
-/// out never waits for this counter (§2.5).
-const ENTRY_HYSTERESIS_TICKS: u32 = 3;
+/// Wall-clock time a row's own conditions (`core_ok`, below) must hold
+/// continuously before the arbiter switches **into** it — §2.5's "3
+/// consecutive ticks (15 s)", stated here in the seconds the spec pins and
+/// converted to a call count by [`ticks_for`] at the caller's own cadence.
+/// Exit is immediate: dropping out never waits for this counter (§2.5).
+pub(crate) const ENTRY_HYSTERESIS_S: f64 = 15.0;
 
 /// Consecutive scored views needed to latch `EC MISMATCH`, or to clear it
 /// (§2.6).
@@ -77,8 +89,11 @@ const SKIP_SLOPE_C_PER_S: f64 = 0.5;
 /// carrying it is at or above this (§2.6).
 const SKIP_GAP_S: f64 = 2.0;
 
-/// Consecutive argmax-uncontrollable ticks before that alone can drop
-/// TempLoop (§2.5's debounce).
+/// Consecutive argmax-uncontrollable **samples** before that alone can drop
+/// TempLoop (§2.5's debounce). Genuinely a sample count, not a duration —
+/// §2.5 specifies it as "3 consecutive samples" because it debounces
+/// integer-rounding noise on the readings, so it is not run through
+/// [`ticks_for`].
 const ARGMAX_DEBOUNCE_TICKS: u8 = 3;
 
 /// An uncontrollable argmax leading the best controllable reading by more
@@ -93,16 +108,32 @@ const FEASIBLE_MARGIN_C: f64 = 5.0;
 /// `slope_at(T*)` strictly above this raises `STEEP CURVE` (§2.7).
 const STEEP_SLOPE_PCT_PER_C: f64 = 2.0;
 
-/// Consecutive feasible ticks needed to clear a latched infeasibility, at
-/// the 5 s allocator cadence (60 s / `PI_PERIOD_S`, §2.7). A literal `const`
-/// rather than computed from [`crate::control::budget::PI_PERIOD_S`] to
-/// avoid a `f64 as u32` const-cast; the module doc above ties the two
-/// together.
-const FEASIBLE_CLEAR_TICKS: u32 = 12;
+/// How long the target must be continuously feasible again before a latched
+/// infeasibility clears (§2.7: "the flag clears when feasible again for 60
+/// s"). Like [`ENTRY_HYSTERESIS_S`], stated in the spec's seconds and
+/// converted to a call count by [`ticks_for`].
+pub(crate) const FEASIBLE_CLEAR_S: f64 = 60.0;
 
 /// How long a budget bound must be held, with the error still calling in
 /// that direction, before the `low`/`high` unreachable reasons fire (§2.7).
 const BOUND_HOLD: Duration = Duration::from_secs(60);
+
+/// Converts one of this module's spec-stated wall-clock durations into the
+/// number of consecutive [`Arbiter::decide`] calls that covers, at the
+/// caller's own cadence (`sample_period_s`). Never returns 0 — a counter
+/// that needed "at least one call" would otherwise be satisfied before it
+/// ever ran. A non-finite or non-positive period falls back to the
+/// allocator cadence rather than panicking: a bad period must not silently
+/// make every hysteresis vacuous.
+pub(crate) fn ticks_for(secs: f64, sample_period_s: f64) -> u32 {
+    let period = if sample_period_s.is_finite() && sample_period_s > 0.0 {
+        sample_period_s
+    } else {
+        crate::control::budget::PI_PERIOD_S
+    };
+    let ticks = (secs / period).round();
+    if ticks < 1.0 { 1 } else { ticks as u32 }
+}
 
 /// Everything the arbiter needs for one `decide` call. Borrowed, not owned:
 /// this is read once per tick and never retained past the call.
@@ -157,6 +188,15 @@ pub struct ArbiterInput<'a> {
     /// (`all_observed_at`) and the sample carrying it — the skip rule's
     /// second half (§2.6). Meaningless (and ignored) unless `view_changed`.
     pub view_to_sample_gap_s: f64,
+    /// The caller's own cadence: how many seconds elapse between two
+    /// consecutive `decide` calls. Every counter this module states in
+    /// seconds ([`ENTRY_HYSTERESIS_S`], [`FEASIBLE_CLEAR_S`]) is converted
+    /// against it by [`ticks_for`], so the spec's wall-clock durations hold
+    /// whatever cadence `decide` is driven at (1 Hz in the controller, 5 s
+    /// in a tick-oriented test). Carried per call rather than fixed at
+    /// construction so a caller that changes cadence cannot leave a stale
+    /// period behind.
+    pub sample_period_s: f64,
 }
 
 /// The arbiter's verdict for one tick (§2.5-§2.7).
@@ -258,6 +298,10 @@ impl Arbiter {
     /// first when `input.view_changed`; §2.7 feasibility/steepness folded
     /// in).
     pub fn decide(&mut self, input: &ArbiterInput) -> Decision {
+        // The spec's wall-clock hysteresis durations, in calls at THIS
+        // caller's cadence (see the module doc's "Two clocks, one call").
+        let entry_hysteresis_ticks = ticks_for(ENTRY_HYSTERESIS_S, input.sample_period_s);
+        let feasible_clear_ticks = ticks_for(FEASIBLE_CLEAR_S, input.sample_period_s);
         let mut reasons: Vec<String> = Vec::new();
         let mut flags: Vec<StatusFlag> = Vec::new();
         let mut reseed_ma: Option<f64> = None;
@@ -393,7 +437,7 @@ impl Arbiter {
             let feasible_now = ts >= max_unc + FEASIBLE_MARGIN_C;
             if feasible_now {
                 self.feasible_streak = self.feasible_streak.saturating_add(1);
-                if self.infeasible_latched && self.feasible_streak >= FEASIBLE_CLEAR_TICKS {
+                if self.infeasible_latched && self.feasible_streak >= feasible_clear_ticks {
                     self.infeasible_latched = false;
                 }
             } else {
@@ -468,7 +512,7 @@ impl Arbiter {
         };
 
         let reconciliation_ok = self.reconciled && !self.ec_mismatch;
-        let temp_loop_ready = self.entry_streak >= ENTRY_HYSTERESIS_TICKS && reconciliation_ok;
+        let temp_loop_ready = self.entry_streak >= entry_hysteresis_ticks && reconciliation_ok;
 
         let mode = if temp_loop_ready {
             LoopMode::TempLoop
@@ -538,6 +582,18 @@ mod tests {
     ];
     const COOL16: &[(f64, u8)] = &[(0.0, 20), (50.0, 20), (60.0, 30), (70.0, 42), (85.0, 100)];
 
+    /// Cadence these unit tests drive `decide` at. The 5 s allocator period
+    /// keeps the historical tick counts of this module's tests (3 in, 12 to
+    /// clear) readable; `hysteresis_is_wall_clock_at_any_cadence` below is
+    /// the test that pins the *durations* at both cadences, including the
+    /// controller's real 1 Hz one.
+    const TEST_PERIOD_S: f64 = crate::control::budget::PI_PERIOD_S;
+
+    /// Consecutive clean calls TempLoop entry needs at `TEST_PERIOD_S`.
+    fn entry_ticks() -> u32 {
+        ticks_for(ENTRY_HYSTERESIS_S, TEST_PERIOD_S)
+    }
+
     fn view(curve: &[(f64, u8)], temperature: f64, ma_temperature: f64) -> FanctrlView {
         FanctrlView {
             strategy: "quiet16".to_string(),
@@ -601,6 +657,7 @@ mod tests {
             curve_valid: true,
             replica_slope_5s_c_per_s: 0.0,
             view_to_sample_gap_s: 0.0,
+            sample_period_s: TEST_PERIOD_S,
         }
     }
 
@@ -617,7 +674,7 @@ mod tests {
         // first tick must NOT report `unreconciled` — it just reconciled.
         // The helper used to assert the opposite, guarded by
         // `|| d.mode != LoopMode::TempLoop`, which is unfailable after one
-        // tick (TempLoop needs ENTRY_HYSTERESIS_TICKS consecutive ticks) and
+        // tick (TempLoop needs ENTRY_HYSTERESIS_S of consecutive ticks) and
         // so hid that the stated premise was backwards for the whole epic.
         // Mutation-checkable: skip the `reconciled = true` write and this
         // fails.
@@ -627,7 +684,7 @@ mod tests {
             d.reasons,
             d.mode
         );
-        for _ in 0..ENTRY_HYSTERESIS_TICKS {
+        for _ in 0..entry_ticks() {
             a.decide(&happy_input(v, ec));
         }
         a
@@ -678,23 +735,33 @@ mod tests {
     // ---- 2. 3-tick entry hysteresis, immediate exit -----------------
 
     #[test]
-    fn entry_hysteresis_needs_three_ticks_exit_is_immediate() {
+    fn entry_hysteresis_needs_the_spec_duration_exit_is_immediate() {
         let v = view(QUIET16, 75.0, 75.0);
         let ec = happy_ec();
         let mut a = Arbiter::new();
 
+        // At TEST_PERIOD_S this is 3 ticks, but the number that matters is
+        // the wall clock the spec pins (15 s), so it is derived here.
+        let n = entry_ticks();
+        assert_eq!(
+            f64::from(n) * TEST_PERIOD_S,
+            ENTRY_HYSTERESIS_S,
+            "premise: {n} ticks at {TEST_PERIOD_S}s is exactly the spec's 15 s"
+        );
         let mut first = happy_input(&v, &ec);
         first.view_changed = true;
-        assert_eq!(a.decide(&first).mode, LoopMode::RpmLoop, "tick 1 of 3");
-        assert_eq!(
-            a.decide(&happy_input(&v, &ec)).mode,
-            LoopMode::RpmLoop,
-            "tick 2 of 3"
-        );
+        assert_eq!(a.decide(&first).mode, LoopMode::RpmLoop, "tick 1 of {n}");
+        for i in 2..n {
+            assert_eq!(
+                a.decide(&happy_input(&v, &ec)).mode,
+                LoopMode::RpmLoop,
+                "tick {i} of {n}: still short of {ENTRY_HYSTERESIS_S}s"
+            );
+        }
         assert_eq!(
             a.decide(&happy_input(&v, &ec)).mode,
             LoopMode::TempLoop,
-            "tick 3 of 3 enters"
+            "tick {n} of {n} enters"
         );
 
         // Immediate exit on a hard fault (freshness lost) — no grace.
@@ -706,10 +773,88 @@ mod tests {
             "hard fault exits the same tick"
         );
 
-        // Re-entry needs a fresh 3-tick climb.
-        assert_eq!(a.decide(&happy_input(&v, &ec)).mode, LoopMode::RpmLoop);
-        assert_eq!(a.decide(&happy_input(&v, &ec)).mode, LoopMode::RpmLoop);
+        // Re-entry needs a fresh full-duration climb.
+        for i in 1..n {
+            assert_eq!(
+                a.decide(&happy_input(&v, &ec)).mode,
+                LoopMode::RpmLoop,
+                "re-entry tick {i} of {n}"
+            );
+        }
         assert_eq!(a.decide(&happy_input(&v, &ec)).mode, LoopMode::TempLoop);
+    }
+
+    /// fw-fanctrl-loop roast-pr-1 finding 6: `decide` runs at 1 Hz in the
+    /// controller, but its hysteresis constants were literal tick counts
+    /// derived against the 5 s allocator cadence, so both timers ran 5x
+    /// fast (15 s -> 3 s, 60 s -> 12 s). This drives the SAME arbiter at
+    /// both cadences and asserts the entry hysteresis and the
+    /// feasible-again clear each take the spec's wall-clock time at each —
+    /// it fails on the old literal `3`/`12` at 1 Hz.
+    #[test]
+    fn hysteresis_is_wall_clock_at_any_cadence() {
+        let v = view(QUIET16, 75.0, 75.0);
+        let ec = happy_ec();
+
+        for period in [1.0_f64, crate::control::budget::PI_PERIOD_S] {
+            let want_entry = (ENTRY_HYSTERESIS_S / period).round() as u32;
+            let mut a = Arbiter::new();
+            let mut first = happy_input(&v, &ec);
+            first.sample_period_s = period;
+            first.view_changed = true;
+            a.decide(&first);
+            for i in 2..want_entry {
+                let mut input = happy_input(&v, &ec);
+                input.sample_period_s = period;
+                assert_eq!(
+                    a.decide(&input).mode,
+                    LoopMode::RpmLoop,
+                    "period {period}s: TempLoop must not engage at call {i}                      ({}s of held conditions, short of {ENTRY_HYSTERESIS_S}s)",
+                    f64::from(i) * period
+                );
+            }
+            let mut last = happy_input(&v, &ec);
+            last.sample_period_s = period;
+            assert_eq!(
+                a.decide(&last).mode,
+                LoopMode::TempLoop,
+                "period {period}s: TempLoop engages after exactly {ENTRY_HYSTERESIS_S}s"
+            );
+
+            // ...and the feasible-again clear, on a fresh arbiter.
+            let infeasible_ec = ec_reading(&[("ambient_f75303@4d", 61.0), ("cpu@4c", 20.0)]);
+            let cool_view = view(QUIET16, 20.0, 20.0);
+            let mut b = Arbiter::new();
+            let mut infeasible = happy_input(&cool_view, &infeasible_ec);
+            infeasible.sample_period_s = period;
+            infeasible.target_duty = 21; // T*=65.5 < 61 + 5
+            assert!(
+                b.decide(&infeasible)
+                    .flags
+                    .contains(&StatusFlag::TargetUnreachable),
+                "premise: the target starts infeasible at period {period}s"
+            );
+            let ok_ec = ec_reading(&[("ambient_f75303@4d", 10.0), ("cpu@4c", 60.0)]);
+            let mut ok_input = happy_input(&cool_view, &ok_ec);
+            ok_input.sample_period_s = period;
+            ok_input.target_duty = 31;
+            let want_clear = (FEASIBLE_CLEAR_S / period).round() as u32;
+            for i in 1..want_clear {
+                assert!(
+                    b.decide(&ok_input)
+                        .flags
+                        .contains(&StatusFlag::TargetUnreachable),
+                    "period {period}s: the latch must survive call {i} ({}s of {FEASIBLE_CLEAR_S}s)",
+                    f64::from(i) * period
+                );
+            }
+            assert!(
+                !b.decide(&ok_input)
+                    .flags
+                    .contains(&StatusFlag::TargetUnreachable),
+                "period {period}s: the latch clears after exactly {FEASIBLE_CLEAR_S}s"
+            );
+        }
     }
 
     // ---- 3. three mismatches -> RpmLoop, three matches -> TempLoop --
@@ -864,12 +1009,20 @@ mod tests {
             d.reasons
         );
 
-        // Feed feasible ticks; the flag must still be present before 12
-        // ticks (60s) and gone at/after 12.
+        // Feed feasible ticks; the flag must still be present before
+        // FEASIBLE_CLEAR_S of them and gone once that much wall clock has
+        // passed. The count is derived from the spec's 60 s, not written as
+        // a literal, so a cadence change can never silently rescale it.
+        let clear_ticks = ticks_for(FEASIBLE_CLEAR_S, TEST_PERIOD_S);
+        assert_eq!(
+            f64::from(clear_ticks) * TEST_PERIOD_S,
+            FEASIBLE_CLEAR_S,
+            "premise: {clear_ticks} ticks at {TEST_PERIOD_S}s is exactly the spec's 60 s"
+        );
         let ok_ec = ec_reading(&[("ambient_f75303@4d", 10.0), ("cpu@4c", 60.0)]);
         let mut ok_input = happy_input(&infeasible_target_view, &ok_ec);
         ok_input.target_duty = 31; // a tread whose T*=80 clears 10+5 easily
-        for i in 0..11 {
+        for i in 0..clear_ticks - 1 {
             let d = a.decide(&ok_input);
             assert!(
                 d.flags.contains(&StatusFlag::TargetUnreachable),

@@ -164,11 +164,28 @@ impl DutyRpmTable {
     }
 
     /// True iff every entry's RPM is strictly greater than the previous
-    /// entry's, in duty order. Test-only: this is the invariant `refine`
-    /// maintains, checked here rather than duplicated at each call site.
-    #[cfg(test)]
+    /// entry's, in duty order. This is the invariant `refine` maintains,
+    /// checked here rather than duplicated at each call site.
     fn is_strictly_increasing(&self) -> bool {
         self.points.values().is_sorted_by(|a, b| a < b)
+    }
+
+    /// True iff this table satisfies every invariant the rest of the code
+    /// assumes: non-empty (`duty_for_rpm` panics on an empty map), every RPM
+    /// finite (a NaN propagates straight into the RPM loop error), and
+    /// strictly increasing in duty (`refine`'s `clamp(lo + m, hi - m)` panics
+    /// with `min > max` on a non-monotone table).
+    ///
+    /// Everything constructed in-process holds these by construction — the
+    /// seeded `Default` and `refine`, which never removes an entry and
+    /// re-clamps into strict order. The one way in that does NOT is
+    /// deserialisation: `PersistedState::load` calls this and falls back to
+    /// `Default` rather than letting a hand-edited or schema-skewed
+    /// `state.json` panic the control loop.
+    pub fn is_valid(&self) -> bool {
+        !self.points.is_empty()
+            && self.points.values().all(|r| r.is_finite())
+            && self.is_strictly_increasing()
     }
 }
 

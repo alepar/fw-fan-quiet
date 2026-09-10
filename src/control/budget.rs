@@ -123,6 +123,25 @@ impl Default for LoopGains {
     }
 }
 
+impl LoopGains {
+    /// True iff these gains are usable by [`Budget::step`]: all four terms
+    /// finite and strictly positive. The integral times in particular are
+    /// load-bearing — `step` divides by `ti` twice (`kc * PI_PERIOD_S / ti`
+    /// and the back-calculation), so a zero or negative `ti_s`/`ti_rpm_s`
+    /// drives `u` to NaN or inverts the integrator, and the control loop
+    /// silently stops controlling.
+    ///
+    /// The calibration fit (`fopdt::derive_one`) already validates what it
+    /// produces; this is the check for gains coming back off disk, where
+    /// `PersistedState::load` drops an invalid set to `None` (i.e. back to
+    /// `LoopGains::default()`) instead of persisting the divide-by-zero.
+    pub fn is_valid(&self) -> bool {
+        [self.kc_w_per_c, self.ti_s, self.kc_w_per_rpm, self.ti_rpm_s]
+            .iter()
+            .all(|v| v.is_finite() && *v > 0.0)
+    }
+}
+
 /// The error the arbiter feeds the integrator each tick (§2.4). Both
 /// variants integrate into the same `u` — the mode switch is bumpless by
 /// construction, and switching kind implicitly resyncs (see module docs).

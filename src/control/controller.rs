@@ -6237,12 +6237,18 @@ mod tests {
     /// config keys that round-tripped through `Config::load`/`save` and
     /// appeared on `ControlStatus` but never actually reached the guards
     /// that are supposed to act on them. Both thresholds are set here WELL
-    /// BELOW the compiled-in defaults (90/80): a temperature that would
-    /// leave the DEFAULTS cold must trip THESE configured, lower ones.
+    /// BELOW the compiled-in defaults (88/80) -- but still inside the range
+    /// `Config::sanitized` allows (roast PR-1 finding 8 added these two keys
+    /// to the sanitizer, so a threshold below the sensor's idle range no
+    /// longer survives load): a temperature that would leave the DEFAULTS
+    /// cold must trip THESE configured, lower ones.
     #[test]
     fn gpu_and_nvme_hot_thresholds_come_from_the_live_config_not_the_compiled_defaults() {
         let runner = FakeRunner::new();
-        let config = Config { gpu_hot_c: 50.0, nvme_hot_c: 40.0, ..Config::default() };
+        let config = Config { gpu_hot_c: 65.0, nvme_hot_c: 55.0, ..Config::default() };
+        // Sanity: the values under test are the ones the guards will see.
+        let config = config.sanitized();
+        assert_eq!((config.gpu_hot_c, config.nvme_hot_c), (65.0, 55.0));
         let (mut ctl, _gpu) = auto_controller(
             &runner,
             PathBuf::from("/nonexistent/platform_profile"),
@@ -6251,8 +6257,8 @@ mod tests {
         ctl.on_command(Command::SetAuto(true));
         let s = Sample {
             gpu_temp_valid: true,
-            gpu_temp_c: 60.0, // below GPU_HOT_C_DEFAULT (90), above the configured 50
-            nvme_temp_c: Some(45.0), // below NVME_HOT_C_DEFAULT (80), above the configured 40
+            gpu_temp_c: 70.0, // below GPU_HOT_C_DEFAULT (88), above the configured 65
+            nvme_temp_c: Some(60.0), // below NVME_HOT_C_DEFAULT (80), above the configured 55
             cpu_temp_valid: true,
             cpu_temp_c: 60.0,
             ..busy_at(ALLOC_PERIOD_S)
@@ -6260,13 +6266,13 @@ mod tests {
         ctl.on_sample(&s);
         assert!(
             ctl.status().flags.contains(&StatusFlag::GpuHot),
-            "60C must trip a configured 50C gpu_hot_c threshold even though it's \
-             well under the compiled-in 90C default: {:?}",
+            "70C must trip a configured 65C gpu_hot_c threshold even though it's \
+             well under the compiled-in 88C default: {:?}",
             ctl.status().flags
         );
         assert!(
             ctl.status().flags.contains(&StatusFlag::NvmeHot),
-            "45C must trip a configured 40C nvme_hot_c threshold even though it's \
+            "60C must trip a configured 55C nvme_hot_c threshold even though it's \
              well under the compiled-in 80C default: {:?}",
             ctl.status().flags
         );

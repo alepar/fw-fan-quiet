@@ -11,11 +11,28 @@ use std::path::{Path, PathBuf};
 use crate::actuators::gpu::clamp_gpu_clock;
 use crate::control::allocator::{CPU_MAX_W, GPU_MAX_W};
 use crate::control::controller::DEFAULT_FAN_TARGET_RPM;
-use crate::control::guards::{GPU_HOT_C_DEFAULT, NVME_HOT_C_DEFAULT};
+use crate::control::guards::{GPU_HOT_C_DEFAULT, GPU_HYSTERESIS_C, NVME_HOT_C_DEFAULT};
+use crate::control::watchdog::GPU_TRIP_C;
 
 /// Lower bound for `cpu_max_w`: below the actuator's ~10 W sustained floor the
 /// grid-search and the manual-mode clamps would degenerate.
 const CPU_MAX_W_FLOOR: f64 = 10.0;
+
+/// Lower bound for `gpu_hot_c`. The card idles in the 40s and cruises in the
+/// 60s–70s under load, so an enter threshold at or below that would latch the
+/// soft guard permanently hot and ratchet the GPU share to its floor forever
+/// (the guard only clears at `enter − GPU_HYSTERESIS_C`).
+const GPU_HOT_C_FLOOR: f64 = 60.0;
+/// Upper bound for `gpu_hot_c`: the soft guard must get its ratchet-down turn
+/// BEFORE the hard thermal watchdog trips, so the enter threshold stays
+/// strictly below [`GPU_TRIP_C`] — and by at least the hysteresis band, so the
+/// guard's *exit* is meaningful rather than sitting above the trip point.
+const GPU_HOT_C_CEIL: f64 = GPU_TRIP_C - GPU_HYSTERESIS_C;
+/// `nvme_hot_c` bounds. Reporting-only guard, so the range only has to keep
+/// the flag from being stuck on (drives idle in the 30s–40s) or unreachable
+/// (consumer NVMe throttles in the 80s and its own critical is ~90).
+const NVME_HOT_C_FLOOR: f64 = 50.0;
+const NVME_HOT_C_CEIL: f64 = 90.0;
 
 /// Default fw-fanctrl `AF_UNIX` command socket (design doc §2.1 / research
 /// doc §"The socket").
@@ -213,6 +230,38 @@ impl Config {
                 self.cpu_max_w
             );
             self.cpu_floor_w = cpu;
+        }
+        // The two guard thresholds (§2.8). NaN is the sharp edge here: every
+        // comparison in `guards::hysteresis` is false against NaN, so a
+        // `gpu_hot_c = nan` silently disables the dGPU guard entirely with no
+        // flag and no log. Below the floor latches the guard permanently hot;
+        // at or above GPU_TRIP_C the hard watchdog's emergency release fires
+        // before the soft ratchet ever gets a turn.
+        let gpu_hot = if self.gpu_hot_c.is_finite() {
+            self.gpu_hot_c.clamp(GPU_HOT_C_FLOOR, GPU_HOT_C_CEIL)
+        } else {
+            GPU_HOT_C_DEFAULT
+        };
+        if gpu_hot != self.gpu_hot_c {
+            tracing::warn!(
+                "config gpu_hot_c {} outside [{GPU_HOT_C_FLOOR}, {GPU_HOT_C_CEIL}] \
+                 (must stay below the {GPU_TRIP_C} °C hard trip); clamped to {gpu_hot}",
+                self.gpu_hot_c
+            );
+            self.gpu_hot_c = gpu_hot;
+        }
+        let nvme_hot = if self.nvme_hot_c.is_finite() {
+            self.nvme_hot_c.clamp(NVME_HOT_C_FLOOR, NVME_HOT_C_CEIL)
+        } else {
+            NVME_HOT_C_DEFAULT
+        };
+        if nvme_hot != self.nvme_hot_c {
+            tracing::warn!(
+                "config nvme_hot_c {} outside [{NVME_HOT_C_FLOOR}, {NVME_HOT_C_CEIL}]; \
+                 clamped to {nvme_hot}",
+                self.nvme_hot_c
+            );
+            self.nvme_hot_c = nvme_hot;
         }
         self
     }
@@ -431,6 +480,110 @@ mod tests {
         };
         config.save(&path).unwrap();
         assert_eq!(Config::load(&path), config);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- finding 8: gpu_hot_c / nvme_hot_c go through sanitized() too -----
+
+    #[test]
+    fn nan_gpu_hot_c_falls_back_to_the_default_instead_of_disabling_the_guard() {
+        // Every comparison in `guards::hysteresis` is false against NaN, so
+        // an unsanitized NaN silently switches the dGPU guard off for good.
+        let config = Config {
+            gpu_hot_c: f64::NAN,
+            ..Config::default()
+        }
+        .sanitized();
+        assert_eq!(config.gpu_hot_c, GPU_HOT_C_DEFAULT);
+        // Same for +inf, which is finite-looking in neither sense.
+        let config = Config {
+            gpu_hot_c: f64::INFINITY,
+            ..Config::default()
+        }
+        .sanitized();
+        assert_eq!(config.gpu_hot_c, GPU_HOT_C_DEFAULT);
+    }
+
+    #[test]
+    fn gpu_hot_c_at_or_below_idle_is_raised_to_the_floor() {
+        // Below the card's cruising range the guard would latch hot forever
+        // and ratchet the GPU share to its floor for the whole session.
+        for value in [-10.0, 0.0, 45.0, 59.9] {
+            let config = Config {
+                gpu_hot_c: value,
+                ..Config::default()
+            }
+            .sanitized();
+            assert_eq!(config.gpu_hot_c, GPU_HOT_C_FLOOR, "gpu_hot_c = {value}");
+        }
+    }
+
+    #[test]
+    fn gpu_hot_c_stays_strictly_below_the_hard_trip_with_hysteresis_margin() {
+        for value in [90.0, GPU_TRIP_C, 120.0] {
+            let config = Config {
+                gpu_hot_c: value,
+                ..Config::default()
+            }
+            .sanitized();
+            assert_eq!(config.gpu_hot_c, GPU_HOT_C_CEIL, "gpu_hot_c = {value}");
+            assert!(
+                config.gpu_hot_c < GPU_TRIP_C,
+                "the soft guard must get its turn before the hard watchdog"
+            );
+            assert!(
+                config.gpu_hot_c + GPU_HYSTERESIS_C <= GPU_TRIP_C,
+                "the guard's exit band must fit under the trip point"
+            );
+        }
+    }
+
+    #[test]
+    fn nvme_hot_c_is_sanitized_the_same_way() {
+        let nan = Config {
+            nvme_hot_c: f64::NAN,
+            ..Config::default()
+        }
+        .sanitized();
+        assert_eq!(nan.nvme_hot_c, NVME_HOT_C_DEFAULT);
+        let low = Config {
+            nvme_hot_c: 10.0,
+            ..Config::default()
+        }
+        .sanitized();
+        assert_eq!(low.nvme_hot_c, NVME_HOT_C_FLOOR);
+        let high = Config {
+            nvme_hot_c: 500.0,
+            ..Config::default()
+        }
+        .sanitized();
+        assert_eq!(high.nvme_hot_c, NVME_HOT_C_CEIL);
+    }
+
+    #[test]
+    fn in_range_guard_thresholds_are_left_alone_by_sanitized() {
+        let config = Config {
+            gpu_hot_c: 84.0,
+            nvme_hot_c: 77.0,
+            ..Config::default()
+        }
+        .sanitized();
+        assert_eq!(config.gpu_hot_c, 84.0);
+        assert_eq!(config.nvme_hot_c, 77.0);
+        // And the defaults themselves must survive their own sanitizer.
+        let d = Config::default().sanitized();
+        assert_eq!(d.gpu_hot_c, GPU_HOT_C_DEFAULT);
+        assert_eq!(d.nvme_hot_c, NVME_HOT_C_DEFAULT);
+    }
+
+    #[test]
+    fn a_bad_gpu_hot_c_in_a_real_file_is_clamped_on_load() {
+        let dir = fixture_dir("gpu-hot-clamp");
+        let path = dir.join("config.toml");
+        fs::write(&path, "gpu_hot_c = 99.0\nnvme_hot_c = nan\n").unwrap();
+        let config = Config::load(&path);
+        assert_eq!(config.gpu_hot_c, GPU_HOT_C_CEIL);
+        assert_eq!(config.nvme_hot_c, NVME_HOT_C_DEFAULT);
         fs::remove_dir_all(&dir).unwrap();
     }
 

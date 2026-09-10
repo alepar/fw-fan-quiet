@@ -45,7 +45,7 @@ pub const NVME_HOT_C_DEFAULT: f64 = 80.0;
 /// thermal tail (measured 2026-09-09: still 67–71 °C forty seconds after
 /// the die was back at 50), so a 5 °C band would latch the guard well past
 /// the episode.
-const GPU_HYSTERESIS_C: f64 = 2.0;
+pub const GPU_HYSTERESIS_C: f64 = 2.0;
 /// NVMe hysteresis band: exit = enter − this. The guard is reporting-only,
 /// so a wide band only affects how long the flag shows.
 const NVME_HYSTERESIS_C: f64 = 5.0;

@@ -62,8 +62,8 @@ impl PersistedState {
                 return PersistedState::default();
             }
         };
-        match serde_json::from_str(&text) {
-            Ok(state) => state,
+        match serde_json::from_str::<PersistedState>(&text) {
+            Ok(state) => state.validated(),
             Err(e) => {
                 tracing::warn!(
                     "corrupt state {}, starting uncalibrated: {e}",
@@ -72,6 +72,42 @@ impl PersistedState {
                 PersistedState::default()
             }
         }
+    }
+
+    /// Enforce, on the way in from disk, the invariants the in-process
+    /// constructors hold by construction. Serde checks the JSON *shape*, not
+    /// the values, and a schema-skewed or hand-edited `state.json` otherwise
+    /// panics the control loop several layers away from here:
+    ///
+    /// - an empty `duty_rpm_table` panics `DutyRpmTable::duty_for_rpm`'s
+    ///   `best.expect(...)`, and a non-monotone one panics `refine`'s
+    ///   `f64::clamp(lo + margin, hi - margin)` with `min > max`;
+    /// - `loop_gains` with a zero/negative/non-finite integral time makes
+    ///   `Budget::step` divide by zero and drives the commanded budget
+    ///   permanently to NaN.
+    ///
+    /// Each invalid field is dropped back to its "not calibrated" value with
+    /// a warning — never a panic, per this module's "Loading NEVER crashes"
+    /// contract. Fields are validated independently: a bad table does not
+    /// throw away good gains.
+    fn validated(mut self) -> PersistedState {
+        if !self.duty_rpm_table.is_valid() {
+            tracing::warn!(
+                "state duty_rpm_table is empty, non-finite or not strictly \
+                 increasing; falling back to the seeded table"
+            );
+            self.duty_rpm_table = DutyRpmTable::default();
+        }
+        if let Some(gains) = self.loop_gains
+            && !gains.is_valid()
+        {
+            tracing::warn!(
+                "state loop_gains {gains:?} are not all finite and positive; \
+                 falling back to the default gains (uncalibrated)"
+            );
+            self.loop_gains = None;
+        }
+        self
     }
 
     /// Atomic save: write `<path>.tmp`, then rename over `path`. Creates the
@@ -220,5 +256,112 @@ mod tests {
         PersistedState::default().save(&path).unwrap();
         assert_eq!(PersistedState::load(&path), PersistedState::default());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- finding 7: load-time invariant validation ------------------------
+    //
+    // Serde only checks the JSON shape. Each case below is well-formed JSON
+    // that deserialises fine and then panics (or NaNs) the control loop
+    // several layers away; `load` must drop the offending field to its
+    // "not calibrated" value instead. Every case round-trips through a real
+    // file, i.e. through the production `load` path.
+
+    /// Write `json` to a fresh fixture file, load it, and remove the dir.
+    fn load_json(name: &str, json: &str) -> PersistedState {
+        let dir = fixture_dir(name);
+        let path = dir.join("state.json");
+        fs::write(&path, json).unwrap();
+        let state = PersistedState::load(&path);
+        fs::remove_dir_all(&dir).unwrap();
+        state
+    }
+
+    #[test]
+    fn empty_duty_rpm_table_falls_back_to_the_seed() {
+        // `duty_for_rpm` on an empty table hits `best.expect(...)`.
+        let state = load_json("empty-table", r#"{ "duty_rpm_table": { "points": {} } }"#);
+        assert_eq!(state.duty_rpm_table, DutyRpmTable::default());
+        // The seeded table answers instead of panicking.
+        assert!(state.duty_rpm_table.duty_for_rpm(2300.0) > 0);
+    }
+
+    #[test]
+    fn non_monotone_duty_rpm_table_falls_back_to_the_seed() {
+        // RPM falling with duty makes `refine`'s clamp(lo + m, hi - m) panic
+        // with min > max on any refinement between the two entries.
+        let state = load_json(
+            "non-monotone-table",
+            r#"{ "duty_rpm_table": { "points": { "15": 5000.0, "40": 1200.0, "85": 5920.0 } } }"#,
+        );
+        assert_eq!(state.duty_rpm_table, DutyRpmTable::default());
+        let mut table = state.duty_rpm_table.clone();
+        table.refine(30, 2560.0); // would panic on the persisted shape
+    }
+
+    #[test]
+    fn non_finite_duty_rpm_table_entry_falls_back_to_the_seed() {
+        // serde_json accepts no bare `NaN`, but a value large enough to
+        // overflow f64 parses as `inf` — non-finite all the same.
+        let state = load_json(
+            "inf-table",
+            r#"{ "duty_rpm_table": { "points": { "15": 1195.0, "85": 1e400 } } }"#,
+        );
+        assert_eq!(state.duty_rpm_table, DutyRpmTable::default());
+        assert!(state.duty_rpm_table.rpm_for_duty(85).is_finite());
+    }
+
+    #[test]
+    fn a_valid_persisted_table_is_kept_verbatim() {
+        // The guard must not eat good calibration data.
+        let state = load_json(
+            "valid-table",
+            r#"{ "duty_rpm_table": { "points": { "15": 1200.0, "40": 3400.0, "85": 5900.0 } } }"#,
+        );
+        assert_ne!(state.duty_rpm_table, DutyRpmTable::default());
+        assert_eq!(state.duty_rpm_table.rpm_for_duty(15), 1200.0);
+    }
+
+    /// A `loop_gains` JSON object with the four fields set as given.
+    fn gains_json(kc_c: &str, ti_s: &str, kc_rpm: &str, ti_rpm: &str) -> String {
+        format!(
+            r#"{{ "loop_gains": {{ "kc_w_per_c": {kc_c}, "ti_s": {ti_s},
+                 "kc_w_per_rpm": {kc_rpm}, "ti_rpm_s": {ti_rpm} }} }}"#
+        )
+    }
+
+    #[test]
+    fn zero_integral_time_drops_the_persisted_gains() {
+        // ti_s == 0 => `Budget::step`'s `kc * PI_PERIOD_S / ti` is inf and
+        // `u` goes permanently NaN.
+        for json in [
+            gains_json("0.31", "0.0", "0.0041", "28.0"),
+            gains_json("0.31", "42.0", "0.0041", "0.0"),
+        ] {
+            let state = load_json("zero-ti", &json);
+            assert_eq!(state.loop_gains, None, "zero integral time must be dropped");
+        }
+    }
+
+    #[test]
+    fn negative_or_non_finite_gains_are_dropped() {
+        for json in [
+            gains_json("0.31", "-42.0", "0.0041", "28.0"),
+            gains_json("-0.31", "42.0", "0.0041", "28.0"),
+            gains_json("0.31", "1e400", "0.0041", "28.0"),
+            gains_json("0.31", "42.0", "0.0", "28.0"),
+        ] {
+            let state = load_json("bad-gains", &json);
+            assert_eq!(state.loop_gains, None, "rejected: {json}");
+        }
+    }
+
+    #[test]
+    fn valid_gains_survive_the_check_and_a_bad_table_does_not_take_them_down() {
+        let json = r#"{ "loop_gains": { "kc_w_per_c": 0.31, "ti_s": 42.0,
+                        "kc_w_per_rpm": 0.0041, "ti_rpm_s": 28.0 },
+                        "duty_rpm_table": { "points": {} } }"#;
+        let state = load_json("gains-kept", json);
+        assert_eq!(state.loop_gains, Some(gains()));
+        assert_eq!(state.duty_rpm_table, DutyRpmTable::default());
     }
 }

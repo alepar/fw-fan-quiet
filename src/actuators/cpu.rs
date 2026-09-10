@@ -423,6 +423,32 @@ mod tests {
         assert_eq!(cpu.set_sustained_mw(48_000), WriteVerdict::Unreadable);
     }
 
+    /// A wedged `ryzenadj` now surfaces as `io::ErrorKind::TimedOut` from
+    /// the bounded `Runner` (see `actuators::cmd::run_with_timeout`) instead
+    /// of hanging the controller thread. Both legs of §2.9 must score that
+    /// as `Unreadable` — read-back blind — never as a hardware `Mismatch`.
+    #[test]
+    fn a_timed_out_ryzenadj_is_read_back_blind_not_a_mismatch() {
+        let timed_out = || io::Error::new(io::ErrorKind::TimedOut, "`ryzenadj` did not exit");
+
+        // The write itself wedged: nothing was commanded, nothing to verify.
+        let runner = FakeRunner::new();
+        runner.push_result(Err(timed_out()));
+        assert_eq!(
+            actuator(runner).set_sustained_mw(48_000),
+            WriteVerdict::Unreadable
+        );
+
+        // The `--info` read-back wedged: the write landed, the verdict is blind.
+        let runner = FakeRunner::new();
+        runner.push_result(Ok(output_with_code(0)));
+        runner.push_result(Err(timed_out()));
+        assert_eq!(
+            actuator(runner).set_sustained_mw(48_000),
+            WriteVerdict::Unreadable
+        );
+    }
+
     #[test]
     fn missing_rows_in_the_read_back_table_are_unreadable() {
         let runner = FakeRunner::new();

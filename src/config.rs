@@ -12,17 +12,24 @@ use crate::actuators::gpu::clamp_gpu_clock;
 use crate::control::allocator::{CPU_MAX_W, GPU_MAX_W};
 use crate::control::controller::DEFAULT_FAN_TARGET_RPM;
 use crate::control::guards::{GPU_HOT_C_DEFAULT, GPU_HYSTERESIS_C, NVME_HOT_C_DEFAULT};
+use crate::control::lut::ClockWattsLut;
 use crate::control::watchdog::GPU_TRIP_C;
 
 /// Lower bound for `cpu_max_w`: below the actuator's ~10 W sustained floor the
 /// grid-search and the manual-mode clamps would degenerate.
 const CPU_MAX_W_FLOOR: f64 = 10.0;
 
-/// Lower bound for `gpu_hot_c`. The card idles in the 40s and cruises in the
-/// 60s–70s under load, so an enter threshold at or below that would latch the
-/// soft guard permanently hot and ratchet the GPU share to its floor forever
-/// (the guard only clears at `enter − GPU_HYSTERESIS_C`).
-const GPU_HOT_C_FLOOR: f64 = 60.0;
+/// Lower bound for `gpu_hot_c`, set at the measured park point minus the
+/// hysteresis band. Design §2.8: under a 100 W gpu-burn the die settles at
+/// 82–83 °C on `quiet16` with the fans free and parks at 87 °C — that band is
+/// the card's *normal* sustained-load state, not a fault. An enter threshold
+/// inside or below it latches the soft guard hot for the whole session and
+/// ratchets the GPU share to its floor forever, since the guard only clears
+/// at `enter − GPU_HYSTERESIS_C` (a temperature the card never reaches under
+/// the load that tripped it). 85 °C = park (87) − `GPU_HYSTERESIS_C` is the
+/// lowest enter threshold whose exit (83 °C) is not *below* the 82–83 °C
+/// cruise band, i.e. the lowest one the guard can still clear from.
+const GPU_HOT_C_FLOOR: f64 = 85.0;
 /// Upper bound for `gpu_hot_c`: the soft guard must get its ratchet-down turn
 /// BEFORE the hard thermal watchdog trips, so the enter threshold stays
 /// strictly below [`GPU_TRIP_C`] — and by at least the hysteresis band, so the
@@ -262,6 +269,54 @@ impl Config {
                 self.nvme_hot_c
             );
             self.nvme_hot_c = nvme_hot;
+        }
+        self
+    }
+
+    /// The cross-field half of [`Config::sanitized`], which needs the
+    /// calibration LUT and so can only run where one is available (the
+    /// controller: on construction and on every live `SetFloors`; plain
+    /// `Config::load` has no LUT and skips it).
+    ///
+    /// Roast PR-2 finding 1: the budget integrator's bounds are
+    /// `lo = cpu_floor_w + watts_for_clock(gpu_floor_mhz)` and
+    /// `hi = cpu_max_w + gpu_max_w`. `sanitized()` clamps all four keys
+    /// independently, so a raised GPU clock floor against a lowered
+    /// `gpu_max_w` inverts the pair — in-range values, panicking
+    /// `f64::clamp` downstream. The invariant enforced here is the tighter,
+    /// per-axis one the allocator already asserts (`allocator::step`:
+    /// `gpu_floor_w <= gpu_max_w`); with `sanitized()`'s
+    /// `cpu_floor_w <= cpu_max_w` it implies `lo <= hi`.
+    ///
+    /// We resolve a violation by **lowering `gpu_floor_mhz`** (through the
+    /// LUT, to the highest clock whose predicted watts still fit under
+    /// `gpu_max_w`) rather than raising `gpu_max_w`: the maxes are the
+    /// operator's power envelope and the actuator's hard ceiling, while the
+    /// clock floor is a performance preference — giving up performance is
+    /// always the safe direction on a thermal controller.
+    /// `clamp_gpu_clock`'s hardware floor (1000 MHz) still applies, so an
+    /// envelope below the cheapest lockable clock stays infeasible; the
+    /// allocator's own `.clamp` and the `Budget`'s bound ordering are what
+    /// make that case degrade instead of panicking.
+    pub fn with_lut_floor_clamp(mut self, lut: Option<&ClockWattsLut>) -> Self {
+        let Some(lut) = lut else { return self };
+        let Some(gpu_floor_w) = lut.watts_for_clock(self.gpu_floor_mhz) else {
+            return self; // empty LUT: nothing to map with
+        };
+        if gpu_floor_w <= self.gpu_max_w {
+            return self;
+        }
+        let lowered = lut
+            .clock_for_watts(self.gpu_max_w)
+            .map_or(self.gpu_floor_mhz, clamp_gpu_clock);
+        if lowered < self.gpu_floor_mhz {
+            tracing::warn!(
+                "config gpu_floor_mhz {} costs {gpu_floor_w:.1} W, above gpu_max_w {}; \
+                 lowered to {lowered} MHz",
+                self.gpu_floor_mhz,
+                self.gpu_max_w
+            );
+            self.gpu_floor_mhz = lowered;
         }
         self
     }
@@ -508,13 +563,44 @@ mod tests {
     fn gpu_hot_c_at_or_below_idle_is_raised_to_the_floor() {
         // Below the card's cruising range the guard would latch hot forever
         // and ratchet the GPU share to its floor for the whole session.
-        for value in [-10.0, 0.0, 45.0, 59.9] {
+        for value in [-10.0, 0.0, 45.0, 84.9] {
             let config = Config {
                 gpu_hot_c: value,
                 ..Config::default()
             }
             .sanitized();
             assert_eq!(config.gpu_hot_c, GPU_HOT_C_FLOOR, "gpu_hot_c = {value}");
+        }
+    }
+
+    /// Roast PR-2 finding 5: the old 60 °C floor sat *below* the card's
+    /// measured sustained-load band (§2.8: die settles at 82–83 °C under a
+    /// 100 W gpu-burn, parks at 87), so every value in 60–84 passed
+    /// sanitization untouched and then latched `GPU HOT` for the session —
+    /// the exact failure the floor exists to exclude. Fails on the old
+    /// floor: 75 survives sanitization.
+    #[test]
+    fn gpu_hot_c_inside_the_measured_cruise_band_is_raised_to_the_floor() {
+        for value in [60.0, 75.0, 82.5, 84.0] {
+            let config = Config {
+                gpu_hot_c: value,
+                ..Config::default()
+            }
+            .sanitized();
+            assert_eq!(
+                config.gpu_hot_c, GPU_HOT_C_FLOOR,
+                "gpu_hot_c = {value} is inside the 82–83 °C cruise / 87 °C park \
+                 band the card runs at under load and would latch the guard hot"
+            );
+        }
+        // And the floor itself must clear that band: its exit threshold is
+        // the temperature the guard has to fall back to before it releases.
+        const {
+            assert!(
+                GPU_HOT_C_FLOOR - GPU_HYSTERESIS_C >= 83.0,
+                "the floor's exit threshold must not sit below the measured \
+                 82-83 C cruise band, or the guard can never clear"
+            );
         }
     }
 
@@ -560,15 +646,81 @@ mod tests {
         assert_eq!(high.nvme_hot_c, NVME_HOT_C_CEIL);
     }
 
+    // --- roast PR-2 finding 1: the cross-field (LUT) floor clamp ----------
+
+    fn test_lut() -> ClockWattsLut {
+        let mut lut = ClockWattsLut::new();
+        lut.insert(1200, 30.0);
+        lut.insert(2000, 60.0);
+        lut.insert(2800, 100.0);
+        lut
+    }
+
+    #[test]
+    fn a_gpu_clock_floor_costing_more_than_gpu_max_w_is_lowered_through_the_lut() {
+        let lut = test_lut();
+        let config = Config {
+            gpu_floor_mhz: 2800, // 100 W
+            gpu_max_w: 35.0,
+            ..Config::default()
+        }
+        .sanitized()
+        .with_lut_floor_clamp(Some(&lut));
+
+        assert!(
+            config.gpu_floor_mhz < 2800,
+            "an unaffordable clock floor must be lowered, got {}",
+            config.gpu_floor_mhz
+        );
+        let floor_w = lut.watts_for_clock(config.gpu_floor_mhz).unwrap();
+        assert!(
+            floor_w <= config.gpu_max_w,
+            "{floor_w} W floor still above the {} W cap",
+            config.gpu_max_w
+        );
+        // The budget bounds the controller derives are ordered as a result.
+        assert!(config.cpu_floor_w + floor_w <= config.cpu_max_w + config.gpu_max_w);
+        // The cap itself is never raised to make the floor fit.
+        assert_eq!(config.gpu_max_w, 35.0);
+    }
+
+    #[test]
+    fn an_affordable_gpu_clock_floor_and_a_missing_lut_are_left_alone() {
+        let base = Config {
+            gpu_floor_mhz: 1200, // 30 W, under the 40 W default cap
+            ..Config::default()
+        }
+        .sanitized();
+        assert_eq!(
+            base.clone().with_lut_floor_clamp(Some(&test_lut())),
+            base,
+            "an affordable floor must not move"
+        );
+        // No LUT (Config::load, or an uncalibrated machine): nothing to map
+        // with, so the config passes through untouched.
+        let high = Config {
+            gpu_floor_mhz: 2800,
+            gpu_max_w: 35.0,
+            ..Config::default()
+        }
+        .sanitized();
+        assert_eq!(high.clone().with_lut_floor_clamp(None), high);
+        assert_eq!(
+            high.clone()
+                .with_lut_floor_clamp(Some(&ClockWattsLut::new())),
+            high
+        );
+    }
+
     #[test]
     fn in_range_guard_thresholds_are_left_alone_by_sanitized() {
         let config = Config {
-            gpu_hot_c: 84.0,
+            gpu_hot_c: 86.0,
             nvme_hot_c: 77.0,
             ..Config::default()
         }
         .sanitized();
-        assert_eq!(config.gpu_hot_c, 84.0);
+        assert_eq!(config.gpu_hot_c, 86.0);
         assert_eq!(config.nvme_hot_c, 77.0);
         // And the defaults themselves must survive their own sanitizer.
         let d = Config::default().sanitized();

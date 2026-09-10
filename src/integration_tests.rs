@@ -697,7 +697,7 @@ mod wiring_sweep {
             ec_mismatch: false,     // calib_arbiter.decide(&ArbiterInput { .. }).ec_mismatch
             fanctrl_active: true,   // s.fanctrl_freshness == Fresh && s.fanctrl.as_ref().is_some_and(|v| v.active)
             argmax_controllable: true, // s.ec.as_ref().is_some_and(|e| e.argmax.is_controllable())
-            budget_bounds: (15.0, 54.0), // self.calib_bounds() (config floors/maxes + the LUT's gpu_floor_w)
+            budget_bounds: (15.0, 54.0), // self.budget_bounds() (config floors/maxes + the LUT's gpu_floor_w)
         };
         // The exhaustive destructure is the verification: a `CalibContext`
         // field added without a named source here fails the build. The

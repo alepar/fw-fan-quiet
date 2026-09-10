@@ -2318,6 +2318,157 @@ fn a_gpu_lock_that_is_not_sticking_scores_a_mismatch_then_the_rewrite_recovers()
     assert_only_expected_runner_calls(&runner);
 }
 
+/// (b), the low-utilisation leg (roast PR-2): `verify_lock`'s
+/// `Unverifiable` branch, reached from a plant-closed run. Both GPU-attached
+/// runs above script `gpu_util_pct = 95`, above the verifier's own 90 %
+/// utilisation floor, and every low-utilisation run in this module leaves
+/// the dGPU unpowered (`with_gpu: false`), so the sub-floor verdict the
+/// design's dGPU scenario names ("no `GPU HOT`, floor honoured, `verify_lock`
+/// `Unverifiable`") was never produced by the loop itself.
+///
+/// This run powers the dGPU, closes the GPU leg through [`gpu_watts_lut`],
+/// and holds `gpu_util_pct` at 85 % -- an idle-ish card -- while scripting
+/// an SM clock 400 MHz OVER the locked ceiling for hundreds of consecutive
+/// ticks. That read-back is a confirmed mismatch at any utilisation ABOVE
+/// the floor (see `a_gpu_lock_that_is_not_sticking_...`, which scores one
+/// off three such ticks), so the run staying quiet is the observable
+/// signature of `Unverifiable`: the verifier refuses to judge an unloaded
+/// card at all, rather than scoring it either way. Break the floor test in
+/// `GpuLockVerifier::verify_lock` and this run scores mismatches, raises
+/// `LIMIT NOT STICKING` and releases the lock to stock.
+#[test]
+fn an_idle_dgpu_read_back_is_unverifiable_and_never_scores_a_mismatch() {
+    let fan_target_rpm = 1900.0;
+    let config = Config {
+        fan_target_rpm,
+        cpu_max_w: 25.0,
+        gpu_max_w: 15.0, // == the LUT's watts at gpu_floor_mhz: GPU pinned at its floor
+        ..Config::default()
+    };
+    assert!(
+        (gpu_floor_watts(&config) - config.gpu_max_w).abs() < 1e-9,
+        "test premise: gpu_max_w must equal the GPU floor watts so the PI saturates at the clock floor"
+    );
+    let runner = FakeRunner::new();
+    let (mut ctl, _state_path, gpu_calls) =
+        build_controller(&runner, "gpu-idle-unverifiable", config.clone(), None, true);
+    let gpu_calls = gpu_calls.expect("build_controller(with_gpu: true) must hand back a call log");
+    let mut plant = ChainedPlant::new("quiet16", QUIET16_POINTS.to_vec(), MA_INTERVAL, AMBIENT_C, 1)
+        .expect("valid curve");
+    ctl.on_command(Command::SetAuto(true));
+    assert_eq!(ctl.status().mode, Mode::Auto, "Auto entry must succeed with a calibrated LUT");
+    let lut = gpu_watts_lut();
+
+    // The tick the scripted over-pin read-back starts on (and never stops).
+    const OVER_FROM: u64 = 120;
+    let trace = run_ticks(&mut plant, &mut ctl, Some(&lut), config.cpu_floor_w, 480, |t, _p, script| {
+        script.cpu_demand_frac = 1.0;
+        script.cpu_util_pct = 95.0;
+        script.on_ac = true;
+        // Powered and sensed -- `gpu_w_valid`, so `run_gpu_pi` really runs
+        // -- but cool: nowhere near the GPU trip.
+        script.gpu_temp_c = Some(50.0);
+        // BELOW `verify_lock`'s 90 % utilisation floor for the whole run.
+        script.gpu_util_pct = 85.0;
+        // The lock is not sticking: the card draws 25 W whatever it is
+        // locked to, which is what makes the PI saturate at the floor.
+        script.gpu_cap_w = 25.0;
+        script.gpu_demand_frac = 1.0;
+        if t >= OVER_FROM {
+            // ... and runs 400 MHz over the locked ceiling while it does.
+            // Above the utilisation floor this is a confirmed mismatch
+            // within three ticks; below it, nothing may be scored at all.
+            script.gpu_sm_mhz += 400.0;
+        }
+    });
+
+    let calls = gpu_calls.lock().expect("gpu call log").clone();
+    let distinct = commanded_locks(&calls);
+    println!(
+        "[gpu-idle-unverifiable] gpu calls={} distinct locks={distinct:?} end_lock={:?}",
+        calls.len(),
+        trace.last().gpu_max_mhz
+    );
+
+    // Premise: the verifier was genuinely REACHED -- a lock is in force and
+    // was commanded through the fake, so `run_gpu_pi` got past its
+    // `gpu_w_valid`/`set_max_clock` guards and called `verify_lock` on the
+    // scripted over-pin read-back every one of these ticks.
+    assert!(
+        trace.any_effect(|e| matches!(e, Effect::GpuSet(_))),
+        "test premise: the GPU PI must have commanded a lock, or verify_lock is never called"
+    );
+    assert_eq!(
+        trace.rows[(OVER_FROM - 1) as usize].gpu_max_mhz,
+        Some(config.gpu_floor_mhz),
+        "test premise: the PI must be saturated at the clock floor when the over-pin starts"
+    );
+    // `Unverifiable`: the over-pin read-back is never scored, so no verdict
+    // event of any kind fires and the mismatch/release path is never entered.
+    let verdict_causes: Vec<&'static str> = trace
+        .rows
+        .iter()
+        .flat_map(|r| r.effects.iter())
+        .filter_map(|e| match e {
+            Effect::Noted { cause }
+                if cause.starts_with("auto:gpu_") && *cause != "auto:gpu_clock" =>
+            {
+                Some(*cause)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        verdict_causes.is_empty(),
+        "a sub-floor utilisation read-back must score no verdict at all, got {} ({:?}...)",
+        verdict_causes.len(),
+        &verdict_causes[..verdict_causes.len().min(6)]
+    );
+    assert!(
+        !trace.any_flag(StatusFlag::LimitNotSticking),
+        "an Unverifiable read-back must never raise LIMIT NOT STICKING"
+    );
+    assert!(
+        !trace.any_flag(StatusFlag::ReadbackBlind),
+        "Unverifiable is a non-event, not an Unreadable strike: READBACK BLIND must stay down"
+    );
+    assert!(
+        !calls.contains(&GpuCall::Release),
+        "an Unverifiable read-back must never escalate to the three-strike release to stock"
+    );
+
+    // ... and the lock the verifier kept scoring stayed in force the whole
+    // time (a scored mismatch would have released it), so `verify_lock` was
+    // genuinely called on every one of those over-pin read-backs.
+    assert!(
+        trace.rows[OVER_FROM as usize..].iter().all(|r| r.gpu_max_mhz.is_some()),
+        "an Unverifiable read-back must leave the lock in force for every over-pin tick"
+    );
+
+    // No `GPU HOT` -- the card is cool all run.
+    assert!(!trace.any_flag(StatusFlag::GpuHot), "a 50 C dGPU must never raise GPU HOT");
+
+    // The clock floor is honoured: nothing was ever locked below it.
+    assert!(
+        distinct.iter().all(|&m| (config.gpu_floor_mhz..=3090).contains(&m)),
+        "every commanded lock must respect the configured clock floor and the driver ceiling: {distinct:?}"
+    );
+    assert!(
+        trace.rows.iter().all(|r| r.gpu_max_mhz.is_none_or(|m| m >= config.gpu_floor_mhz)),
+        "no tick may report a lock below the configured clock floor"
+    );
+    assert_eq!(
+        trace.last().gpu_max_mhz,
+        Some(config.gpu_floor_mhz),
+        "the run must end with the floor lock still in force"
+    );
+    assert!(
+        !trace.any_flag(StatusFlag::ThermalEmergency),
+        "the run must stay clear of the thermal watchdog"
+    );
+    assert_only_expected_runner_calls(&runner);
+}
+
 // =====================================================================
 // Calibration: a StepTest on the plant, then the quiet16/TempLoop
 // acceptance repeated with the fitted gains -- graded against the

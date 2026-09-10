@@ -56,7 +56,7 @@ use std::time::Instant;
 
 use crate::actuators::cmd::test_support::{queue_ryzenadj_readback, FakeRunner};
 use crate::actuators::cpu::CpuActuator;
-use crate::actuators::gpu::test_support::FakeGpu;
+use crate::actuators::gpu::test_support::{FakeGpu, GpuCall};
 use crate::actuators::guard::RestoreGuard;
 use crate::actuators::smu_module::SmuModule;
 use crate::config::Config;
@@ -453,6 +453,10 @@ struct TraceRow {
     /// engaged), used by the fault-matrix mismatch/release tests below.
     cpu_limit_w: Option<f64>,
     gpu_max_mhz: Option<u32>,
+    /// `Sample.gpu_w` -- what the dGPU actually DREW this tick (plant
+    /// state, not a commanded value): the observable the GPU-heavy budget
+    /// split is graded on.
+    gpu_w: f64,
     effects: Vec<Effect>,
 }
 
@@ -512,9 +516,14 @@ impl Trace {
 /// `script_fn` for the scenario's own layer (load level, faults, socket
 /// events, curve edits, plant perturbations via the `&mut ChainedPlant`
 /// it's given) before calling `plant.tick`/`ctl.on_sample` and recording the
-/// result. `gpu_lut` is `None` for a dGPU-off run (leaves `gpu_cap_w` at the
-/// `TickScript::default()` `0.0` every tick, matching an always-unpowered
-/// dGPU).
+/// result. `gpu_lut` is `None` for a dGPU-off run (leaves
+/// `gpu_cap_w`/`gpu_sm_mhz` at the `TickScript::default()` `0.0` every
+/// tick, matching an always-unpowered dGPU); `Some(lut)` closes the GPU leg
+/// too -- the controller's own last-commanded clock lock becomes both this
+/// tick's `gpu_cap_w` (through the LUT) and this tick's `gpu_sm_mhz`
+/// read-back (an obedient card pinned at its locked ceiling), which is what
+/// makes the GPU PI, the actuator write path and `verify_lock` reachable in
+/// a plant-closed run.
 fn run_ticks<R: crate::actuators::cmd::Runner>(
     plant: &mut ChainedPlant,
     ctl: &mut Controller<R>,
@@ -530,6 +539,18 @@ fn run_ticks<R: crate::actuators::cmd::Runner>(
             cpu_cap_w: status.cpu_limit_w.unwrap_or(cpu_floor_w),
             gpu_cap_w: match (gpu_lut, status.gpu_max_mhz) {
                 (Some(lut), Some(mhz)) => lut.watts_for_clock(mhz).unwrap_or(0.0),
+                _ => 0.0,
+            },
+            // The GPU leg's READ-BACK input, closed the same way the cap
+            // is: a card that obeys the lock sits AT the locked ceiling
+            // while loaded, so `verify_lock`'s pin rule sees a compliant
+            // clock without the test scripting one. A scenario modelling a
+            // lock that is NOT sticking overrides this in its `script_fn`
+            // (see `a_gpu_lock_that_is_not_sticking_...`). Left at the
+            // `TickScript::default()` `0.0` for every dGPU-off run,
+            // exactly as before.
+            gpu_sm_mhz: match (gpu_lut, status.gpu_max_mhz) {
+                (Some(_), Some(mhz)) => f64::from(mhz),
                 _ => 0.0,
             },
             ..TickScript::default()
@@ -551,6 +572,7 @@ fn run_ticks<R: crate::actuators::cmd::Runner>(
             cpu_pkg_w: sample.cpu_pkg_w,
             cpu_limit_w: after.cpu_limit_w,
             gpu_max_mhz: after.gpu_max_mhz,
+            gpu_w: sample.gpu_w,
             effects,
         });
     }
@@ -1013,6 +1035,7 @@ fn run_ticks_perturbed<R: crate::actuators::cmd::Runner>(
             cpu_pkg_w: sample.cpu_pkg_w,
             cpu_limit_w: after.cpu_limit_w,
             gpu_max_mhz: after.gpu_max_mhz,
+            gpu_w: sample.gpu_w,
             effects,
         });
     }
@@ -1316,6 +1339,7 @@ fn a_non_monotone_curve_keeps_rpmloop_at_the_quarter_gain_clamp_with_curve_inval
             cpu_pkg_w: sample.cpu_pkg_w,
             cpu_limit_w: after.cpu_limit_w,
             gpu_max_mhz: after.gpu_max_mhz,
+            gpu_w: sample.gpu_w,
             effects,
         });
     }
@@ -2003,6 +2027,297 @@ fn a_dgpu_unpowered_run_raises_no_gpu_hot_and_never_commands_a_gpu_clock() {
     assert_only_expected_runner_calls(&runner);
 }
 
+
+// =====================================================================
+// dGPU ON, plant-closed (roast PR-1 finding 10): the runs above all leave
+// the GPU leg open -- `with_gpu: false`, `gpu_lut: None` -- so the GPU PI,
+// the `GpuClockCtl` write path and `verify_lock` were never reached from a
+// closed-loop run; the "dGPU on" coverage axis was satisfied by a single
+// tick that only scripted a sensor TEMPERATURE. The runs below close the
+// GPU leg for real: `build_controller(with_gpu: true)` attaches a
+// `FakeGpu`, `run_ticks` is handed the real [`gpu_watts_lut`], and every
+// assertion is on what the controller COMMANDED the fake (the `GpuCall`
+// log) or on what the plant then DREW (`Sample.gpu_w`) -- never on a
+// vector the test itself pushed.
+// =====================================================================
+
+/// A GPU-heavy workload on a powered dGPU: BOTH axes saturate their
+/// allocation (anything less is a demand-limited hold, §2.4 -- the
+/// integrator then parks `u` at the floors' sum and there is no remainder
+/// for the split to move anywhere), and the run's `Config` caps the CPU
+/// axis low, so `split_budget`'s cap-surplus reassignment is what decides
+/// how much of the budget the dGPU gets. `gpu_cap_w`/`gpu_sm_mhz` are
+/// deliberately NOT set here -- [`run_ticks`] has already filled both from
+/// the controller's own last-commanded clock lock, which is what closes the
+/// GPU leg.
+fn gpu_heavy_script(_t: u64, _plant: &mut ChainedPlant, script: &mut TickScript) {
+    script.cpu_demand_frac = 1.0;
+    script.cpu_util_pct = 95.0;
+    // A hair under its allocation, so the GPU PI has a real (non-zero)
+    // residual to trim rather than a LUT that happens to be exact.
+    script.gpu_demand_frac = 0.98;
+    script.gpu_util_pct = 95.0; // above verify_lock's own 90 % floor
+    script.gpu_temp_c = Some(70.0);
+    script.on_ac = true;
+}
+
+/// Watts the GPU axis is floored at: the LUT's watts at the configured
+/// clock floor, exactly as `Controller::run_budget_and_allocate` computes
+/// it. "The split moved GPU watts" is graded against THIS, not against zero.
+fn gpu_floor_watts(config: &Config) -> f64 {
+    gpu_watts_lut()
+        .watts_for_clock(config.gpu_floor_mhz)
+        .expect("the test LUT must cover the configured clock floor")
+}
+
+/// One dGPU-powered, plant-closed run: a `FakeGpu` attached, the GPU leg of
+/// the loop closed through [`gpu_watts_lut`], `minutes` of the GPU-heavy
+/// workload. Returns the trace and the fake actuator's own call log.
+fn run_gpu_heavy(tag: &str, config: &Config, minutes: u64) -> (Trace, Vec<GpuCall>) {
+    let runner = FakeRunner::new();
+    let (mut ctl, _state_path, gpu_calls) =
+        build_controller(&runner, tag, config.clone(), None, true);
+    let gpu_calls = gpu_calls.expect("build_controller(with_gpu: true) must hand back a call log");
+    let mut plant = ChainedPlant::new("quiet16", QUIET16_POINTS.to_vec(), MA_INTERVAL, AMBIENT_C, 1)
+        .expect("valid curve");
+    ctl.on_command(Command::SetAuto(true));
+    assert_eq!(ctl.status().mode, Mode::Auto, "Auto entry must succeed with a calibrated LUT");
+    let lut = gpu_watts_lut();
+    let trace = run_ticks(
+        &mut plant,
+        &mut ctl,
+        Some(&lut),
+        config.cpu_floor_w,
+        minutes * 60,
+        gpu_heavy_script,
+    );
+    assert_only_expected_runner_calls(&runner);
+    let calls = gpu_calls.lock().expect("gpu call log").clone();
+    (trace, calls)
+}
+
+/// Every distinct clock the run commanded the fake actuator, in order of
+/// value; `Release` calls are reported separately by the caller.
+fn commanded_locks(calls: &[GpuCall]) -> std::collections::BTreeSet<u32> {
+    calls
+        .iter()
+        .filter_map(|c| match c {
+            GpuCall::Set(mhz) => Some(*mhz),
+            GpuCall::Release => None,
+        })
+        .collect()
+}
+
+/// (a) + (c) of the finding: a 30 min GPU-heavy closed-loop run must
+/// actually drive the GPU actuator (the PI's clock-lock commands reach the
+/// fake), the budget split must move real watts onto the GPU axis (well
+/// above its floor), and the fan loop must still meet §5's acceptance bar
+/// (>= 90 % of the settled window inside +/-150 RPM, no relay).
+#[test]
+fn a_gpu_heavy_closed_loop_run_locks_clocks_and_settles_inside_the_band() {
+    // A target high enough that the loop's own budget has real room above
+    // the floors' sum (quiet16's duty-37 tread, ~82 C, buys ~52 W of draw)
+    // -- at a low target the loop parks `u` at `lo` and there is no
+    // remainder for the split to move onto either axis.
+    let fan_target_rpm = 3100.0;
+    // `cpu_max_w` well under what the budget can afford: the CPU axis pins
+    // at its own cap and every surplus watt is handed to the GPU axis.
+    let config = Config { fan_target_rpm, cpu_max_w: 20.0, ..Config::default() };
+    let (trace, calls) = run_gpu_heavy("gpu-heavy", &config, 40);
+
+    // (a) The PI's clock-lock commands reached the actuator, and MOVED --
+    // a single command would be a feedforward seed, not a running loop.
+    let distinct = commanded_locks(&calls);
+    println!(
+        "[gpu-heavy] gpu calls={} distinct locks={} min={:?} max={:?} end_lock={:?}",
+        calls.len(),
+        distinct.len(),
+        distinct.iter().next(),
+        distinct.iter().next_back(),
+        trace.last().gpu_max_mhz
+    );
+    assert!(!distinct.is_empty(), "the GPU PI must have commanded at least one clock lock");
+    assert!(
+        distinct.len() >= 3,
+        "the GPU PI must MOVE the lock, not just seed it once: distinct commanded clocks {distinct:?}"
+    );
+    assert!(
+        distinct.iter().all(|&m| (config.gpu_floor_mhz..=3090).contains(&m)),
+        "every commanded lock must respect the configured clock floor and the driver ceiling: {distinct:?}"
+    );
+    assert!(
+        trace.any_effect(|e| matches!(e, Effect::GpuSet(_))),
+        "a commanded lock must surface as a GpuSet effect"
+    );
+    assert!(
+        !calls.contains(&GpuCall::Release),
+        "a healthy run must never release the GPU lock to stock"
+    );
+    assert!(trace.last().gpu_max_mhz.is_some(), "the run must end with a lock in force");
+
+    // (c) The split actually moved watts onto the GPU axis: the card is
+    // DRAWING well above its floor allocation by the end of the run.
+    let floor_w = gpu_floor_watts(&config);
+    let last = trace.last();
+    println!(
+        "[gpu-heavy] gpu_w_end={:.2} (floor {floor_w:.2}) cpu_pkg_w_end={:.2} u_end={:.2} mode={:?}",
+        last.gpu_w, last.cpu_pkg_w, last.budget_w, last.mode
+    );
+    assert!(
+        last.gpu_w > floor_w + 5.0,
+        "a GPU-heavy load must pull the split well past the GPU floor ({floor_w:.2} W): got {:.2} W",
+        last.gpu_w
+    );
+    assert!(
+        last.gpu_w > last.cpu_pkg_w,
+        "under a GPU-heavy demand split the dGPU must out-draw the half-idle CPU: gpu {:.2} W vs cpu {:.2} W",
+        last.gpu_w,
+        last.cpu_pkg_w
+    );
+
+    // (c) ... and the outer fan loop still meets the design's own bar.
+    let errors = trace.rpm_errors_vs_snapped(fan_target_rpm);
+    let settled = &errors[SETTLE_TICKS..];
+    let residency = band_residency_pct(settled, 150.0);
+    let relay = detect_relay(settled, 150.0);
+    println!("[gpu-heavy] residency={residency:.1}% relay={relay:?}");
+    assert!(
+        residency >= 90.0,
+        "a dGPU-powered run must still hold >= 90% of the settled window inside +/-150 RPM: got {residency:.1}%"
+    );
+    assert!(!relay.is_relay(), "the closed GPU leg must not make the fan loop hunt: {relay:?}");
+    assert!(
+        !trace.any_flag(StatusFlag::ThermalEmergency),
+        "the run must stay clear of the thermal watchdog"
+    );
+    assert_ec_ma_tracks_emulator(&trace, 1.0);
+}
+
+/// (b) of the finding: `verify_lock`'s read-back, exercised from a
+/// plant-closed run. The premise is a lock that is NOT sticking -- the card
+/// keeps drawing 25 W and keeps running above the locked ceiling however
+/// low we lock it -- which is exactly the shape §2.9's GPU pin rule exists
+/// to catch, and the only shape that holds ONE locked value still long
+/// enough for the verifier's 3-consecutive-sample rule to run (the verifier
+/// is rebuilt whenever the locked value changes).
+///
+/// `gpu_max_w == gpu_floor_watts` pins the allocator's GPU target at the
+/// floor, so the PI saturates at `gpu_floor_mhz` and re-commands the SAME
+/// clock every tick; the over-pin `gpu_sm_mhz` is scripted for exactly
+/// three consecutive ticks, so the run walks the whole verdict path:
+/// Verified -> two sub-threshold strikes -> a confirmed `Mismatch` -> the
+/// re-write on the following ticks -> `Verified` again -> recovery.
+#[test]
+fn a_gpu_lock_that_is_not_sticking_scores_a_mismatch_then_the_rewrite_recovers() {
+    let fan_target_rpm = 1900.0;
+    let config = Config {
+        fan_target_rpm,
+        cpu_max_w: 25.0,
+        gpu_max_w: 15.0, // == the LUT's watts at gpu_floor_mhz: GPU pinned at its floor
+        ..Config::default()
+    };
+    assert!(
+        (gpu_floor_watts(&config) - config.gpu_max_w).abs() < 1e-9,
+        "test premise: gpu_max_w must equal the GPU floor watts so the PI saturates at the clock floor"
+    );
+    let runner = FakeRunner::new();
+    let (mut ctl, _state_path, gpu_calls) =
+        build_controller(&runner, "gpu-lock-mismatch", config.clone(), None, true);
+    let gpu_calls = gpu_calls.expect("with_gpu");
+    let mut plant = ChainedPlant::new("quiet16", QUIET16_POINTS.to_vec(), MA_INTERVAL, AMBIENT_C, 1)
+        .expect("valid curve");
+    ctl.on_command(Command::SetAuto(true));
+    let lut = gpu_watts_lut();
+
+    // The three ticks the card is scripted to run over its locked ceiling.
+    const OVER_FROM: u64 = 300;
+    const OVER_TO: u64 = 302;
+    let trace = run_ticks(&mut plant, &mut ctl, Some(&lut), config.cpu_floor_w, 360, |t, _p, script| {
+        script.cpu_demand_frac = 1.0;
+        script.cpu_util_pct = 95.0;
+        script.on_ac = true;
+        script.gpu_temp_c = Some(70.0);
+        script.gpu_util_pct = 95.0; // above verify_lock's 90 % utilisation floor
+        // The lock is not sticking: the card draws 25 W whatever it is
+        // locked to (this is what makes the PI saturate at the floor).
+        script.gpu_cap_w = 25.0;
+        script.gpu_demand_frac = 1.0;
+        if (OVER_FROM..=OVER_TO).contains(&t) {
+            // ... and runs 400 MHz over the locked ceiling while it does.
+            script.gpu_sm_mhz += 400.0;
+        }
+    });
+
+    let noted_at = |cause: &str| -> Option<u64> {
+        trace
+            .rows
+            .iter()
+            .find(|r| {
+                r.effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::Noted { cause: c } if *c == cause))
+            })
+            .map(|r| r.t)
+    };
+    let mismatch_at = noted_at("auto:gpu_mismatch");
+    let recovered_at = noted_at("auto:gpu_verdict_recovered");
+    println!(
+        "[gpu-lock-mismatch] lock_end={:?} mismatch_at={mismatch_at:?} recovered_at={recovered_at:?}",
+        trace.last().gpu_max_mhz
+    );
+
+    // The lock the verifier was scoring really was the clock floor, held
+    // still by the saturated PI -- not something this test set.
+    assert_eq!(
+        trace.rows[(OVER_FROM - 2) as usize].gpu_max_mhz,
+        Some(config.gpu_floor_mhz),
+        "test premise: the PI must be saturated at the clock floor when the overshoot starts"
+    );
+    assert_eq!(
+        mismatch_at,
+        Some(OVER_TO),
+        "verify_lock must confirm a Mismatch on the THIRD consecutive over-pin sample, no earlier"
+    );
+    assert!(
+        trace.rows[(OVER_TO - 1) as usize].flags.contains(&StatusFlag::LimitNotSticking),
+        "a confirmed GPU mismatch must raise LIMIT NOT STICKING"
+    );
+
+    // The re-write path: the controller keeps re-commanding the lock after
+    // the mismatch instead of abandoning it (and never gives up to stock --
+    // one confirmed mismatch is a strike, not the three-strike release).
+    let calls = gpu_calls.lock().expect("gpu call log").clone();
+    let floor_sets = calls
+        .iter()
+        .filter(|c| matches!(c, GpuCall::Set(mhz) if *mhz == config.gpu_floor_mhz))
+        .count();
+    println!("[gpu-lock-mismatch] total gpu calls={} floor-sets={floor_sets}", calls.len());
+    assert!(
+        floor_sets > 3,
+        "the mismatch must be followed by further re-writes of the same lock, got {floor_sets}"
+    );
+    assert!(
+        !calls.contains(&GpuCall::Release),
+        "a single confirmed mismatch is one strike, never the three-strike release to stock"
+    );
+    assert_eq!(
+        trace.last().gpu_max_mhz,
+        Some(config.gpu_floor_mhz),
+        "the lock must still be in force after the episode"
+    );
+
+    // ... and the first compliant read-back after the episode clears it.
+    assert!(
+        recovered_at.is_some_and(|t| t > OVER_TO && t <= OVER_TO + 3),
+        "the first compliant read-back after the episode must score a recovery, got {recovered_at:?}"
+    );
+    assert!(
+        !trace.last().flags.contains(&StatusFlag::LimitNotSticking),
+        "the recovery must clear LIMIT NOT STICKING again"
+    );
+    assert_only_expected_runner_calls(&runner);
+}
+
 // =====================================================================
 // Calibration: a StepTest on the plant, then the quiet16/TempLoop
 // acceptance repeated with the fitted gains -- graded against the
@@ -2176,27 +2491,29 @@ fn configuration_coverage_checklist_2_strategies_3_modes_dgpu_on_off_default_vs_
         modes.push(LoopMode::Released);
     }
 
-    // dGPU on: a hot-but-sub-watchdog dGPU sample, dGPU off: the default
-    // (already covered by every run above, which all leave `gpu_temp_c:
-    // None`).
+    // dGPU on: a PLANT-CLOSED run with a real GPU actuator attached and the
+    // GPU leg of the loop closed through the LUT (roast PR-1 finding 10 --
+    // this axis used to be "covered" by a single tick that scripted a
+    // sensor temperature and never reached the GPU PI, the actuator write
+    // path or `verify_lock` at all). Abbreviated to 5 min: the full 40 min
+    // acceptance and the `verify_lock` mismatch/re-write path are the two
+    // dedicated runs above, this is the checklist's own end-to-end proof
+    // that the combination is reachable.
     {
-        let fan_target_rpm = 1900.0;
-        let config = Config { fan_target_rpm, ..Config::default() };
-        let runner = FakeRunner::new();
-        let (mut ctl, _state_path, _gpu) =
-            build_controller(&runner, "cov-dgpu-on", config.clone(), None, false);
-        let mut plant = ChainedPlant::new("quiet16", QUIET16_POINTS.to_vec(), MA_INTERVAL, AMBIENT_C, 1)
-            .expect("valid curve");
-        ctl.on_command(Command::SetAuto(true));
-        let sample = plant.tick(&TickScript {
-            cpu_cap_w: 15.0,
-            cpu_demand_frac: 1.0,
-            gpu_temp_c: Some(86.0),
-            on_ac: true,
-            ..Default::default()
-        });
-        assert!(sample.gpu_temp_valid, "test premise: a scripted gpu_temp_c must be sensed valid");
-        let _ = ctl.on_sample(&sample);
+        let config = Config { fan_target_rpm: 3100.0, cpu_max_w: 20.0, ..Config::default() };
+        let (trace, calls) = run_gpu_heavy("cov-dgpu-on", &config, 5);
+        assert!(
+            !commanded_locks(&calls).is_empty(),
+            "dGPU-on coverage: the GPU PI must reach the actuator with a clock lock"
+        );
+        assert!(
+            trace.any_effect(|e| matches!(e, Effect::GpuSet(_))),
+            "dGPU-on coverage: a commanded lock must surface as a GpuSet effect"
+        );
+        assert!(
+            trace.last().gpu_w > gpu_floor_watts(&config),
+            "dGPU-on coverage: the powered dGPU must be drawing above its floor allocation"
+        );
         dgpu_powered.push(true);
     }
     dgpu_powered.push(false); // every run above already leaves it None.

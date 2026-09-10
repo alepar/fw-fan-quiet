@@ -7,7 +7,9 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use crate::fanctrl::client::{FanctrlError, FanctrlSource, FanctrlView, Freshness, PrintCommand};
+use crate::fanctrl::client::{
+    FanctrlError, FanctrlSnapshot, FanctrlSource, FanctrlView, Freshness, PrintCommand,
+};
 
 /// One scripted outcome for the next `poll()` call, regardless of which
 /// `PrintCommand` it answers — the test itself controls that by choosing
@@ -76,6 +78,19 @@ impl FakeFanctrl {
     pub fn command_log(&self) -> &[PrintCommand] {
         &self.log
     }
+
+    /// The last-known view. Inherent, not part of [`FanctrlSource`]: readers
+    /// on another thread go through the published `FanctrlSnapshot` instead
+    /// (see `sensors::poller`).
+    pub fn view(&self) -> Option<&FanctrlView> {
+        self.view.as_ref()
+    }
+
+    /// [`Freshness`] of `view()` as of `now` -- the same shared rule
+    /// `UnixFanctrlClient` uses, so the two never drift apart.
+    pub fn freshness(&self, now: Instant) -> Freshness {
+        crate::fanctrl::client::compute_freshness(self.last_absent, self.view.as_ref(), now)
+    }
 }
 
 impl FanctrlSource for FakeFanctrl {
@@ -124,12 +139,11 @@ impl FanctrlSource for FakeFanctrl {
         }
     }
 
-    fn view(&self) -> Option<&FanctrlView> {
-        self.view.as_ref()
-    }
-
-    fn freshness(&self, now: Instant) -> Freshness {
-        crate::fanctrl::client::compute_freshness(self.last_absent, self.view.as_ref(), now)
+    fn snapshot(&self) -> FanctrlSnapshot {
+        FanctrlSnapshot {
+            view: self.view.clone(),
+            last_absent: self.last_absent,
+        }
     }
 }
 

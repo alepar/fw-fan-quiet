@@ -2,11 +2,16 @@
 //! or the `print speed` staleness rule that governs Mode A (design doc §3.4):
 //!
 //! - [`FanctrlPoller`] runs `print speed` every 5 s and `print all` every
-//!   30 s (never faster) against a shared [`FanctrlSource`], on its own
-//!   thread. The sampler tick only ever *reads* through the same
-//!   `Arc<Mutex<_>>` (`view()`/`freshness()`) -- it never calls `poll`
-//!   itself, so a slow or hung socket round trip on the poller thread can
-//!   never stall a `Sample`.
+//!   30 s (never faster) against a [`FanctrlSource`] it **owns outright**,
+//!   on its own thread. The socket round trip therefore holds no lock the
+//!   sampler can ever contend on; after each attempt the poller publishes a
+//!   detached [`FanctrlSnapshot`] into [`SharedFanctrl`], a tiny mutex whose
+//!   only critical sections are one assignment (poller side) and one clone
+//!   (sampler side). Neither side ever holds it across I/O, so a slow or
+//!   hung socket round trip can never stall a `Sample`. (Before roast PR-1
+//!   finding 1 the source itself lived behind that mutex and `poll` ran
+//!   under it, which made this paragraph's invariant false: a 3 s read
+//!   timeout blocked the 1 Hz tick for 3 s.)
 //! - [`spawn_nvme_poller`] reads the NVMe composite temperature every 30 s on
 //!   a thread of its own -- **neither** the sampler tick **nor**
 //!   `FanctrlPoller`. A SMART admin read can block for the kernel's 60 s
@@ -23,8 +28,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::fanctrl::client::{FanctrlSource, PrintCommand};
+use crate::fanctrl::client::{FanctrlSnapshot, FanctrlSource, PrintCommand};
 use crate::sensors::sampler::sleep_unless_shutdown;
+use crate::sync_util::lock;
 
 /// `print speed` cadence -- never faster (design doc §2.1/§3.4).
 pub const SPEED_PERIOD: Duration = Duration::from_secs(5);
@@ -35,14 +41,35 @@ pub const ALL_PERIOD: Duration = Duration::from_secs(30);
 /// sampler's own `SHUTDOWN_POLL`.
 const POLLER_TICK: Duration = Duration::from_millis(250);
 
-/// A `FanctrlSource` shared between the poller thread (which calls `poll`)
-/// and the sampler tick (which only ever calls `view`/`freshness`).
-pub type SharedFanctrl = Arc<Mutex<Box<dyn FanctrlSource + Send>>>;
+/// The published side of the fw-fanctrl poll: a detached
+/// [`FanctrlSnapshot`], written by the poller thread and read by the sampler
+/// tick. **Deliberately not the `FanctrlSource` itself** -- see the module
+/// doc: this mutex is only ever held for one assignment or one clone, never
+/// across socket I/O.
+pub type SharedFanctrl = Arc<Mutex<FanctrlSnapshot>>;
 
-/// Runs `print speed`/`print all` against a [`SharedFanctrl`] at their fixed
-/// cadences, on its own thread.
+/// A fresh, empty [`SharedFanctrl`] (no view yet, not absent) -- the state
+/// before the poller's first attempt lands.
+pub fn shared_fanctrl() -> SharedFanctrl {
+    Arc::new(Mutex::new(FanctrlSnapshot::default()))
+}
+
+/// Publishes `source`'s current snapshot into `shared`. The only writer in
+/// production is [`FanctrlPoller::tick`]; tests that drive a source by hand
+/// (rather than through the poller thread) use this to make its state
+/// visible to a `Sampler` the same way.
+pub fn publish(shared: &SharedFanctrl, source: &dyn FanctrlSource) {
+    *lock(shared) = source.snapshot();
+}
+
+/// Runs `print speed`/`print all` at their fixed cadences on its own thread,
+/// against a [`FanctrlSource`] it owns exclusively, publishing the resulting
+/// snapshot into a [`SharedFanctrl`] after each attempt.
 pub struct FanctrlPoller {
-    source: SharedFanctrl,
+    /// Owned outright, never shared: nothing else can contend on it, so the
+    /// blocking round trip below cannot stall any other thread.
+    source: Box<dyn FanctrlSource + Send>,
+    snapshot: SharedFanctrl,
     next_speed_due: Instant,
     next_all_due: Instant,
 }
@@ -50,32 +77,38 @@ pub struct FanctrlPoller {
 impl FanctrlPoller {
     /// `start` is the instant both cadences are first due, so the very first
     /// `tick`/thread iteration sends both `Speed` and `All`.
-    pub fn new(source: SharedFanctrl, start: Instant) -> Self {
+    pub fn new(
+        source: Box<dyn FanctrlSource + Send>,
+        snapshot: SharedFanctrl,
+        start: Instant,
+    ) -> Self {
         Self {
             source,
+            snapshot,
             next_speed_due: start,
             next_all_due: start,
         }
     }
 
     /// Sends whichever command(s) are due as of `now`, never faster than
-    /// their own period; a poll failure is swallowed here (the source's own
-    /// `freshness()` is how a caller learns about it). This is the testable
-    /// core: `spawn`'s real-time loop calls it with `Instant::now()`, and
-    /// tests call it directly with synthetic instants stepped in 1 s
-    /// increments to script a run without any real sleeping.
+    /// their own period, then publishes the resulting snapshot; a poll
+    /// failure is swallowed here (the published snapshot's own `freshness()`
+    /// is how a caller learns about it). This is the testable core:
+    /// `spawn`'s real-time loop calls it with `Instant::now()`, and tests
+    /// call it directly with synthetic instants stepped in 1 s increments to
+    /// script a run without any real sleeping.
+    ///
+    /// The `poll` calls run outside every lock; only `publish` takes one.
     pub fn tick(&mut self, now: Instant) {
         if now >= self.next_all_due {
-            let mut src = self.source.lock().expect("fanctrl source mutex poisoned");
-            let _ = src.poll(PrintCommand::All, now);
-            drop(src);
+            let _ = self.source.poll(PrintCommand::All, now);
             self.next_all_due += ALL_PERIOD;
+            publish(&self.snapshot, self.source.as_ref());
         }
         if now >= self.next_speed_due {
-            let mut src = self.source.lock().expect("fanctrl source mutex poisoned");
-            let _ = src.poll(PrintCommand::Speed, now);
-            drop(src);
+            let _ = self.source.poll(PrintCommand::Speed, now);
             self.next_speed_due += SPEED_PERIOD;
+            publish(&self.snapshot, self.source.as_ref());
         }
     }
 
@@ -115,7 +148,7 @@ pub type SharedNvme = Arc<Mutex<Option<(f64, Instant)>>>;
 /// own monotonic `t_mono`-derived instant), never read internally, so this
 /// is deterministic and never touches a wall clock.
 pub fn read_nvme(cache: &SharedNvme, now: Instant) -> Option<f64> {
-    let last = *cache.lock().expect("nvme cache mutex poisoned");
+    let last = *lock(cache);
     last.and_then(|(temp, stamp)| {
         if now.saturating_duration_since(stamp) < NVME_STALE_AFTER {
             Some(temp)
@@ -148,8 +181,7 @@ where
         .spawn(move || {
             while !shutdown.load(Ordering::Relaxed) {
                 if let Some(temp) = read() {
-                    let mut guard = cache.lock().expect("nvme cache mutex poisoned");
-                    *guard = Some((temp, Instant::now()));
+                    *lock(&cache) = Some((temp, Instant::now()));
                 }
                 sleep_unless_shutdown(NVME_PERIOD, &shutdown);
             }
@@ -161,7 +193,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fanctrl::client::{FanctrlError, FanctrlView, Freshness};
+    use crate::fanctrl::client::{FanctrlError, Freshness};
     use crate::test_support::fakes::{FakeFanctrl, ScriptedOutcome};
 
     fn all_success() -> ScriptedOutcome {
@@ -176,8 +208,8 @@ mod tests {
         }
     }
 
-    fn boxed(source: impl FanctrlSource + Send + 'static) -> SharedFanctrl {
-        Arc::new(Mutex::new(Box::new(source) as Box<dyn FanctrlSource + Send>))
+    fn boxed(source: impl FanctrlSource + Send + 'static) -> Box<dyn FanctrlSource + Send> {
+        Box::new(source) as Box<dyn FanctrlSource + Send>
     }
 
     // --- Step 2: cadence -------------------------------------------------
@@ -197,11 +229,8 @@ mod tests {
             self.log.lock().unwrap().push(cmd);
             Ok(())
         }
-        fn view(&self) -> Option<&FanctrlView> {
-            None
-        }
-        fn freshness(&self, _now: Instant) -> Freshness {
-            Freshness::Stale
+        fn snapshot(&self) -> FanctrlSnapshot {
+            FanctrlSnapshot::default()
         }
     }
 
@@ -211,7 +240,7 @@ mod tests {
         let source = boxed(RecordingSource {
             log: Arc::clone(&log),
         });
-        let mut poller = FanctrlPoller::new(source, Instant::now());
+        let mut poller = FanctrlPoller::new(source, shared_fanctrl(), Instant::now());
 
         // A "60 s scripted run": 60 ticks one simulated second apart, driven
         // through synthetic instants rather than real sleeping (mirrors
@@ -254,15 +283,15 @@ mod tests {
             }
             fake.script(ScriptedOutcome::Speed(31));
         }
-        let source = boxed(fake);
-        let mut poller = FanctrlPoller::new(Arc::clone(&source), Instant::now());
+        let snapshot = shared_fanctrl();
+        let mut poller = FanctrlPoller::new(boxed(fake), Arc::clone(&snapshot), Instant::now());
 
         let t0 = Instant::now();
         for t in (0..=90).step_by(5) {
             poller.tick(t0 + Duration::from_secs(t));
         }
 
-        let src = source.lock().unwrap();
+        let src = lock(&snapshot).clone();
         assert_eq!(
             src.freshness(t0 + Duration::from_secs(89)),
             Freshness::Fresh,
@@ -289,15 +318,15 @@ mod tests {
         for _ in (5..=20).step_by(5) {
             fake.script(ScriptedOutcome::Fail(FanctrlError::Timeout)); // Speed fails
         }
-        let source = boxed(fake);
-        let mut poller = FanctrlPoller::new(Arc::clone(&source), Instant::now());
+        let snapshot = shared_fanctrl();
+        let mut poller = FanctrlPoller::new(boxed(fake), Arc::clone(&snapshot), Instant::now());
 
         let t0 = Instant::now();
         for t in (0..=20).step_by(5) {
             poller.tick(t0 + Duration::from_secs(t));
         }
 
-        let src = source.lock().unwrap();
+        let src = lock(&snapshot).clone();
         assert_eq!(
             src.freshness(t0 + Duration::from_secs(14)),
             Freshness::Fresh,
@@ -318,7 +347,7 @@ mod tests {
         let t0 = Instant::now();
         assert_eq!(read_nvme(&cache, t0), None, "never populated");
 
-        *cache.lock().unwrap() = Some((55.0, t0));
+        *lock(&cache) = Some((55.0, t0));
         assert_eq!(
             read_nvme(&cache, t0 + Duration::from_secs(89)),
             Some(55.0),

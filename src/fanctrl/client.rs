@@ -19,8 +19,15 @@ use std::time::{Duration, Instant};
 
 /// Default connect timeout (design doc §2.1).
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
-/// Default read timeout (design doc §2.1).
+/// Default read timeout (design doc §2.1). Applied *both* per read syscall
+/// (`SO_RCVTIMEO`) and as a total deadline across the whole reply.
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Hard cap on one reply body. The real `print all` dump is ~8.8 KB
+/// (`tests/fixtures/fanctrl/print_all_quiet16.json`); 1 MiB is ~100x that,
+/// so no legitimate configuration can reach it, and a peer that never stops
+/// writing cannot grow this process's heap.
+const MAX_BODY: u64 = 1024 * 1024;
 
 /// No successful `print speed` for this long ⇒ [`Freshness::Stale`] (design
 /// doc §2.1), even while `print all` is within its own window.
@@ -143,14 +150,33 @@ pub trait FanctrlSource {
     /// instead of real sleeps.
     fn poll(&mut self, cmd: PrintCommand, now: Instant) -> Result<(), FanctrlError>;
 
-    /// The last-known view, or `None` if no poll has ever succeeded.
-    fn view(&self) -> Option<&FanctrlView>;
+    /// Everything a *reader on another thread* needs, detached from `self`:
+    /// the view plus the connect-failure flag that drives `Absent`. The
+    /// poller thread publishes one of these into a small mutex after each
+    /// round trip so the sampler tick never has to reach into a source that
+    /// is (or may be) blocked inside socket I/O — see `sensors::poller`.
+    fn snapshot(&self) -> FanctrlSnapshot;
+}
 
-    /// [`Freshness`] of `view()` as of `now`. Never panics regardless of
-    /// how `now` relates to the view's stamps (uses saturating duration
-    /// arithmetic), so a caller may safely pass a clock that has jumped
-    /// (e.g. a synthetic test instant, or a real resume-from-suspend gap).
-    fn freshness(&self, now: Instant) -> Freshness;
+/// A detached copy of a [`FanctrlSource`]'s observable state. Cheap to
+/// publish (one assignment under a mutex that is never held across I/O) and
+/// self-contained: [`Self::freshness`] applies the very same
+/// [`compute_freshness`] rule the source itself would.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FanctrlSnapshot {
+    pub view: Option<FanctrlView>,
+    /// Mirrors `UnixFanctrlClient::last_absent`: the most recent poll
+    /// attempt could not even connect (ENOENT/refused).
+    pub last_absent: bool,
+}
+
+impl FanctrlSnapshot {
+    /// [`Freshness`] of this snapshot as of `now` — identical rule to
+    /// `FanctrlSource::freshness`, so a reader loses nothing by going
+    /// through the published copy.
+    pub fn freshness(&self, now: Instant) -> Freshness {
+        compute_freshness(self.last_absent, self.view.as_ref(), now)
+    }
 }
 
 /// Shared freshness rule (design doc §2.1), used by both
@@ -204,13 +230,32 @@ struct ConfigurationField {
 
 #[derive(serde::Deserialize)]
 struct ConfigDataField {
-    strategies: HashMap<String, StrategyField>,
+    /// **Deliberately untyped per entry.** fw-fanctrl's `print all` dumps the
+    /// operator's *whole* configuration, and its own `config.schema.json`
+    /// requires only `speedCurve` per strategy — so a schema-valid strategy
+    /// the operator never activates may legitimately omit
+    /// `movingAverageInterval`. Deserialising every entry strictly made one
+    /// such inactive entry fail the entire poll, which stales
+    /// `all_observed_at` after 90 s and drops the loop out of Mode A for good
+    /// (roast PR-1 finding 9). Only the entry actually being looked up is
+    /// parsed into a typed [`StrategyField`], and only that one has to be
+    /// complete.
+    strategies: HashMap<String, serde_json::Value>,
 }
 
+/// One strategy entry, parsed on demand out of the raw
+/// `strategies[name]` JSON value — never for the map as a whole.
 #[derive(serde::Deserialize)]
 struct StrategyField {
     #[serde(rename = "movingAverageInterval")]
     moving_average_interval: u32,
+}
+
+/// The curve half of a strategy entry, kept separate from [`StrategyField`]
+/// so `resolve_curve` can read a strategy's points even when that entry
+/// omits `movingAverageInterval`.
+#[derive(serde::Deserialize)]
+struct StrategyCurveField {
     #[serde(rename = "speedCurve")]
     speed_curve: Vec<CurvePointField>,
 }
@@ -241,13 +286,16 @@ pub fn resolve_curve(print_all_json: &str, strategy: &str) -> Vec<(f64, u8)> {
     let Ok(parsed) = serde_json::from_str::<PrintAllResponse>(print_all_json) else {
         return Vec::new();
     };
-    parsed
-        .configuration
-        .data
-        .strategies
-        .get(strategy)
-        .map(|s| s.speed_curve.iter().map(|p| (p.temp, p.speed)).collect())
-        .unwrap_or_default()
+    let Some(raw) = parsed.configuration.data.strategies.get(strategy) else {
+        return Vec::new();
+    };
+    // Per-entry parse: an entry missing `speedCurve` (or shaped unexpectedly)
+    // yields the same empty "nothing resolved" list a missing name does, and
+    // never poisons the other entries.
+    match serde_json::from_value::<StrategyCurveField>(raw.clone()) {
+        Ok(s) => s.speed_curve.iter().map(|p| (p.temp, p.speed)).collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Parses a raw `print all` JSON body into the `All`-sourced fields of a
@@ -258,12 +306,22 @@ pub fn resolve_curve(print_all_json: &str, strategy: &str) -> Vec<(f64, u8)> {
 fn parse_print_all(json: &str) -> Result<ParsedAll, FanctrlError> {
     let parsed: PrintAllResponse =
         serde_json::from_str(json).map_err(|e| FanctrlError::Other(e.to_string()))?;
-    let Some(entry) = parsed.configuration.data.strategies.get(&parsed.strategy) else {
+    let Some(raw_entry) = parsed.configuration.data.strategies.get(&parsed.strategy) else {
         return Err(FanctrlError::Other(format!(
             "print all names active strategy {:?}, which is not in its own strategies map",
             parsed.strategy
         )));
     };
+    // Only the *active* strategy has to be complete: the EC moving-average
+    // emulator cannot run without its interval, so a missing one here is a
+    // real error (degrading to the designed FANCTRL LOST / Mode B fallback)
+    // rather than something to paper over with a guessed default.
+    let entry: StrategyField = serde_json::from_value(raw_entry.clone()).map_err(|e| {
+        FanctrlError::Other(format!(
+            "print all's active strategy {:?} did not parse: {e}",
+            parsed.strategy
+        ))
+    })?;
     let ma_interval = entry.moving_average_interval;
     // Single source of truth for "strategy name -> curve points" (design
     // §2.1): this production path and every direct `resolve_curve` caller
@@ -328,12 +386,21 @@ fn classify_io_error(e: std::io::Error) -> FanctrlError {
 /// no way to cancel a blocked syscall from the outside in std alone); its
 /// eventual `tx.send` then silently fails since `rx` has already been
 /// dropped, and the thread exits.
+///
+/// Uses `thread::Builder::spawn` rather than `thread::spawn`: the latter
+/// *panics* if the OS refuses to create the thread, and this runs on the
+/// poller thread with the shared snapshot lock available to the sampler — a
+/// panic here used to poison it (roast PR-1 finding 3). OS refusal is
+/// reported as a plain `Other` error, i.e. one failed poll.
 fn connect_with_timeout(path: &Path, timeout: Duration) -> Result<UnixStream, FanctrlError> {
     let (tx, rx) = mpsc::channel();
     let owned = path.to_path_buf();
-    thread::spawn(move || {
-        let _ = tx.send(UnixStream::connect(&owned));
-    });
+    thread::Builder::new()
+        .name("fanctrl-connect".into())
+        .spawn(move || {
+            let _ = tx.send(UnixStream::connect(&owned));
+        })
+        .map_err(|e| FanctrlError::Other(format!("could not spawn fanctrl connect thread: {e}")))?;
     match rx.recv_timeout(timeout) {
         Ok(Ok(stream)) => Ok(stream),
         Ok(Err(e)) => Err(classify_io_error(e)),
@@ -387,9 +454,33 @@ impl UnixFanctrlClient {
         }
     }
 
+    /// The last-known view, or `None` if no poll has ever succeeded.
+    /// Inherent rather than part of [`FanctrlSource`]: cross-thread readers
+    /// go through the published [`FanctrlSnapshot`] instead (see
+    /// `sensors::poller`), so the trait exposes only `poll`/`snapshot`.
+    #[cfg(test)]
+    fn view(&self) -> Option<&FanctrlView> {
+        self.view.as_ref()
+    }
+
+    /// [`Freshness`] of `view()` as of `now`. Never panics regardless of how
+    /// `now` relates to the view's stamps (uses saturating duration
+    /// arithmetic), so a caller may safely pass a clock that has jumped.
+    #[cfg(test)]
+    fn freshness(&self, now: Instant) -> Freshness {
+        compute_freshness(self.last_absent, self.view.as_ref(), now)
+    }
+
     /// One full round trip: connect, send `cmd`'s raw CLI string, shut down
     /// the write half (so a server reading to EOF sees the command end),
-    /// read the response to EOF.
+    /// read the response to EOF — bounded by both [`MAX_BODY`] and a *total*
+    /// read deadline of `read_timeout`.
+    ///
+    /// The two bounds are not redundant with `set_read_timeout`: `SO_RCVTIMEO`
+    /// applies to each individual read syscall, so a peer trickling one byte
+    /// per interval kept the old `read_to_string`-to-EOF loop running
+    /// unboundedly, and a peer that never stops writing grew `body`
+    /// unboundedly (roast PR-1 finding 2).
     fn send(&self, cmd: PrintCommand) -> Result<String, FanctrlError> {
         let mut stream = connect_with_timeout(&self.socket_path, self.connect_timeout)?;
         stream
@@ -404,11 +495,40 @@ impl UnixFanctrlClient {
         // Signal EOF on our side so a server that reads-to-EOF-then-
         // responds is not left waiting for more input that never comes.
         let _ = stream.shutdown(std::net::Shutdown::Write);
-        let mut body = String::new();
-        stream
-            .read_to_string(&mut body)
-            .map_err(classify_io_error)?;
-        Ok(body)
+        self.read_body(stream)
+    }
+
+    /// The bounded read half of [`Self::send`]: reads to EOF, but never past
+    /// [`MAX_BODY`] bytes and never past a total deadline of `read_timeout`
+    /// from the moment the read phase begins.
+    fn read_body(&self, stream: UnixStream) -> Result<String, FanctrlError> {
+        let deadline = Instant::now() + self.read_timeout;
+        // +1 so an exactly-MAX_BODY body still reads its real EOF, while the
+        // first byte past the cap is observable rather than silently
+        // truncated into a body that would then "just" fail to parse.
+        let mut limited = stream.take(MAX_BODY + 1);
+        let mut body: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            if Instant::now() >= deadline {
+                return Err(FanctrlError::Timeout);
+            }
+            match limited.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    body.extend_from_slice(&chunk[..n]);
+                    if body.len() as u64 > MAX_BODY {
+                        return Err(FanctrlError::Other(format!(
+                            "reply exceeded the {MAX_BODY} byte cap"
+                        )));
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(classify_io_error(e)),
+            }
+        }
+        String::from_utf8(body)
+            .map_err(|e| FanctrlError::Other(format!("reply was not valid UTF-8: {e}")))
     }
 }
 
@@ -452,12 +572,11 @@ impl FanctrlSource for UnixFanctrlClient {
         }
     }
 
-    fn view(&self) -> Option<&FanctrlView> {
-        self.view.as_ref()
-    }
-
-    fn freshness(&self, now: Instant) -> Freshness {
-        compute_freshness(self.last_absent, self.view.as_ref(), now)
+    fn snapshot(&self) -> FanctrlSnapshot {
+        FanctrlSnapshot {
+            view: self.view.clone(),
+            last_absent: self.last_absent,
+        }
     }
 }
 
@@ -791,6 +910,130 @@ mod tests {
         assert!(matches!(err, FanctrlError::Timeout), "got {err:?}");
         assert_eq!(client.freshness(Instant::now()), Freshness::Stale);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- roast PR-1 finding 2: bounded reads --------------------------------
+
+    #[test]
+    fn a_trickling_peer_hits_the_total_read_deadline_instead_of_reading_forever() {
+        // `SO_RCVTIMEO` bounds each individual read, not the whole reply, so
+        // a peer that dribbles one byte per interval below that timeout kept
+        // the old `read_to_string`-to-EOF loop running for as long as it
+        // cared to keep dribbling. The total deadline must cut it off.
+        let path = spawn_one_shot_server(|mut stream| {
+            let mut sent = String::new();
+            let _ = stream.read_to_string(&mut sent);
+            // 100 x 50 ms = ~5 s of trickle, every gap comfortably inside the
+            // 300 ms per-read timeout below.
+            for _ in 0..100 {
+                if stream.write_all(b" ").is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let mut client = UnixFanctrlClient::with_timeouts(
+            path.clone(),
+            Duration::from_millis(200),
+            Duration::from_millis(300),
+        );
+        let started = Instant::now();
+        let err = client.poll(PrintCommand::All, Instant::now()).unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(matches!(err, FanctrlError::Timeout), "got {err:?}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the trickle ran for {elapsed:?}: the total read deadline was not enforced"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_oversized_reply_is_refused_at_the_body_cap() {
+        // A peer that never stops writing must not be able to grow this
+        // process's heap: the reply is capped, and the cap is reported as
+        // its own error rather than as a truncated body that merely fails
+        // to parse.
+        let path = spawn_one_shot_server(|mut stream| {
+            let mut sent = String::new();
+            let _ = stream.read_to_string(&mut sent);
+            let chunk = vec![b'x'; 64 * 1024];
+            // 4 MiB, i.e. four times the cap.
+            for _ in 0..64 {
+                if stream.write_all(&chunk).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut client = UnixFanctrlClient::with_timeouts(
+            path.clone(),
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+        );
+        let err = client.poll(PrintCommand::All, Instant::now()).unwrap_err();
+        match err {
+            FanctrlError::Other(msg) => assert!(
+                msg.contains("exceeded") && msg.contains("cap"),
+                "expected the body-cap error, got {msg:?}"
+            ),
+            other => panic!("expected the body-cap error, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- roast PR-1 finding 9: lenient inactive strategies -------------------
+
+    /// A `print all` body whose *inactive* `userCustom` strategy omits
+    /// `movingAverageInterval` -- schema-valid upstream (fw-fanctrl's
+    /// `config.schema.json` requires only `speedCurve`) and produced verbatim
+    /// by `dump_details`, since it returns the operator's raw configuration.
+    const PRINT_ALL_INACTIVE_STRATEGY_MISSING_MA: &str = r#"{
+      "strategy": "quiet16",
+      "active": true,
+      "speed": 32,
+      "temperature": 77.0,
+      "movingAverageTemperature": 76.5,
+      "configuration": { "data": { "strategies": {
+        "quiet16": {
+          "movingAverageInterval": 60,
+          "speedCurve": [{"temp": 0, "speed": 15}, {"temp": 95, "speed": 100}]
+        },
+        "userCustom": {
+          "speedCurve": [{"temp": 0, "speed": 20}, {"temp": 80, "speed": 90}]
+        }
+      } } }
+    }"#;
+
+    #[test]
+    fn an_inactive_strategy_missing_moving_average_interval_does_not_fail_the_poll() {
+        // Before the fix every entry in the map was deserialised strictly, so
+        // this one unrelated entry failed the whole `print all` -- staling
+        // `all_observed_at` after 90 s and dropping the loop out of Mode A
+        // permanently, even though only the active strategy's data is used.
+        let parsed = parse_print_all(PRINT_ALL_INACTIVE_STRATEGY_MISSING_MA)
+            .expect("an incomplete inactive strategy must not fail the poll");
+        assert_eq!(parsed.strategy, "quiet16");
+        assert_eq!(parsed.ma_interval, 60);
+        assert_eq!(parsed.curve, vec![(0.0, 15), (95.0, 100)]);
+    }
+
+    #[test]
+    fn an_incomplete_inactive_strategys_curve_still_resolves() {
+        assert_eq!(
+            resolve_curve(PRINT_ALL_INACTIVE_STRATEGY_MISSING_MA, "userCustom"),
+            vec![(0.0, 20), (80.0, 90)]
+        );
+    }
+
+    #[test]
+    fn the_active_strategy_missing_moving_average_interval_is_still_an_error() {
+        // The EC moving-average emulator cannot run without the interval, so
+        // this degrades to the designed FANCTRL LOST / Mode B fallback rather
+        // than being papered over with a guessed default.
+        let json =
+            PRINT_ALL_INACTIVE_STRATEGY_MISSING_MA.replace("\"movingAverageInterval\": 60,", "");
+        let err = parse_print_all(&json).unwrap_err();
+        assert!(matches!(err, FanctrlError::Other(_)), "got {err:?}");
     }
 
     // --- Step 7: PrintCommand is exactly two variants -----------------------

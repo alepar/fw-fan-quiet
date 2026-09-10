@@ -721,7 +721,7 @@ mod real_types {
     use std::sync::{Arc, Mutex};
 
     use crate::fanctrl::client::{FanctrlSource, UnixFanctrlClient};
-    use crate::sensors::poller::{FanctrlPoller, SharedFanctrl, SharedNvme};
+    use crate::sensors::poller::{self, FanctrlPoller, SharedFanctrl, SharedNvme};
     use crate::sensors::sampler::Sampler;
     use crate::telemetry::{Record, Telemetry};
 
@@ -736,9 +736,7 @@ mod real_types {
     #[test]
     fn sampler_to_controller_to_telemetry_line_with_real_types() {
         let dir = fixture_dir("real-types-telemetry");
-        let fanctrl_source: SharedFanctrl = Arc::new(Mutex::new(Box::new(UnixFanctrlClient::new(
-            PathBuf::from("/nonexistent/fanctrl.sock"),
-        )) as Box<dyn FanctrlSource + Send>));
+        let fanctrl_source: SharedFanctrl = poller::shared_fanctrl();
         let nvme_cache: SharedNvme = Arc::new(Mutex::new(None));
         let mut sampler = Sampler::with_paths(
             Path::new("/nonexistent/hwmon"),
@@ -801,13 +799,17 @@ mod real_types {
             fanctrl_socket: PathBuf::from("/tmp/bazerame-fanctrl-loop-nsc-test.sock"),
             ..Config::default()
         };
-        let fanctrl_source: SharedFanctrl = Arc::new(Mutex::new(Box::new(UnixFanctrlClient::new(
-            config.fanctrl_socket.clone(),
-        )) as Box<dyn FanctrlSource + Send>));
-        let poller = FanctrlPoller::new(Arc::clone(&fanctrl_source), std::time::Instant::now());
+        let client = Box::new(UnixFanctrlClient::new(config.fanctrl_socket.clone()))
+            as Box<dyn FanctrlSource + Send>;
+        let snapshot: SharedFanctrl = poller::shared_fanctrl();
+        let fanctrl_poller = FanctrlPoller::new(
+            client,
+            Arc::clone(&snapshot),
+            std::time::Instant::now(),
+        );
         // Construction alone must not have polled anything yet.
-        assert!(fanctrl_source.lock().unwrap().view().is_none());
-        drop(poller);
+        assert!(crate::sync_util::lock(&snapshot).view.is_none());
+        drop(fanctrl_poller);
     }
 
     /// A full `on_command`/`on_sample` session on the fakes: Manual mode

@@ -90,8 +90,9 @@ pub struct Sampler {
     /// absent -- every tick's `ec`/`ec_valid` then flattens accordingly,
     /// same shape as every other optional sensor here.
     cros_ec_dir: Option<PathBuf>,
-    /// fw-fanctrl's last-known state, merged (never polled) from the
-    /// background `FanctrlPoller` -- see `sensors::poller`.
+    /// fw-fanctrl's last-known state as a published snapshot, merged (never
+    /// polled, and never the socket client itself) from the background
+    /// `FanctrlPoller` -- see `sensors::poller`.
     fanctrl: SharedFanctrl,
     /// NVMe last-good-value cache, merged (never read directly) from its own
     /// background thread -- see `sensors::poller`.
@@ -229,15 +230,20 @@ impl Sampler {
         }
     }
 
-    /// Reads (never polls) the shared `fanctrl` handle: the current view,
-    /// its freshness as of `now`, and whether this tick is the first one to
-    /// observe a new `All` view since the previous tick (`Sample`'s doc
-    /// comment on `fanctrl_view_changed` has the exact rule).
+    /// Reads (never polls) the snapshot the `FanctrlPoller` thread publishes:
+    /// the current view, its freshness as of `now`, and whether this tick is
+    /// the first one to observe a new `All` view since the previous tick
+    /// (`Sample`'s doc comment on `fanctrl_view_changed` has the exact rule).
+    ///
+    /// The lock below is held for exactly one clone of an already-materialised
+    /// snapshot. It is never the socket client itself, so no socket round trip
+    /// can ever be in flight while this tick waits (roast PR-1 finding 1), and
+    /// it is poison-tolerant so a panic in the poller thread degrades the
+    /// fanctrl reading rather than killing the whole sample stream (finding 3).
     fn merge_fanctrl(&mut self, now: Instant) -> (Option<FanctrlView>, Freshness, bool) {
-        let guard = self.fanctrl.lock().expect("fanctrl source mutex poisoned");
-        let view = guard.view().cloned();
-        let freshness = guard.freshness(now);
-        drop(guard);
+        let snapshot = crate::sync_util::lock(&self.fanctrl).clone();
+        let freshness = snapshot.freshness(now);
+        let view = snapshot.view;
         let all_observed_at = view.as_ref().and_then(|v| v.all_observed_at);
         let changed = all_observed_at != self.prev_all_observed_at;
         self.prev_all_observed_at = all_observed_at;
@@ -285,7 +291,7 @@ impl Sampler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fanctrl::client::{FanctrlSource, Freshness, PrintCommand};
+    use crate::fanctrl::client::{FanctrlError, FanctrlSource, Freshness, PrintCommand};
     use crate::sensors::poller::{FanctrlPoller, spawn_nvme_poller};
     use crate::test_support::fakes::{FakeFanctrl, ScriptedOutcome};
     use std::fs;
@@ -331,12 +337,9 @@ mod tests {
         root
     }
 
-    /// An empty `FakeFanctrl` behind the shared handle `Sampler`/`FanctrlPoller`
-    /// expect -- no view, no scripted outcomes, freshness `Stale`.
+    /// An empty published snapshot -- no view, freshness `Stale`.
     fn empty_fanctrl() -> SharedFanctrl {
-        Arc::new(Mutex::new(
-            Box::new(FakeFanctrl::new()) as Box<dyn FanctrlSource + Send>
-        ))
+        poller::shared_fanctrl()
     }
 
     fn empty_nvme_cache() -> SharedNvme {
@@ -522,8 +525,7 @@ mod tests {
         fake.script(ScriptedOutcome::Speed(32)); // speed-only refresh
         fake.script(ScriptedOutcome::Speed(33)); // another speed-only refresh
         fake.script(all_outcome(40)); // second, new All view
-        let source: SharedFanctrl =
-            Arc::new(Mutex::new(Box::new(fake) as Box<dyn FanctrlSource + Send>));
+        let source: SharedFanctrl = poller::shared_fanctrl();
 
         let mut sampler = fixture_sampler_with(
             Path::new("/nonexistent/hwmon"),
@@ -537,35 +539,23 @@ mod tests {
         assert!(!s0.fanctrl_view_changed);
 
         // First All lands between t=0 and t=1.
-        source
-            .lock()
-            .unwrap()
-            .poll(PrintCommand::All, Instant::now())
-            .unwrap();
+        fake.poll(PrintCommand::All, Instant::now()).unwrap();
+        poller::publish(&source, &fake);
         let s1 = sampler.sample_at(1.0);
         assert!(s1.fanctrl.is_some());
         assert!(s1.fanctrl_view_changed, "first All view must flip changed");
 
         // Two Speed-only refreshes in a row must never set it.
-        source
-            .lock()
-            .unwrap()
-            .poll(PrintCommand::Speed, Instant::now())
-            .unwrap();
+        fake.poll(PrintCommand::Speed, Instant::now()).unwrap();
+        poller::publish(&source, &fake);
         assert!(!sampler.sample_at(2.0).fanctrl_view_changed);
-        source
-            .lock()
-            .unwrap()
-            .poll(PrintCommand::Speed, Instant::now())
-            .unwrap();
+        fake.poll(PrintCommand::Speed, Instant::now()).unwrap();
+        poller::publish(&source, &fake);
         assert!(!sampler.sample_at(3.0).fanctrl_view_changed);
 
         // A second All view flips it again, exactly once.
-        source
-            .lock()
-            .unwrap()
-            .poll(PrintCommand::All, Instant::now())
-            .unwrap();
+        fake.poll(PrintCommand::All, Instant::now()).unwrap();
+        poller::publish(&source, &fake);
         assert!(sampler.sample_at(4.0).fanctrl_view_changed);
         assert!(
             !sampler.sample_at(5.0).fanctrl_view_changed,
@@ -601,17 +591,20 @@ mod tests {
         for _ in 0..8 {
             fake.script(all_outcome(31));
         }
-        let fanctrl_source: SharedFanctrl =
-            Arc::new(Mutex::new(Box::new(fake) as Box<dyn FanctrlSource + Send>));
-        let poller = FanctrlPoller::new(Arc::clone(&fanctrl_source), Instant::now());
-        let poller_thread = poller.spawn(Arc::clone(&shutdown));
+        let fanctrl_source: SharedFanctrl = poller::shared_fanctrl();
+        let fanctrl_poller = FanctrlPoller::new(
+            Box::new(fake) as Box<dyn FanctrlSource + Send>,
+            Arc::clone(&fanctrl_source),
+            Instant::now(),
+        );
+        let poller_thread = fanctrl_poller.spawn(Arc::clone(&shutdown));
 
         // Bounded wait for both: the nvme thread stuck inside its blocking
         // read, and the fanctrl poller's first (seeding) poll landed.
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let nvme_ready = read_entered.load(Ordering::Relaxed);
-            let fanctrl_ready = fanctrl_source.lock().unwrap().view().is_some();
+            let fanctrl_ready = crate::sync_util::lock(&fanctrl_source).view.is_some();
             if nvme_ready && fanctrl_ready {
                 break;
             }
@@ -658,5 +651,163 @@ mod tests {
             .join()
             .expect("fanctrl poller thread should not panic");
         fs::remove_dir_all(&hwmon_root).unwrap();
+    }
+
+    // --- roast PR-1 finding 1: the fanctrl twin of the NVMe test above ----
+
+    /// A `FanctrlSource` whose first `All` succeeds and whose every later
+    /// poll blocks until the test releases it -- a hung fw-fanctrl socket
+    /// round trip (`connect` 1 s + `read_to_string` looping on a 3 s
+    /// per-read timeout), modelled deterministically instead of with a real
+    /// slow server.
+    struct HungFanctrl {
+        view: Option<FanctrlView>,
+        entered: Arc<AtomicBool>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl FanctrlSource for HungFanctrl {
+        fn poll(&mut self, _cmd: PrintCommand, now: Instant) -> Result<(), FanctrlError> {
+            if self.view.is_none() {
+                self.view = Some(FanctrlView {
+                    strategy: "quiet16".to_string(),
+                    active: true,
+                    speed_pct: 31,
+                    temperature: 75.0,
+                    ma_temperature: 75.0,
+                    ma_interval: 60,
+                    curve: vec![(0.0, 15), (95.0, 100)],
+                    observed_at: now,
+                    all_observed_at: Some(now),
+                });
+                return Ok(());
+            }
+            self.entered.store(true, Ordering::Relaxed);
+            let _ = self.release.recv();
+            Ok(())
+        }
+        fn snapshot(&self) -> crate::fanctrl::client::FanctrlSnapshot {
+            crate::fanctrl::client::FanctrlSnapshot {
+                view: self.view.clone(),
+                last_absent: false,
+            }
+        }
+    }
+
+    #[test]
+    fn hung_fanctrl_socket_does_not_stall_the_sampler() {
+        // The exact stall roast PR-1 finding 1 describes: while the poller
+        // thread sits inside a blocking socket round trip, the 1 Hz tick --
+        // which feeds the PI loop, the thermal watchdog and the actuator
+        // reassert -- must keep producing samples, and must keep reporting
+        // the last snapshot the poller published before it blocked.
+        //
+        // Before the fix the poller held the shared fanctrl mutex across
+        // that round trip and `merge_fanctrl` locked the same mutex, so the
+        // `sample_at` calls below would block until the round trip returned
+        // (i.e. this test would hang instead of failing an assertion --
+        // exactly how the sibling NVMe isolation test above is written).
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let entered = Arc::new(AtomicBool::new(false));
+        let source = HungFanctrl {
+            view: None,
+            entered: Arc::clone(&entered),
+            release: release_rx,
+        };
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let fanctrl_source: SharedFanctrl = poller::shared_fanctrl();
+        let fanctrl_poller = FanctrlPoller::new(
+            Box::new(source) as Box<dyn FanctrlSource + Send>,
+            Arc::clone(&fanctrl_source),
+            Instant::now(),
+        );
+        let poller_thread = fanctrl_poller.spawn(Arc::clone(&shutdown));
+
+        // Bounded wait for the poller thread to be genuinely stuck inside a
+        // poll, with its seeding All already published.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !entered.load(Ordering::Relaxed) {
+            assert!(
+                Instant::now() < deadline,
+                "the hung poll was never entered: test setup did not converge"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let mut sampler = fixture_sampler_with(
+            Path::new("/nonexistent/hwmon"),
+            Arc::clone(&fanctrl_source),
+            empty_nvme_cache(),
+        );
+        let started = Instant::now();
+        for i in 0..3 {
+            let s = sampler.sample_at(f64::from(i));
+            assert!(
+                s.fanctrl.is_some(),
+                "the snapshot published before the poller blocked must still be readable"
+            );
+            assert_eq!(
+                s.fanctrl_freshness,
+                Freshness::Fresh,
+                "freshness comes from the published snapshot, not the blocked source"
+            );
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "three ticks took {:?}: the sampler waited on the hung poller",
+            started.elapsed()
+        );
+
+        release_tx
+            .send(())
+            .expect("the poller thread should still be blocked in recv");
+        shutdown.store(true, Ordering::Relaxed);
+        poller_thread
+            .join()
+            .expect("fanctrl poller thread should not panic");
+    }
+
+    // --- roast PR-1 finding 3: poisoned mutexes must not kill the stream --
+
+    #[test]
+    fn a_poisoned_fanctrl_or_nvme_mutex_does_not_kill_the_sample_stream() {
+        // A panic in either poller thread while it holds its lock poisons
+        // that mutex. The sampler used to `.expect(...)` on both, i.e. the
+        // sample stream died while the controller kept its applied caps and
+        // the watchdog stopped observing. It must degrade instead.
+        let fanctrl_source: SharedFanctrl = poller::shared_fanctrl();
+        let nvme_cache = empty_nvme_cache();
+        *crate::sync_util::lock(&nvme_cache) = Some((44.0, Instant::now()));
+
+        for _ in 0..1 {
+            let f = Arc::clone(&fanctrl_source);
+            let _ = std::thread::spawn(move || {
+                let _g = f.lock().unwrap();
+                panic!("poller thread panicked while holding the fanctrl lock");
+            })
+            .join();
+            let n = Arc::clone(&nvme_cache);
+            let _ = std::thread::spawn(move || {
+                let _g = n.lock().unwrap();
+                panic!("nvme thread panicked while holding the cache lock");
+            })
+            .join();
+        }
+        assert!(fanctrl_source.is_poisoned(), "setup: fanctrl lock poisoned");
+        assert!(nvme_cache.is_poisoned(), "setup: nvme lock poisoned");
+
+        let mut sampler = fixture_sampler_with(
+            Path::new("/nonexistent/hwmon"),
+            Arc::clone(&fanctrl_source),
+            Arc::clone(&nvme_cache),
+        );
+        let s = sampler.sample_at(1.0);
+        assert_eq!(s.fanctrl_freshness, Freshness::Stale);
+        assert_eq!(
+            s.nvme_temp_c,
+            Some(44.0),
+            "the last-good value written before the panic is still readable"
+        );
     }
 }

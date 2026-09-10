@@ -1798,22 +1798,16 @@ fn a_dgpu_powered_and_hot_30_min_run_stays_in_temploop_with_no_ec_mismatch() {
         .expect("valid curve");
     ctl.on_command(Command::SetAuto(true));
 
-    // KNOWN PRODUCT DEFECT (fw-fanctrl-loop-a78, filed while writing this
-    // suite, out of this task's `filesTouched`): `watchdog::GPU_TRIP_C`
-    // (87C, hard emergency release + latch) sits BELOW
-    // `guards::GPU_HOT_C_DEFAULT` (90C, the soft ratchet-down guard this
-    // scenario is meant to exercise) -- guards.rs's own doc comment
-    // explains 90C was chosen specifically to sit ABOVE the card's
-    // documented normal 87C sustained-load parking point so normal
-    // gaming does NOT trip the soft guard, yet the hard watchdog trips at
-    // that exact "normal gaming" temperature. There is therefore no
-    // gpu_temp_c that reaches the GpuHot guard's own enter band without
-    // ThermalWatchdog releasing everything first (dropping AutoState and
-    // exiting TempLoop entirely) -- so this run uses 86C, just under the
-    // watchdog trip, to test what CAN be verified today: a warm,
-    // continuously-sensed dGPU (an unrelated sensor) must not itself
-    // dislodge TempLoop or trigger EC MISMATCH. It does not exercise
-    // GpuHot itself -- see fw-fanctrl-loop-a78.
+    // fw-fanctrl-loop-a78 (resolved 2026-09-09): the hard watchdog used to
+    // sit at 87C, BELOW the 90C soft guard, so no gpu_temp_c could reach
+    // GpuHot without ThermalWatchdog releasing everything first. Thresholds
+    // are now soft 88 / exit 86 / trip 91 (measured against the card's own
+    // park 87 / slowdown 89 / shutdown 92). This run deliberately scripts
+    // 86C -- warm, sensed, and BELOW the soft guard's enter -- so it still
+    // tests exactly what it always did: a warm, continuously-sensed dGPU
+    // (an unrelated sensor) must not itself dislodge TempLoop or trigger
+    // EC MISMATCH. The GpuHot episode itself is exercised by
+    // `a_5min_gpu_hot_episode_at_88c_raises_the_flag_with_no_post_episode_overshoot`.
     let trace = run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, 1800, |_t, _plant, script| {
         load_step_script(_t, _plant, script);
         script.gpu_temp_c = Some(86.0);
@@ -2301,26 +2295,23 @@ fn a_high_unreachable_target_pins_at_the_upper_bound_and_raises_target_unreachab
     assert_only_expected_runner_calls(&runner);
 }
 
-/// The brief's literal "5 min `GPU HOT` episode at the 90C threshold" run.
+/// The brief's literal "5 min `GPU HOT` episode at the soft-guard threshold"
+/// run, at the threshold's current default (88C).
 ///
-/// KNOWN PRODUCT DEFECT (fw-fanctrl-loop-a78) -- see
-/// `a_dgpu_powered_and_hot_30_min_run_stays_in_temploop_with_no_ec_mismatch`'s
-/// doc, right above, for the full finding: `watchdog::GPU_TRIP_C` (87C,
-/// hard emergency release) sits BELOW `guards::GPU_HOT_C_DEFAULT` (90C,
-/// the soft guard this run is meant to exercise), so there is no
-/// `gpu_temp_c` that reaches 90C without the hard watchdog releasing
-/// everything first. `#[ignore]`d (not deleted, not narrowed to a
-/// below-watchdog temperature like the sibling test above) so this stays
-/// the literal brief-shaped regression, ready to flip green the moment
-/// fw-fanctrl-loop-a78 lands.
+/// Was `#[ignore]`d under fw-fanctrl-loop-a78: `watchdog::GPU_TRIP_C` (then
+/// 87C) sat BELOW `guards::GPU_HOT_C_DEFAULT` (then 90C), so no `gpu_temp_c`
+/// reached the soft guard without the hard watchdog releasing everything
+/// first. Resolved 2026-09-09 by measurement against the card's own NVML
+/// T.Limit specs (park 87 / slowdown 89 / shutdown 92): soft 88 / exit 86 /
+/// trip 91, so a sustained 88C episode raises `GPU HOT`, ratchets the GPU
+/// share down, and stays comfortably clear of the watchdog.
 #[test]
-#[ignore = "known defect fw-fanctrl-loop-a78: GPU_TRIP_C (87C) fires before GPU_HOT_C_DEFAULT (90C) is ever reachable"]
-fn a_5min_gpu_hot_episode_at_90c_raises_the_flag_with_no_post_episode_overshoot() {
+fn a_5min_gpu_hot_episode_at_88c_raises_the_flag_with_no_post_episode_overshoot() {
     let fan_target_rpm = 1900.0;
     let config = Config { fan_target_rpm, ..Config::default() };
     let runner = FakeRunner::new();
     let (mut ctl, _state_path, _gpu) =
-        build_controller(&runner, "gpu-hot-90c", config.clone(), None, false);
+        build_controller(&runner, "gpu-hot-88c", config.clone(), None, false);
     let mut plant = ChainedPlant::new("quiet16", QUIET16_POINTS.to_vec(), MA_INTERVAL, AMBIENT_C, 1)
         .expect("valid curve");
     ctl.on_command(Command::SetAuto(true));
@@ -2329,24 +2320,24 @@ fn a_5min_gpu_hot_episode_at_90c_raises_the_flag_with_no_post_episode_overshoot(
     let trace = run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, SETTLE_TICKS as u64 + 900, |t, _plant, script| {
         load_step_script(t, _plant, script);
         script.gpu_util_pct = 20.0;
-        // A 5-minute episode at the 90C soft-guard threshold, once settled.
+        // A 5-minute episode at the 88C soft-guard threshold, once settled.
         if (SETTLE_TICKS as u64..SETTLE_TICKS as u64 + 300).contains(&t) {
-            script.gpu_temp_c = Some(90.0);
+            script.gpu_temp_c = Some(88.0);
             hot_window += 1;
         } else {
-            script.gpu_temp_c = Some(86.0); // sensed but below both thresholds otherwise
+            script.gpu_temp_c = Some(84.0); // sensed, below the 86C exit, so the guard clears
         }
     });
     assert_eq!(hot_window, 300, "test premise: the 90C episode must actually have been scripted");
 
     println!(
-        "[gpu-hot-90c] any GpuHot={} last flags={:?}",
+        "[gpu-hot-88c] any GpuHot={} last flags={:?}",
         trace.any_flag(StatusFlag::GpuHot),
         trace.last().flags
     );
     assert!(
         trace.any_flag(StatusFlag::GpuHot),
-        "a 5-minute 90C episode must raise GPU HOT"
+        "a 5-minute 88C episode must raise GPU HOT"
     );
 
     // Post-episode: no lingering overshoot above the +/-150 RPM band.
@@ -2359,10 +2350,10 @@ fn a_5min_gpu_hot_episode_at_90c_raises_the_flag_with_no_post_episode_overshoot(
         })
         .collect();
     let relay = detect_relay(&errors, 150.0);
-    println!("[gpu-hot-90c] post-episode relay: {relay:?}");
+    println!("[gpu-hot-88c] post-episode relay: {relay:?}");
     assert!(!relay.is_relay(), "no post-episode relay: {relay:?}");
     let residency = band_residency_pct(&errors, 150.0);
-    println!("[gpu-hot-90c] post-episode residency: {residency:.1}%");
+    println!("[gpu-hot-88c] post-episode residency: {residency:.1}%");
     assert!(
         residency >= 90.0,
         "no post-episode overshoot above 150 RPM: residency {residency:.1}%"

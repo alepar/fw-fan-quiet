@@ -51,16 +51,33 @@ controller's adaptation tier no longer exist.
 - Live curves (2026-09-07): `quiet16` = (0,15) (55,15) (65,21) (75,31) (82,37) (88,55) (95,100),
   `movingAverageInterval` 60; `cool16` = (0,20) (50,20) (60,30) (70,42) (85,100), interval 60.
   Verified truncation case on cool16: T_eff 51.8 → duty 21.
-- **Measured 2026-09-08 with the dGPU powered** (NVML: 18.9 W, P0, 38 °C): the cros_ec `gpu_amb`,
-  `gpu_vr` and `gpu_vram` sensors still read −150 and `gpu_temp@40` still returns ENODATA. They
-  are not merely "off while unpowered" — they never report on this machine, confirming the
-  research doc's original finding that the dGPU does not feed the EC fan curve. The replica's
-  rule is nonetheless "every positive reading joins the max", which matches fw-fanctrl's own
-  regex and costs nothing if a future firmware makes them live.
+- **CORRECTED 2026-09-09 — the dGPU DOES feed the EC fan curve, and dominates it under GPU
+  load.** An earlier entry here claimed `gpu_amb`/`gpu_vr`/`gpu_vram` "read −150" and
+  `gpu_temp@40` "returns ENODATA". Re-measured through `ectool temps all` (the path fw-fanctrl
+  itself reads) and `sensors`: all four report live values (idle: `gpu_amb` 44, `gpu_vr` 49,
+  `gpu_vram` 44, `gpu_temp@40` 42 °C — the last tracking NVML's die temperature within 1 °C). The
+  "−150" was almost certainly the EC's *unset-threshold* sentinel: `sensors` shows `gpu_amb` and
+  `gpu_vram` with `high/crit/emerg = −273.1 °C` (no thresholds configured) while their inputs are
+  normal; `gpu_vr` (high 70.8, crit 89.8, emerg 104.8) and `gpu_temp@40` (high 86.8, crit 96.8,
+  emerg 99.8) carry real thresholds. Under a 240 s ~100 W gpu-burn with fw-fanctrl on `quiet16`
+  (`docs/research/2026-09-09-gpu-burn-fanctrl-quiet16.csv`): a GPU sensor took the argmax **13 s**
+  into load and held it — `gpu_temp@40` first, then `gpu_vr` at steady state (mean 83.2, max 84,
+  ~1 °C above the die) — driving duty 18 → 38 % and fans 1478 → 3330 rpm (max 3461) while
+  `ambient` only crept 61 → 65 and `cpu@4c` fell 53 → 47. The same burn under the EC's native
+  curve (`…-ec-native.csv`) ran fans at 4002 rpm and held the die at 76 °C. `gpu_vr` also has a
+  long tail: 67–71 °C forty seconds after the die was back at 50–53. The replica's "every
+  positive reading joins the max" rule was therefore already correct in effect.
 - **Measured 2026-09-08, dGPU thermals (NVML):** `GPU Target Temperature Specification` is
-  **87 °C**, and the driver reports headroom against that same reference. The card deliberately
-  runs to 87 °C under sustained load, so any guard threshold below it fires during normal
-  gaming.
+  **87 °C**, and the driver reports headroom against that same reference. **Re-measured
+  2026-09-09 with the T.Limit specs read in full** (`nvidia-smi -q -d TEMPERATURE`): Max
+  Operating at T.Limit 0 = **87 °C**, Slowdown at −2 = **89 °C**, Shutdown at −5 = **92 °C** —
+  a 5 °C band between "normal" and "the card cuts power". **The card does not reach 87 with the
+  fans free:** under a 240 s ~100 W gpu-burn the die settled at 82.4 °C mean / 83 max (peak 85
+  during the ramp) on `quiet16` at ~3330 rpm, and at 76 °C at ~4000 rpm under the EC's native
+  curve (`docs/research/2026-09-09-gpu-burn-*.csv`). 87 is where it parks only when something
+  holds the fans below what its sensors ask for — which is exactly what this controller does for
+  a quiet RPM target. So a GPU reading at or above the park point in auto mode is a real
+  "our cap is the limiting factor" signal, not normal operation.
 - **Measured 2026-09-08 under load:** cros_ec max 74.85 °C (argmax `cpu@4c`) against the socket's
   `temperature: 75.0` — the round-to-integer max rule holds under load as well as at idle.
 - **Measured 2026-09-08, duty→RPM seed validated in place:** under `quiet16` at EC max 75 °C the
@@ -619,9 +636,17 @@ Both run every sample in any auto mode, ahead of the arbiter, with hysteresis
   `GPU Target Temperature Specification` 87 °C, plus Shutdown, Slowdown and Max-Operating limits
   expressed as offsets against a T.Limit reference (measured 2026-09-08: current temp 38 °C with
   49 °C of T.Limit headroom, Shutdown −5, Slowdown −2, Max Operating 0, so the reference is that
-  same 87 °C). 87 is where the card's own loop deliberately parks under sustained load, so a
+  same 87 °C). 87 is where the card's own loop parks when the fans are held down, so a
   threshold below it latches for entire sessions and ratchets the GPU to its floor — which is why
-  83/78 was wrong. 90/85 sits above the park point and below the slowdown region. Keying the
+  83/78 was wrong. **Revised 2026-09-09 (fw-fanctrl-loop-a78):** the absolute values of those
+  offsets are Slowdown **89** and Shutdown **92**, so the earlier 90/85 pair sat *above* the
+  slowdown point, not below it, and the hard watchdog's 87 sat *below* the soft guard — an
+  inversion that made `gpu_hot` unreachable and tripped an emergency release at the card's
+  park point. The defaults are now **soft 88 / exit 86 / hard trip 91**: 88 is one degree above
+  the park point (does not fire under ordinary sustained load — measured, the die settles at
+  82–83 on `quiet16` with fans free), the hysteresis is 2 °C rather than 5 because the band is
+  only 5 °C wide and `gpu_vr` has a 40 s+ thermal tail, and 91 sits above slowdown and below
+  shutdown so the watchdog fires only once the soft ratchet has demonstrably failed. Keying the
   guard on the published T.Limit margin instead of an absolute number is the more robust form and
   is left as a follow-on (§6).
 - **NVMe** (`nvme_hot_c`, default 80; new hwmon read of the `nvme` chip's `Composite`):
@@ -1001,14 +1026,17 @@ variant added later fails that module to compile until it is named. Result:
   here by clearing both fields too, and the regression test un-ignored.
   Bead closed.
 
-One gap surfaced by the sweep is **not** fixed inline — it is a genuine
-tuning/design tension, not a wiring miss, and stays a filed blocker:
-`fw-fanctrl-loop-a78` (GPU_TRIP_C, the hard-watchdog GPU emergency
-threshold, sits at 87 °C — the card's own documented normal sustained-load
-parking point — which is *below* `GPU_HOT_C_DEFAULT` (90 °C), so there is no
-GPU temperature at which the soft guard can ever ratchet the share down
-before the hard watchdog emergency-releases everything and demands a manual
-re-arm). Its regression test stays `#[ignore]`d pending that decision.
+One gap surfaced by the sweep was **not** fixed inline — it was a genuine
+tuning/design tension, not a wiring miss, and was filed as
+`fw-fanctrl-loop-a78`: GPU_TRIP_C, the hard-watchdog GPU emergency
+threshold, sat at 87 °C — *below* `GPU_HOT_C_DEFAULT` (90 °C) — so there was
+no GPU temperature at which the soft guard could ever ratchet the share down
+before the hard watchdog emergency-released everything and demanded a manual
+re-arm. **Resolved 2026-09-09 by measurement** (§Facts, §2.8): soft 88 /
+exit 86 / hard trip 91 against the card's measured park 87 / slowdown 89 /
+shutdown 92, and the regression test
+(`a_5min_gpu_hot_episode_at_88c_raises_the_flag_with_no_post_episode_overshoot`)
+is un-ignored.
 
 Every `Effect`/`CalibContext`/telemetry-field claim in `wiring_sweep`'s
 comments was verified against the source while writing this sweep (file/

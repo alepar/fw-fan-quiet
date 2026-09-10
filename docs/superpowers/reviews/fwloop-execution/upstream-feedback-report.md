@@ -1,5 +1,7 @@
 # fw-fanctrl-loop-6ma: a false `alreadyMerged` closed the epic's headline bead with zero work done, and a missing `schema:` zeroed the entire Metrics block — neither catchable by the dryRun harness
 
+Filed: https://github.com/alepar/superpowers/issues/7 (2026-09-09, label `upstream-feedback`, unscrubbed)
+
 Plugin: `superpowers-alepar/superpowers` 6.3.0-alepar3.8 (`skills/super-code`). Run: 25 beads, 3 coordinator invocations (1 productive round each), ~351 agents, ~24.5M subagent tokens, ~11 h wall, `stopReason: root-closed`, 2026-09-09. Tracker `bd` 1.2.2. Project is a Rust binary checked out as nested git worktrees.
 
 Adaptation check: the executed script differs from the canonical skeleton by 91 lines in 10 hunks — two module constants (`SDD_DIR`/`SC_DIR`), one added `schema:`, and prompt text. No control flow, scheduler, phase, or schema logic differs. Every defect below is verified present in the canonical skeleton.

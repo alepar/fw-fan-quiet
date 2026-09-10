@@ -4512,12 +4512,12 @@ mod tests {
         let mut ctl = controller(&runner, path);
         ctl.on_command(Command::SetCpuW(20.0));
 
-        // GPU at its 87 °C threshold, CPU valid and cool: the OR trips.
+        // GPU at its trip threshold (91 °C), CPU valid and cool: the OR trips.
         let gpu_hot_at = |t: f64| Sample {
             t_mono: t,
             cpu_temp_c: 60.0,
             cpu_temp_valid: true,
-            gpu_temp_c: 87.0,
+            gpu_temp_c: crate::control::watchdog::GPU_TRIP_C,
             gpu_temp_valid: true,
             ..Sample::default()
         };
@@ -6316,20 +6316,15 @@ mod tests {
                 gpu_w: (last_gpu - 0.1).max(0.0),
                 gpu_w_valid: true,
                 gpu_temp_valid: true,
-                // The dGPU guard's own enter threshold (GPU_HOT_C_DEFAULT,
-                // 90 C) sits ABOVE `ThermalWatchdog`'s separate GPU_TRIP_C
-                // (87 C, TRIP_STREAK=3 consecutive samples): a temperature
-                // that latches the guard hot would also, within 3 samples,
-                // trip the unrelated thermal emergency and release
-                // everything -- collapsing this test's premise before the
-                // ratchet gets anywhere. So: one sample AT the guard's
-                // enter threshold (90) to latch it, then hold at 86 C --
-                // inside the guard's OWN hysteresis band (exit is
-                // enter-5=85, so 86 keeps it latched hot per
-                // `gpu_hysteresis_enters_at_threshold_and_exits_five_below`)
-                // but below the watchdog's 87 C trip, so its hot_streak
-                // keeps resetting to 0 every tick instead of accumulating.
-                gpu_temp_c: if i == 100 { 90.0 } else { 86.0 },
+                // One sample AT the dGPU guard's enter threshold
+                // (GPU_HOT_C_DEFAULT, 88 C) to latch it hot, then hold at
+                // 87 C -- inside the guard's own 2 C hysteresis band (exit
+                // is 86, so 87 keeps it latched per
+                // `gpu_hysteresis_enters_at_threshold_and_exits_two_below`)
+                // and well below `ThermalWatchdog`'s GPU_TRIP_C (91 C), so
+                // the unrelated thermal emergency never enters the picture
+                // and the ratchet is what this run measures.
+                gpu_temp_c: if i == 100 { 88.0 } else { 87.0 },
                 cpu_temp_valid: true,
                 cpu_temp_c: 60.0,
                 ..busy_at(t)

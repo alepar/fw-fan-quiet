@@ -270,7 +270,7 @@ mod tests {
             fast_limit_mw: 60_000,
             cpu_max_w: 50.0,
             gpu_max_w: 90.0,
-            gpu_hot_c: 88.0,
+            gpu_hot_c: 86.0,
             nvme_hot_c: 78.0,
             leds: LedConfig {
                 enabled: false,
@@ -422,10 +422,10 @@ mod tests {
         let dir = fixture_dir("guard-thresholds");
         let path = dir.join("config.toml");
         let defaults = Config::default();
-        assert_eq!(defaults.gpu_hot_c, 90.0);
+        assert_eq!(defaults.gpu_hot_c, 88.0);
         assert_eq!(defaults.nvme_hot_c, 80.0);
         let config = Config {
-            gpu_hot_c: 88.0,
+            gpu_hot_c: 86.0,
             nvme_hot_c: 77.0,
             ..Config::default()
         };

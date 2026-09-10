@@ -612,7 +612,21 @@ mod tests {
         let mut first = happy_input(v, ec);
         first.view_changed = true;
         let d = a.decide(&first);
-        assert!(d.reasons.contains(&"unreconciled".to_string()) || d.mode != LoopMode::TempLoop);
+        // A scorable `view_changed` tick IS the reconciliation event (§2.6:
+        // `decide` sets `reconciled = true` on a fresh, fair view), so this
+        // first tick must NOT report `unreconciled` — it just reconciled.
+        // The helper used to assert the opposite, guarded by
+        // `|| d.mode != LoopMode::TempLoop`, which is unfailable after one
+        // tick (TempLoop needs ENTRY_HYSTERESIS_TICKS consecutive ticks) and
+        // so hid that the stated premise was backwards for the whole epic.
+        // Mutation-checkable: skip the `reconciled = true` write and this
+        // fails.
+        assert!(
+            !d.reasons.contains(&"unreconciled".to_string()),
+            "a scorable view_changed first tick reconciles, so `unreconciled` must be absent; got {:?} (mode {:?})",
+            d.reasons,
+            d.mode
+        );
         for _ in 0..ENTRY_HYSTERESIS_TICKS {
             a.decide(&happy_input(v, ec));
         }

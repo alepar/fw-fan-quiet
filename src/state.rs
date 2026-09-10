@@ -179,11 +179,9 @@ mod tests {
     fn missing_file_gives_default() {
         let dir = fixture_dir("missing");
         let state = PersistedState::load(&dir.join("nope.json"));
+        // The whole-struct equality is the assertion; per-field checks after
+        // it cannot fail independently of it, so none are repeated here.
         assert_eq!(state, PersistedState::default());
-        assert!(state.lut.is_none());
-        assert_eq!(state.duty_rpm_table, DutyRpmTable::default());
-        assert!(state.warm_start.is_empty());
-        assert_eq!(state.loop_gains, None);
         fs::remove_dir_all(&dir).unwrap();
     }
 

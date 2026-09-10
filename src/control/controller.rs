@@ -5693,8 +5693,13 @@ mod tests {
         // Same shape as the strategy-change case above, but the LAST tick
         // flips `on_ac` (false -> true) instead of strategy. `WarmStart::
         // key` includes `on_ac`, so an AC-unplug/replug tick must re-key
-        // exactly like a strategy change: no reseed, the tick's delta is
-        // the ordinary PI increment.
+        // exactly like a strategy change: no reseed. A reseed would land
+        // `u` on the planted 999.0 and break the equality below — that is
+        // the falsifiable claim. What this run does NOT show is a nonzero
+        // "ordinary PI increment" on the re-key tick: `rpm_view_sample`
+        // feeds zero draw, so both sides sit under `Freeze::DemandLimited`
+        // and the tick's `du` is masked to 0 on each — asserted as a stated
+        // premise rather than left implied (ledger: task 20 deferred minor).
         let base_runner = FakeRunner::new();
         let (mut base, _g1) = auto_controller_no_profile(&base_runner);
         base.on_command(Command::SetAuto(true));
@@ -5719,8 +5724,17 @@ mod tests {
 
         let t = 3.0 * ALLOC_PERIOD_S;
         base.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
-        rekey.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, true));
+        let rekey_effects = rekey.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, true));
 
+        assert!(
+            rekey_effects.iter().any(|e| matches!(
+                e,
+                Effect::AutoAllocated { freeze: Some("demand_limited"), .. }
+            )),
+            "premise: the re-key tick runs under Freeze::DemandLimited (zero draw), so its du is \
+             masked to 0 — the equality below proves no reseed, not a nonzero PI increment: \
+             {rekey_effects:?}"
+        );
         assert_eq!(
             base.status().budget_w,
             rekey.status().budget_w,
@@ -5769,8 +5783,17 @@ mod tests {
 
         let t = 3.0 * ALLOC_PERIOD_S;
         base.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
-        rekey.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
+        let rekey_effects = rekey.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
 
+        assert!(
+            rekey_effects.iter().any(|e| matches!(
+                e,
+                Effect::AutoAllocated { freeze: Some("demand_limited"), .. }
+            )),
+            "premise: the re-key tick runs under Freeze::DemandLimited (zero draw), so its du is \
+             masked to 0 — the equality below proves no reseed, not a nonzero PI increment: \
+             {rekey_effects:?}"
+        );
         assert_eq!(
             base.status().budget_w,
             rekey.status().budget_w,

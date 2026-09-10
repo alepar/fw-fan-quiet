@@ -732,6 +732,52 @@ mod tests {
         assert!(!all.iter().any(|e| matches!(e, RunnerEffect::Fitted { .. })));
     }
 
+    /// The `MIN_STEP_DELTA_W` gate is `delta_w < MIN_STEP_DELTA_W`, so the
+    /// boundary itself is *loaded*: exactly 1.0 W must not be rejected as
+    /// "never rose", and anything under it must. The unloaded test above
+    /// drives a zero delta, well clear of the threshold; this pins the
+    /// comparison's direction and inclusivity (ledger: task 18 self-reported
+    /// the boundary as unmeasured).
+    ///
+    /// The delta `conclude_step` measures is the step-phase DRAW minus the
+    /// settle baseline (`settle_sample`: 10 W CPU + 5 W GPU) — NOT
+    /// `step_sample`'s fourth argument, which only shapes the EC/RPM
+    /// response. So the boundary is scripted through `cpu_w`: 11.0 is a
+    /// delta of exactly 1.0 (exact in f64), 11.0 − 1e-3 is just under.
+    #[test]
+    fn min_step_delta_boundary_is_inclusive() {
+        let never_rose = |effects: &[RunnerEffect]| {
+            effects
+                .iter()
+                .any(|e| matches!(e, RunnerEffect::Noted(reason) if reason.contains("never rose")))
+        };
+
+        let mut at = StepTest::new();
+        at.enter((10.0, 130.0));
+        let ctx = happy_ctx();
+        for _ in 0..EC_FLAT_WINDOW_S {
+            at.on_sample(&settle_sample(), &ctx);
+        }
+        let at_boundary = drive_step(&mut at, 10.0 + MIN_STEP_DELTA_W, 5.0, 24.0);
+        assert!(
+            !never_rose(&at_boundary),
+            "a delta of exactly MIN_STEP_DELTA_W ({MIN_STEP_DELTA_W} W) is loaded and must not be \
+             rejected as 'never rose': {at_boundary:?}"
+        );
+
+        let mut under = StepTest::new();
+        under.enter((10.0, 130.0));
+        for _ in 0..EC_FLAT_WINDOW_S {
+            under.on_sample(&settle_sample(), &ctx);
+        }
+        let just_under = drive_step(&mut under, 10.0 + MIN_STEP_DELTA_W - 1e-3, 5.0, 24.0);
+        assert!(
+            never_rose(&just_under),
+            "a delta just under MIN_STEP_DELTA_W must be rejected as 'never rose': {just_under:?}"
+        );
+        assert!(!just_under.iter().any(|e| matches!(e, RunnerEffect::Fitted { .. })));
+    }
+
     #[test]
     fn ec_over_95c_aborts_mid_step_and_restores_the_floor() {
         let mut step = StepTest::new();

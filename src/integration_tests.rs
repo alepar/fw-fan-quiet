@@ -542,8 +542,12 @@ mod wiring_sweep {
                     "ui/view.rs: \"READBACK BLIND\", info",
                 ),
             };
-            assert!(!raised_where.is_empty());
-            assert!(!rendered_where.is_empty());
+            // The exhaustive `match` above IS the verification: a new
+            // `StatusFlag` variant fails the build until its raise/render
+            // sites are named. These two strings are documentation, not
+            // evidence — `!literal.is_empty()` cannot fail — so they are
+            // bound here rather than asserted on (ledger: task 24 minor).
+            let _ = (raised_where, rendered_where);
         }
     }
 
@@ -614,21 +618,18 @@ mod wiring_sweep {
                 budget_w,      // status.budget_w (always carried, never Option)
                 freeze,        // Effect::AutoAllocated.freeze
             } => {
-                assert_eq!(t_mono, 1.0);
-                assert_eq!(mode, "auto");
-                assert_eq!(cpu_limit_w, Some(20.0));
-                assert_eq!(gpu_max_mhz, Some(2000));
-                assert_eq!(fan_target_rpm, 2600.0);
-                assert_eq!(cause, "auto:allocate");
-                assert_eq!(flags, vec!["steep_curve".to_string()]);
-                assert_eq!(demand_cpu, Some(10.0));
-                assert_eq!(demand_gpu, Some(5.0));
-                assert_eq!(alloc_cpu_w, Some(9.0));
-                assert_eq!(alloc_gpu_w, Some(4.0));
-                assert_eq!(pi_target_w, Some(4.0));
-                assert_eq!(t_star, Some(60.0));
-                assert_eq!(budget_w, 30.0);
-                assert_eq!(freeze, Some("Calibrating".to_string()));
+                // Unlike the `Record::sample` half above (a production
+                // builder whose outputs are genuinely checked), this record
+                // is a hand-built literal: asserting each field equal to the
+                // value it was just constructed from cannot fail. The
+                // exhaustive pattern (no `..`) is the verification — a new
+                // `Decision` field fails the build until it is named here
+                // with its source. Bound, not asserted (ledger: task 24).
+                let _ = (
+                    t_mono, mode, cpu_limit_w, gpu_max_mhz, fan_target_rpm, cause, flags,
+                    demand_cpu, demand_gpu, alloc_cpu_w, alloc_gpu_w, pi_target_w, t_star,
+                    budget_w, freeze,
+                );
             }
             Record::Flag { .. } | Record::Sample { .. } => {
                 panic!("must stay a Record::Decision line")
@@ -664,7 +665,12 @@ mod wiring_sweep {
             Effect::Flagged { flag: "gpu_hot", active: true },
             Effect::Quit,
         ];
-        assert_eq!(effects.len(), 9, "keep this list in lockstep with Effect's variant count");
+        // No count assertion: a hand-typed length compared to a hand-typed
+        // list cannot catch a variant the same author forgot in both. The
+        // exhaustive `match` below (no wildcard) is the verification — a
+        // new `Effect` variant fails the build until its apply site is
+        // named, and a removed one leaves an unreachable arm that also
+        // fails to compile (ledger: task 24 minor).
         for effect in &effects {
             match effect {
                 Effect::CpuSet(_) => {}     // already committed to hardware inside on_sample/on_command
@@ -693,12 +699,16 @@ mod wiring_sweep {
             argmax_controllable: true, // s.ec.as_ref().is_some_and(|e| e.argmax.is_controllable())
             budget_bounds: (15.0, 54.0), // self.calib_bounds() (config floors/maxes + the LUT's gpu_floor_w)
         };
+        // The exhaustive destructure is the verification: a `CalibContext`
+        // field added without a named source here fails the build. The
+        // values are a hand-built literal, so asserting them equal to
+        // themselves cannot fail — bound, not asserted (ledger: task 24).
+        // The runtime claim that each field comes from live data is
+        // covered by `calib_context_real_wiring_lets_the_step_test_actually_settle`
+        // in control::controller's test module, which drives the real
+        // `build_calib_context`.
         let CalibContext { ec_ma, ec_mismatch, fanctrl_active, argmax_controllable, budget_bounds } = ctx;
-        assert_eq!(ec_ma, Some(50.0));
-        assert!(!ec_mismatch);
-        assert!(fanctrl_active);
-        assert!(argmax_controllable);
-        assert_eq!(budget_bounds, (15.0, 54.0));
+        let _ = (ec_ma, ec_mismatch, fanctrl_active, argmax_controllable, budget_bounds);
     }
 }
 

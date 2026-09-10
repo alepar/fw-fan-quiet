@@ -28,7 +28,15 @@ mod tests {
     #[test]
     fn resolves_an_existing_fixture_to_an_absolute_path() {
         let p = path("fanctrl/print_all_quiet16.json");
-        assert!(p.is_absolute(), "{} is not absolute", p.display());
+        // `is_absolute()` cannot fail here — `path()` always joins onto the
+        // Cargo-guaranteed-absolute CARGO_MANIFEST_DIR — so assert the part
+        // a bad join WOULD break: the requested relative fixture is the
+        // resolved path's tail, component for component.
+        assert!(
+            p.ends_with("tests/fixtures/fanctrl/print_all_quiet16.json"),
+            "{} does not end with the requested fixture path",
+            p.display()
+        );
         assert!(p.is_file(), "{} does not exist", p.display());
     }
 

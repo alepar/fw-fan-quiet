@@ -16,6 +16,7 @@ mod ring;
 mod selftest;
 mod sensors;
 mod state;
+mod sync_util;
 mod telemetry;
 #[cfg(test)]
 mod test_support;
@@ -42,7 +43,7 @@ use event::Event;
 use fanctrl::client::{FanctrlSource, UnixFanctrlClient};
 use model::Model;
 use sensors::hwmon::Hwmon;
-use sensors::poller::{FanctrlPoller, SharedFanctrl, SharedNvme, spawn_nvme_poller};
+use sensors::poller::{self, FanctrlPoller, SharedFanctrl, SharedNvme, spawn_nvme_poller};
 use sensors::sampler::Sampler;
 use telemetry::{Record, Telemetry};
 use ui::view::view;
@@ -196,15 +197,20 @@ fn main() -> Result<()> {
         led_sample_rx,
     );
     // fw-fanctrl socket poller + NVMe poller (design doc §3.4 / Task 14):
-    // each gets its own thread, sharing an `Arc<Mutex<_>>` the sampler tick
-    // only ever reads through -- see `sensors::poller`'s module doc for why
-    // neither lives on the sampler tick itself. Construction only, here:
-    // the cadence/merge logic is `sensors::poller`'s and `Sampler`'s.
-    let fanctrl_source: SharedFanctrl = Arc::new(Mutex::new(Box::new(UnixFanctrlClient::new(
-        config.fanctrl_socket.clone(),
-    ))
-        as Box<dyn FanctrlSource + Send>));
-    let fanctrl_poller = FanctrlPoller::new(Arc::clone(&fanctrl_source), Instant::now());
+    // each gets its own thread and owns its own source outright, publishing
+    // into a small `Arc<Mutex<_>>` the sampler tick only ever reads -- see
+    // `sensors::poller`'s module doc for why neither lives on the sampler
+    // tick itself, and why the socket client is not what is shared.
+    // Construction only, here: the cadence/merge logic is
+    // `sensors::poller`'s and `Sampler`'s.
+    let fanctrl_snapshot: SharedFanctrl = poller::shared_fanctrl();
+    let fanctrl_client = Box::new(UnixFanctrlClient::new(config.fanctrl_socket.clone()))
+        as Box<dyn FanctrlSource + Send>;
+    let fanctrl_poller = FanctrlPoller::new(
+        fanctrl_client,
+        Arc::clone(&fanctrl_snapshot),
+        Instant::now(),
+    );
     let fanctrl_poller_thread = fanctrl_poller.spawn(Arc::clone(&shutdown));
 
     let nvme_hwmon = Hwmon::discover(Path::new("/sys/class/hwmon"));
@@ -220,7 +226,7 @@ fn main() -> Result<()> {
         sampler_txs.push(led_sample_tx);
     }
     let sampler =
-        Sampler::new_system(fanctrl_source, nvme_cache).spawn(sampler_txs, Arc::clone(&shutdown));
+        Sampler::new_system(fanctrl_snapshot, nvme_cache).spawn(sampler_txs, Arc::clone(&shutdown));
     let ctl = controller::spawn(
         Controller::new(guard, persisted, args.state_file, config, args.config),
         ctl_sample_rx,

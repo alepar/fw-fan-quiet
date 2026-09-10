@@ -289,12 +289,13 @@ impl Telemetry {
 /// the controller thread (decisions): if the other thread panicked while
 /// holding the lock, keep logging instead of cascading the panic. Callers
 /// keep lock scopes one-call tiny.
+///
+/// Delegates to [`crate::sync_util::lock`], the single copy of this rule --
+/// the sensor path adopted it in roast PR-1 finding 3.
 pub fn lock(
     shared: &std::sync::Mutex<Option<Telemetry>>,
 ) -> std::sync::MutexGuard<'_, Option<Telemetry>> {
-    shared
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    crate::sync_util::lock(shared)
 }
 
 /// Opens under `preferred_dir`, falling back to `fallback_dir` if that fails

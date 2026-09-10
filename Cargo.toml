@@ -12,7 +12,6 @@ crossterm = "0.29"
 crossbeam-channel = "0.5"
 nvml-wrapper = "0.12"
 pid = "2"
-nalgebra = "0.33"
 serde = { version = "1", features = ["derive"] }
 # float_roundtrip: lossless f64 persistence (thermal model params in state.json)
 serde_json = { version = "1", features = ["float_roundtrip"] }

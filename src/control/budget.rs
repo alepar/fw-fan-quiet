@@ -416,6 +416,19 @@ impl Budget {
     /// Resets to zero the moment it is off that bound (including while at
     /// the upper bound, or while frozen — dwell only accrues on ticks that
     /// actually ran the clamp).
+    /// The freeze reason passed to the most recent [`step`](Self::step)
+    /// (`None` after an unfrozen step, or before the first). Exposed so a
+    /// caller's wiring can be asserted directly — "was this integrator
+    /// actually stepped under `Freeze::Calibrating`?" — rather than inferred
+    /// from `u` not moving, which a zero error also produces. Test-only:
+    /// production code never needs to ask, and gating it keeps it out of
+    /// the release binary rather than papering over it with
+    /// `#[allow(dead_code)]`.
+    #[cfg(test)]
+    pub fn last_freeze(&self) -> Option<Freeze> {
+        self.last_freeze
+    }
+
     pub fn at_lower_bound_for(&self) -> Duration {
         self.lower_bound_dwell
     }

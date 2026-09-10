@@ -185,13 +185,12 @@ fn loop_status_segment(model: &Model) -> String {
 /// keeping their established relative order within a tier and the six new
 /// Task 15 flags slotted in by the severities design §3.5 states for them
 /// (`CURVE INVALID`'s is stated by the acceptance criteria directly:
-/// warning, outranking the `STEEP CURVE` info flag). This intentionally
-/// diverges from `controller::flag_severity` on `NvmeHot`: that function
-/// (Task 4's type-classification surface, `#[allow(dead_code)]` and wired
-/// into no rendering) files it Info, but design §3.5's header text is
-/// explicit that `NVME HOT` renders as a warning alongside `GPU HOT` — the
-/// spec wins per Global Constraints, and `flag_severity` is unchanged
-/// since it isn't this task's file.
+/// warning, outranking the `STEEP CURVE` info flag). Agrees with
+/// `controller::flag_severity` on every flag, `NvmeHot` included: design
+/// §3.5's header text is explicit that `NVME HOT` renders as a warning
+/// alongside `GPU HOT`. (For one epic the two diverged — this file carried
+/// the warning while `flag_severity` still said Info, because the flag's
+/// task could not touch `controller.rs`; reconciled after the epic landed.)
 fn render_priority(flag: StatusFlag) -> u8 {
     match flag {
         // Critical

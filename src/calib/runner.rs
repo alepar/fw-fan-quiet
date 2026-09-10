@@ -504,8 +504,6 @@ mod tests {
     fn burner_starts_before_the_settle_hold_and_stops_after_the_step() {
         let mut runner = CalibRunner::new();
         drive_sweep(&mut runner);
-        let entry_effects_idx = 0; // enter() effects are appended right after Finished
-        let _ = entry_effects_idx;
 
         // Re-derive entry effects directly: the last sweep sample's return
         // already carries StartBurner (from step.enter()), asserted above

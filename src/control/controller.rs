@@ -297,7 +297,11 @@ pub fn flag_severity(flag: StatusFlag) -> Severity {
         StatusFlag::NotCalibrated => Severity::Warning,
         StatusFlag::ReadbackBlind => Severity::Info,
         StatusFlag::SteepCurve => Severity::Info,
-        StatusFlag::NvmeHot => Severity::Info,
+        // Design §3.5: `NVME HOT` renders as a warning alongside `GPU HOT`.
+        // Was Info until the epic's deletion sweep — the flag's own task
+        // could not touch this file, so `ui/view.rs` carried the correct
+        // severity alone (its doc used to record the divergence).
+        StatusFlag::NvmeHot => Severity::Warning,
         StatusFlag::Resumed => Severity::Info,
     }
 }
@@ -5813,6 +5817,13 @@ mod tests {
         // `u` exactly through the LUT sweep — no `SetBudget` fires until the
         // step test's hand-off, so `status.budget_w` (only ever written by
         // `apply_calib_set_budget`) never moves off its default.
+        //
+        // The `budget_w == 0.0` checks below are the premise, not the proof:
+        // `on_calib_sample` steps the scratch integrator with a ZERO error,
+        // so `u` would sit still even with the freeze deleted. The
+        // load-bearing assertion is the `last_freeze()` check at the end —
+        // remove `Some(BudgetFreeze::Calibrating)` from that step call and
+        // it fails (ledger: task 20 deferred minor, run-3 review MUST-FIX 2).
         let runner = FakeRunner::new();
         let (dir, path) = profile_fixture("calib-freeze-sweep");
         let mut ctl = controller(&runner, path);
@@ -5837,6 +5848,16 @@ mod tests {
             ctl.status().budget_w,
             0.0,
             "u must be unchanged across the LUT sweep"
+        );
+        // The falsifiable part: the scratch integrator was really stepped
+        // under the whole-session freeze on the most recent sweep sample.
+        assert_eq!(
+            ctl.calib_budget
+                .as_ref()
+                .expect("calib_budget is Some for the whole calibration session")
+                .last_freeze(),
+            Some(BudgetFreeze::Calibrating),
+            "every calibration sample must step the scratch integrator under Freeze::Calibrating"
         );
         ctl.on_command(Command::AbortCalibration);
         fs::remove_dir_all(&dir).unwrap();

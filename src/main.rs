@@ -6,6 +6,9 @@ mod calib;
 mod config;
 mod control;
 mod event;
+mod fanctrl;
+#[cfg(test)]
+mod integration_tests;
 mod led;
 mod logging;
 mod model;
@@ -14,13 +17,15 @@ mod selftest;
 mod sensors;
 mod state;
 mod telemetry;
+#[cfg(test)]
+mod test_support;
 mod types;
 mod ui;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
@@ -34,7 +39,10 @@ use actuators::smu_module::SmuModule;
 use control::Command;
 use control::controller::{self, Controller};
 use event::Event;
+use fanctrl::client::{FanctrlSource, UnixFanctrlClient};
 use model::Model;
+use sensors::hwmon::Hwmon;
+use sensors::poller::{FanctrlPoller, SharedFanctrl, SharedNvme, spawn_nvme_poller};
 use sensors::sampler::Sampler;
 use telemetry::{Record, Telemetry};
 use ui::view::view;
@@ -187,11 +195,32 @@ fn main() -> Result<()> {
         config.gpu_max_w,
         led_sample_rx,
     );
+    // fw-fanctrl socket poller + NVMe poller (design doc §3.4 / Task 14):
+    // each gets its own thread, sharing an `Arc<Mutex<_>>` the sampler tick
+    // only ever reads through -- see `sensors::poller`'s module doc for why
+    // neither lives on the sampler tick itself. Construction only, here:
+    // the cadence/merge logic is `sensors::poller`'s and `Sampler`'s.
+    let fanctrl_source: SharedFanctrl = Arc::new(Mutex::new(Box::new(UnixFanctrlClient::new(
+        config.fanctrl_socket.clone(),
+    ))
+        as Box<dyn FanctrlSource + Send>));
+    let fanctrl_poller = FanctrlPoller::new(Arc::clone(&fanctrl_source), Instant::now());
+    let fanctrl_poller_thread = fanctrl_poller.spawn(Arc::clone(&shutdown));
+
+    let nvme_hwmon = Hwmon::discover(Path::new("/sys/class/hwmon"));
+    let nvme_cache: SharedNvme = Arc::new(Mutex::new(None));
+    let nvme_poller_thread = spawn_nvme_poller(
+        move || nvme_hwmon.nvme_composite_c(),
+        Arc::clone(&nvme_cache),
+        Arc::clone(&shutdown),
+    );
+
     let mut sampler_txs = vec![ui_tx.clone(), ctl_sample_tx];
     if led.is_some() {
         sampler_txs.push(led_sample_tx);
     }
-    let sampler = Sampler::new_system().spawn(sampler_txs, Arc::clone(&shutdown));
+    let sampler =
+        Sampler::new_system(fanctrl_source, nvme_cache).spawn(sampler_txs, Arc::clone(&shutdown));
     let ctl = controller::spawn(
         Controller::new(guard, persisted, args.state_file, config, args.config),
         ctl_sample_rx,
@@ -264,6 +293,15 @@ fn main() -> Result<()> {
     if sampler.join().is_err() {
         tracing::error!("sampler thread panicked");
     }
+    // The fanctrl/NVMe poller threads: `shutdown` is already set above, so
+    // both are already exiting (or exited) by the time we get here; this is
+    // just reaping them, same as the sampler join above.
+    if fanctrl_poller_thread.join().is_err() {
+        tracing::error!("fanctrl poller thread panicked");
+    }
+    if nvme_poller_thread.join().is_err() {
+        tracing::error!("nvme poller thread panicked");
+    }
     // After the sampler: it held the only live led_sample sender, so its exit
     // disconnects the LED channel, letting that thread blank the panels and
     // return. A no-op when the feature was inert (`led` is None).
@@ -279,17 +317,68 @@ fn main() -> Result<()> {
     result
 }
 
+/// How long shutdown waits for the controller to finish restoring hardware
+/// before giving up on it and continuing (terminal restore in particular).
+/// Generous: the restore itself is ~400 ms, and every external command it
+/// runs is independently bounded by `actuators::cmd::RUN_TIMEOUT` (5 s), so
+/// this only bites when the controller thread is wedged somewhere with no
+/// timeout of its own.
+const CONTROLLER_JOIN_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Outcome of [`join_with_timeout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinOutcome {
+    Joined,
+    Panicked,
+    TimedOut,
+}
+
+/// `JoinHandle::join` with a deadline. `join` itself cannot be interrupted,
+/// so the handle is moved into a helper thread that reports back over a
+/// channel; on timeout the helper is simply left running (it owns nothing
+/// but the handle and exits when the thread it is waiting on does).
+fn join_with_timeout(handle: std::thread::JoinHandle<()>, timeout: Duration) -> JoinOutcome {
+    let (done_tx, done_rx) = unbounded();
+    // A spawn failure here must not itself be fatal: fall back to reporting
+    // a timeout, which is the same "carry on with shutdown" behaviour.
+    if std::thread::Builder::new()
+        .name("join-waiter".to_string())
+        .spawn(move || {
+            let _ = done_tx.send(handle.join().is_ok());
+        })
+        .is_err()
+    {
+        return JoinOutcome::TimedOut;
+    }
+    match done_rx.recv_timeout(timeout) {
+        Ok(true) => JoinOutcome::Joined,
+        Ok(false) => JoinOutcome::Panicked,
+        Err(_) => JoinOutcome::TimedOut,
+    }
+}
+
 /// Restore hardware first: tell the controller to Quit and JOIN it, so stock
 /// state is guaranteed back before any later teardown step (terminal I/O in
 /// particular) gets a chance to block. A send failure means the controller
 /// already exited (it restores on channel disconnect too); the join still
 /// reaps it either way.
+///
+/// The join is BOUNDED ([`CONTROLLER_JOIN_TIMEOUT`]): hardware restore comes
+/// first, but it may not come *forever*, or a wedged controller thread would
+/// leave the terminal in raw mode with no cursor for as long as the process
+/// lives. On expiry we log and continue; `FinalRestore`'s `Drop` and the
+/// controller's own disconnect path are still there to restore the hardware.
 fn quit_and_join_controller(cmd_tx: Sender<Command>, ctl: std::thread::JoinHandle<()>) {
     if cmd_tx.send(Command::Quit).is_err() {
         tracing::warn!("controller already gone at shutdown");
     }
-    if ctl.join().is_err() {
-        tracing::error!("controller thread panicked");
+    match join_with_timeout(ctl, CONTROLLER_JOIN_TIMEOUT) {
+        JoinOutcome::Joined => {}
+        JoinOutcome::Panicked => tracing::error!("controller thread panicked"),
+        JoinOutcome::TimedOut => tracing::error!(
+            "controller thread did not finish restoring within {CONTROLLER_JOIN_TIMEOUT:?}; \
+             continuing shutdown so the terminal is restored"
+        ),
     }
 }
 
@@ -321,7 +410,11 @@ fn run(
                 'events: while let Some(ev) = next {
                     if let Event::Sample(s) = &ev {
                         if let Some(t) = telemetry::lock(telemetry).as_mut() {
-                            t.log(&Record::Sample(s));
+                            // `ec_ma` (design §3.5) is the controller's own
+                            // live EC boxcar average, not part of `Sample`
+                            // (Task 15) -- the model's echoed status is the
+                            // freshest copy this loop has of it.
+                            t.log(&Record::sample(s, model.status.ec_ma_c));
                         }
                     }
                     for c in model.update(ev) {
@@ -411,5 +504,49 @@ mod tests {
             Args::try_parse_from(["bazerame-fans", "--log-dir", "/tmp/x", "selftest"]).unwrap();
         assert!(matches!(args.command, Some(Commands::Selftest)));
         assert_eq!(args.log_dir, PathBuf::from("/tmp/x"));
+    }
+
+    // --- finding 4: shutdown may never hang on the controller join --------
+
+    #[test]
+    fn join_with_timeout_reports_a_clean_join() {
+        let h = std::thread::spawn(|| {});
+        assert_eq!(
+            join_with_timeout(h, Duration::from_secs(5)),
+            JoinOutcome::Joined
+        );
+    }
+
+    #[test]
+    fn join_with_timeout_reports_a_panicking_thread() {
+        let h = std::thread::spawn(|| panic!("controller blew up"));
+        assert_eq!(
+            join_with_timeout(h, Duration::from_secs(5)),
+            JoinOutcome::Panicked
+        );
+    }
+
+    /// The pin: a controller thread wedged in an untimed hardware call must
+    /// NOT keep the terminal in raw mode forever. Before the bound, this
+    /// blocked for the full lifetime of the stuck thread.
+    #[test]
+    fn join_with_timeout_gives_up_on_a_wedged_thread() {
+        let release = Arc::new(AtomicBool::new(false));
+        let held = Arc::clone(&release);
+        let h = std::thread::spawn(move || {
+            while !held.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let started = Instant::now();
+        let outcome = join_with_timeout(h, Duration::from_millis(150));
+        let elapsed = started.elapsed();
+        release.store(true, Ordering::Relaxed);
+
+        assert_eq!(outcome, JoinOutcome::TimedOut);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "gave up only after {elapsed:?}; the join is not bounded"
+        );
     }
 }

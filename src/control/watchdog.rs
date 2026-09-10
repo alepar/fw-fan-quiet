@@ -15,8 +15,14 @@ use crate::types::Sample;
 
 /// Tctl trip threshold (°C): sustained readings at/above this trip.
 pub const CPU_TRIP_C: f64 = 95.0;
-/// GPU temperature trip threshold (°C).
-pub const GPU_TRIP_C: f64 = 87.0;
+/// GPU temperature trip threshold (°C). Sits ABOVE the soft guard
+/// (`guards::GPU_HOT_C_DEFAULT`, 88) so the ratchet-down gets a turn first,
+/// and below the card's own shutdown point. Measured on this card
+/// (RTX 5070 Laptop, NVML T.Limit specs, 2026-09-09): park/max-operating
+/// 87 °C, Slowdown 89 °C, Shutdown 92 °C. The old 87 was the card's normal
+/// sustained-load park point — three seconds there during ordinary gaming
+/// latched an emergency release (fw-fanctrl-loop-a78).
+pub const GPU_TRIP_C: f64 = 91.0;
 /// Consecutive hot samples (either device) before the thermal trip.
 pub const TRIP_STREAK: u8 = 3;
 /// Consecutive `cpu_temp_valid == false` samples before the sensor-lost

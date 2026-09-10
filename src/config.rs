@@ -11,10 +11,32 @@ use std::path::{Path, PathBuf};
 use crate::actuators::gpu::clamp_gpu_clock;
 use crate::control::allocator::{CPU_MAX_W, GPU_MAX_W};
 use crate::control::controller::DEFAULT_FAN_TARGET_RPM;
+use crate::control::guards::{GPU_HOT_C_DEFAULT, GPU_HYSTERESIS_C, NVME_HOT_C_DEFAULT};
+use crate::control::watchdog::GPU_TRIP_C;
 
 /// Lower bound for `cpu_max_w`: below the actuator's ~10 W sustained floor the
 /// grid-search and the manual-mode clamps would degenerate.
 const CPU_MAX_W_FLOOR: f64 = 10.0;
+
+/// Lower bound for `gpu_hot_c`. The card idles in the 40s and cruises in the
+/// 60s–70s under load, so an enter threshold at or below that would latch the
+/// soft guard permanently hot and ratchet the GPU share to its floor forever
+/// (the guard only clears at `enter − GPU_HYSTERESIS_C`).
+const GPU_HOT_C_FLOOR: f64 = 60.0;
+/// Upper bound for `gpu_hot_c`: the soft guard must get its ratchet-down turn
+/// BEFORE the hard thermal watchdog trips, so the enter threshold stays
+/// strictly below [`GPU_TRIP_C`] — and by at least the hysteresis band, so the
+/// guard's *exit* is meaningful rather than sitting above the trip point.
+const GPU_HOT_C_CEIL: f64 = GPU_TRIP_C - GPU_HYSTERESIS_C;
+/// `nvme_hot_c` bounds. Reporting-only guard, so the range only has to keep
+/// the flag from being stuck on (drives idle in the 30s–40s) or unreachable
+/// (consumer NVMe throttles in the 80s and its own critical is ~90).
+const NVME_HOT_C_FLOOR: f64 = 50.0;
+const NVME_HOT_C_CEIL: f64 = 90.0;
+
+/// Default fw-fanctrl `AF_UNIX` command socket (design doc §2.1 / research
+/// doc §"The socket").
+const DEFAULT_FANCTRL_SOCKET: &str = "/run/fw-fanctrl/.fw-fanctrl.commands.sock";
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -27,11 +49,17 @@ pub struct Config {
     pub gpu_floor_mhz: u32,
     /// CPU fast (short-burst) PPT limit handed to ryzenadj, milliwatts.
     pub fast_limit_mw: u32,
-    // (Removed 2026-07, adaptation v2: `online_rls` is gone — the 2-state
-    // Kalman filter owns Auto-mode adaptation and full-surface RLS was
-    // field-disabled after the degenerate-divisor incident. `serde(default)`
-    // without `deny_unknown_fields` means old config files that still carry
-    // the key load fine.)
+    // Unknown keys are always ignored (`serde(default)` without
+    // `deny_unknown_fields`), so old config files never fail to load just
+    // because a key was removed. Two real examples that must keep loading:
+    // `online_rls` (removed 2026-07, adaptation v2 — the 2-state Kalman
+    // filter owns Auto-mode adaptation, and full-surface RLS was
+    // field-disabled after the degenerate-divisor incident) and
+    // `nvme_boost_rpm` (never shipped — an early NVMe-guard design that
+    // raised the fan target for a hot drive, dropped per §2.8/§Facts:
+    // raising the target raises T* and therefore the CPU/GPU budget,
+    // injecting more heat into a scenario measured to have nothing to raise
+    // it for).
     /// CPU sustained operating max (watts): the single source of truth for the
     /// "100%" CPU power. The allocator grid-searches up to it, the CPU actuator
     /// clamps commanded sustained power to it, and the TUI/LED displays scale by
@@ -41,9 +69,20 @@ pub struct Config {
     /// GPU operating max (watts): same role for the GPU. Defaults to / clamped
     /// to the RTX 5070 module TGP ([`GPU_MAX_W`]).
     pub gpu_max_w: f64,
+    /// dGPU guard enter threshold (°C, exit is this − 5). See
+    /// [`crate::control::guards`] for the hysteresis and the 87 °C
+    /// card-spec derivation of the default.
+    pub gpu_hot_c: f64,
+    /// NVMe guard enter threshold (°C, exit is this − 5). Reporting-only —
+    /// see [`crate::control::guards`].
+    pub nvme_hot_c: f64,
     /// LED matrix wattage display (`[leds]` table). Optional feature; its own
     /// `enabled` flag defaults on but a missing/failed module just stays dark.
     pub leds: LedConfig,
+    /// `AF_UNIX` socket path for the fw-fanctrl client (design doc §2.1).
+    /// This binary never writes to it — see `fanctrl::client`'s read-only
+    /// `PrintCommand`.
+    pub fanctrl_socket: PathBuf,
 }
 
 impl Default for Config {
@@ -55,7 +94,10 @@ impl Default for Config {
             fast_limit_mw: 53_000,
             cpu_max_w: CPU_MAX_W,
             gpu_max_w: GPU_MAX_W,
+            gpu_hot_c: GPU_HOT_C_DEFAULT,
+            nvme_hot_c: NVME_HOT_C_DEFAULT,
             leds: LedConfig::default(),
+            fanctrl_socket: PathBuf::from(DEFAULT_FANCTRL_SOCKET),
         }
     }
 }
@@ -189,6 +231,38 @@ impl Config {
             );
             self.cpu_floor_w = cpu;
         }
+        // The two guard thresholds (§2.8). NaN is the sharp edge here: every
+        // comparison in `guards::hysteresis` is false against NaN, so a
+        // `gpu_hot_c = nan` silently disables the dGPU guard entirely with no
+        // flag and no log. Below the floor latches the guard permanently hot;
+        // at or above GPU_TRIP_C the hard watchdog's emergency release fires
+        // before the soft ratchet ever gets a turn.
+        let gpu_hot = if self.gpu_hot_c.is_finite() {
+            self.gpu_hot_c.clamp(GPU_HOT_C_FLOOR, GPU_HOT_C_CEIL)
+        } else {
+            GPU_HOT_C_DEFAULT
+        };
+        if gpu_hot != self.gpu_hot_c {
+            tracing::warn!(
+                "config gpu_hot_c {} outside [{GPU_HOT_C_FLOOR}, {GPU_HOT_C_CEIL}] \
+                 (must stay below the {GPU_TRIP_C} °C hard trip); clamped to {gpu_hot}",
+                self.gpu_hot_c
+            );
+            self.gpu_hot_c = gpu_hot;
+        }
+        let nvme_hot = if self.nvme_hot_c.is_finite() {
+            self.nvme_hot_c.clamp(NVME_HOT_C_FLOOR, NVME_HOT_C_CEIL)
+        } else {
+            NVME_HOT_C_DEFAULT
+        };
+        if nvme_hot != self.nvme_hot_c {
+            tracing::warn!(
+                "config nvme_hot_c {} outside [{NVME_HOT_C_FLOOR}, {NVME_HOT_C_CEIL}]; \
+                 clamped to {nvme_hot}",
+                self.nvme_hot_c
+            );
+            self.nvme_hot_c = nvme_hot;
+        }
         self
     }
 
@@ -245,6 +319,8 @@ mod tests {
             fast_limit_mw: 60_000,
             cpu_max_w: 50.0,
             gpu_max_w: 90.0,
+            gpu_hot_c: 86.0,
+            nvme_hot_c: 78.0,
             leds: LedConfig {
                 enabled: false,
                 cpu_port: "/dev/ttyACM9".to_string(),
@@ -254,9 +330,33 @@ mod tests {
                 cpu_flip_watts: false,
                 gpu_flip_watts: true,
             },
+            fanctrl_socket: PathBuf::from("/run/fw-fanctrl/custom.sock"),
         };
         config.save(&path).unwrap();
         assert_eq!(Config::load(&path), config);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fanctrl_socket_defaults_and_round_trips() {
+        assert_eq!(
+            Config::default().fanctrl_socket,
+            PathBuf::from("/run/fw-fanctrl/.fw-fanctrl.commands.sock")
+        );
+
+        let dir = fixture_dir("fanctrl-socket");
+        let path = dir.join("config.toml");
+        fs::write(&path, "fanctrl_socket = \"/tmp/alt.sock\"\n").unwrap();
+        let config = Config::load(&path);
+        assert_eq!(config.fanctrl_socket, PathBuf::from("/tmp/alt.sock"));
+        // A file that doesn't name the key at all still gets the default —
+        // this is the exact shape a legacy config.toml predating this key
+        // is in.
+        fs::write(&path, "fan_target_rpm = 2500\n").unwrap();
+        assert_eq!(
+            Config::load(&path).fanctrl_socket,
+            Config::default().fanctrl_socket
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -340,17 +440,150 @@ mod tests {
     }
 
     #[test]
-    fn unknown_fields_tolerated() {
+    fn unknown_keys_are_ignored() {
         let dir = fixture_dir("unknown");
         let path = dir.join("config.toml");
-        // `online_rls` is a REAL legacy key (removed with adaptation v2):
-        // old config files that still carry it must keep loading.
+        // Three unknown-key shapes that must all still load: `online_rls` is
+        // a REAL removed legacy key (adaptation v2), `nvme_boost_rpm` is a
+        // key that was designed and then dropped before ever shipping (the
+        // rejected NVMe-guard target-raise, §2.8), and `totally_made_up_key`
+        // stands in for any future removal or typo — none of them should be
+        // able to fail a load.
         fs::write(
             &path,
-            "fan_target_rpm = 2500\nfuture_knob = true\nonline_rls = true\n",
+            "fan_target_rpm = 2500\n\
+             online_rls = true\n\
+             nvme_boost_rpm = 500\n\
+             totally_made_up_key = \"whatever\"\n",
         )
         .unwrap();
-        assert_eq!(Config::load(&path).fan_target_rpm, 2500.0);
+        let config = Config::load(&path);
+        assert_eq!(config.fan_target_rpm, 2500.0);
+        // Loading survived AND fell through to real defaults for everything
+        // the file didn't name — a config that silently zeroed unnamed
+        // fields on an unknown key would also pass the line above.
+        assert_eq!(config.gpu_hot_c, Config::default().gpu_hot_c);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn guard_thresholds_default_and_round_trip() {
+        let dir = fixture_dir("guard-thresholds");
+        let path = dir.join("config.toml");
+        let defaults = Config::default();
+        assert_eq!(defaults.gpu_hot_c, 88.0);
+        assert_eq!(defaults.nvme_hot_c, 80.0);
+        let config = Config {
+            gpu_hot_c: 86.0,
+            nvme_hot_c: 77.0,
+            ..Config::default()
+        };
+        config.save(&path).unwrap();
+        assert_eq!(Config::load(&path), config);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- finding 8: gpu_hot_c / nvme_hot_c go through sanitized() too -----
+
+    #[test]
+    fn nan_gpu_hot_c_falls_back_to_the_default_instead_of_disabling_the_guard() {
+        // Every comparison in `guards::hysteresis` is false against NaN, so
+        // an unsanitized NaN silently switches the dGPU guard off for good.
+        let config = Config {
+            gpu_hot_c: f64::NAN,
+            ..Config::default()
+        }
+        .sanitized();
+        assert_eq!(config.gpu_hot_c, GPU_HOT_C_DEFAULT);
+        // Same for +inf, which is finite-looking in neither sense.
+        let config = Config {
+            gpu_hot_c: f64::INFINITY,
+            ..Config::default()
+        }
+        .sanitized();
+        assert_eq!(config.gpu_hot_c, GPU_HOT_C_DEFAULT);
+    }
+
+    #[test]
+    fn gpu_hot_c_at_or_below_idle_is_raised_to_the_floor() {
+        // Below the card's cruising range the guard would latch hot forever
+        // and ratchet the GPU share to its floor for the whole session.
+        for value in [-10.0, 0.0, 45.0, 59.9] {
+            let config = Config {
+                gpu_hot_c: value,
+                ..Config::default()
+            }
+            .sanitized();
+            assert_eq!(config.gpu_hot_c, GPU_HOT_C_FLOOR, "gpu_hot_c = {value}");
+        }
+    }
+
+    #[test]
+    fn gpu_hot_c_stays_strictly_below_the_hard_trip_with_hysteresis_margin() {
+        for value in [90.0, GPU_TRIP_C, 120.0] {
+            let config = Config {
+                gpu_hot_c: value,
+                ..Config::default()
+            }
+            .sanitized();
+            assert_eq!(config.gpu_hot_c, GPU_HOT_C_CEIL, "gpu_hot_c = {value}");
+            assert!(
+                config.gpu_hot_c < GPU_TRIP_C,
+                "the soft guard must get its turn before the hard watchdog"
+            );
+            assert!(
+                config.gpu_hot_c + GPU_HYSTERESIS_C <= GPU_TRIP_C,
+                "the guard's exit band must fit under the trip point"
+            );
+        }
+    }
+
+    #[test]
+    fn nvme_hot_c_is_sanitized_the_same_way() {
+        let nan = Config {
+            nvme_hot_c: f64::NAN,
+            ..Config::default()
+        }
+        .sanitized();
+        assert_eq!(nan.nvme_hot_c, NVME_HOT_C_DEFAULT);
+        let low = Config {
+            nvme_hot_c: 10.0,
+            ..Config::default()
+        }
+        .sanitized();
+        assert_eq!(low.nvme_hot_c, NVME_HOT_C_FLOOR);
+        let high = Config {
+            nvme_hot_c: 500.0,
+            ..Config::default()
+        }
+        .sanitized();
+        assert_eq!(high.nvme_hot_c, NVME_HOT_C_CEIL);
+    }
+
+    #[test]
+    fn in_range_guard_thresholds_are_left_alone_by_sanitized() {
+        let config = Config {
+            gpu_hot_c: 84.0,
+            nvme_hot_c: 77.0,
+            ..Config::default()
+        }
+        .sanitized();
+        assert_eq!(config.gpu_hot_c, 84.0);
+        assert_eq!(config.nvme_hot_c, 77.0);
+        // And the defaults themselves must survive their own sanitizer.
+        let d = Config::default().sanitized();
+        assert_eq!(d.gpu_hot_c, GPU_HOT_C_DEFAULT);
+        assert_eq!(d.nvme_hot_c, NVME_HOT_C_DEFAULT);
+    }
+
+    #[test]
+    fn a_bad_gpu_hot_c_in_a_real_file_is_clamped_on_load() {
+        let dir = fixture_dir("gpu-hot-clamp");
+        let path = dir.join("config.toml");
+        fs::write(&path, "gpu_hot_c = 99.0\nnvme_hot_c = nan\n").unwrap();
+        let config = Config::load(&path);
+        assert_eq!(config.gpu_hot_c, GPU_HOT_C_CEIL);
+        assert_eq!(config.nvme_hot_c, NVME_HOT_C_DEFAULT);
         fs::remove_dir_all(&dir).unwrap();
     }
 

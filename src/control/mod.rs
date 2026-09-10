@@ -4,17 +4,16 @@
 //! reasserts, watchdog flags and `ControlStatus` updates.
 
 pub mod allocator;
+pub mod budget;
 pub mod controller;
-pub mod cooldown;
 pub mod gpu_pid;
-pub mod kalman;
+pub mod guards;
 pub mod lut;
-pub mod thermal_model;
-// Superseded by `kalman` in production; retained test-only as the allocator
-// field-replay sim's minutes-scale adaptation stand-in.
+pub mod mode;
 #[cfg(test)]
-pub mod trim;
-pub mod trust;
+mod sim_tests;
+#[cfg(test)]
+pub mod spike_antiwindup;
 pub mod watchdog;
 
 // Mode/StatusFlag are reached via `controller::` where needed (view/tests).

@@ -187,7 +187,7 @@ impl Model {
                 };
                 let v = (self.fan_target_rpm + step).clamp(FAN_MIN_RPM, FAN_MAX_RPM);
                 // Updated locally too for an instant redraw; the command keeps
-                // the controller (and the Auto contour target) in sync.
+                // the controller (and the Auto fan target) in sync.
                 self.fan_target_rpm = v;
                 vec![Command::SetFanTarget(v)]
             }
@@ -376,7 +376,6 @@ mod tests {
             cpu_limit_w: Some(20.0),
             gpu_max_mhz: Some(1500),
             fan_target_rpm: 2500.0,
-            trim_rpm: 0.0,
             flags: vec![StatusFlag::Resumed],
             calib: None,
             ..ControlStatus::default()
@@ -554,7 +553,6 @@ mod tests {
             cpu_limit_w: Some(20.0),
             gpu_max_mhz: Some(1500),
             fan_target_rpm: 2500.0,
-            trim_rpm: 0.0,
             flags: vec![],
             calib: None,
             ..ControlStatus::default()

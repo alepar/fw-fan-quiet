@@ -8,7 +8,7 @@ use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Axis, Block, Chart, Dataset, Gauge, GraphType, Paragraph};
 
-use crate::control::controller::{CalibProgressLite, Mode, StatusFlag};
+use crate::control::controller::{CalibProgressLite, LoopMode, Mode, StatusFlag};
 use crate::model::{Model, RING_CAP};
 use crate::ring::Ring;
 
@@ -96,31 +96,18 @@ fn header_line(model: &Model) -> Line<'static> {
             model.fan_target_rpm
         )),
     ];
-    // Kalman bias (Auto mode; keeps the trim-era "trim" label — same role):
-    // informational, so dim — the loud version of this signal is the
-    // TargetUnreachable flag below.
-    if model.status.trim_rpm != 0.0 {
-        spans.push(Span::styled(
-            format!(" | trim {:+.0}rpm", model.status.trim_rpm),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    // Kalman gain (Auto mode): dim like the bias, shown only once it has
-    // moved off the identity — a learned GPU-slope correction is rare and
-    // worth a glance, a 1.00 would be noise.
-    if (model.status.gain - 1.0).abs() > 0.005 {
-        spans.push(Span::styled(
-            format!(" | gain x{:.2}", model.status.gain),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
+    // The Kalman trim/gain readout is removed (`ControlStatus` no longer
+    // carries the old bias/gain fields, Task 4's type surface); the
+    // arbiter/budget segment below (design §3.5) takes its place.
+    spans.push(Span::raw(" | "));
+    spans.push(Span::raw(loop_status_segment(model)));
     // Severity-first render order: the single-line header has no wrap
     // (ratatui clips at the right edge), so an emergency tripping AFTER
     // milder flags must never be pushed out of view by them. The status
     // Vec itself keeps insertion order (telemetry/tests rely on it); only
     // the spans are sorted.
     let mut flags: Vec<StatusFlag> = model.status.flags.clone();
-    flags.sort_by_key(|f| flag_severity(*f));
+    flags.sort_by_key(|f| render_priority(*f));
     // With several flags competing for one row, drop the parenthetical
     // "(press ...)" hints so every flag NAME stays visible; a lone flag
     // keeps its full hint.
@@ -159,17 +146,69 @@ fn header_line(model: &Model) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The arbiter/budget segment (design §3.5): `mode A|B|rel · T* · ma ·
+/// duty -> rpm · budget`, in that literal order. Every piece but `mode`
+/// and `budget` is an `Option` on `ControlStatus` (`None` outside the mode
+/// that produces it, or before the arbiter has ever run) and renders as
+/// "–" — the same missing-value convention the `cpu`/`gpu` limit spans
+/// above already use.
+fn loop_status_segment(model: &Model) -> String {
+    let status = &model.status;
+    let mode = match status.loop_mode {
+        LoopMode::TempLoop => "A",
+        LoopMode::RpmLoop => "B",
+        LoopMode::Released => "rel",
+    };
+    let t_star = match status.t_star_c {
+        Some(t) => format!("T* {t:.1}\u{b0}C"),
+        None => "T* \u{2013}".into(),
+    };
+    let ma = match status.ec_ma_c {
+        Some(v) => format!("ma {v:.1}"),
+        None => "ma \u{2013}".into(),
+    };
+    let duty = match status.duty_cmd {
+        Some(d) => format!("duty {d} \u{2192} {:.0} rpm", status.snapped_rpm),
+        None => "duty \u{2013}".into(),
+    };
+    format!(
+        "mode {mode} \u{b7} {t_star} \u{b7} {ma} \u{b7} {duty} \u{b7} budget {:.1} W",
+        status.budget_w
+    )
+}
+
 /// Header render priority: lower sorts (and therefore renders) first, so
 /// the loudest flag is the one guaranteed to survive right-edge clipping.
-fn flag_severity(flag: StatusFlag) -> u8 {
+/// A strict per-flag order (unlike `controller::Severity`'s three coarse
+/// tiers, which classify but can't alone break a tie between two flags of
+/// the same tier): Critical, then Warning, then Info, existing flags
+/// keeping their established relative order within a tier and the six new
+/// Task 15 flags slotted in by the severities design §3.5 states for them
+/// (`CURVE INVALID`'s is stated by the acceptance criteria directly:
+/// warning, outranking the `STEEP CURVE` info flag). Agrees with
+/// `controller::flag_severity` on every flag, `NvmeHot` included: design
+/// §3.5's header text is explicit that `NVME HOT` renders as a warning
+/// alongside `GPU HOT`. (For one epic the two diverged — this file carried
+/// the warning while `flag_severity` still said Info, because the flag's
+/// task could not touch `controller.rs`; reconciled after the epic landed.)
+fn render_priority(flag: StatusFlag) -> u8 {
     match flag {
+        // Critical
         StatusFlag::ThermalEmergency => 0,
         StatusFlag::SensorLost => 1,
-        StatusFlag::ModelDistrust => 2,
-        StatusFlag::TargetUnreachable => 3,
-        StatusFlag::LimitNotSticking => 4,
-        StatusFlag::NotCalibrated => 5,
-        StatusFlag::Resumed => 6,
+        StatusFlag::TargetUnreachable => 2,
+        // Warning
+        StatusFlag::LimitNotSticking => 3,
+        StatusFlag::NotCalibrated => 4,
+        StatusFlag::CurveInvalid => 5,
+        StatusFlag::EcMismatch => 6,
+        StatusFlag::FanctrlLost => 7,
+        StatusFlag::GpuHot => 8,
+        StatusFlag::NvmeHot => 9,
+        // Info
+        StatusFlag::Resumed => 10,
+        StatusFlag::SteepCurve => 11,
+        StatusFlag::ReadbackBlind => 12,
     }
 }
 
@@ -193,10 +232,6 @@ fn flag_span(flag: StatusFlag, with_hint: bool) -> Span<'static> {
         // shown the header would overflow a 120-col terminal ("check intake/
         // ambient" lives in the flag's doc + design notes).
         StatusFlag::TargetUnreachable => Span::styled("TARGET UNREACHABLE", red_bold),
-        // The model's predictions have been persistently wrong for 5+
-        // minutes: RLS frozen, trim at half gain (recalibrate if this
-        // persists — the hint lives in the flag's doc, not the header).
-        StatusFlag::ModelDistrust => Span::styled("MODEL DISTRUST", red_bold),
         // Watchdog emergencies: everything was released toward stock and
         // stays released until the user acknowledges (first actuating
         // press re-arms without executing; the second acts normally).
@@ -216,6 +251,24 @@ fn flag_span(flag: StatusFlag, with_hint: bool) -> Span<'static> {
             },
             red_bold,
         ),
+        // The five Task 15 warning-severity flags (design §3.5 + the
+        // acceptance criteria's explicit call on CURVE INVALID): yellow,
+        // one step down from the red-bold Critical flags above, matching
+        // NOT CALIBRATED's existing warning-tier look.
+        StatusFlag::CurveInvalid => {
+            Span::styled("CURVE INVALID", Style::default().fg(Color::Yellow))
+        }
+        StatusFlag::EcMismatch => Span::styled("EC MISMATCH", Style::default().fg(Color::Yellow)),
+        StatusFlag::FanctrlLost => Span::styled("FANCTRL LOST", Style::default().fg(Color::Yellow)),
+        StatusFlag::GpuHot => Span::styled("GPU HOT", Style::default().fg(Color::Yellow)),
+        StatusFlag::NvmeHot => Span::styled("NVME HOT", Style::default().fg(Color::Yellow)),
+        // The two Task 15 info-severity flags (`READBACK BLIND` per the
+        // brief, `STEEP CURVE` per design §3.5): a plain, unbolded gray —
+        // visible but clearly a notch below the warnings above.
+        StatusFlag::SteepCurve => Span::styled("STEEP CURVE", Style::default().fg(Color::Gray)),
+        StatusFlag::ReadbackBlind => {
+            Span::styled("READBACK BLIND", Style::default().fg(Color::Gray))
+        }
     }
 }
 
@@ -463,8 +516,15 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    /// Default test width, 200 cols. Widened from 120 (Task 15): the new
+    /// arbiter/budget segment (design §3.5) always renders ~50 more
+    /// characters into the single-line header, on top of what already
+    /// filled a 120-col terminal in prior tasks.
+    /// `emergency_stays_visible_when_flags_would_overflow_the_header` below
+    /// keeps its own dedicated, narrower terminal — the one test that is
+    /// deliberately about clipping.
     fn draw(model: &Model) -> Terminal<TestBackend> {
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
         terminal.draw(|f| view(model, f)).unwrap();
         terminal
     }
@@ -492,6 +552,25 @@ mod tests {
         (0..buf.area.width)
             .map(|x| buf.cell((x, y)).unwrap().symbol())
             .collect()
+    }
+
+    /// Column (cell) index of `needle`'s first match in `text` at or after
+    /// column `from`. `row_text` joins each cell's symbol into a `String`
+    /// one-cell-per-`char`, so a column is a CHAR position — `str::find`'s
+    /// BYTE offset desyncs from it the moment a multi-byte glyph (°, ·, ≤,
+    /// –, →, the header is full of them) appears before the match, which
+    /// silently mis-locates cell-color assertions instead of failing them.
+    fn find_col_from(text: &str, needle: &str, from: usize) -> Option<usize> {
+        let chars: Vec<char> = text.chars().collect();
+        let needle: Vec<char> = needle.chars().collect();
+        if needle.is_empty() || from + needle.len() > chars.len() {
+            return None;
+        }
+        (from..=chars.len() - needle.len()).find(|&i| chars[i..i + needle.len()] == needle[..])
+    }
+
+    fn find_col(text: &str, needle: &str) -> Option<usize> {
+        find_col_from(text, needle, 0)
     }
 
     #[test]
@@ -582,7 +661,6 @@ mod tests {
             cpu_limit_w: Some(20.0),
             gpu_max_mhz: Some(1500),
             fan_target_rpm: 2500.0,
-            trim_rpm: 0.0,
             flags: vec![StatusFlag::LimitNotSticking, StatusFlag::Resumed],
             calib: None,
             ..ControlStatus::default()
@@ -621,14 +699,13 @@ mod tests {
             cpu_limit_w: Some(20.0),
             gpu_max_mhz: None,
             fan_target_rpm: 3000.0,
-            trim_rpm: 0.0,
             flags: vec![StatusFlag::LimitNotSticking],
             calib: None,
             ..ControlStatus::default()
         }));
         let terminal = draw(&m);
         let header = row_text(&terminal, 0);
-        let x = header.find("LIMIT-SLIP!").expect("flag text present") as u16;
+        let x = find_col(&header, "LIMIT-SLIP!").expect("flag text present") as u16;
         let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
         assert_eq!(cell.fg, Color::Red);
         assert!(cell.modifier.contains(Modifier::BOLD));
@@ -645,16 +722,17 @@ mod tests {
             cpu_limit_w: None,
             gpu_max_mhz: None,
             fan_target_rpm: 3000.0,
-            trim_rpm: 0.0,
             flags: vec![StatusFlag::ThermalEmergency],
             calib: None,
             ..ControlStatus::default()
         }));
         let terminal = draw(&m);
         let header = row_text(&terminal, 0);
-        let x = header
-            .find("THERMAL EMERGENCY (press a, c/g or k to acknowledge)")
-            .expect("flag text present") as u16;
+        let x = find_col(
+            &header,
+            "THERMAL EMERGENCY (press a, c/g or k to acknowledge)",
+        )
+        .expect("flag text present") as u16;
         let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
         assert_eq!(cell.fg, Color::Red);
         assert!(cell.modifier.contains(Modifier::BOLD));
@@ -671,15 +749,13 @@ mod tests {
             cpu_limit_w: None,
             gpu_max_mhz: None,
             fan_target_rpm: 3000.0,
-            trim_rpm: 0.0,
             flags: vec![StatusFlag::SensorLost],
             calib: None,
             ..ControlStatus::default()
         }));
         let terminal = draw(&m);
         let header = row_text(&terminal, 0);
-        let x = header
-            .find("SENSOR LOST (press a, c/g or k to acknowledge)")
+        let x = find_col(&header, "SENSOR LOST (press a, c/g or k to acknowledge)")
             .expect("flag text present") as u16;
         let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
         assert_eq!(cell.fg, Color::Red);
@@ -687,20 +763,25 @@ mod tests {
     }
 
     #[test]
-    fn emergency_stays_visible_at_120_cols_with_many_flags() {
+    fn emergency_stays_visible_when_flags_would_overflow_the_header() {
         use crate::control::ControlStatus;
         use crate::control::controller::{Mode, StatusFlag};
         // Worst case from the review: THERMAL EMERGENCY trips LAST, after
-        // Auto + trim + four other flags already fill the header. Without
+        // Auto + four other flags already fill the header. Without
         // severity-first ordering (and hint dropping) the emergency text
-        // starts past column 120 and ratatui clips it invisible.
+        // starts past the terminal's right edge and ratatui clips it
+        // invisible. A dedicated (not the shared `draw()`) 170-col
+        // terminal, deliberately narrow enough that the base header (mode/
+        // limits/Task 15's arbiter segment, ~116 cols here) plus all five
+        // flags (~83 cols) does NOT fit — 120 cols, this test's width
+        // before Task 15, no longer clips anything once the arbiter
+        // segment alone eats 116 of it.
         let mut m = Model::new();
         m.update(Event::Status(ControlStatus {
             mode: Mode::Auto,
             cpu_limit_w: Some(17.0),
             gpu_max_mhz: Some(1653),
             fan_target_rpm: 3000.0,
-            trim_rpm: 400.0,
             flags: vec![
                 StatusFlag::Resumed,
                 StatusFlag::LimitNotSticking,
@@ -711,14 +792,14 @@ mod tests {
             calib: None,
             ..ControlStatus::default()
         }));
-        let terminal = draw(&m); // 120x40 TestBackend
+        let mut terminal = Terminal::new(TestBackend::new(170, 40)).unwrap();
+        terminal.draw(|f| view(&m, f)).unwrap();
         let header = row_text(&terminal, 0);
-        let emergency = header
-            .find("THERMAL EMERGENCY")
-            .expect("emergency must survive clipping") as u16;
+        let emergency =
+            find_col(&header, "THERMAL EMERGENCY").expect("emergency must survive clipping") as u16;
         // Rendered FIRST among the flags despite being last in the Vec.
         for other in ["TARGET UNREACHABLE", "LIMIT-SLIP!", "resumed"] {
-            if let Some(x) = header.find(other) {
+            if let Some(x) = find_col(&header, other) {
                 assert!(
                     emergency < x as u16,
                     "{other} must render after the emergency: {header:?}"
@@ -764,7 +845,7 @@ mod tests {
             header.contains("floors 15W/1000MHz"),
             "header was: {header:?}"
         );
-        let x = header.find("floors 15W/1000MHz").unwrap() as u16;
+        let x = find_col(&header, "floors 15W/1000MHz").unwrap() as u16;
         let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
         assert_eq!(cell.fg, Color::DarkGray, "floors must render dim");
 
@@ -794,14 +875,13 @@ mod tests {
             cpu_limit_w: Some(17.0),
             gpu_max_mhz: Some(1653),
             fan_target_rpm: 3000.0,
-            trim_rpm: 0.0,
             flags: vec![],
             calib: None,
             ..ControlStatus::default()
         }));
         let terminal = draw(&m);
         let header = row_text(&terminal, 0);
-        let x = header.find("auto").expect("mode text present") as u16;
+        let x = find_col(&header, "auto").expect("mode text present") as u16;
         let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
         assert_eq!(cell.fg, Color::Green);
         assert!(cell.modifier.contains(Modifier::BOLD));
@@ -813,95 +893,9 @@ mod tests {
         );
     }
 
-    // --- Task 26: trim + TargetUnreachable in the header ---
-
-    #[test]
-    fn header_shows_trim_dim_when_nonzero() {
-        use crate::control::ControlStatus;
-        use crate::control::controller::Mode;
-        let mut m = Model::new();
-        m.update(Event::Status(ControlStatus {
-            mode: Mode::Auto,
-            cpu_limit_w: Some(17.0),
-            gpu_max_mhz: Some(1653),
-            fan_target_rpm: 3000.0,
-            trim_rpm: 123.0,
-            flags: vec![],
-            calib: None,
-            ..ControlStatus::default()
-        }));
-        let terminal = draw(&m);
-        let header = row_text(&terminal, 0);
-        assert!(header.contains("trim +123rpm"), "header was: {header:?}");
-        let x = header.find("trim +123rpm").unwrap() as u16;
-        let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
-        assert_eq!(cell.fg, Color::DarkGray, "trim must render dim");
-
-        // Negative trim shows its sign too.
-        m.update(Event::Status(ControlStatus {
-            mode: Mode::Auto,
-            cpu_limit_w: Some(17.0),
-            gpu_max_mhz: Some(1653),
-            fan_target_rpm: 3000.0,
-            trim_rpm: -17.0,
-            flags: vec![],
-            calib: None,
-            ..ControlStatus::default()
-        }));
-        let header = row_text(&draw(&m), 0);
-        assert!(header.contains("trim -17rpm"), "header was: {header:?}");
-    }
-
-    #[test]
-    fn header_hides_trim_when_zero() {
-        // Default status has trim 0: no trim clutter in the header.
-        let header = row_text(&draw(&Model::new()), 0);
-        assert!(!header.contains("trim"), "header was: {header:?}");
-    }
-
-    #[test]
-    fn header_shows_gain_dim_when_off_identity() {
-        use crate::control::ControlStatus;
-        use crate::control::controller::Mode;
-        let mut m = Model::new();
-        m.update(Event::Status(ControlStatus {
-            mode: Mode::Auto,
-            cpu_limit_w: Some(17.0),
-            gpu_max_mhz: Some(1653),
-            fan_target_rpm: 3000.0,
-            gain: 1.12,
-            flags: vec![],
-            calib: None,
-            ..ControlStatus::default()
-        }));
-        let terminal = draw(&m);
-        let header = row_text(&terminal, 0);
-        assert!(header.contains("gain x1.12"), "header was: {header:?}");
-        let x = header.find("gain x1.12").unwrap() as u16;
-        let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
-        assert_eq!(cell.fg, Color::DarkGray, "gain must render dim");
-    }
-
-    #[test]
-    fn header_hides_gain_at_identity() {
-        // The default 1.0 gain (and anything that would DISPLAY as x1.00)
-        // is noise, not signal: hidden.
-        use crate::control::ControlStatus;
-        use crate::control::controller::Mode;
-        let mut m = Model::new();
-        m.update(Event::Status(ControlStatus {
-            mode: Mode::Auto,
-            cpu_limit_w: Some(17.0),
-            gpu_max_mhz: Some(1653),
-            fan_target_rpm: 3000.0,
-            gain: 1.002,
-            flags: vec![],
-            calib: None,
-            ..ControlStatus::default()
-        }));
-        let header = row_text(&draw(&m), 0);
-        assert!(!header.contains("gain"), "header was: {header:?}");
-    }
+    // --- Task 26: TargetUnreachable in the header ---
+    // (the trim/gain readout these tests used to also exercise is removed —
+    // Task 4 drops the old bias/gain fields from `ControlStatus`.)
 
     #[test]
     fn target_unreachable_flag_is_red_bold() {
@@ -914,48 +908,21 @@ mod tests {
             cpu_limit_w: Some(15.0),
             gpu_max_mhz: Some(1200),
             fan_target_rpm: 3000.0,
-            trim_rpm: 400.0,
             flags: vec![StatusFlag::TargetUnreachable],
             calib: None,
             ..ControlStatus::default()
         }));
         let terminal = draw(&m);
         let header = row_text(&terminal, 0);
-        let x = header
-            .find("TARGET UNREACHABLE")
-            .expect("flag text present") as u16;
-        // The saturated trim shows alongside (the flag means "pinned at max").
-        assert!(header.contains("trim +400rpm"), "header was: {header:?}");
+        let x = find_col(&header, "TARGET UNREACHABLE").expect("flag text present") as u16;
         let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
         assert_eq!(cell.fg, Color::Red);
         assert!(cell.modifier.contains(Modifier::BOLD));
     }
 
-    // --- Task 27: ModelDistrust in the header ---
-
-    #[test]
-    fn model_distrust_flag_is_red_bold() {
-        use crate::control::ControlStatus;
-        use crate::control::controller::{Mode, StatusFlag};
-        use ratatui::style::Modifier;
-        let mut m = Model::new();
-        m.update(Event::Status(ControlStatus {
-            mode: Mode::Auto,
-            cpu_limit_w: Some(17.0),
-            gpu_max_mhz: Some(1653),
-            fan_target_rpm: 3000.0,
-            trim_rpm: 200.0,
-            flags: vec![StatusFlag::ModelDistrust],
-            calib: None,
-            ..ControlStatus::default()
-        }));
-        let terminal = draw(&m);
-        let header = row_text(&terminal, 0);
-        let x = header.find("MODEL DISTRUST").expect("flag text present") as u16;
-        let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
-        assert_eq!(cell.fg, Color::Red);
-        assert!(cell.modifier.contains(Modifier::BOLD));
-    }
+    // Task 27's ModelDistrust flag is removed from the Task 4 type surface
+    // (`model_distrust_flag_is_red_bold` tested it here; StatusFlag no
+    // longer has that variant, so there is nothing left to render).
 
     #[test]
     fn not_calibrated_flag_renders_yellow_hint() {
@@ -967,14 +934,13 @@ mod tests {
             cpu_limit_w: None,
             gpu_max_mhz: None,
             fan_target_rpm: 3000.0,
-            trim_rpm: 0.0,
             flags: vec![StatusFlag::NotCalibrated],
             calib: None,
             ..ControlStatus::default()
         }));
         let terminal = draw(&m);
         let header = row_text(&terminal, 0);
-        let x = header.find("NOT CALIBRATED").expect("hint present") as u16;
+        let x = find_col(&header, "NOT CALIBRATED").expect("hint present") as u16;
         assert!(
             header.contains("press k to calibrate"),
             "header was: {header:?}"
@@ -1006,7 +972,6 @@ mod tests {
             cpu_limit_w: Some(30.0),
             gpu_max_mhz: Some(1950),
             fan_target_rpm: 3000.0,
-            trim_rpm: 0.0,
             flags: vec![],
             calib: Some(CalibProgressLite {
                 phase: "matrix".into(),
@@ -1059,7 +1024,6 @@ mod tests {
             cpu_limit_w: None,
             gpu_max_mhz: None,
             fan_target_rpm: 3000.0,
-            trim_rpm: 0.0,
             flags: vec![],
             calib: Some(CalibProgressLite {
                 phase: "aborted".into(),
@@ -1087,7 +1051,6 @@ mod tests {
             cpu_limit_w: Some(20.0),
             gpu_max_mhz: Some(1500),
             fan_target_rpm: 3000.0,
-            trim_rpm: 0.0,
             flags: vec![],
             calib: None,
             ..ControlStatus::default()
@@ -1103,7 +1066,6 @@ mod tests {
             cpu_limit_w: Some(54.0),
             gpu_max_mhz: Some(3090),
             fan_target_rpm: 3000.0,
-            trim_rpm: 0.0,
             flags: vec![],
             calib: None,
             ..ControlStatus::default()
@@ -1112,6 +1074,246 @@ mod tests {
         // ...and back to None mid-session (release).
         m.update(Event::Status(ControlStatus::default()));
         draw(&m);
+    }
+
+    // --- Task 15: arbiter/budget header segment ---
+
+    /// Asserts every needle appears in `header`, each strictly after the
+    /// previous one ends — the "specified order" the acceptance criteria
+    /// asks for, not just presence. Searching from the previous match's END
+    /// (not its start, and not from 0) both enforces the order and avoids
+    /// matching an earlier, unrelated occurrence of a short needle like
+    /// "rpm" (which also appears in "fan target 3000 rpm", well before the
+    /// arbiter segment this asserts on).
+    fn assert_order(header: &str, needles: &[&str]) {
+        let mut from = 0;
+        for needle in needles {
+            let pos = find_col_from(header, needle, from).unwrap_or_else(|| {
+                panic!("{needle:?} not found at/after column {from} in header: {header:?}")
+            });
+            from = pos + needle.chars().count();
+        }
+    }
+
+    #[test]
+    fn header_segment_for_temp_loop_mode_a() {
+        use crate::control::ControlStatus;
+        let mut m = Model::new();
+        m.update(Event::Status(ControlStatus {
+            loop_mode: LoopMode::TempLoop,
+            t_star_c: Some(71.5),
+            ec_ma_c: Some(70.8),
+            duty_cmd: Some(31),
+            snapped_rpm: 3050.0,
+            budget_w: 68.0,
+            ..ControlStatus::default()
+        }));
+        let terminal = draw(&m);
+        let header = row_text(&terminal, 0);
+        assert!(
+            header.contains(
+                "mode A \u{b7} T* 71.5\u{b0}C \u{b7} ma 70.8 \u{b7} duty 31 \u{2192} 3050 rpm \u{b7} budget 68.0 W"
+            ),
+            "header was: {header:?}"
+        );
+        assert_order(&header, &["mode A", "T*", "ma", "duty", "rpm", "budget"]);
+    }
+
+    #[test]
+    fn header_segment_for_rpm_loop_mode_b() {
+        use crate::control::ControlStatus;
+        let mut m = Model::new();
+        m.update(Event::Status(ControlStatus {
+            loop_mode: LoopMode::RpmLoop,
+            t_star_c: None,
+            ec_ma_c: Some(65.2),
+            duty_cmd: None,
+            snapped_rpm: 0.0,
+            budget_w: 40.0,
+            ..ControlStatus::default()
+        }));
+        let terminal = draw(&m);
+        let header = row_text(&terminal, 0);
+        assert!(header.contains("mode B"), "header was: {header:?}");
+        // T* and duty have nothing to show in RpmLoop: the missing-value
+        // dash, not a stale/zero number.
+        assert!(header.contains("T* \u{2013}"), "header was: {header:?}");
+        assert!(header.contains("ma 65.2"), "header was: {header:?}");
+        assert!(header.contains("duty \u{2013}"), "header was: {header:?}");
+        assert!(header.contains("budget 40.0 W"), "header was: {header:?}");
+        assert_order(&header, &["mode B", "T*", "ma", "duty", "budget"]);
+    }
+
+    #[test]
+    fn header_segment_for_released_mode() {
+        use crate::control::ControlStatus;
+        let mut m = Model::new();
+        m.update(Event::Status(ControlStatus {
+            loop_mode: LoopMode::Released,
+            t_star_c: None,
+            ec_ma_c: None,
+            duty_cmd: None,
+            snapped_rpm: 0.0,
+            budget_w: 0.0,
+            ..ControlStatus::default()
+        }));
+        let terminal = draw(&m);
+        let header = row_text(&terminal, 0);
+        assert!(header.contains("mode rel"), "header was: {header:?}");
+        assert!(header.contains("T* \u{2013}"), "header was: {header:?}");
+        assert!(header.contains("ma \u{2013}"), "header was: {header:?}");
+        assert!(header.contains("duty \u{2013}"), "header was: {header:?}");
+        assert!(header.contains("budget 0.0 W"), "header was: {header:?}");
+        assert_order(&header, &["mode rel", "T*", "ma", "duty", "budget"]);
+    }
+
+    // --- Task 15: the seven new StatusFlags ---
+
+    fn status_with_flag(flag: StatusFlag) -> crate::control::ControlStatus {
+        use crate::control::ControlStatus;
+        ControlStatus {
+            flags: vec![flag],
+            ..ControlStatus::default()
+        }
+    }
+
+    fn flag_text(flag: StatusFlag) -> &'static str {
+        match flag {
+            StatusFlag::FanctrlLost => "FANCTRL LOST",
+            StatusFlag::EcMismatch => "EC MISMATCH",
+            StatusFlag::SteepCurve => "STEEP CURVE",
+            StatusFlag::CurveInvalid => "CURVE INVALID",
+            StatusFlag::GpuHot => "GPU HOT",
+            StatusFlag::NvmeHot => "NVME HOT",
+            StatusFlag::ReadbackBlind => "READBACK BLIND",
+            _ => unreachable!("not one of the seven Task 15 flags"),
+        }
+    }
+
+    #[test]
+    fn each_new_flag_renders_its_name() {
+        for flag in [
+            StatusFlag::FanctrlLost,
+            StatusFlag::EcMismatch,
+            StatusFlag::SteepCurve,
+            StatusFlag::CurveInvalid,
+            StatusFlag::GpuHot,
+            StatusFlag::NvmeHot,
+            StatusFlag::ReadbackBlind,
+        ] {
+            let mut m = Model::new();
+            m.update(Event::Status(status_with_flag(flag)));
+            let terminal = draw(&m);
+            let header = row_text(&terminal, 0);
+            let text = flag_text(flag);
+            assert!(
+                header.contains(text),
+                "flag {flag:?} must render {text:?}; header was: {header:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn warning_severity_new_flags_are_yellow() {
+        for flag in [
+            StatusFlag::CurveInvalid,
+            StatusFlag::EcMismatch,
+            StatusFlag::FanctrlLost,
+            StatusFlag::GpuHot,
+            StatusFlag::NvmeHot,
+        ] {
+            let mut m = Model::new();
+            m.update(Event::Status(status_with_flag(flag)));
+            let terminal = draw(&m);
+            let header = row_text(&terminal, 0);
+            let text = flag_text(flag);
+            let x = find_col(&header, text)
+                .unwrap_or_else(|| panic!("{text:?} missing: {header:?}"))
+                as u16;
+            let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
+            assert_eq!(cell.fg, Color::Yellow, "flag {flag:?} must be yellow");
+        }
+    }
+
+    #[test]
+    fn info_severity_new_flags_are_gray() {
+        for flag in [StatusFlag::SteepCurve, StatusFlag::ReadbackBlind] {
+            let mut m = Model::new();
+            m.update(Event::Status(status_with_flag(flag)));
+            let terminal = draw(&m);
+            let header = row_text(&terminal, 0);
+            let text = flag_text(flag);
+            let x = find_col(&header, text)
+                .unwrap_or_else(|| panic!("{text:?} missing: {header:?}"))
+                as u16;
+            let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
+            assert_eq!(cell.fg, Color::Gray, "flag {flag:?} must be gray");
+        }
+    }
+
+    /// Acceptance criteria, verbatim: a warning-severity flag must outrank
+    /// an info one when both are present — specifically CURVE INVALID
+    /// (warning) over STEEP CURVE (info).
+    #[test]
+    fn curve_invalid_outranks_steep_curve() {
+        use crate::control::ControlStatus;
+        let mut m = Model::new();
+        m.update(Event::Status(ControlStatus {
+            // Info flag listed FIRST in the Vec: only severity-first
+            // sorting, not insertion order, can put CURVE INVALID ahead.
+            flags: vec![StatusFlag::SteepCurve, StatusFlag::CurveInvalid],
+            ..ControlStatus::default()
+        }));
+        let terminal = draw(&m);
+        let header = row_text(&terminal, 0);
+        let curve_invalid = find_col(&header, "CURVE INVALID").expect("CURVE INVALID must render");
+        let steep_curve = find_col(&header, "STEEP CURVE").expect("STEEP CURVE must render");
+        assert!(
+            curve_invalid < steep_curve,
+            "CURVE INVALID (warning) must outrank STEEP CURVE (info): {header:?}"
+        );
+    }
+
+    // --- Task 15: calibration phase renders verbatim ---
+
+    #[test]
+    fn calib_wizard_renders_lut_phase_verbatim() {
+        use crate::control::ControlStatus;
+        use crate::control::controller::{CalibProgressLite, Mode};
+        let mut m = Model::new();
+        m.update(Event::Status(ControlStatus {
+            mode: Mode::Calibrating,
+            calib: Some(CalibProgressLite {
+                phase: "lut".into(),
+                step: 2,
+                total: 10,
+                needs_load: false,
+                note: String::new(),
+            }),
+            ..ControlStatus::default()
+        }));
+        let text = all_text(&draw(&m));
+        assert!(text.contains("calibration \u{2014} lut"), "text: {text}");
+    }
+
+    #[test]
+    fn calib_wizard_renders_step_phase_verbatim() {
+        use crate::control::ControlStatus;
+        use crate::control::controller::{CalibProgressLite, Mode};
+        let mut m = Model::new();
+        m.update(Event::Status(ControlStatus {
+            mode: Mode::Calibrating,
+            calib: Some(CalibProgressLite {
+                phase: "step".into(),
+                step: 5,
+                total: 8,
+                needs_load: false,
+                note: String::new(),
+            }),
+            ..ControlStatus::default()
+        }));
+        let text = all_text(&draw(&m));
+        assert!(text.contains("calibration \u{2014} step"), "text: {text}");
     }
 
     #[test]

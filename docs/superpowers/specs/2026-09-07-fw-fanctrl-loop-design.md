@@ -51,16 +51,33 @@ controller's adaptation tier no longer exist.
 - Live curves (2026-09-07): `quiet16` = (0,15) (55,15) (65,21) (75,31) (82,37) (88,55) (95,100),
   `movingAverageInterval` 60; `cool16` = (0,20) (50,20) (60,30) (70,42) (85,100), interval 60.
   Verified truncation case on cool16: T_eff 51.8 → duty 21.
-- **Measured 2026-09-08 with the dGPU powered** (NVML: 18.9 W, P0, 38 °C): the cros_ec `gpu_amb`,
-  `gpu_vr` and `gpu_vram` sensors still read −150 and `gpu_temp@40` still returns ENODATA. They
-  are not merely "off while unpowered" — they never report on this machine, confirming the
-  research doc's original finding that the dGPU does not feed the EC fan curve. The replica's
-  rule is nonetheless "every positive reading joins the max", which matches fw-fanctrl's own
-  regex and costs nothing if a future firmware makes them live.
+- **CORRECTED 2026-09-09 — the dGPU DOES feed the EC fan curve, and dominates it under GPU
+  load.** An earlier entry here claimed `gpu_amb`/`gpu_vr`/`gpu_vram` "read −150" and
+  `gpu_temp@40` "returns ENODATA". Re-measured through `ectool temps all` (the path fw-fanctrl
+  itself reads) and `sensors`: all four report live values (idle: `gpu_amb` 44, `gpu_vr` 49,
+  `gpu_vram` 44, `gpu_temp@40` 42 °C — the last tracking NVML's die temperature within 1 °C). The
+  "−150" was almost certainly the EC's *unset-threshold* sentinel: `sensors` shows `gpu_amb` and
+  `gpu_vram` with `high/crit/emerg = −273.1 °C` (no thresholds configured) while their inputs are
+  normal; `gpu_vr` (high 70.8, crit 89.8, emerg 104.8) and `gpu_temp@40` (high 86.8, crit 96.8,
+  emerg 99.8) carry real thresholds. Under a 240 s ~100 W gpu-burn with fw-fanctrl on `quiet16`
+  (`docs/research/2026-09-09-gpu-burn-fanctrl-quiet16.csv`): a GPU sensor took the argmax **13 s**
+  into load and held it — `gpu_temp@40` first, then `gpu_vr` at steady state (mean 83.2, max 84,
+  ~1 °C above the die) — driving duty 18 → 38 % and fans 1478 → 3330 rpm (max 3461) while
+  `ambient` only crept 61 → 65 and `cpu@4c` fell 53 → 47. The same burn under the EC's native
+  curve (`…-ec-native.csv`) ran fans at 4002 rpm and held the die at 76 °C. `gpu_vr` also has a
+  long tail: 67–71 °C forty seconds after the die was back at 50–53. The replica's "every
+  positive reading joins the max" rule was therefore already correct in effect.
 - **Measured 2026-09-08, dGPU thermals (NVML):** `GPU Target Temperature Specification` is
-  **87 °C**, and the driver reports headroom against that same reference. The card deliberately
-  runs to 87 °C under sustained load, so any guard threshold below it fires during normal
-  gaming.
+  **87 °C**, and the driver reports headroom against that same reference. **Re-measured
+  2026-09-09 with the T.Limit specs read in full** (`nvidia-smi -q -d TEMPERATURE`): Max
+  Operating at T.Limit 0 = **87 °C**, Slowdown at −2 = **89 °C**, Shutdown at −5 = **92 °C** —
+  a 5 °C band between "normal" and "the card cuts power". **The card does not reach 87 with the
+  fans free:** under a 240 s ~100 W gpu-burn the die settled at 82.4 °C mean / 83 max (peak 85
+  during the ramp) on `quiet16` at ~3330 rpm, and at 76 °C at ~4000 rpm under the EC's native
+  curve (`docs/research/2026-09-09-gpu-burn-*.csv`). 87 is where it parks only when something
+  holds the fans below what its sensors ask for — which is exactly what this controller does for
+  a quiet RPM target. So a GPU reading at or above the park point in auto mode is a real
+  "our cap is the limiting factor" signal, not normal operation.
 - **Measured 2026-09-08 under load:** cros_ec max 74.85 °C (argmax `cpu@4c`) against the socket's
   `temperature: 75.0` — the round-to-integer max rule holds under load as well as at idle.
 - **Measured 2026-09-08, duty→RPM seed validated in place:** under `quiet16` at EC max 75 °C the
@@ -94,6 +111,42 @@ controller's adaptation tier no longer exist.
   `smu_module.rs` already enforces for writes, so read-back shares it.
 - `nvidia-smi` reports `power.limit` N/A and `enforced.power.limit` 100 W; we control locked
   clocks, not power, so the GPU read-back is the measured SM clock under load.
+- **Measured 2026-09-09, `DEMAND_MARGIN_W` per axis (§2.4's anti-windup spike, `fwloop.24`,
+  bead `fw-fanctrl-loop-9it`).** Method: command a sustained cap, drive a load, sample
+  commanded-vs-drawn power at the 5 s allocator cadence for 7 ticks after a settle window, at
+  several cap levels and load compositions.
+  - **CPU: unloaded `ryzen_smu` and left it unloaded for the duration** (the precondition above
+    — `ryzenadj --info` needs it unloaded; unloading and immediately reloading, as a prior
+    attempt did, restores the broken precondition before `ryzenadj` runs). With `ryzen_smu`
+    unloaded, `sudo ryzenadj --stapm-limit=<mw> --slow-limit=<mw> --fast-limit=53000` plus
+    `stress-ng --cpu 24` (24-thread AVX matrixprod, full saturation) at 20 W and 35 W caps:
+    `PPT VALUE SLOW` (drawn) tracked `PPT LIMIT SLOW` (commanded) within 0.005–0.08 W across all
+    14 samples, RAPL `energy_uj` (root, `/sys/class/powercap/intel-rapl:0`) cross-validated to
+    within 0.01 W of the same commanded value over the sampling window. The same ≤ 0.08 W noise
+    floor held under lighter, genuinely cap-bound loads too (2-thread `stress-ng`, a single
+    15%-duty-cycled thread, and ordinary desktop background load, all at the 35 W cap — this
+    machine's live desktop background draw turned out to already sit above 35 W, so those
+    "light" loads were still cap-bound, not demand-limited, on this run). A genuine
+    demand-limited gap was measured directly instead: at a 54 W cap (near-unconstrained) with
+    only ordinary desktop background load, drawn power settled to 36.8 W (RAPL) — a 17.2 W gap.
+    **`DEMAND_MARGIN_W_CPU = 2.0 W`** — ~25x the measured noise floor, ~8x below the smallest
+    measured genuine gap. Module state was restored (`modprobe ryzen_smu`) and stock CPU limits
+    reasserted (platform-profile toggle) after the measurement; no stray load processes were
+    left running.
+  - **GPU:** `nvidia-smi -lgc 210,1500` (applied clock read back 1492 MHz) with a `glxgears`
+    fill/geometry-bound proxy load at 95–100% reported utilization: `power.draw` settled 13.50 →
+    13.39 W over 7 ticks, a 0.11 W spread. **Limitation, stated because this number is used as a
+    margin:** `glxgears` is fill/geometry-bound, not compute-bound (unlocked, it draws only
+    24.7 W of the card's 100 W limit at 97–100% reported utilization), so this spread likely
+    understates the noise floor a real compute-bound game workload would show; a heavier
+    generator (`glmark2`/`vkmark`/CUDA) was not available on this machine (same
+    "Limitation, stated because the numbers are used as a plant" pattern as the EC autofan curve
+    fact above). A genuine demand gap was measured directly at the same lock: idle (no
+    artificial load) settled to 7.27 W vs the proxy-loaded 13.4 W above — a 6.1 W gap.
+    **`DEMAND_MARGIN_W_GPU = 3.0 W`** — ~27x the measured noise floor (proportionally larger
+    than the CPU margin's ratio, since the GPU noise-floor number itself is the weaker
+    measurement) and about half the smallest measured genuine gap. The clock lock was released
+    (`nvidia-smi -rgc`) after the measurement.
 
 ## 1. Architecture
 
@@ -154,9 +207,50 @@ controllers on one measurement benign. Never add a second integrator on the same
   curve validity as an input and falls to RpmLoop.
   - `duty_at(t: f64) -> u8`
   - `tread(d: u8) -> Option<(t_lo, t_hi)>`: the maximal temperature interval where
-    `duty_at(t) == d`; `None` when no temperature yields exactly `d` (the target then snaps to
-    the nearest reachable duty, see 2.3).
-  - `t_star(d) = (t_lo + t_hi) / 2`.
+    `duty_at(t) == d`, computed by **the same rule at every duty** — `min_duty`/`max_duty` (the
+    curve's own floor/ceiling) get no special case. `None` when no temperature yields exactly
+    `d` (the target then snaps to the nearest reachable duty, see 2.3).
+    **Endpoint semantics (settled here; was a deferred minor on Task 1, `fw-fanctrl-loop-9dv`,
+    never signed off before Task 16, `fw-fanctrl-loop-iym`, merged as its first consumer —
+    `fw-fanctrl-loop-nez` closes the gap):** the interval is unbounded in principle at the
+    curve's own floor and ceiling — fw-fanctrl would report that duty at any arbitrarily
+    low/high temperature past the curve's own defined domain — but `tread` is **the unbounded
+    interval intersected with the curve's own domain**, `[points.first().0, points.last().0]`,
+    never left open with a `NEG_INFINITY`/`INFINITY` endpoint. Concretely:
+    - **Where the curve defines a genuine flat run at that extreme** (both `quiet16` and
+      `cool16` have one at their floor: 0→55 °C at duty 15, 0→50 °C at duty 20), the
+      intersection is a real, finite, non-empty interval — same shape as any interior duty's
+      tread, just clamped at the domain edge instead of a neighbouring point. T* lands inside
+      it and Mode A runs there exactly as it would anywhere else: **the quietest reachable
+      target keeps the temperature loop**, it does not permanently fall to RpmLoop.
+    - **Where the extreme duty is attained only instantaneously, at a single defining point with
+      no flat run** (both curves' *ceiling*: quiet16 and cool16 each reach their top duty only
+      at their very last point), the intersection is empty and `tread` returns `None` for that
+      exact duty. This is not by itself `TARGET UNREACHABLE`: 2.3's `nearest_tread` already
+      snaps a duty with no tread of its own to the nearest one that has one, and the immediately
+      adjacent duty always does (one integer step is a small enough temperature step that the
+      curve attains it over a real, if narrow, interval) — so a target sitting exactly on such a
+      ceiling still resolves to a finite T* one duty in (quiet16's 100 resolves via 99, T* ≈
+      94.9 °C), and Mode A keeps running there too, not just at the floor.
+    - The two ends are **not required to behave identically, and for both of this design's own
+      curves do not** — a flat lead-in and an instantaneous ceiling are different curve shapes,
+      not an arbitrary per-end special case. It is one rule (intersect with the domain) applied
+      uniformly; the asymmetric *outcome* is a fact about `quiet16`/`cool16`, not about `tread`.
+      A hypothetical curve with a flat run at its ceiling too (e.g. an extra point repeating the
+      max duty) would get a finite ceiling tread from the same rule, no code change required.
+    - `slope_at(t_star)` stays meaningful in both cases above: whenever `t_star` is `Some`, it
+      lies inside `[points.first().0, points.last().0]` by construction (never on the flat
+      clamp, where `slope_at` is defined as `0`), so `STEEP CURVE` is judged on the same real
+      segment slope as any interior duty — never coerced by an out-of-domain 0.
+    - The §2.7 "unreachable from above" bound-hold rule is unaffected either way: it reads
+      `Budget::at_upper_bound_for()` and the tick's `error_sign` directly, never `t_star`, so it
+      fires exactly as before regardless of which duty's tread ends up backing T* at the
+      ceiling.
+    - Net effect on the curve/arbiter seam (`fw-fanctrl-loop-nez`): `tread`/`t_star` can no
+      longer return a non-finite value for **any** duty in `[min_duty, max_duty]`, on either
+      curve, at any point — the velocity-form PI (2.4) never again sees an infinite error.
+  - `t_star(d) = (t_lo + t_hi) / 2` — always finite when `tread(d)` is `Some`, by the above;
+    `None` exactly when `tread(d)` is `None`.
   - `slope_at(t) -> f64` in %/°C (the segment's slope; 0 on the flat clamps).
 
 ### 2.2 `sensors/ec.rs` — fw-fanctrl sensor replica (new)
@@ -274,16 +368,18 @@ controllers on one measurement benign. Never add a second integrator on the same
   at `cpu_max_w + gpu_max_w` so the next load onset runs uncapped through the whole dead time.
   The old design's conservative start and model contour covered this; they are deleted.
 
-  **This spec does not state the replacement rule, on purpose.** Three prose revisions of it were
-  each confirmed Blocking by an independent adversarial panel, and each failure was introduced by
-  the previous fix — a back-calculation toward the draw that turned out to be a tracker, then a
-  freeze that turned out to latch. That is a signal the rule cannot be settled by writing more
-  prose about it. `fwloop.24` builds a throwaway harness (the `Budget`, a first-order thermal
-  plant, a demand model) and **measures** the candidates against every scenario the three review
-  rounds named, then writes the winner and its constants back into this section before the
-  controller is wired.
+  **This spec did not originally state the replacement rule, on purpose.** Three prose revisions
+  of it were each confirmed Blocking by an independent adversarial panel, and each failure was
+  introduced by the previous fix — a back-calculation toward the draw that turned out to be a
+  tracker, then a freeze that turned out to latch. That was a signal the rule could not be
+  settled by writing more prose about it. `fwloop.24` (bead `fw-fanctrl-loop-9it`) built a
+  throwaway harness (the real `Budget`, a first-order thermal plant driven by **actual drawn
+  watts** rather than commanded `u`, a demand model, and the real `allocator::split_budget`) and
+  **measured** four candidate rules against every scenario the three review rounds named. What
+  follows is the result: the rule this section now states normatively, and — below the fixed
+  invariants — the measurements and the sweep that justify it.
 
-  What **is** fixed, and what the spike may not violate:
+  What **is** fixed, and what the decided rule below must not violate (unchanged by the spike):
   - **Anti-windup is directional.** Accumulation may be halted only in the direction that
     deepens the condition — the standard conditional-integration form. A rule that also blocks
     integration in the *recovering* direction can self-latch, which is exactly how revision three
@@ -300,12 +396,117 @@ controllers on one measurement benign. Never add a second integrator on the same
     telemetry, so a loop that is deliberately not integrating is distinguishable from one that is
     converged.
 
-  Open for the spike to decide and record: the predicate itself; whether the per-axis comparison
-  uses the pre- or post-guard-override cap; `DEMAND_MARGIN_W` per axis, derived from the measured
-  spread between commanded and drawn power on each actuator rather than assumed; hysteresis,
-  dwell or debounce on entering and leaving; whether leaving calls `resync_error`; and whether a
-  `GPU HOT` episode freezes the integrator or hands the discarded GPU watts to the CPU axis
-  inside `split_budget`.
+  #### The decided rule (settled 2026-09-09 by `fwloop.24`, `src/control/spike_antiwindup.rs`)
+
+  **Per axis, `ConditionalHysteresis`.** Every allocator tick, for each axis `i` independently:
+
+  ```text
+  demand_limited(i) := cap_i > floor_i + ε   AND   (cap_i − draw_i) > DEMAND_MARGIN_W(i)
+  ```
+
+  `cap_i` is the axis's **post-guard-override** commanded cap for this tick — the value
+  `split_budget` actually produced after `gpu_share_override` (§2.8) has been applied to
+  `gpu_max_w`, not a hypothetical pre-override value. There is only one cap an axis is ever
+  actually offered in a given tick; comparing draw against anything else would compare it against
+  power that was never really available. `floor_i` is that axis's own configured floor
+  (`cpu_floor_w`, or the LUT's watts at `gpu_floor_mhz`) — **not** zero and **not** a
+  powered/unpowered flag. The `cap_i > floor_i + ε` guard is the load-bearing half of "judge each
+  axis separately": it is what excludes an axis that was never offered headroom above its floor
+  (a structurally-undrawn GPU sits with `cap == floor` every tick, since `split_budget`'s
+  demand-proportional split gives a zero-demand axis nothing beyond its floor) from ever
+  registering as "wasting unused headroom" — see the sweep's dedicated predicate tests below for
+  why a naive per-axis check *without* this guard, or a sum-of-axes check, both fail this exact
+  case.
+
+  The **halt** applied to the integrator each tick is `any(demand_limited(i) for i in {cpu, gpu})
+  AND error_sign > 0` (`error_sign` = `sign(e_c)`, the *current* tick's Mode A/B error before this
+  tick's step) — one axis's condition is enough to gate the shared scalar `u`, but only in the
+  deepening direction; `Budget::step`'s existing `Freeze::DemandLimited` handling already applies
+  that gate correctly (see `src/control/budget.rs`, unchanged by this task).
+
+  **Hysteresis: `HYSTERESIS_DWELL_TICKS = 2`** (10 s at the 5 s allocator cadence), applied
+  per-axis, symmetric on entering and leaving. A candidate's raw per-tick verdict must persist for
+  2 consecutive ticks before the effective (debounced) state changes. 10 s is short relative to
+  `Ti = 35` s, so it costs negligible recovery latency, but the sweep's scenario 7 (draw held
+  right at the margin, ±noise) shows it cuts hysteresis-state chatter from 81 raw transitions to
+  29 over a 100-tick window — worth having; `Conditional` (no hysteresis) is not the chosen rule.
+
+  **`DEMAND_MARGIN_W` (§Facts has the full measurement):**
+  - CPU: **2.0 W**. `ryzenadj --info`'s `PPT VALUE SLOW` (drawn) against `PPT LIMIT SLOW`
+    (commanded) tracked within ≤ 0.08 W across four cap-bound load compositions, RAPL
+    `energy_uj`-cross-validated to ≤ 0.01 W at the two heaviest; a genuine demand-limited gap,
+    measured directly, was 17.2 W. 2.0 W is ~25x the noise floor and ~8x below the smallest
+    measured genuine gap.
+  - GPU: **3.0 W**. NVML `power.draw` at a 1500 MHz clock lock, `glxgears` proxy load: 0.11 W
+    spread; a genuine idle-vs-loaded gap at the same lock, measured directly, was 6.1 W. 3.0 W is
+    ~27x the noise floor and about half the smallest measured genuine gap — a larger margin
+    relative to its own noise floor than the CPU's, because the GPU noise-floor number itself
+    rests on a weaker (fill/geometry-bound, not compute-bound) proxy load; §Facts states that
+    limitation explicitly.
+
+  **Leaving the hold does not need a bespoke resync rule.** `Budget::step`'s existing generic
+  "leaving any freeze" resync (`kind_switched || leaving_freeze`, in `src/control/budget.rs`,
+  already implemented and untouched by this task) already fires exactly once whenever a
+  `DemandLimited` tick is followed by a non-halted one, because `step` treats every
+  `Some(freeze) -> None` transition uniformly. No new special case is required or was added.
+
+  **`GPU HOT` does not freeze the integrator.** `Guards::gpu_share_override` (§2.8) already
+  ratchets the GPU's effective `gpu_max_w` down toward its floor at `DOWN_RATE_W`/tick while hot;
+  feeding that ratcheted value into `split_budget` as `gpu_max_w` is enough on its own —
+  `split_budget`'s existing surplus-reassignment (an axis's rejected `cpu_over`/`gpu_over` flows
+  to the other axis) automatically hands the GPU's shrinking share to the CPU axis, with no new
+  mechanism. The demand-limited predicate above, evaluated against the resulting post-override
+  `cap_i`, then behaves correctly on its own: neither axis shows a spurious gap during a HOT
+  episode (confirmed by the sweep's scenario 6), so there is nothing for a `Budget`-level freeze
+  to add.
+
+  #### The sweep (candidate x scenario, `cargo test control::spike_antiwindup -- --nocapture`)
+
+  Four candidates: `NoHalt` (baseline, no demand-limited halt at all — only the existing
+  clamp+back-calc anti-windup), `Conditional` (the rule above, no hysteresis), the decided
+  `ConditionalHysteresis`, and `CombinedSum` (directional, but judged on `Σdraw` vs `Σcap` rather
+  than per axis — kept in the sweep specifically to demonstrate why the "judge each axis
+  separately" invariant above is fixed, not optional). All four wrap the real `Budget`; the
+  thermal plant is τ 35 s / θ 20 s / K 0.8 °C/W (§5), driven by **actual drawn watts**.
+
+  | Scenario | NoHalt | Conditional | **ConditionalHysteresis (chosen)** | CombinedSum |
+  |---|---|---|---|---|
+  | 1 idle wind-up then load onset | **overshoots target by 14.0 °C-equiv** (windup) | holds, 0 overshoot | **holds, 0 overshoot** | holds, 0 overshoot |
+  | 2 lull mid-session | **self-latches** (never recovers within the graded window) | recovers | **recovers** | recovers |
+  | 3 warm-start, lighter load, EC above T* | holds | holds | **holds** | holds |
+  | 4 mid-session target drop | holds | holds | **holds** | holds |
+  | 5 structurally undrawn axis (dGPU unpowered) | holds | holds | **holds** | holds, but measurably worse than per-axis (see note) |
+  | 6 GPU HOT, CPU at its own cap | holds (identical across all four — no differentiation expected, see below) | holds | **holds** | holds |
+  | 7 oscillation around the margin | holds (never triggers a halt in this configuration) | holds, **81 hysteresis-state transitions** | **holds, 29 transitions** | holds (never triggers a halt in this configuration) |
+
+  No candidate ever pulled `u` toward the draw in any cell (`cap_tracking` false throughout —
+  `Budget::step`'s clamp-only back-calculation held in every run, as it must).
+
+  **Scenario 5 note.** On this machine's specific measured `DEMAND_MARGIN_W` values, the GPU's
+  structural floor share (5 W in the harness) sits close enough to `margin_sum` (2.0 + 3.0 = 5.0
+  W) that `CombinedSum`'s closed-loop degradation versus per-axis is small in this configuration
+  (mean settled error 0.063 °C-equiv vs 0.060 for both per-axis variants) rather than the more
+  dramatic "CPU pinned at its floor" failure the invariant's reasoning describes — that failure
+  is real and structural,
+  not scenario-configuration-dependent, and is demonstrated directly (not just via this one
+  closed-loop run) by two predicate-level tests in `spike_antiwindup.rs`:
+  `per_axis_predicate_excludes_an_axis_pinned_at_its_floor` and
+  `combined_sum_predicate_mis_flags_a_perfectly_tracked_cpu_next_to_a_pinned_gpu_floor` (the
+  latter uses a deliberately larger floor than this harness's own 5 W specifically to make the
+  point unambiguously, since the closed-loop run alone would understate it here).
+
+  **Scenario 6 note.** All four candidates are identical because the scenario's target is
+  reachable within `cpu_max_w + gpu_floor_w` even at the GPU's fully-ratcheted-down cap during the
+  HOT episode (by construction — a target *not* reachable there would conflate the guard's own,
+  expected, ceiling reduction with an anti-windup defect, which is not what this scenario tests).
+  The identical result across candidates is itself the finding: none of them add a spurious extra
+  hold on top of the guard's already-correct behavior.
+
+  The harness (real `Budget`, thermal plant, demand model, the four `Rule` variants, the seven
+  scenarios as data, and the predicate-level tests) is **kept** as a `#[cfg(test)]` fixture
+  (`src/control/spike_antiwindup.rs`, declared in `src/control/mod.rs`) rather than deleted: it is
+  the only place the decided rule and its constants are exercised against every named scenario
+  together, and it stays green as a regression on both.
 
 ### 2.5 `control/mode.rs` — arbiter (new)
 
@@ -435,9 +636,17 @@ Both run every sample in any auto mode, ahead of the arbiter, with hysteresis
   `GPU Target Temperature Specification` 87 °C, plus Shutdown, Slowdown and Max-Operating limits
   expressed as offsets against a T.Limit reference (measured 2026-09-08: current temp 38 °C with
   49 °C of T.Limit headroom, Shutdown −5, Slowdown −2, Max Operating 0, so the reference is that
-  same 87 °C). 87 is where the card's own loop deliberately parks under sustained load, so a
+  same 87 °C). 87 is where the card's own loop parks when the fans are held down, so a
   threshold below it latches for entire sessions and ratchets the GPU to its floor — which is why
-  83/78 was wrong. 90/85 sits above the park point and below the slowdown region. Keying the
+  83/78 was wrong. **Revised 2026-09-09 (fw-fanctrl-loop-a78):** the absolute values of those
+  offsets are Slowdown **89** and Shutdown **92**, so the earlier 90/85 pair sat *above* the
+  slowdown point, not below it, and the hard watchdog's 87 sat *below* the soft guard — an
+  inversion that made `gpu_hot` unreachable and tripped an emergency release at the card's
+  park point. The defaults are now **soft 88 / exit 86 / hard trip 91**: 88 is one degree above
+  the park point (does not fire under ordinary sustained load — measured, the die settles at
+  82–83 on `quiet16` with fans free), the hysteresis is 2 °C rather than 5 because the band is
+  only 5 °C wide and `gpu_vr` has a 40 s+ thermal tail, and 91 sits above slowdown and below
+  shutdown so the watchdog fires only once the soft ratchet has demonstrably failed. Keying the
   guard on the published T.Limit margin instead of an absolute number is the more robust form and
   is left as a follow-on (§6).
 - **NVMe** (`nvme_hot_c`, default 80; new hwmon read of the `nvme` chip's `Composite`):
@@ -760,3 +969,105 @@ the acceptance grades the shipping loop; fwloop.23 is the terminal join.
 ## Post-Implementation Notes
 
 *As this design is implemented and iterated on — bug fixes, adjustments, anything that diverged from the assumptions above — append a dated note here, whether or not a formal debugging skill was used.*
+
+### 2026-09-09 — Integration sweep (`fw-fanctrl-loop-nsc`)
+
+Root integration task, run on the merged tree after all 22 leaf tasks (plus the
+`fwloop.24` anti-windup spike). Three jobs, per the bead:
+
+**(1) Main flows walked end to end**, new `src/integration_tests.rs`
+(`main_flow` module), one continuous session on a single `state.json`:
+`SetAuto(true)` from a fresh, LUT-only persisted state → drives a real
+`ChainedPlant` into `TempLoop` → a scripted socket death → `RpmLoop` +
+`FANCTRL LOST` → socket revival → recovery to `TempLoop` → `SetAuto(false)` →
+`StartCalibration` (a real LUT sweep through the controller, then a real
+step test against a *second* `ChainedPlant` — physically simulated, not the
+FOPDT math directly like `control::sim_tests`'s own calibration test) → a
+landed fit (`calibrated_at`/`loop_gains` both persisted, gains verified
+non-default) → a simulated **daemon restart**: a brand-new `Controller`
+built from `PersistedState::load` off the same `state.json` path, exactly
+`main.rs`'s own startup sequence, confirming the LUT clears `NOT CALIBRATED`
+on the new instance and a non-empty `warm_start` seeds `u` above the floor
+sum on its very first tick. Test:
+`engage_walk_calibrate_and_restart_reloads_warm_start_table_and_gains`.
+
+**(2) Unwired-sweep checklist** — all five enumerations, each written as an
+exhaustive destructure/match in `src/integration_tests.rs`'s `wiring_sweep`
+module (`every_config_key_is_read_somewhere`,
+`every_status_flag_is_raised_and_rendered`,
+`every_telemetry_field_is_populated`, `every_effect_variant_is_applied`,
+`every_calib_context_field_originates_from_live_data`), so a field or
+variant added later fails that module to compile until it is named. Result:
+**zero open items.** The sweep found three real gaps, all fixed inline
+(small — each a one-call-site wiring miss, not a redesign):
+
+- `AutoState::new` hard-coded `Guards::new(GPU_HOT_C_DEFAULT,
+  NVME_HOT_C_DEFAULT)` regardless of the live `Config` — `gpu_hot_c`/
+  `nvme_hot_c` round-tripped through `Config::load`/`save` and appeared on
+  `ControlStatus`, but a user-edited threshold had **zero effect** on the
+  actual guard behavior, invisible only because the defaults matched.
+  Fixed: `AutoState::new` now takes `(gpu_hot_c, nvme_hot_c)` from
+  `self.config` at Auto entry. Regression test:
+  `control::controller::tests::gpu_and_nvme_hot_thresholds_come_from_the_live_config_not_the_compiled_defaults`.
+- `StatusFlag::TargetUnreachable` was computed correctly by
+  `mode::Arbiter::decide` for all three §2.7 cases but never reached
+  `ControlStatus.flags`: `mirror_decision`'s sync list named five of the six
+  `Decision`-sourced flags and dropped this one. Already caught and filed as
+  `fw-fanctrl-loop-a5j` by the `fw-fanctrl-loop-cm7` fix round (with four
+  regression tests left `#[ignore]`d against it); fixed here by adding the
+  flag to the sync list, and all four tests un-ignored and passing. Bead
+  closed.
+- `Controller::on_sample`'s resume branch cleared the fan window and EC
+  boxcar on a `resumed` sample but never `AutoState::steady_window`/
+  `steady_key`, contradicting §2.2's "clears ... the steady window" verbatim
+  — a pre-suspend window one sample from completing could complete on the
+  very next post-resume sample from readings spanning the gap. Already
+  caught and filed as `fw-fanctrl-loop-hwg` by the same fix round; fixed
+  here by clearing both fields too, and the regression test un-ignored.
+  Bead closed.
+
+One gap surfaced by the sweep was **not** fixed inline — it was a genuine
+tuning/design tension, not a wiring miss, and was filed as
+`fw-fanctrl-loop-a78`: GPU_TRIP_C, the hard-watchdog GPU emergency
+threshold, sat at 87 °C — *below* `GPU_HOT_C_DEFAULT` (90 °C) — so there was
+no GPU temperature at which the soft guard could ever ratchet the share down
+before the hard watchdog emergency-released everything and demanded a manual
+re-arm. **Resolved 2026-09-09 by measurement** (§Facts, §2.8): soft 88 /
+exit 86 / hard trip 91 against the card's measured park 87 / slowdown 89 /
+shutdown 92, and the regression test
+(`a_5min_gpu_hot_episode_at_88c_raises_the_flag_with_no_post_episode_overshoot`)
+is un-ignored.
+
+Every `Effect`/`CalibContext`/telemetry-field claim in `wiring_sweep`'s
+comments was verified against the source while writing this sweep (file/
+function cited inline); none needed a code change.
+
+**(3) The three integration tests no per-task test covered** — `real_types`
+module: `sampler_to_controller_to_telemetry_line_with_real_types` (the real,
+non-fake `Sampler::with_paths`/`Sampler::sample()` — not
+`test_support::plant`'s synthetic `Sample` — into a real `Controller` into a
+real `Telemetry`/`Record::sample` JSONL line, read back and parsed);
+`config_fanctrl_socket_flows_into_real_poller_construction` (`Config` →
+`UnixFanctrlClient` → `FanctrlPoller::new`, the exact chain `main.rs` builds);
+`full_manual_mode_on_command_on_sample_session_on_the_fakes` (`SetFloors` →
+`SetCpuW` → a live sample → `ReleaseAll` → `Quit`, the manual-control path
+none of the Auto/calibration-focused suites exercise end to end).
+
+**Also fixed while sweeping** (small, `src/**`, not called out by name
+above): four `clippy::needless_range_loop`/type-complexity/`ptr_arg`/
+too-many-arguments findings in `control::sim_tests` (pre-existing, blocking
+`cargo clippy -D warnings`); `fanctrl::client::parse_print_all` duplicated
+`resolve_curve`'s own strategy-curve lookup instead of calling it (now
+shared, one source of truth); five stale `#[allow(dead_code)]`/comments
+across `control::guards`, `control::controller` (the `StatusFlag`/`Severity`
+surface) left over from before `fwloop.12` wired the guards module in,
+removed or corrected to say what is actually true now; `Budget::set_gains`,
+`Curve::duty_at`/`continuous_duty_at` and `EcAverage::is_seeded`/
+`sample_count` are genuinely unused outside their own tests and
+`FanctrlEmulator`/cfg(test) consumers by design — annotated with a comment
+explaining why, matching the codebase's own established convention, rather
+than force an artificial call site.
+
+**Acceptance:** `cargo test` — 630 passed, 0 failed, 3 ignored (2 need real
+NVIDIA hardware, 1 is the filed `fw-fanctrl-loop-a78` design-tension
+blocker); `cargo clippy --all-targets -- -D warnings` — clean.

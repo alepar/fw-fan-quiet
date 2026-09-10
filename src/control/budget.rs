@@ -79,15 +79,25 @@ pub const DEMAND_MARGIN_W_GPU: f64 = 3.0;
 const DEMAND_HYSTERESIS_TICKS: u32 = 2;
 
 /// One axis's demand-limited predicate (§2.4's decided rule): only an axis
-/// actually offered headroom above its own floor (`cap > floor`) can ever
-/// register a false "unused headroom" signal — an axis pinned exactly at
-/// its floor (a structurally undrawn GPU, say) was never given room to
-/// waste. This is the "judge each axis separately" invariant's actual
-/// content, not just "loop over axes". Mirrors
-/// `spike_antiwindup::demand_limited_axis` exactly (that copy stays
-/// private to the throwaway harness; this is the production seam).
+/// actually offered headroom above its own floor can ever register a false
+/// "unused headroom" signal — an axis pinned at its floor (a structurally
+/// undrawn GPU, say) was never given room to waste. This is the "judge each
+/// axis separately" invariant's actual content, not just "loop over axes".
+///
+/// "Offered headroom" means MORE THAN THE MARGIN above the floor, not an
+/// epsilon (field deadlock, 2026-09-10): the allocator quantises to a 0.5 W
+/// grid, so an axis at its floor share routinely sits 0.2 W above `floor`;
+/// and `floor_w` itself comes from the LUT clamped at its lowest swept
+/// clock, which can overstate what the card draws at a lower clock floor
+/// (49.3 W claimed, 45 W drawn at 997 MHz). With the epsilon rule that axis
+/// was "limited", the halt blocked upward integration, the budget could
+/// never leave its lower bound, and the axis could never leave its floor —
+/// self-sustaining. Requiring `cap − floor > margin` means an axis can only
+/// be judged wasteful over headroom it could actually have spent.
+/// Mirrors `spike_antiwindup::demand_limited_axis` (that copy stays private
+/// to the throwaway harness; this is the production seam).
 fn demand_limited_axis(draw_w: f64, cap_w: f64, floor_w: f64, margin_w: f64) -> bool {
-    cap_w > floor_w + 1e-9 && (cap_w - draw_w) > margin_w
+    cap_w - floor_w > margin_w && (cap_w - draw_w) > margin_w
 }
 
 /// Persisted PI gains for both loop legs (§2.4). `Default` is the
@@ -1006,6 +1016,22 @@ mod tests {
         // guard the naive `draw >= cap` / combined-sum rules both lacked.
         let pinned_at_floor = (0.0, 5.0, 5.0);
         assert!(!latch(&mut budget, pinned_at_floor, GPU_AT_FLOOR, 1.0));
+    }
+
+    /// Field deadlock, 2026-09-10 (`run-1789067819`, t≈2050–2150): the GPU
+    /// share sat 0.2 W above a LUT-clamped floor of 49.3 W (the allocator's
+    /// 0.5 W grid) while the card at the 997 MHz floor clock could only draw
+    /// 45 W. The epsilon rule called it demand-limited, the halt blocked
+    /// upward integration, and the budget could never leave its lower
+    /// bound. Headroom under the margin is not headroom.
+    #[test]
+    fn set_demand_state_headroom_under_the_margin_is_not_limited() {
+        let mut budget = Budget::new(&LoopGains::default());
+        let gpu_grid_above_floor = (45.3, 49.5, 49.3);
+        assert!(!latch(&mut budget, CPU_NOT_LIMITED, gpu_grid_above_floor, 1.0));
+        // Headroom past the margin, still undrawn: limited as before.
+        let gpu_real_headroom = (45.3, 53.0, 49.3);
+        assert!(latch(&mut budget, CPU_NOT_LIMITED, gpu_real_headroom, 1.0));
     }
 
     #[test]

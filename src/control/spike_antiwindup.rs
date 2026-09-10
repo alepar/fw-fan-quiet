@@ -195,7 +195,9 @@ const ALL_RULES: [Rule; 4] = [
 /// "loop over axes", but "loop over axes, and only count headroom that was
 /// actually offered".
 fn demand_limited_axis(draw_w: f64, cap_w: f64, floor_w: f64, margin_w: f64) -> bool {
-    cap_w > floor_w + 1e-9 && (cap_w - draw_w) > margin_w
+    // Mirrors `budget::demand_limited_axis` (amended 2026-09-10: headroom
+    // under the margin is not headroom — see the production doc comment).
+    cap_w - floor_w > margin_w && (cap_w - draw_w) > margin_w
 }
 
 /// Rolling per-run state a [`Rule`] needs across ticks (hysteresis dwell

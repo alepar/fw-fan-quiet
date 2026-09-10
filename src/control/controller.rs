@@ -1911,13 +1911,22 @@ impl<R: Runner> Controller<R> {
         // (§2.4) fall out of this gate rather than needing separate code.
         if !self.auto.as_ref().expect("in auto").budget_seeded {
             let target_duty = self.auto.as_ref().expect("in auto").target_duty;
+            // No warm start: seed from what the machine is DRAWING right
+            // now, never below the floors (field 2026-09-10: a floor-sum
+            // seed of 64 W engaged against a card at its 100 W ceiling cut
+            // it to the floor clock in one second, dropping the fans from
+            // 3700 to 2400 RPM with the error the wrong way round; the loop
+            // then had to climb back at Mode A's deliberately slow gain).
+            // `seed` clamps to the bounds, so an over-cap draw lands at hi.
+            let draw_w = (if s.cpu_pkg_w.is_finite() { s.cpu_pkg_w } else { 0.0 })
+                + (if s.gpu_w_valid && s.gpu_w.is_finite() { s.gpu_w } else { 0.0 });
             let seed_u = self
                 .status
                 .strategy
                 .as_deref()
                 .map(|strat| WarmStart::key(strat, target_duty, s.on_ac))
                 .and_then(|key| WarmStart::lookup(&self.warm_start, &key))
-                .unwrap_or(cpu_floor_w + gpu_floor_w);
+                .unwrap_or((cpu_floor_w + gpu_floor_w).max(draw_w));
             let auto = self.auto.as_mut().expect("in auto");
             auto.budget.seed(seed_u);
             auto.budget_seeded = true;
@@ -5986,6 +5995,51 @@ mod tests {
         );
     }
 
+    /// Field 2026-09-10: with no warm-start entry the seed was the floor sum
+    /// (64 W here) while the card was at its 100 W ceiling — Auto entry cut
+    /// the GPU to the floor clock in one second and the fans fell 3700 →
+    /// 2400 RPM. The seed must start from the measured draw (never below
+    /// the floors), so engaging the loop is bumpless.
+    #[test]
+    fn auto_entry_without_a_warm_start_seeds_from_the_measured_draw_not_the_floors() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        let effects = ctl.on_sample(&Sample {
+            cpu_pkg_w: 14.0,
+            gpu_w: 99.0,
+            ..busy_at(0.0)
+        });
+        let budget_w = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::AutoAllocated { budget_w, .. } => Some(*budget_w),
+                _ => None,
+            })
+            .expect("AutoAllocated on entry");
+        assert!(
+            budget_w >= 113.0 - 1e-9,
+            "seed must be at least the 113 W being drawn, got {budget_w}"
+        );
+
+        // And below the floors the floors still win.
+        let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        let effects = ctl.on_sample(&Sample {
+            cpu_pkg_w: 3.0,
+            gpu_w: 8.0,
+            ..busy_at(0.0)
+        });
+        let budget_w = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::AutoAllocated { budget_w, .. } => Some(*budget_w),
+                _ => None,
+            })
+            .expect("AutoAllocated on entry");
+        assert!(budget_w >= 45.0, "floor sum is the minimum seed, got {budget_w}");
+    }
+
     // ---- fw-fanctrl-loop-438: steady-window / warm-start / calibration hooks ----
 
     /// An Auto-eligible RpmLoop sample carrying a fanctrl view (so
@@ -6224,11 +6278,12 @@ mod tests {
         assert!(
             rekey_effects.iter().any(|e| matches!(
                 e,
-                Effect::AutoAllocated { freeze: Some("demand_limited"), .. }
+                Effect::AutoAllocated { freeze: None, .. }
             )),
-            "premise: the re-key tick runs under Freeze::DemandLimited (zero draw), so its du is \
-             masked to 0 — the equality below proves no reseed, not a nonzero PI increment: \
-             {rekey_effects:?}"
+            "premise: the re-key tick is NOT demand-halted — both axes sit at their floor share \
+             with no headroom offered, so zero draw is not \"unused headroom\" (2026-09-10 rule); \
+             both sides therefore take the SAME nonzero PI increment, and the equality below \
+             proves no reseed (a reseed would land u on the planted 999.0): {rekey_effects:?}"
         );
         assert_eq!(
             base.status().budget_w,
@@ -6419,16 +6474,20 @@ mod tests {
         assert!(
             rekey_effects.iter().any(|e| matches!(
                 e,
-                Effect::AutoAllocated { freeze: Some("demand_limited"), .. }
+                Effect::AutoAllocated { freeze: None, .. }
             )),
-            "premise: the re-key tick runs under Freeze::DemandLimited (zero draw), so its du is \
-             masked to 0 — the equality below proves no reseed, not a nonzero PI increment: \
-             {rekey_effects:?}"
+            "premise: the re-key tick is NOT demand-halted — both axes sit at their floor share \
+             with no headroom offered, so zero draw is not \"unused headroom\" (2026-09-10 rule); \
+             both sides therefore take the SAME nonzero PI increment, and the equality below \
+             proves no reseed (a reseed would land u on the planted 999.0): {rekey_effects:?}"
         );
-        assert_eq!(
-            base.status().budget_w,
-            rekey.status().budget_w,
-            "a snapped target_duty change must re-key without touching u"
+        // The re-keyed side is regulating toward a DIFFERENT fan target, so
+        // its PI increment legitimately differs from base's by one integral
+        // step (sub-watt). A reseed would have landed it on 999.0.
+        let (b, r) = (base.status().budget_w, rekey.status().budget_w);
+        assert!(
+            (b - r).abs() < 1.0 && r < 100.0,
+            "a snapped target_duty change must re-key without touching u: base {b}, rekey {r}"
         );
     }
 

@@ -357,7 +357,11 @@ controllers on one measurement benign. Never add a second integrator on the same
   applies the conservative `0.25×` clamp rather than the `1×` that a defaulted zero slope would
   silently produce.
 - Warm-start: **only on auto entry** (and on re-engaging from `Released` or at calibration
-  exit) the integrator seeds `u` from `warm_start[key]` if present, else from the floors. A
+  exit) the integrator seeds `u` from `warm_start[key]` if present, else from the **measured draw**
+  (`cpu_pkg_w + gpu_w`, never below the floor sum; `seed` clamps an over-cap draw to `hi`) —
+  engaging the loop is bumpless. (Amended 2026-09-10 from "else from the floors": a floor-sum seed
+  of 64 W engaged against a card at its 100 W ceiling cut it to the floor clock in one second,
+  fans 3700 → 2400 RPM, and the loop then had to climb back at Mode A's deliberately slow gain.) A
   mid-session key change (strategy edit, snapped-duty change, AC↔battery) never re-seeds — it only
   changes which key the next steady window records into. This keeps §2.5's rule that `u` is never
   touched by a transition. The **current** `u` is written to `warm_start[key]` whenever the loop
@@ -401,7 +405,7 @@ controllers on one measurement benign. Never add a second integrator on the same
   **Per axis, `ConditionalHysteresis`.** Every allocator tick, for each axis `i` independently:
 
   ```text
-  demand_limited(i) := cap_i > floor_i + ε   AND   (cap_i − draw_i) > DEMAND_MARGIN_W(i)
+  demand_limited(i) := (cap_i − floor_i) > DEMAND_MARGIN_W(i)   AND   (cap_i − draw_i) > DEMAND_MARGIN_W(i)
   ```
 
   `cap_i` is the axis's **post-guard-override** commanded cap for this tick — the value
@@ -410,7 +414,11 @@ controllers on one measurement benign. Never add a second integrator on the same
   actually offered in a given tick; comparing draw against anything else would compare it against
   power that was never really available. `floor_i` is that axis's own configured floor
   (`cpu_floor_w`, or the LUT's watts at `gpu_floor_mhz`) — **not** zero and **not** a
-  powered/unpowered flag. The `cap_i > floor_i + ε` guard is the load-bearing half of "judge each
+  powered/unpowered flag. The `(cap_i − floor_i) > DEMAND_MARGIN_W(i)` guard (amended 2026-09-10 from
+  `cap_i > floor_i + ε`: `split_budget`'s 0.5 W grid routinely leaves a floor-pinned axis 0.2 W above its
+  floor, and a LUT floor clamped at its lowest swept clock overstates what the card can draw at a lower
+  clock floor — 49.3 W claimed vs 45 W drawn at 997 MHz — so the epsilon rule halted the budget at its
+  lower bound with the GPU stuck at the floor clock, self-sustaining) is the load-bearing half of "judge each
   axis separately": it is what excludes an axis that was never offered headroom above its floor
   (a structurally-undrawn GPU sits with `cap == floor` every tick, since `split_budget`'s
   demand-proportional split gives a zero-demand axis nothing beyond its floor) from ever

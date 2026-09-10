@@ -67,6 +67,17 @@ pub struct GpuPid {
     /// Integral contribution reported by the crate on the last unsaturated
     /// step; reused verbatim while frozen.
     frozen_i: f64,
+    /// Which way the last saturation pushed the output: `+1` = the clamp
+    /// RAISED it (floor / lower rate limit), `-1` = LOWERED it (ceiling /
+    /// upper rate limit), `0` = not saturated. Conditional integration
+    /// freezes the integrator only while the error would drive the output
+    /// FURTHER into that clamp; an error pulling it back out integrates
+    /// normally. Without the direction (field 2026-09-10): one transient
+    /// 70 W sample at Auto entry wound the I term to −300 MHz, the output
+    /// clamped to the floor, and "frozen while saturated" kept that −300
+    /// forever — P alone (≤ 5 × 4 W = 20 MHz) could never lift the clock
+    /// off the floor while the card sat 4 W under its allocation.
+    sat_dir: i8,
 }
 
 impl GpuPid {
@@ -76,6 +87,7 @@ impl GpuPid {
             last_clock: None,
             saturated: false,
             frozen_i: 0.0,
+            sat_dir: 0,
         }
     }
 
@@ -124,6 +136,7 @@ impl GpuPid {
             && last < gpu_floor_mhz
         {
             self.saturated = true; // clamped output: freeze the integrator
+            self.sat_dir = 1; // ...against a RAISE; a positive error may still integrate
             self.last_clock = Some(gpu_floor_mhz);
             return Some(gpu_floor_mhz);
         }
@@ -134,10 +147,13 @@ impl GpuPid {
         }
         let ff = lut.clock_for_watts(self.pid.setpoint)?;
 
-        let correction = if self.saturated {
-            // Conditional integration: previous output was saturated, so
-            // freeze the integrator (don't call the crate — it always
-            // integrates) and recompute only the P term.
+        // Conditional integration, DIRECTIONAL (see `sat_dir`): freeze only
+        // while the error pushes further into the clamp that bit last time.
+        let deepening = self.sat_dir != 0 && (error > 0.0) != (self.sat_dir > 0);
+        let correction = if self.saturated && deepening {
+            // Previous output was saturated and this error would only wind
+            // it deeper, so freeze the integrator (don't call the crate — it
+            // always integrates) and recompute only the P term.
             let p = (error * KP).clamp(-OUTPUT_LIMIT, OUTPUT_LIMIT);
             p + self.frozen_i
         } else {
@@ -168,6 +184,18 @@ impl GpuPid {
         }
 
         self.saturated = saturated;
+        // Direction of the net clamp: final clock vs what the loop wanted
+        // (feedforward plus the UNBOUNDED correction).
+        let wanted = f64::from(ff) + correction;
+        self.sat_dir = if !saturated {
+            0
+        } else if f64::from(clock) > wanted {
+            1
+        } else if f64::from(clock) < wanted {
+            -1
+        } else {
+            0
+        };
         self.last_clock = Some(clock);
         Some(clock)
     }
@@ -183,6 +211,7 @@ impl GpuPid {
         self.last_clock = None;
         self.saturated = false;
         self.frozen_i = 0.0;
+        self.sat_dir = 0;
     }
 }
 
@@ -223,6 +252,51 @@ mod tests {
         pid.seed_last_clock(Some(1500));
         pid.seed_last_clock(None);
         assert_eq!(pid.update(40.0, &lut, FLOOR), Some(2400));
+    }
+
+    /// Field deadlock, 2026-09-10 (`run-1789067819`, t≈2049): Auto entry
+    /// re-targeted the card from its 100 W ceiling to a 49.5 W share; the
+    /// first sample still read 70 W (the card ramping down), the −20 W
+    /// error wound the I term to about −300 MHz and the output clamped to
+    /// the 1000 MHz floor. From then on the card drew ~45 W at the floor —
+    /// 4 W UNDER its share — yet "freeze while saturated" kept the −300 and
+    /// P alone could never lift the clock. Directional conditional
+    /// integration must let a positive error unwind out of a low clamp.
+    #[test]
+    fn a_positive_error_unwinds_an_integrator_frozen_at_the_floor() {
+        let mut lut = ClockWattsLut::new();
+        for (m, w) in [(1197, 49.3), (1402, 53.5), (1612, 64.2), (1807, 75.9), (1995, 90.8), (2143, 99.4)] {
+            lut.insert(m, w);
+        }
+        let mut pid = GpuPid::new();
+        pid.set_target_w(49.5);
+        pid.seed_last_clock(Some(2122));
+        // Transient: card still at its old draw on the retarget tick.
+        let mut clock = pid.update(70.0, &lut, FLOOR).expect("large error commands a clock");
+        for _ in 0..12 {
+            // Ramping down toward the floor; the −20 W error keeps clamping.
+            if let Some(c) = pid.update(70.0, &lut, FLOOR) {
+                clock = c;
+            }
+        }
+        assert_eq!(clock, FLOOR, "premise: clamped at the floor with a wound-down integrator");
+        // Now the card sits at the floor drawing 45.3 W against a 49.5 W
+        // share: error +4.2 W, outside the deadband, pulling AWAY from the
+        // floor clamp. The clock must come off the floor within a few ticks.
+        let mut lifted = None;
+        for i in 0..10 {
+            if let Some(c) = pid.update(45.3, &lut, FLOOR) {
+                clock = c;
+            }
+            if clock > FLOOR {
+                lifted = Some(i);
+                break;
+            }
+        }
+        assert!(
+            lifted.is_some(),
+            "clock stuck at the floor with a 4 W positive error: {clock} MHz"
+        );
     }
 
     #[test]

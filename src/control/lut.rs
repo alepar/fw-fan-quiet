@@ -42,6 +42,24 @@ impl ClockWattsLut {
         self.points.is_empty()
     }
 
+    /// The invariants `insert` holds by construction, checked on data that
+    /// did not come through it — a hand-edited or schema-skewed
+    /// `state.json` (see `PersistedState::validated`). Both lookups index
+    /// and `binary_search_by_key` the point list, so out-of-order or
+    /// duplicated clocks silently mis-answer, and a non-finite watts entry
+    /// propagates straight into `Budget::set_bounds`, whose `f64::clamp`
+    /// panics on a non-finite bound.
+    ///
+    /// Deliberately NOT checked: monotonicity of the *watts* column. Real
+    /// sweeps dip (see the type docs) and `clock_for_watts` is written to
+    /// stay conservative through a dip; rejecting that would throw away
+    /// good calibration data.
+    pub fn is_valid(&self) -> bool {
+        !self.points.is_empty()
+            && self.points.iter().all(|&(_, w)| w.is_finite() && w >= 0.0)
+            && self.points.windows(2).all(|p| p[0].0 < p[1].0)
+    }
+
     /// Inverse lookup: the largest clock whose predicted watts stay <= the
     /// target budget (we command a clock to ACHIEVE a watts budget, so we
     /// must stay under it). Linear interpolation between bracketing points;
@@ -221,5 +239,43 @@ mod tests {
         let json = serde_json::to_string(&lut).unwrap();
         let back: ClockWattsLut = serde_json::from_str(&json).unwrap();
         assert_eq!(back, lut);
+    }
+
+    // --- is_valid (load-time guard for hand-edited state.json) ------------
+
+    /// Deserialize a points array directly — the only way to build a LUT
+    /// that violates `insert`'s invariants, and exactly what `load` does.
+    fn from_points_json(points: &str) -> ClockWattsLut {
+        serde_json::from_str(&format!(r#"{{ "points": {points} }}"#)).unwrap()
+    }
+
+    #[test]
+    fn is_valid_accepts_a_swept_lut_dips_included() {
+        assert!(lut3().is_valid());
+        // Non-monotone watts are real measured data, not corruption.
+        assert!(from_points_json("[[1200, 60.0], [2000, 50.0], [2800, 100.0]]").is_valid());
+    }
+
+    #[test]
+    fn is_valid_rejects_empty_out_of_order_duplicate_and_negative() {
+        assert!(!ClockWattsLut::new().is_valid());
+        assert!(!from_points_json("[[2800, 100.0], [1200, 30.0]]").is_valid());
+        assert!(!from_points_json("[[1200, 30.0], [1200, 40.0]]").is_valid());
+        assert!(!from_points_json("[[1200, 30.0], [2000, -5.0]]").is_valid());
+    }
+
+    #[test]
+    fn is_valid_rejects_non_finite_watts() {
+        // Built through `insert`, not JSON: serde_json's `float_roundtrip`
+        // parser (Cargo.toml) rejects `1e400` outright rather than
+        // saturating to `inf`, so a non-finite watts entry cannot be
+        // *spelled* in a state file today. This clause is the belt to that
+        // parser's braces — a non-finite watts value reaches
+        // `Budget::set_bounds`, whose `f64::clamp` panics on it.
+        for bad in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let mut lut = lut3();
+            lut.insert(2000, bad);
+            assert!(!lut.is_valid(), "rejected: {bad}");
+        }
     }
 }

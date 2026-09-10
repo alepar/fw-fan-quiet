@@ -490,6 +490,31 @@ impl WarmStart {
     pub fn record(map: &mut BTreeMap<String, f64>, key: String, u: f64) {
         map.insert(key, u);
     }
+
+    /// Drops entries whose recorded `u` is not finite, returning the keys
+    /// removed so the caller can log them. `record` only ever stores a
+    /// finite, bounded `u`, so this is for the map that comes back from
+    /// disk (`PersistedState::validated`): a non-finite seed is permanent
+    /// loss of control, since `Budget::seed`'s `u.clamp(lo, hi)` lets NaN
+    /// straight through and every later velocity-form update keeps it NaN.
+    /// Belt-and-braces today — serde_json's `float_roundtrip` parser
+    /// rejects an out-of-range literal instead of saturating to `inf`, so
+    /// the load path cannot currently spell one — and the cheap guarantee
+    /// that keeps that a parser detail rather than a control-loop hazard.
+    ///
+    /// Per-entry, not whole-map: one poisoned key must not throw away the
+    /// other strategy/duty/AC combinations' good warm starts.
+    pub fn drop_non_finite(map: &mut BTreeMap<String, f64>) -> Vec<String> {
+        let bad: Vec<String> = map
+            .iter()
+            .filter(|&(_, &u)| !u.is_finite())
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in &bad {
+            map.remove(key);
+        }
+        bad
+    }
 }
 
 #[cfg(test)]
@@ -953,5 +978,27 @@ mod tests {
         assert_eq!(WarmStart::lookup(&map, &key), Some(42.5));
 
         assert_eq!(WarmStart::lookup(&map, "no-such-key"), None);
+    }
+
+    #[test]
+    fn warm_start_drop_non_finite_removes_only_the_poisoned_keys() {
+        let mut map = BTreeMap::new();
+        let good = WarmStart::key("quiet16", 30, true);
+        let inf = WarmStart::key("cool16", 30, true);
+        let nan = WarmStart::key("quiet16", 36, false);
+        WarmStart::record(&mut map, good.clone(), 42.5);
+        WarmStart::record(&mut map, inf.clone(), f64::INFINITY);
+        WarmStart::record(&mut map, nan.clone(), f64::NAN);
+
+        let mut dropped = WarmStart::drop_non_finite(&mut map);
+        dropped.sort();
+        let mut want = vec![inf, nan];
+        want.sort();
+        assert_eq!(dropped, want);
+        assert_eq!(WarmStart::lookup(&map, &good), Some(42.5));
+        assert_eq!(map.len(), 1);
+
+        // Idempotent on a clean map, and it reports nothing to log.
+        assert!(WarmStart::drop_non_finite(&mut map).is_empty());
     }
 }

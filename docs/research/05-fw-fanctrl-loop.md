@@ -59,6 +59,49 @@ Active strategies (config as of 2026-09-07): `quiet16` (15%→55 °C, 21@65, 31@
 Slopes: quiet16 65–82 °C ≈ 0.9–1.0 %/°C (benign); cool16 70–85 ≈ 3.9 %/°C (hunting-prone, >2 %/°C).
 freq=1 + avg=60 measured: 1-point duty steps (~55 RPM) on ramp-up; 1.45% of one core.
 
+### 2026-09-09 — GPU load alone raises fan RPM (the dGPU DOES feed the EC curve)
+
+An earlier entry in the design doc's §Facts claimed the cros_ec `gpu_*` sensors "read −150" and
+that the dGPU does not feed the EC fan curve. Re-measured; **false on this machine.** The "−150"
+was the EC's unset-*threshold* sentinel (`sensors` shows `high/crit/emerg = −273.1 °C` on
+`gpu_amb`/`gpu_vram`), not a reading — all four `gpu_*` inputs are live through `ectool temps
+all`, the path fw-fanctrl itself reads, and `gpu_temp@40` tracks NVML's die temperature within
+1 °C. The EC also carries real thresholds on them: `gpu_vr` high **70.8** / crit 89.8 / emerg
+104.8; `gpu_temp@40` high 86.8 / crit 96.8 / emerg 99.8.
+
+Two 240 s gpu-burn runs (`localhost/gpu_burn:blackwell`, ~100 W, CPU idle), sampled every 2 s
+(`2026-09-09-gpu-burn-fanctrl-quiet16.csv`, `2026-09-09-gpu-burn-ec-native.csv`):
+
+| | **A: fw-fanctrl `quiet16`** | **B: EC native (`ectool autofanctrl`)** |
+|---|---|---|
+| pre-load argmax | `ambient` 61 °C | `ambient` 58 °C |
+| first GPU-sensor argmax | **t = 13 s** (`gpu_temp@40` 67) | **t = 14 s** |
+| steady-state argmax | `gpu_vr` | `gpu_vr` |
+| GPU die, steady mean / max | 82.4 / 83 (peak 85 on the ramp) | 76.0 / 77 |
+| `gpu_vr`, steady mean / max | 83.2 / 84 | 76.6 / 78 |
+| `ambient`, steady | 64.5 (from 61) | 61.9 |
+| `cpu@4c`, steady | 47 (**fell** from 53) | 44 |
+| fan0, steady mean / max | **3330 / 3461 rpm** (from 1478, duty 18 → 38 %) | **4002 / 4028 rpm** |
+| 40 s after load-off | `gpu_vr` 71, die 53, fan 2313 | `gpu_vr` 67, die 50, fan 2368 |
+
+What this establishes:
+- **A GPU sensor takes the argmax ~13 s into GPU-only load and never gives it back.** The fans
+  went 1478 → 3330 rpm with the CPU idle and `ambient` moving only 61 → 65: the ramp was driven
+  by `gpu_temp@40` first and `gpu_vr` at steady state, not by any CPU/chassis sensor.
+- **`gpu_vr` runs ~1 °C above the die and has a long tail** — still 67–71 °C forty seconds after
+  the die is back at 50. A guard keyed on the EC argmax holds longer than the die suggests.
+- **The card does not reach its 87 °C park point with the fans free.** It settles at 82–83 on
+  `quiet16` and 76 under the EC's native (~670 rpm more aggressive) curve. 87 is reached only
+  when something holds the fans below what the GPU sensors ask for — which is what this
+  controller does for a quiet RPM target. So a GPU reading at/above 87 in auto mode is a genuine
+  "our cap is the limiting factor" signal, not normal operation.
+- **Consequence for the design:** "release caps to stock" on a GPU thermal trip *does* summon
+  cooling (the curve sees the GPU), so a hard trip is coherent; and the dGPU guard needs no
+  separate NVML-only path to be reachable by the fans (open question 3 below, now resolved).
+  NVML T.Limit specs on this card: park/max-operating 87, **Slowdown 89**, **Shutdown 92** — a
+  5 °C band, which is why the guard/trip pair became 88 / 91 with a 2 °C hysteresis
+  (fw-fanctrl-loop-a78).
+
 ## 3. bazerame-fans code map (2026-09-07, 19,452 lines incl. tests)
 
 Control loop: `control/controller.rs` (`on_auto_sample` ~:985-1329); allocator 5 s
@@ -167,6 +210,9 @@ for the June degenerate-divisor incident — confirm it isn't the degenerate one
 1. User-facing unit: RPM (needs the measured duty→RPM table), duty %, or temperature?
 2. CPU/GPU allocation policy exposed how (fixed ratio / priority / measured-share)?
 3. Independent NVML GPU-temperature guard outside the noise loop — required (dGPU invisible to EC).
+   **Premise refuted 2026-09-09** (§2 above): the dGPU is visible to the EC and dominates the
+   curve under GPU load. The guard remains useful as the *ratchet-down* response, but not because
+   the fans can't see the card.
 4. NVMe (SN850X, 90 °C warn, 66 min cumulative above it) is invisible to fw-fanctrl too — in
    scope as a guard, or out of scope?
 5. What happens on `active:false` / socket missing: hold last cap, release to stock, or RPM mode?

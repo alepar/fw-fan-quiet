@@ -32,7 +32,7 @@ use clap::{Parser, Subcommand};
 use color_eyre::Result;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 
-use actuators::cmd::RealRunner;
+use actuators::cmd::{self, RealRunner};
 use actuators::cpu::{CpuActuator, PLATFORM_PROFILE_PATH};
 use actuators::gpu::{BoxedGpu, GpuActuator};
 use actuators::guard::{FinalRestore, RestoreGuard};
@@ -234,6 +234,7 @@ fn main() -> Result<()> {
         ui_tx.clone(),
         Arc::clone(&telemetry),
         Arc::clone(&restored),
+        Arc::clone(&shutdown),
     );
 
     // try_init() returns Err instead of panicking when there is no usable
@@ -323,13 +324,27 @@ fn main() -> Result<()> {
     result
 }
 
+/// Margin on top of the bounded worst case in [`CONTROLLER_JOIN_TIMEOUT`]:
+/// covers the ~400 ms fan-profile toggle, the untimed-but-fast `nvml`
+/// release, and scheduling slop.
+const CONTROLLER_JOIN_MARGIN: Duration = Duration::from_secs(5);
+
 /// How long shutdown waits for the controller to finish restoring hardware
 /// before giving up on it and continuing (terminal restore in particular).
-/// Generous: the restore itself is ~400 ms, and every external command it
-/// runs is independently bounded by `actuators::cmd::RUN_TIMEOUT` (5 s), so
-/// this only bites when the controller thread is wedged somewhere with no
-/// timeout of its own.
-const CONTROLLER_JOIN_TIMEOUT: Duration = Duration::from_secs(20);
+///
+/// DERIVED from `actuators::cmd::RUN_TIMEOUT` so the two cannot drift
+/// (roast-pr-2 finding 3). The bounded worst case for "one in-flight sample
+/// plus the restore that follows" is five external commands, each capped at
+/// `RUN_TIMEOUT`: a `set_sustained_mw` (write + `verify_write` = 2), its
+/// design-§2.9 Mismatch re-write (another 2 — itself now skipped once
+/// shutdown began, so this is the pessimistic bound), and `modprobe
+/// ryzen_smu` in the restore (1). At the previous flat 20 s the join could
+/// expire with every external command honouring its own deadline, which is
+/// exactly the abandoned-thread window finding 2 closes; the constant's doc
+/// claimed it "only bites when the controller thread is wedged somewhere
+/// with no timeout of its own", and now that is true.
+const CONTROLLER_JOIN_TIMEOUT: Duration =
+    Duration::from_secs(5 * cmd::RUN_TIMEOUT.as_secs() + CONTROLLER_JOIN_MARGIN.as_secs());
 
 /// Outcome of [`join_with_timeout`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -510,6 +525,26 @@ mod tests {
             Args::try_parse_from(["bazerame-fans", "--log-dir", "/tmp/x", "selftest"]).unwrap();
         assert!(matches!(args.command, Some(Commands::Selftest)));
         assert_eq!(args.log_dir, PathBuf::from("/tmp/x"));
+    }
+
+    // --- roast-pr-2 finding 3: the join bound must exceed the BOUNDED case -
+
+    /// The pin: `CONTROLLER_JOIN_TIMEOUT`'s doc promises it "only bites when
+    /// the controller thread is wedged somewhere with no timeout of its
+    /// own". The worst case in which every external command honours its own
+    /// deadline is five `RUN_TIMEOUT`s (a `set_sustained_mw` write +
+    /// `verify_write`, its Mismatch re-write + `verify_write`, and the
+    /// restore's `modprobe ryzen_smu`). At the previous flat 20 s the join
+    /// expired on a merely slow SMU mailbox, orphaning the controller
+    /// thread. Derivation, not duplication: this fails if either constant
+    /// drifts.
+    #[test]
+    fn controller_join_timeout_exceeds_the_bounded_worst_case() {
+        assert!(
+            CONTROLLER_JOIN_TIMEOUT > 5 * cmd::RUN_TIMEOUT,
+            "join bound {CONTROLLER_JOIN_TIMEOUT:?} does not exceed 5 x RUN_TIMEOUT ({:?})",
+            5 * cmd::RUN_TIMEOUT
+        );
     }
 
     // --- finding 4: shutdown may never hang on the controller join --------

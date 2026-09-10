@@ -777,6 +777,18 @@ pub struct Controller<R: Runner> {
     /// Short raw `ec.max_c` history feeding `calib_arbiter`'s reconciliation
     /// skip rule (mirrors `AutoState::ec_slope_window`).
     calib_ec_slope_window: std::collections::VecDeque<f64>,
+    /// Main's shutdown flag (roast-pr-2 finding 2), installed by [`spawn`].
+    /// `None` in unit tests and any construction that never shuts down.
+    ///
+    /// This is the STOP FENCE for an abandoned controller thread: main's
+    /// controller join is bounded, so a thread that was wedged in an untimed
+    /// call (NVML) can unwedge *after* `FinalRestore::drop` has already put
+    /// the hardware back to stock. Without the fence it would then service a
+    /// still-queued `Sample`, re-issue a CPU cap, and leave that cap in
+    /// place at process exit. Checked at the top of `on_sample` and again
+    /// immediately before every actuator WRITE (never before a restore —
+    /// restores must always be allowed through).
+    shutdown: Option<Arc<AtomicBool>>,
 }
 
 /// Static `Effect::Noted` cause for a genuine `LoopMode` transition (design
@@ -909,7 +921,24 @@ impl<R: Runner> Controller<R> {
             calib_ec_ma: None,
             calib_ec_seeded: false,
             calib_ec_slope_window: std::collections::VecDeque::new(),
+            shutdown: None,
         }
+    }
+
+    /// Install main's shutdown flag as this controller's stop fence
+    /// (roast-pr-2 finding 2). Called by [`spawn`]; tests that need the
+    /// fence call it directly.
+    pub fn set_shutdown_flag(&mut self, shutdown: Arc<AtomicBool>) {
+        self.shutdown = Some(shutdown);
+    }
+
+    /// True once main has begun shutting down (its `shutdown` flag is set
+    /// strictly BEFORE `Command::Quit` is sent, so this also means "Quit is
+    /// pending"). No actuator write may be issued while this holds.
+    fn shutting_down(&self) -> bool {
+        self.shutdown
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Relaxed))
     }
 
     /// Current status (the shell clones it into `Event::Status`).
@@ -990,6 +1019,12 @@ impl<R: Runner> Controller<R> {
         let cause = match c {
             Command::SetCpuW(w) => {
                 match self.guard.cpu.as_ref() {
+                    // Stop fence (roast-pr-2 finding 2): main raises
+                    // `shutdown` before it sends Quit, so a manual key that
+                    // raced shutdown must not land a cap either.
+                    Some(_) if self.shutting_down() => {
+                        tracing::debug!("shutting down; ignoring SetCpuW({w})");
+                    }
                     None => tracing::warn!("no CPU actuator this run; ignoring SetCpuW({w})"),
                     // fw-fanctrl-loop-j6s: non-Verified verdicts (Mismatch/
                     // Unreadable/Unverifiable) are mapped to today's plain
@@ -1014,7 +1049,13 @@ impl<R: Runner> Controller<R> {
                 "command:set_cpu_w"
             }
             Command::SetGpuMaxClock(mhz) => {
+                // Stop fence (roast-pr-2 finding 2); read before the
+                // scrutinee takes its &mut borrow of `self.guard`.
+                let fenced = self.shutting_down();
                 match self.guard.gpu.as_mut() {
+                    Some(_) if fenced => {
+                        tracing::debug!("shutting down; ignoring SetGpuMaxClock({mhz})");
+                    }
                     None => {
                         tracing::warn!("no GPU actuator this run; ignoring SetGpuMaxClock({mhz})");
                     }
@@ -1200,6 +1241,14 @@ impl<R: Runner> Controller<R> {
     /// would fight the runner's deliberate low limits, and the runner
     /// re-commands each point itself).
     pub fn on_sample(&mut self, s: &Sample) -> Vec<Effect> {
+        // STOP FENCE (roast-pr-2 finding 2), before anything else: once main
+        // has begun shutting down, queued samples are DRAINED and ignored.
+        // Main's controller join is bounded, so this thread may still be
+        // alive after `FinalRestore` restored stock hardware; servicing a
+        // sample here would re-issue a CPU cap that nothing would ever undo.
+        if self.shutting_down() {
+            return Vec::new();
+        }
         // Thermal watchdog FIRST, before any mode dispatch: it observes in
         // every mode (Calibrating included — the runner's deliberate limits
         // are exactly what an emergency must release). A trip only ACTS when
@@ -1975,7 +2024,17 @@ impl<R: Runner> Controller<R> {
                 }
                 Some(cpu) => {
                     let mut verdict = cpu.set_sustained_mw(cpu_mw);
-                    if matches!(verdict, WriteVerdict::Mismatch { .. }) && !suppress {
+                    // The Mismatch re-write is the single worst case for the
+                    // bounded controller join (roast-pr-2 finding 3): a
+                    // second write + `verify_write`, i.e. two more
+                    // `RUN_TIMEOUT`s. Skip it once shutdown has begun (the
+                    // flag can be raised while this very call is in flight)
+                    // — the scoring it feeds is pointless when we are about
+                    // to restore stock anyway.
+                    if matches!(verdict, WriteVerdict::Mismatch { .. })
+                        && !suppress
+                        && !self.shutting_down()
+                    {
                         // Re-read once before scoring (design §2.9).
                         verdict = cpu.set_sustained_mw(cpu_mw);
                     }
@@ -2023,6 +2082,12 @@ impl<R: Runner> Controller<R> {
         if !s.gpu_w_valid || self.status.loop_mode == LoopMode::Released {
             // Released: caps stay released to stock (design §2.5) — see the
             // matching guard in `run_budget_and_allocate`.
+            return;
+        }
+        // Stop fence (roast-pr-2 finding 2): no clock lock once shutdown
+        // began — `on_sample` already fences, this covers the flag being
+        // raised mid-sample.
+        if self.shutting_down() {
             return;
         }
         let lut = self.lut.as_ref().expect("checked by caller").clone();
@@ -2384,6 +2449,11 @@ impl<R: Runner> Controller<R> {
         let demand = allocator::demand(s, self.status.cpu_limit_w, None, self.status.gpu_max_mhz);
         let (cpu_w, _gpu_w) =
             allocator::split_budget(u, demand, cpu_floor_w, gpu_floor_w, cpu_max_w, gpu_max_w);
+        // Stop fence (roast-pr-2 finding 2): no calibration write once
+        // shutdown began.
+        if self.shutting_down() {
+            return;
+        }
         match self.guard.cpu.as_ref() {
             None => tracing::warn!("calib: no CPU actuator; SetBudget({w}) not applied"),
             Some(cpu) => {
@@ -2433,6 +2503,10 @@ impl<R: Runner> Controller<R> {
         for effect in effects {
             match effect {
                 RunnerEffect::SetBudget(w) => self.apply_calib_set_budget(w, s),
+                // Stop fence (roast-pr-2 finding 2) on the write arm only.
+                RunnerEffect::SetGpuMaxClock(mhz) if self.shutting_down() => {
+                    tracing::debug!("calib: shutting down; SetGpuMaxClock({mhz}) skipped");
+                }
                 RunnerEffect::SetGpuMaxClock(mhz) => match self.guard.gpu.as_mut() {
                     None => tracing::warn!("calib: no GPU actuator; SetGpuMaxClock({mhz}) skipped"),
                     Some(gpu) => match gpu.set_max_clock(mhz) {
@@ -2660,6 +2734,12 @@ impl<R: Runner> Controller<R> {
     /// commanded; otherwise `Some(all_calls_succeeded)` so telemetry can
     /// distinguish real reasserts from failed attempts.
     fn reassert_actuators(&mut self) -> Option<bool> {
+        // Stop fence (roast-pr-2 finding 2): a reassert re-issues the cap we
+        // are about to restore away from. Nothing was attempted, so report
+        // "nothing commanded" rather than a failed attempt.
+        if self.shutting_down() {
+            return None;
+        }
         let mut any = false;
         let mut all_ok = true;
         if let (Some(w), Some(cpu)) = (self.status.cpu_limit_w, self.guard.cpu.as_ref()) {
@@ -2725,6 +2805,11 @@ impl<R: Runner> Controller<R> {
 /// `Event::Status` sends and telemetry `Decision` records. On loop exit
 /// (Quit or command-channel disconnect) it restores hardware and flips
 /// `restored` so main's `FinalRestore` knows to stand down.
+///
+/// `shutdown` is main's shutdown flag, installed on the controller as its
+/// stop fence (roast-pr-2 finding 2). Main's join of this thread is BOUNDED,
+/// so this thread can outlive both the join and `FinalRestore`'s restore;
+/// the fence guarantees an orphaned thread issues no further actuator write.
 pub fn spawn<R: Runner + Send + 'static>(
     controller: Controller<R>,
     sample_rx: Receiver<Event>,
@@ -2732,11 +2817,13 @@ pub fn spawn<R: Runner + Send + 'static>(
     ui_tx: Sender<Event>,
     telemetry: Arc<Mutex<Option<Telemetry>>>,
     restored: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("controller".into())
         .spawn(move || {
             let mut controller = controller;
+            controller.set_shutdown_flag(Arc::clone(&shutdown));
             let mut sample_rx = sample_rx;
             // Initial status push: the config-seeded fan target must show in
             // the UI before the first change-driven Status event (the model's
@@ -2754,8 +2841,17 @@ pub fn spawn<R: Runner + Send + 'static>(
                     recv(sample_rx) -> msg => match msg {
                         Ok(Event::Sample(s)) => {
                             t_mono = s.t_mono;
-                            let effects = controller.on_sample(&s);
-                            apply_effects(&effects, &controller, t_mono, &ui_tx, &telemetry);
+                            // Drain, don't service: once shutdown began (and
+                            // so Quit is pending) queued samples are dropped
+                            // on the floor. `on_sample` fences too — this
+                            // arm skips the work and the telemetry record as
+                            // well (roast-pr-2 finding 2).
+                            if !shutdown.load(Ordering::Relaxed) {
+                                let effects = controller.on_sample(&s);
+                                apply_effects(
+                                    &effects, &controller, t_mono, &ui_tx, &telemetry,
+                                );
+                            }
                         }
                         Ok(_) => {} // only samples arrive on this channel
                         Err(_) => {
@@ -3263,6 +3359,72 @@ mod tests {
         assert_eq!(status_changes(&effects), 0);
     }
 
+    // --- roast-pr-2 finding 2: the abandoned-thread stop fence ------------
+
+    /// The pin: main's controller join is BOUNDED, so this thread can still
+    /// be alive after `FinalRestore` put the hardware back to stock. A
+    /// sample serviced then would re-issue a CPU cap that nothing undoes.
+    /// Without the fence this reasserts and the call count goes to 2.
+    #[test]
+    fn a_sample_after_shutdown_began_issues_no_actuator_write() {
+        let runner = FakeRunner::new();
+        let mut ctl = controller_no_profile(&runner);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        ctl.set_shutdown_flag(Arc::clone(&shutdown));
+
+        ctl.on_command(Command::SetCpuW(20.0));
+        assert_eq!(ryzenadj_calls(&runner).len(), 1);
+        ctl.on_sample(&sample_at(0.0)); // reassert baseline
+
+        // Main begins shutting down; the orphaned thread unwedges and finds
+        // a queued sample that is well past the reassert period.
+        shutdown.store(true, Ordering::Relaxed);
+        let effects = ctl.on_sample(&sample_at(10.1));
+
+        assert!(
+            effects.is_empty(),
+            "sample was serviced anyway: {effects:?}"
+        );
+        assert_eq!(
+            ryzenadj_calls(&runner).len(),
+            1,
+            "an actuator write landed after shutdown began: {:?}",
+            ryzenadj_calls(&runner)
+        );
+    }
+
+    /// Same fence on the command path: main raises `shutdown` strictly
+    /// before it sends `Quit`, so a manual key that raced shutdown must not
+    /// land a cap either.
+    #[test]
+    fn a_manual_command_after_shutdown_began_issues_no_actuator_write() {
+        let runner = FakeRunner::new();
+        let mut ctl = controller_no_profile(&runner);
+        let shutdown = Arc::new(AtomicBool::new(true));
+        ctl.set_shutdown_flag(shutdown);
+
+        ctl.on_command(Command::SetCpuW(20.0));
+
+        assert!(ryzenadj_calls(&runner).is_empty());
+        assert_eq!(ctl.status().cpu_limit_w, None);
+    }
+
+    /// The restore path is deliberately NOT fenced: shutdown is exactly when
+    /// it must run.
+    #[test]
+    fn restore_all_still_runs_with_the_shutdown_fence_raised() {
+        let runner = FakeRunner::new();
+        let (dir, profile) = profile_fixture("shutdown-fence-restore");
+        let mut ctl = controller(&runner, profile);
+        ctl.on_command(Command::SetCpuW(20.0));
+        ctl.set_shutdown_flag(Arc::new(AtomicBool::new(true)));
+
+        ctl.restore_all();
+
+        assert_eq!(modprobe_reload_calls(&runner), 1, "stock was not restored");
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn default_status_starts_at_the_real_fan_target() {
         // Not 0.0: the first Status event must never show an unrepresentable
@@ -3536,6 +3698,7 @@ mod tests {
             ui_tx,
             telemetry,
             Arc::clone(&restored),
+            Arc::new(AtomicBool::new(false)),
         );
 
         // The shell pushes one initial Status at startup (so a config-seeded

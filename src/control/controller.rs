@@ -60,8 +60,10 @@ const ALLOC_PERIOD_S: f64 = 5.0;
 /// to the arbiter on every call so its spec-stated wall-clock hysteresis
 /// durations (§2.5's 15 s entry, §2.7's 60 s feasible-again clear) come out
 /// right at the cadence they are actually driven at, rather than at the 5 s
-/// allocator cadence their tick counts were once derived against.
-const SAMPLE_PERIOD_S: f64 = 1.0;
+/// allocator cadence their tick counts were once derived against. Derived
+/// from the sampler's own constant, never restated (roast PR-2 finding 6):
+/// the two cannot drift.
+const SAMPLE_PERIOD_S: f64 = crate::sensors::sampler::SAMPLE_PERIOD.as_secs_f64();
 /// A sample must exceed the CPU limit by this margin to count as a
 /// stickiness violation (RAPL vs STAPM accounting slack).
 const STICKINESS_MARGIN_W: f64 = 5.0;
@@ -864,7 +866,13 @@ impl<R: Runner> Controller<R> {
         // Belt and suspenders (Config::load already sanitizes): out-of-range
         // floors would trip the GPU PI's clamp / the allocator's debug
         // assert once Auto starts. No construction path may skip this.
-        let config = config.sanitized();
+        // `with_lut_floor_clamp` is the cross-field half `Config::load` has
+        // no LUT to run (roast PR-2 finding 1): a GPU clock floor whose
+        // watts do not fit under cpu_max_w + gpu_max_w inverts the budget
+        // bounds.
+        let config = config
+            .sanitized()
+            .with_lut_floor_clamp(persisted.lut.as_ref());
         // Config owns the burst ceiling and the sustained operating max; the
         // actuator defaults only cover a hypothetical config-less construction.
         // set_sustained_max_mw re-clamps to the hardware ceiling as a backstop.
@@ -1061,13 +1069,17 @@ impl<R: Runner> Controller<R> {
             Command::SetFloors { cpu_w, gpu_mhz } => {
                 // Same clamps as config load (Config::sanitized): out-of-
                 // range floors would panic the GPU PI's clamp / trip the
-                // allocator's debug assert on the next Auto step.
+                // allocator's debug assert on the next Auto step. Plus the
+                // cross-field clamp load cannot run (roast PR-2 finding 1):
+                // a live floor raise against a soft-capped gpu_max_w would
+                // otherwise put the budget's lower bound above its upper.
                 let sanitized = Config {
                     cpu_floor_w: cpu_w,
                     gpu_floor_mhz: gpu_mhz,
                     ..self.config.clone()
                 }
-                .sanitized();
+                .sanitized()
+                .with_lut_floor_clamp(self.lut.as_ref());
                 if sanitized != self.config {
                     self.config = sanitized;
                     self.status.cpu_floor_w = self.config.cpu_floor_w;
@@ -1500,12 +1512,9 @@ impl<R: Runner> Controller<R> {
             .last_alloc
             .is_none_or(|last| s.t_mono - last >= ALLOC_PERIOD_S);
         if due {
-            let lut = self.lut.as_ref().expect("checked above");
-            let gpu_floor_w = lut
-                .watts_for_clock(self.config.gpu_floor_mhz)
-                .unwrap_or(0.0);
-            let lo = self.config.cpu_floor_w + gpu_floor_w;
-            let hi = self.config.cpu_max_w + self.config.gpu_max_w;
+            // One computation for both loops, ordered pair guaranteed (see
+            // `budget_bounds`; `self.lut` is Some here, checked above).
+            let (lo, hi) = self.budget_bounds();
             let target_duty = self.duty_rpm_table.duty_for_rpm(self.status.fan_target_rpm);
             let auto = self.auto.as_mut().expect("checked above");
             auto.budget.set_bounds(lo, hi);
@@ -2192,7 +2201,7 @@ impl<R: Runner> Controller<R> {
     /// status.
     fn on_calib_sample(&mut self, s: &Sample) -> Vec<Effect> {
         let before = self.status.clone();
-        let (lo, hi) = self.calib_bounds();
+        let (lo, hi) = self.budget_bounds();
         if let Some(budget) = self.calib_budget.as_mut() {
             budget.set_bounds(lo, hi);
         }
@@ -2236,13 +2245,19 @@ impl<R: Runner> Controller<R> {
         effects
     }
 
-    /// The budget integrator's `(lo, hi)` clamp bounds (design §2.4),
-    /// computed the same way `on_auto_sample`'s every-5s block does —
-    /// tolerant of `self.lut` still being `None` (a calibration's own LUT
-    /// sweep hasn't landed in `self.lut` yet the first time this runs;
-    /// `self.lut` only updates at `RunnerEffect::SaveState`, i.e. session
-    /// end), falling the GPU floor back to 0 W in that case.
-    fn calib_bounds(&self) -> (f64, f64) {
+    /// The budget integrator's `(lo, hi)` clamp bounds (design §2.4). The
+    /// single computation for both the Auto every-5s block and the
+    /// calibration runner — tolerant of `self.lut` still being `None` (a
+    /// calibration's own LUT sweep hasn't landed in `self.lut` yet the first
+    /// time this runs; `self.lut` only updates at `RunnerEffect::SaveState`,
+    /// i.e. session end), falling the GPU floor back to 0 W in that case.
+    ///
+    /// Roast PR-2 finding 1: `lo` and `hi` come from independent config keys
+    /// and a floor-derived `lo` can exceed the cap-derived `hi`. `lo` is
+    /// lowered to `hi` here (`Budget` collapses the pair the same way as its
+    /// own last-resort guard) — never `hi` raised, which would let an
+    /// infeasible floor spend past the operator's power cap.
+    fn budget_bounds(&self) -> (f64, f64) {
         let gpu_floor_w = self
             .lut
             .as_ref()
@@ -2250,6 +2265,18 @@ impl<R: Runner> Controller<R> {
             .unwrap_or(0.0);
         let lo = self.config.cpu_floor_w + gpu_floor_w;
         let hi = self.config.cpu_max_w + self.config.gpu_max_w;
+        if lo > hi {
+            tracing::warn!(
+                "budget floor {lo:.1} W (cpu_floor_w {:.1} + {gpu_floor_w:.1} W at \
+                 gpu_floor_mhz {}) exceeds the cap {hi:.1} W (cpu_max_w {:.1} + \
+                 gpu_max_w {:.1}); holding the floor at the cap",
+                self.config.cpu_floor_w,
+                self.config.gpu_floor_mhz,
+                self.config.cpu_max_w,
+                self.config.gpu_max_w
+            );
+            return (hi, hi);
+        }
         (lo, hi)
     }
 
@@ -2258,7 +2285,7 @@ impl<R: Runner> Controller<R> {
     /// (the same inputs — EC replica, `print all` view, reconciliation
     /// scoring — the auto loop feeds its own instances), `fanctrl_active`
     /// and `argmax_controllable` read directly off the sample, and
-    /// `budget_bounds` as computed by `calib_bounds`.
+    /// `budget_bounds` as computed by [`Controller::budget_bounds`].
     fn build_calib_context(&mut self, s: &Sample, lo: f64, hi: f64) -> CalibContext {
         // EC boxcar: seed from the first view this session, retarget its
         // interval on a fresh view, push every EC reading — mirrors
@@ -2358,7 +2385,7 @@ impl<R: Runner> Controller<R> {
     /// the step phase), so `split_budget`'s GPU share is computed (it feeds
     /// the CPU/GPU proportional split) but never written to hardware.
     fn apply_calib_set_budget(&mut self, w: f64, s: Option<&Sample>) {
-        let (lo, hi) = self.calib_bounds();
+        let (lo, hi) = self.budget_bounds();
         let u = w.clamp(lo, hi);
         if let Some(budget) = self.calib_budget.as_mut() {
             budget.seed(u);
@@ -4763,6 +4790,59 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Roast PR-2 finding 1. The budget's lower bound is
+    /// `cpu_floor_w + watts_for_clock(gpu_floor_mhz)` and its upper bound
+    /// `cpu_max_w + gpu_max_w`; both were sanitized only field-by-field, so
+    /// an operator who soft-caps `gpu_max_w` and then walks the GPU clock
+    /// floor up with the TUI's `D` key inverted the pair and
+    /// `Budget::set_bounds`'s `f64::clamp` killed the controller thread —
+    /// in release too. Fails before the fix with "min > max".
+    #[test]
+    fn raising_the_gpu_floor_against_a_soft_capped_gpu_max_w_does_not_panic() {
+        let runner = FakeRunner::new();
+        // In-range operator config: sanitized() allows gpu_max_w in
+        // [1, GPU_MAX_W]. hi = 54 + 35 = 89 W.
+        let config = Config {
+            gpu_max_w: 35.0,
+            ..Config::default()
+        };
+        let (mut ctl, _gpu) = auto_controller(
+            &runner,
+            PathBuf::from("/nonexistent/platform_profile"),
+            config,
+        );
+        ctl.on_command(Command::SetAuto(true));
+
+        // The test LUT's top point is 2800 MHz = 100 W, so the raw lower
+        // bound would be 15 + 100 = 115 W, well above the 89 W cap.
+        ctl.on_command(Command::SetFloors {
+            cpu_w: 15.0,
+            gpu_mhz: 2800,
+        });
+        let floor = ctl.status().gpu_floor_mhz;
+        assert!(
+            floor < 2800,
+            "an unaffordable clock floor must be lowered through the LUT, got {floor} MHz"
+        );
+        let (lo, hi) = ctl.budget_bounds();
+        assert!(lo <= hi, "budget bounds must be ordered, got ({lo}, {hi})");
+        assert_eq!(
+            hi, 89.0,
+            "the operator's power cap is never raised to make a floor fit"
+        );
+
+        // And the loop keeps running: the every-5s block is what called
+        // set_bounds(115, 89) before the fix.
+        for i in 1..=3 {
+            ctl.on_sample(&busy_at(ALLOC_PERIOD_S * f64::from(i)));
+        }
+        assert!(
+            ctl.status().budget_w <= hi + 1e-9,
+            "budget {} must stay under the cap {hi}",
+            ctl.status().budget_w
+        );
+    }
+
     #[test]
     fn set_floors_shifts_the_next_allocation() {
         let runner = FakeRunner::new();
@@ -5311,6 +5391,29 @@ mod tests {
             last = ctl.on_sample(&temploop_sample(t0 + f64::from(i), 75.0, 74.0, TEMP_CURVE));
         }
         last
+    }
+
+    /// roast PR-2 finding 6: `SAMPLE_PERIOD_S` is the sampler's real cadence,
+    /// by construction rather than by coincidence. The spec timers §2.5's
+    /// 15 s and §2.7's 60 s are derived from it via `ticks_for`, so a second,
+    /// unlinked copy of the cadence would silently rescale both the day the
+    /// sampler's tick changes — with the whole suite still green. This test
+    /// cannot fail while the derivation stands; it fails to compile (and the
+    /// timers stay right) if someone restates the constant instead.
+    #[test]
+    fn the_controller_sample_period_is_the_samplers_own_cadence() {
+        assert_eq!(
+            SAMPLE_PERIOD_S,
+            crate::sensors::sampler::SAMPLE_PERIOD.as_secs_f64(),
+            "the controller's spec-timer cadence must BE the sampler's tick"
+        );
+        const {
+            assert!(
+                SAMPLE_PERIOD_S > 0.0,
+                "ticks_for divides by it: a zero cadence would make every \
+                 hysteresis timer infinite"
+            );
+        }
     }
 
     /// roast-pr-1 finding 6, at the cadence that actually matters: the
@@ -6465,19 +6568,20 @@ mod tests {
     /// regardless of the live `Config`, so `gpu_hot_c`/`nvme_hot_c` were
     /// config keys that round-tripped through `Config::load`/`save` and
     /// appeared on `ControlStatus` but never actually reached the guards
-    /// that are supposed to act on them. Both thresholds are set here WELL
-    /// BELOW the compiled-in defaults (88/80) -- but still inside the range
+    /// that are supposed to act on them. Both thresholds are set here BELOW
+    /// the compiled-in defaults (88/80) -- but still inside the range
     /// `Config::sanitized` allows (roast PR-1 finding 8 added these two keys
-    /// to the sanitizer, so a threshold below the sensor's idle range no
-    /// longer survives load): a temperature that would leave the DEFAULTS
-    /// cold must trip THESE configured, lower ones.
+    /// to the sanitizer, and roast PR-2 finding 5 raised `GPU_HOT_C_FLOOR`
+    /// to 85 so a threshold inside the card's measured 82-83/87 sustained
+    /// band no longer survives load): a temperature that would leave the
+    /// DEFAULTS cold must trip THESE configured, lower ones.
     #[test]
     fn gpu_and_nvme_hot_thresholds_come_from_the_live_config_not_the_compiled_defaults() {
         let runner = FakeRunner::new();
-        let config = Config { gpu_hot_c: 65.0, nvme_hot_c: 55.0, ..Config::default() };
+        let config = Config { gpu_hot_c: 86.0, nvme_hot_c: 55.0, ..Config::default() };
         // Sanity: the values under test are the ones the guards will see.
         let config = config.sanitized();
-        assert_eq!((config.gpu_hot_c, config.nvme_hot_c), (65.0, 55.0));
+        assert_eq!((config.gpu_hot_c, config.nvme_hot_c), (86.0, 55.0));
         let (mut ctl, _gpu) = auto_controller(
             &runner,
             PathBuf::from("/nonexistent/platform_profile"),
@@ -6486,7 +6590,7 @@ mod tests {
         ctl.on_command(Command::SetAuto(true));
         let s = Sample {
             gpu_temp_valid: true,
-            gpu_temp_c: 70.0, // below GPU_HOT_C_DEFAULT (88), above the configured 65
+            gpu_temp_c: 87.0, // below GPU_HOT_C_DEFAULT (88), above the configured 86
             nvme_temp_c: Some(60.0), // below NVME_HOT_C_DEFAULT (80), above the configured 55
             cpu_temp_valid: true,
             cpu_temp_c: 60.0,
@@ -6495,8 +6599,8 @@ mod tests {
         ctl.on_sample(&s);
         assert!(
             ctl.status().flags.contains(&StatusFlag::GpuHot),
-            "70C must trip a configured 65C gpu_hot_c threshold even though it's \
-             well under the compiled-in 88C default: {:?}",
+            "87C must trip a configured 86C gpu_hot_c threshold even though it's \
+             under the compiled-in 88C default: {:?}",
             ctl.status().flags
         );
         assert!(

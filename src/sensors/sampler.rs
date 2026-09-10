@@ -27,8 +27,12 @@ use crate::sensors::poller::{self, SharedFanctrl, SharedNvme};
 use crate::sensors::rapl::RaplReader;
 use crate::types::Sample;
 
-/// Target sampling cadence.
-const SAMPLE_PERIOD: Duration = Duration::from_secs(1);
+/// Target sampling cadence. `pub(crate)`: this is the ONE cadence the whole
+/// control loop runs at — `control::controller::SAMPLE_PERIOD_S` is derived
+/// from it (roast PR-2 finding 6), so §2.5's 15 s entry and §2.7's 60 s
+/// feasible-again hysteresis stay wall-clock correct if this ever changes,
+/// instead of being silently rescaled by a second, unlinked copy.
+pub(crate) const SAMPLE_PERIOD: Duration = Duration::from_secs(1);
 
 /// The inter-sample sleep checks the shutdown flag at least this often, so
 /// quitting never waits out a full sample period. `pub(crate)`: also used by

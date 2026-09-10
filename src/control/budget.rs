@@ -232,6 +232,38 @@ pub struct Budget {
     gpu_demand_pending: u32,
 }
 
+/// Orders a `(lo, hi)` bound pair so it is always safe to hand to
+/// `f64::clamp`, which panics when `min > max` or either end is NaN.
+///
+/// The controller derives `lo = cpu_floor_w + watts_for_clock(gpu_floor_mhz)`
+/// and `hi = cpu_max_w + gpu_max_w` from independent config keys, so an
+/// operator config (or a live TUI floor key) can invert the pair: a raised
+/// GPU clock floor against a lowered `gpu_max_w`. Panicking there would kill
+/// the controller thread in a release build and take fan control with it —
+/// exactly the class of failure the sanitizers exist to prevent. So a
+/// disordered or non-finite pair collapses to an ordered one and warns once
+/// per process: `lo` is lowered to `hi` (never `hi` raised to `lo` — the
+/// upper bound is the operator's power-envelope cap and must not be exceeded
+/// to honour an infeasible floor), and a non-finite end falls back to `0` /
+/// `lo`. `Config::sanitized` and the controller's own cross-field floor
+/// clamp are the first line of defence; this is the last.
+fn ordered_bounds(lo: f64, hi: f64) -> (f64, f64) {
+    if lo.is_finite() && hi.is_finite() && lo <= hi {
+        return (lo, hi);
+    }
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            "budget bounds ({lo}, {hi}) are disordered or non-finite; collapsing to an \
+             ordered pair (check cpu_floor_w/gpu_floor_mhz against cpu_max_w/gpu_max_w). \
+             Warned once per process."
+        );
+    });
+    let lo = if lo.is_finite() { lo } else { 0.0 };
+    let hi = if hi.is_finite() { hi } else { lo };
+    (lo.min(hi), hi)
+}
+
 impl Budget {
     /// New integrator, bounds `[0, 0]` (nothing to command) until
     /// [`Budget::set_bounds`] is called, `u = 0`, no dwell.
@@ -274,10 +306,19 @@ impl Budget {
     /// so it never reports a value outside the new bounds; the internal
     /// accumulator `v` is left as-is and self-corrects on the next `step`.
     pub fn set_bounds(&mut self, lo: f64, hi: f64) {
-        debug_assert!(lo <= hi, "budget bounds must be ordered: {lo} <= {hi}");
+        let (lo, hi) = ordered_bounds(lo, hi);
         self.lo = lo;
         self.hi = hi;
-        self.u = self.u.clamp(lo, hi);
+        self.u = self.clamp_to_bounds(self.u);
+    }
+
+    /// Clamps to the current bounds without ever handing `f64::clamp` an
+    /// unordered pair. [`set_bounds`](Self::set_bounds) already orders the
+    /// fields (and `new` starts them at `[0, 0]`), so the `hi.max(self.lo)`
+    /// here is pure defence in depth: it makes the panic unreachable however
+    /// the fields got their values.
+    fn clamp_to_bounds(&self, x: f64) -> f64 {
+        x.clamp(self.lo, self.hi.max(self.lo))
     }
 
     /// Warm-start (or floor) seed: sets `u` (and the internal accumulator,
@@ -285,7 +326,7 @@ impl Budget {
     /// current bounds. Does not touch `e_prev` — the caller resyncs
     /// separately if the error source is also changing.
     pub fn seed(&mut self, u: f64) {
-        let u = u.clamp(self.lo, self.hi);
+        let u = self.clamp_to_bounds(u);
         self.u = u;
         self.v = u;
     }
@@ -410,7 +451,7 @@ impl Budget {
         // differ, i.e. whenever the last tick saturated.
         let back_calc = (PI_PERIOD_S / ti) * (self.u - self.v);
         let v_new = self.v + du + back_calc;
-        let u_new = v_new.clamp(self.lo, self.hi);
+        let u_new = self.clamp_to_bounds(v_new);
 
         let at_lower = v_new <= self.lo;
         let at_upper = v_new >= self.hi;
@@ -654,6 +695,50 @@ mod tests {
             off_bound_tick.is_some(),
             "u never left the upper bound within one Ti ({ti_ticks} ticks)"
         );
+    }
+
+    // ---- roast PR-2 finding 1: disordered bounds must not panic ----
+
+    /// `lo > hi` reaches `set_bounds` from a perfectly in-range operator
+    /// config (a raised `gpu_floor_mhz` against a lowered `gpu_max_w`), and
+    /// `f64::clamp(min > max)` panics in **release** too — so this must hold
+    /// with no `debug_assert` in sight (`cargo test --release` runs it as
+    /// written). Fails before the fix with "min > max" at `set_bounds`.
+    #[test]
+    fn disordered_bounds_collapse_instead_of_panicking() {
+        let mut budget = Budget::new(&LoopGains::default());
+        budget.set_bounds(0.0, 94.0);
+        budget.seed(50.0);
+
+        // lo (15 W CPU floor + ~95 W GPU floor watts) above hi (54 + 40).
+        budget.set_bounds(110.0, 94.0);
+        // The cap is what survives: never raise the operator's ceiling to
+        // honour an infeasible floor.
+        assert_eq!((budget.lo, budget.hi), (94.0, 94.0));
+        assert_eq!(budget.u, 94.0);
+
+        // seed and step must be equally safe with the collapsed pair.
+        budget.seed(1000.0);
+        assert_eq!(budget.u, 94.0);
+        let u = budget.step(LoopError::Temp { e_c: 1000.0 }, None);
+        assert_eq!(u, 94.0);
+        let u = budget.step(LoopError::Temp { e_c: -1000.0 }, None);
+        assert_eq!(u, 94.0);
+    }
+
+    #[test]
+    fn non_finite_bounds_fall_back_to_an_ordered_finite_pair() {
+        let mut budget = Budget::new(&LoopGains::default());
+        budget.set_bounds(f64::NAN, 94.0);
+        assert_eq!((budget.lo, budget.hi), (0.0, 94.0));
+
+        budget.set_bounds(15.0, f64::INFINITY);
+        assert_eq!((budget.lo, budget.hi), (15.0, 15.0));
+
+        budget.set_bounds(f64::NEG_INFINITY, f64::NAN);
+        assert_eq!((budget.lo, budget.hi), (0.0, 0.0));
+        // Still steppable, still finite.
+        assert!(budget.step(LoopError::Temp { e_c: 5.0 }, None).is_finite());
     }
 
     // ---- Step 5: bound-dwell counters ----

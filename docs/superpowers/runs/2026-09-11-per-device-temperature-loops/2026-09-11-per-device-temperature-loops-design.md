@@ -182,9 +182,13 @@ States and transitions:
 - **Held.** Entered from `Curve` when the view goes stale, the curve is invalid, or
   reconciliation fails (§2.6's `EC MISMATCH`), and at Auto entry when no curve is available.
   `T*` starts at the last good curve-derived value (persisted; default 75 °C when none) and is
-  driven by the **RPM PI**: `err_rpm = fan_target − fan_smoothed`, a slow velocity-form PI
-  (Kc in °C per RPM, Ti several minutes — defaults derived so its closed-loop constant is ≥ 3×
-  the slower device loop's) whose output is clamped to `[T*_floor, gpu_hot_c − 2]` where
+  driven by the **RPM PI**: `err_rpm = fan_target − fan_smoothed` (`fan_smoothed` = the existing
+  `FAN_SMOOTH_N = 5` tail mean of `max(fan1, fan2)`, raw fallback on outage), a slow velocity-form
+  PI in °C per RPM at `PI_PERIOD_S = 5`. Defaults: plant gain K ≈ 78 RPM/°C (one duty tread per
+  °C at the curve's reference slope, §2.3 of the prior design), τ = 35 s, θ_eff = 90 s (the GPU
+  group's, the slower one), λ chosen so the closed-loop constant is ≥ 3× the slower device
+  loop's 360 s → λ = 1000 s → Kc = 35/(78 × 1090) ≈ 4.1e-4 °C/RPM, Ti = 35 s; output step
+  bounded to 0.5 °C per PI tick. Output clamped to `[T*_floor, gpu_hot_c − 2]` where
   `T*_floor` = max(uncontrollable sensors) + 5 °C (§2.7's feasibility bound). Its integrator
   holds when both device loops report `Hold::Clamp` at `max` (nothing left to heat) or at
   `floor` (nothing left to cool) — the same "would the extra move anywhere" rule the device
@@ -211,8 +215,10 @@ replica, the steady window and the warm start. `on_auto_sample`:
 1. replica tick (§2.2) → `cpu_group_c`, `gpu_group_c`, reconciliation verdict;
 2. `tstar.tick(...)` → `t_star`, flags;
 3. guards (§2.8): `gpu_share_override` becomes a **GPU max override**: while `GPU HOT` the GPU
-   loop's `max` ratchets down by `DOWN_RATE` per tick to no lower than `floor`, exactly the
-   current share ratchet expressed in MHz;
+   loop's `max` ratchets down by `DOWN_RATE_MHZ = 105` per allocation tick (one actuator
+   rate-limit step; the old 8 W/tick share ratchet was ≈ 160 MHz at 0.05 W/MHz — 105 keeps the
+   ratchet within the slew the lock can follow) to no lower than `floor`, and recovers at the
+   same rate once the guard clears;
 4. `cpu.tick(...)`, `gpu.tick(...)` → two caps;
 5. write through the existing actuator paths: `cpu.set_sustained_mw` with read-back (§2.9),
    `gpu.set_max_clock` with `verify_lock`; the stickiness watchdog, the Mismatch re-write,
@@ -220,6 +226,10 @@ replica, the steady window and the warm start. `on_auto_sample`:
 6. warm start: when both groups have sat within 1 °C of T\* and the fan within the steady
    window's tolerance for `STEADY_WINDOW_N` samples, record `(cpu_cap, gpu_lock)` under
    `WarmStart::key(strategy, duty, on_ac)` and refine the duty↔RPM table as today.
+
+**Auto no longer requires calibration** (the `NOT CALIBRATED` gate on `SetAuto(true)` in
+`controller.rs` is removed by the controller bead; the flag stays informational, raised when
+either device has no fitted gains).
 
 **Auto entry is bumpless by construction:** with no warm-start entry each loop seeds its
 thermal integrator at `max(floor, draw)` — the CPU at its current package watts, the GPU at its
@@ -242,8 +252,10 @@ are unchanged in behaviour; they now address the two loops instead of the budget
    names which condition failed and for how long, so the operator can tell "load moved" from
    "fans noisy".
 2. **CPU step:** raise the CPU cap by `STEP_W = 15` W (from the settled cap, clamped to
-   `cpu_max_w`), hold the GPU lock; record the CPU group for the fit window; `fit_fopdt` +
-   `derive_gains` as §3.3, in W/°C. **Cross-term rejection:** if the GPU group moved more than
+   `cpu_max_w`), hold the GPU lock; record the CPU group for a **fit window of
+   `FIT_WINDOW_S = 360` s** (θ_eff 90 + 5τ 175 + margin — the same window for both devices,
+   sized for the slower one), then `fit_fopdt` + `derive_gains` as §3.3, in W/°C, with the
+   fitted θ̂ used as-is (no `+ ma_interval/2`, as §3.3 already requires). **Cross-term rejection:** if the GPU group moved more than
    1 °C during the step window the fit is rejected ("load changed"), not the step.
 3. **GPU step:** raise the GPU lock by `STEP_MHZ = 500` (clamped to 3090), hold the CPU cap;
    fit against the GPU group in MHz/°C; reject if the CPU group moved more than 1 °C.
@@ -309,7 +321,15 @@ budget, split, LUT, Mode A/Mode B.
   labels, `None` on an unpowered dGPU, the fixture `cros_ec_dgpu_on` re-captured so a `gpu_*`
   sensor is the argmax under load.
 - **Simulation** (`ChainedPlant` grows a second thermal node: CPU heat → CPU group with
-  τ≈35 s, GPU clock → GPU group with the `gpu_vr` tail, cross-coupling 0.1 °C/°C each way):
+  τ≈35 s, GPU clock → GPU group with the `gpu_vr` tail, cross-coupling 0.1 °C/°C each way).
+  **GPU clock→draw model (no LUT):** `draw_w = load_level × P_full(clock)`, where
+  `P_full(clock)` is the September full-load sweep as a piecewise-linear table —
+  (1197 MHz, 49.3 W), (1402, 53.5), (1612, 64.2), (1807, 75.9), (1995, 90.8), (2143, 99.4),
+  extended flat to 3090 at 100 W (the card's power limit) and linearly to (1000, 45) below —
+  and `load_level ∈ [0, 1]` is the scripted GPU load; the reported SM clock is the lock when
+  `load_level ≥ 0.9` and `lock × load_level` below (so the pinned test behaves as on hardware);
+  GPU heat = `draw_w × 0.8 °C/W` into the GPU node. CPU: `draw_w = min(cap, cpu_load_w)` with
+  heat `× 0.8 °C/W` into the CPU node, as today.
   1. CPU-heavy, light GPU: CPU group settles at T\*, GPU sits at its shadow cap above draw,
      fans ±150 RPM of target ≥ 90 % of a 30-min converged window.
   2. GPU-heavy, light CPU: the mirror.

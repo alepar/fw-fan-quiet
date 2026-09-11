@@ -9,7 +9,7 @@ base: epic-fw-fanctrl-loop-6ma-integration
 spec: 2026-09-11-per-device-temperature-loops-design.md
 epic: fw-fanctrl-loop-eb9
 parked:
-- kind: escalation · source: design roast 1 (§2.4 Held plant gain: EC-autofan curve ~0 RPM/°C at 67–73 °C vs the fixed 78 RPM/°C) · mitigation applied in spec rev2 / eb9.16: the slope schedule is retained (Kc × slope_ref/max(slope_at(T*), slope_ref) clamped to [0.25, 1], 0.25× when no curve resolves a slope) · open question for the user: whether an EC-autofan sim leg must also gate eb9.16 · owner: the user
+- kind: escalation · source: design roast 1 (§2.4 Held plant gain: EC-autofan curve ~0 RPM/°C at 67–73 °C vs the fixed 78 RPM/°C) · mitigation applied in spec rev2 / eb9.16: the slope schedule is retained (Kc × slope_ref/max(slope_at(T*), slope_ref) clamped to [0.25, 1], 0.25× when no curve resolves a slope) · RESOLVED by design roast 2 (d2-21): sim 6 (eb9.14) is the EC-autofan leg, written against λ_eff with the 0.25× floor engaged, and gates eb9.16 through the integration sweep · no user action needed
 - kind: escalation · source: promotion review (design) · VR/VRAM label-to-label mapping between framework_tool and hwmon is a hardware load-test spike (spec Facts); taken on faith in eb9.1 (groups are max, no cross-group ambiguity by name) · owner: the user, on this machine
 approvals:
 - top-split (2026-09-11, human): epic fw-fanctrl-loop-eb9; children eb9.1 LEAF, eb9.2 LEAF, eb9.3 LEAF, eb9.4 LEAF, eb9.5 LEAF (demoted-by-session), eb9.6 LEAF, eb9.7 LEAF (demoted-by-session), eb9.8 LEAF (demoted-by-session), eb9.9 LEAF (demoted-by-session, TUI split out), eb9.10 LEAF, eb9.11 LEAF (demoted-by-session, sims 5-8 split out), eb9.12 LEAF, eb9.13 LEAF, eb9.14 LEAF
@@ -24,6 +24,7 @@ coverage-round-2:
 - tree changes: edges eb9.9<-eb9.16, eb9.13<-eb9.16, eb9.4<-eb9.6, eb9.15<-eb9.6, eb9.7<-eb9.16, eb9.12<-eb9.15; descriptions amended on eb9.3, eb9.4, eb9.7, eb9.9, eb9.10, eb9.12, eb9.14, eb9.16
 - integration sweep: eb9.17 (blocks on eb9.1..eb9.16)
 - ledger: per-device-temperature-loops-coverage-ledger.md (c2-01..c2-13)
-roastDesignRound: 2
+roastDesignRound: 3
 roast-design:
 - 2026-09-11-per-device-temperature-loops-roast-design-1.md (Blocking, 32 confirmed: 3 Blocking / 27 Should-fix / 2 Nit; 8 scouts, 153 raw -> 86 deduped, 61 panels, judge completion 100%, not degraded) — all 32 confirmed applied as spec revision 2 + bead amendments (ledger: Design roast 1 dispositions d1-01..d1-32); escalation mitigated and parked
+- 2026-09-11-per-device-temperature-loops-roast-design-2.md (Blocking, 27 confirmed: 8 Blocking / 18 Should-fix / 1 Nit; delta 16 new (4 B) · 0 carried · 22 resolved · 10 regressed (6 B); 9 scouts, 77 raw -> 41 deduped, 38 panels, judge completion 100%, not degraded) — all 27 applied as spec revision 3 (parking/band replaced by hot-only tracking; jump rule deleted; directional Held anti-windup; entry in Held; ThermalMode) + every bead body rewritten wholesale (ledger: Design roast 2 dispositions d2-01..d2-27)

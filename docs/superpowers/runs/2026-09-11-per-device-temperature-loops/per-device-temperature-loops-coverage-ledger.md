@@ -83,3 +83,34 @@ Every confirmed finding is design-level; each was applied as a spec rewrite (rev
 - d1-32 · Nit · t_star_last_good write cadence · applied · Held exit / Auto exit / ≤ every 60 s while dirty → eb9.5, eb9.7.
 - Spot-checked nits (BOUND_HOLD value, T* step sim, shadow tunables) · applied · BOUND_HOLD_S 60 (eb9.16); the T* step leg folds into sim 10's no-relay window (eb9.11); the five shadow tunables stay Config keys (user-tunable acoustics knobs) — recorded, not changed.
 - Escalation (Held plant gain vs the deleted slope schedule) · mitigated + parked · the slope schedule is restored for the RPM PI (Kc × slope_ref/max(slope,slope_ref) clamped [0.25, 1]; 0.25× with no resolvable slope) in eb9.16; whether an EC-autofan sim leg is also needed before eb9.16 lands is the user's call (run.md parked).
+
+## Design roast 2 dispositions (2026-09-11; report 2026-09-11-per-device-temperature-loops-roast-design-2.md; spec revision 3)
+
+Root cause of the Blocking cluster: rev2's parking rule + band. Rev3 replaces both with one rule — the thermal candidate is always live, never tracked while the device is cool (it saturates at max), and tracked one-sided (thermal := min(thermal, cap)) only while the group is above T*; the shadow is draw + headroom always (no pinned test), rises only while the group is at or below T*. Every bead body was rewritten wholesale (no amendment paragraphs remain).
+- d2-01 · Blocking · hold-at-applied freezes the cap in-band · applied · band and parking deleted; hot-only one-sided tracking (§2.3 steps 2–4) → eb9.3, eb9.4.
+- d2-02 · Blocking · parked candidate is a hysteresis-free relay · applied · no parking: the thermal state is never discarded; the cap moves at the rise slew or the PI's rate only; sim 10 gains a fluctuating-load leg → eb9.3, eb9.11.
+- d2-03 · Blocking · sim 4 bar unsatisfiable / plateau walk from max · applied · the shadow tracks the reported clock so a power-limited card's cap sits one headroom above the knee; the crossing tracks the thermal candidate to that cap (≤ 300 MHz of dead zone); sim 4 bar re-set (≤ 4 °C cold / ≤ 2 °C warm, no GPU HOT trip, settle in 3 λ) with the dead-zone paragraph → spec §2.3, eb9.11.
+- d2-04 · Blocking · Held anti-windup non-directional · applied · directional hold sets (up-blocking vs down-blocking; Shadow blocks up only, Clamp(Floor) down only; complement-of-None, exhaustive) → eb9.16.
+- d2-05 · Blocking · jump rule ambiguous · applied · jump rule deleted; absolute stateless gate on every label; plausible-but-stuck fails safe and surfaces as DeviceUnreachable; sim 11 re-stated → eb9.1, eb9.14, eb9.16.
+- d2-06 · Blocking · P_limit undefined · applied · no pinned test at all (draw + headroom always); P_limit gone → eb9.3, eb9.4, eb9.12.
+- d2-07 · Blocking · bead bodies contradicted by amendments · applied · every leaf body rewritten wholesale against rev3 (eb9.1–eb9.16).
+- d2-08 · Blocking · no state for Auto entry with an uncontrollable argmax / the hysteresis window · applied · Auto entry starts in Held (T* = last good or current controllable max); Held = "not curve-derived right now"; Uncontrollable entered from Held or Curve → eb9.5.
+- d2-09 · Should-fix · Uncontrollable needs a tick input · applied · ThermalMode{Regulate, Bypass} on the tick contract (eb9.3), output by the T* source (eb9.5), plumbed by eb9.7.
+- d2-10 · Should-fix · gpu_shadow_enabled off = no control · applied · with no parking, off = thermal-only GPU control (the A/B works); cost noted → spec, eb9.4.
+- d2-11 · Should-fix · err<0 override contradiction · applied · rule collapsed: shadow rises only while err ≥ 0, never an instant drop → eb9.4.
+- d2-12 · Should-fix · stuck at start · applied · accepted fail-safe disposition + DeviceUnreachable, sim 11 from-start leg → eb9.1, eb9.14.
+- d2-13 · Should-fix · filter scoped to group max · applied · absolute gate applies before argmax/all; T*_floor uses plausible readings → eb9.1, eb9.16.
+- d2-14 · Should-fix · GroupUnavailable dwell mis-scoped / action ambiguous · applied · absent-from-start vs lost-mid-session; release = cap max (not stock), written; sim 8 legs → eb9.3, eb9.7, eb9.14.
+- d2-15 · Should-fix · eb9.6 Option<Gains> · applied · body rewritten: BTreeMap keyed map → eb9.6.
+- d2-16 · Should-fix · gains precedence · applied · config > fitted > default, resolved by eb9.7, gains_source reported (eb9.9, eb9.13) → spec §2.3 Gains.
+- d2-17 · Should-fix · hold set omits ActuatorMismatch · applied · complement-of-None directional sets → eb9.16.
+- d2-18 · Should-fix · DrawUnavailable removes temperature regulation · applied · thermal regulation continues; shadow holds; 60 s dwell → thermal-only → eb9.3.
+- d2-19 · Should-fix · T* clamp inversion · applied · T*_floor = min(raw floor, ceiling); TargetUnreachable(high) → eb9.16; cpu_hot_c sanitiser range → eb9.6.
+- d2-20 · Should-fix · Released vs calibration · applied · calibration is a controller-level freeze, not a TStarSource state; "settled cap" defined → eb9.5, eb9.7, eb9.8.
+- d2-21 · Should-fix · λ_held × 0.25 floor vs sim 6 bar · applied · sim 6 written against λ_eff with an EC-autofan leg (the d1 escalation's leg) and a quiet16 leg → eb9.14; escalation resolved (see run.md parked).
+- d2-22 · Should-fix · §4 heat equation 0.8 · applied · 0.4 °C/W in the equation → spec §4, eb9.10.
+- d2-23 · Should-fix · unit bar unsatisfiable · applied · unit bars rewritten for hot-only tracking → spec §4, eb9.3, eb9.4.
+- d2-24 · Should-fix · CPU burst ratchets the shadow to max · applied · CPU draw = 5-sample tail mean; rise slew 10 W/s; burst example quantified → spec §2.3, eb9.7, eb9.10.
+- d2-25 · Should-fix · CPU hot guard undebounced / no sim · applied · CPU_HOT_STREAK = 3; sim 9(b) → eb9.7, eb9.14, eb9.15.
+- d2-26 · Should-fix · Mismatch freeze vs guard ratchet · applied · applied cap = min(cap, max) always; guards precede the freeze; immediate write → eb9.3, eb9.7.
+- d2-27 · Nit · θ_eff frozen at 60 s · applied · default_gains(ma_interval) computed live → eb9.3, eb9.7.

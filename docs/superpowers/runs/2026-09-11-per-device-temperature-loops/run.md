@@ -12,3 +12,8 @@ parked:
 - kind: escalation · source: promotion review (design) · VR/VRAM label-to-label mapping between framework_tool and hwmon is a hardware load-test spike (spec Facts); taken on faith in eb9.1 (groups are max, no cross-group ambiguity by name) · owner: the user, on this machine
 approvals:
 - top-split (2026-09-11, human): epic fw-fanctrl-loop-eb9; children eb9.1 LEAF, eb9.2 LEAF, eb9.3 LEAF, eb9.4 LEAF, eb9.5 LEAF (demoted-by-session), eb9.6 LEAF, eb9.7 LEAF (demoted-by-session), eb9.8 LEAF (demoted-by-session), eb9.9 LEAF (demoted-by-session, TUI split out), eb9.10 LEAF, eb9.11 LEAF (demoted-by-session, sims 5-8 split out), eb9.12 LEAF, eb9.13 LEAF, eb9.14 LEAF
+coverage-round-1:
+- requirements: 16 · mapped: 16 · unmapped: 0 () · R-new: 2 (R17 calibration freeze of both loops; R18 DeviceLoop seed/resync API)
+- reviewers: 3/3 valid (opus, input-bounded) · raw 40 · deduped 21 (incl. 5 flag-sweep) · applied 18 (auto) · accepted 3 (auto) · rejected 1 (auto: already applied)
+- tree changes: edges eb9.7<-eb9.4, eb9.13<-eb9.9, eb9.7<-eb9.9, eb9.5<-eb9.6, eb9.12<-eb9.11, eb9.12<-eb9.14, eb9.8<-eb9.7; new leaves eb9.15 (GPU HOT max ratchet, split from eb9.7) and eb9.16 (Held driver, split from eb9.5); descriptions amended on eb9.3, eb9.5, eb9.6, eb9.7, eb9.9, eb9.10, eb9.11, eb9.12, eb9.14
+- ledger: per-device-temperature-loops-coverage-ledger.md (c1-01..c1-21)

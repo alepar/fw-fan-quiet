@@ -26,4 +26,5 @@ are automatic (autonomous run); every applied fix names the bead(s) it changed.
 - c1-19 · flag-sweep eb9.8 · accepted · reason holds: one-to-one with §2.6, single file set.
 - c1-20 · flag-sweep eb9.9 · accepted · reason holds: split to eb9.13 is visible; the two seams it left (c1-02, c1-03) are applied.
 - c1-21 · flag-sweep eb9.11 · accepted · reason holds: split to eb9.14 is visible and contracted.
+- c1-22 · UNSATISFIABLE-ACCEPTANCE (unwired) · applied · eb9.9's sample-line fields come from eb9.1 with no path → edge eb9.9←eb9.1 + reason line.
 - R-new (accepted into the canonical list as R17, R18): R17 the calibration path freezes both loops at their applied caps for the run and reseeds them on exit with no cap step; R18 DeviceLoop exposes a seed/resync API the controller and TStarSource drive.

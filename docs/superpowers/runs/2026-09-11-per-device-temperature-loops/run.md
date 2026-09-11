@@ -7,3 +7,4 @@ idea: Replace the scalar power budget and CPU/GPU split in bazerame-fans with pe
 branch: super-auto/per-device-temperature-loops
 base: epic-fw-fanctrl-loop-6ma-integration
 spec: 2026-09-11-per-device-temperature-loops-design.md
+epic: fw-fanctrl-loop-eb9

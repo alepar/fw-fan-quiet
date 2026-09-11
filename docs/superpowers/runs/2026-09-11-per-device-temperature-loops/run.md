@@ -8,3 +8,5 @@ branch: super-auto/per-device-temperature-loops
 base: epic-fw-fanctrl-loop-6ma-integration
 spec: 2026-09-11-per-device-temperature-loops-design.md
 epic: fw-fanctrl-loop-eb9
+parked:
+- kind: escalation · source: promotion review (design) · VR/VRAM label-to-label mapping between framework_tool and hwmon is a hardware load-test spike (spec Facts); taken on faith in eb9.1 (groups are max, no cross-group ambiguity by name) · owner: the user, on this machine

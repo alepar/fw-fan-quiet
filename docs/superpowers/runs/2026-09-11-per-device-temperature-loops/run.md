@@ -24,3 +24,5 @@ coverage-round-2:
 - integration sweep: eb9.17 (blocks on eb9.1..eb9.16)
 - ledger: per-device-temperature-loops-coverage-ledger.md (c2-01..c2-13)
 roastDesignRound: 1
+roast-design:
+- 2026-09-11-per-device-temperature-loops-roast-design-1.md (Blocking, 32 confirmed: 3 Blocking / 27 Should-fix / 2 Nit; 8 scouts, 153 raw -> 86 deduped, 61 panels, judge completion 100%, not degraded)

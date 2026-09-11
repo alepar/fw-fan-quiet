@@ -17,3 +17,9 @@ coverage-round-1:
 - reviewers: 3/3 valid (opus, input-bounded) · raw 40 · deduped 21 (incl. 5 flag-sweep) · applied 18 (auto) · accepted 3 (auto) · rejected 1 (auto: already applied)
 - tree changes: edges eb9.7<-eb9.4, eb9.13<-eb9.9, eb9.7<-eb9.9, eb9.5<-eb9.6, eb9.12<-eb9.11, eb9.12<-eb9.14, eb9.8<-eb9.7; new leaves eb9.15 (GPU HOT max ratchet, split from eb9.7) and eb9.16 (Held driver, split from eb9.5); descriptions amended on eb9.3, eb9.5, eb9.6, eb9.7, eb9.9, eb9.10, eb9.11, eb9.12, eb9.14
 - ledger: per-device-temperature-loops-coverage-ledger.md (c1-01..c1-21)
+coverage-round-2:
+- requirements: 18 · mapped: 18 · unmapped: 0 () · R-new: 0
+- reviewers: 3/3 valid · raw 14 · deduped 13 · applied 13 (auto) · rejected 0 · count 22 → 13 (shrinking; all identities trace to round-1 fixes — check 9 doing its job, not scope widening)
+- tree changes: edges eb9.9<-eb9.16, eb9.13<-eb9.16, eb9.4<-eb9.6, eb9.15<-eb9.6, eb9.7<-eb9.16, eb9.12<-eb9.15; descriptions amended on eb9.3, eb9.4, eb9.7, eb9.9, eb9.10, eb9.12, eb9.14, eb9.16
+- integration sweep: eb9.17 (blocks on eb9.1..eb9.16)
+- ledger: per-device-temperature-loops-coverage-ledger.md (c2-01..c2-13)

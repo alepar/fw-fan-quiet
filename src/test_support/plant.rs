@@ -31,7 +31,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::fanctrl::client::{compute_freshness, FanctrlView, Freshness};
+use crate::fanctrl::client::{FanctrlView, Freshness, compute_freshness};
 use crate::fanctrl::curve::{Curve, CurveError};
 use crate::fanctrl::table::DutyRpmTable;
 use crate::sensors::ec::{EcAverage, EcReading};
@@ -293,7 +293,8 @@ mod emulator_tests {
         assert_eq!(e.ma_temperature, 51.8, "boxcar mean should be 51.8");
         assert_eq!(e.temperature, 60.0);
         assert_eq!(
-            e.speed_pct(), 21,
+            e.speed_pct(),
+            21,
             "eff = min(51.8, 60.0) = 51.8 -> cool16 duty_at(51.8) truncates to 21, not 22"
         );
     }
@@ -304,13 +305,22 @@ mod emulator_tests {
         // to literal values exactly like ec.rs's own off-by-one test.
         let mut e = FanctrlEmulator::new("t", vec![(0.0, 0), (100.0, 100)], 3).unwrap();
         e.tick(SensorRead::Ok(10.0));
-        assert_eq!(e.ma_temperature, 10.0, "first tick: no prior samples, eff falls back to current");
+        assert_eq!(
+            e.ma_temperature, 10.0,
+            "first tick: no prior samples, eff falls back to current"
+        );
         e.tick(SensorRead::Ok(20.0));
-        assert_eq!(e.ma_temperature, 10.0, "mean of [10] before this sample is folded in");
+        assert_eq!(
+            e.ma_temperature, 10.0,
+            "mean of [10] before this sample is folded in"
+        );
         e.tick(SensorRead::Ok(30.0));
         assert_eq!(e.ma_temperature, 15.0, "mean of [10, 20]");
         e.tick(SensorRead::Ok(40.0));
-        assert_eq!(e.ma_temperature, 20.0, "mean of [10, 20, 30] (buffer capped at 3)");
+        assert_eq!(
+            e.ma_temperature, 20.0,
+            "mean of [10, 20, 30] (buffer capped at 3)"
+        );
     }
 
     // --- Step 2: a scripted temperature drop drives eff from `current` ----
@@ -357,9 +367,19 @@ mod emulator_tests {
         for _ in 0..10 {
             e.tick(SensorRead::Ok(99.0));
         }
-        assert_eq!(e.ma_temperature, ma_before_pause, "MA must not move while paused");
-        assert_eq!(e.temperature, temp_before_pause, "current reading must not move while paused");
-        assert_eq!(e.speed_pct(), duty_before_pause, "duty must not move while paused");
+        assert_eq!(
+            e.ma_temperature, ma_before_pause,
+            "MA must not move while paused"
+        );
+        assert_eq!(
+            e.temperature, temp_before_pause,
+            "current reading must not move while paused"
+        );
+        assert_eq!(
+            e.speed_pct(),
+            duty_before_pause,
+            "duty must not move while paused"
+        );
 
         e.set_active(true);
         e.tick(SensorRead::Ok(60.0));
@@ -378,12 +398,18 @@ mod emulator_tests {
         let mut e = cool16();
         e.tick(SensorRead::Ok(70.0));
         e.tick(SensorRead::Failed);
-        assert_eq!(e.temperature, 50.0, "a failed read reports the hardcoded 50C");
+        assert_eq!(
+            e.temperature, 50.0,
+            "a failed read reports the hardcoded 50C"
+        );
         e.tick(SensorRead::Ok(70.0));
         // The failure's 50.0 must have joined the boxcar too (it is a real
         // sample as far as fw-fanctrl's own loop is concerned) -- mean of
         // [70.0, 50.0] before this third sample is folded in.
-        assert_eq!(e.ma_temperature, 60.0, "the injected 50C must have been retained in the boxcar");
+        assert_eq!(
+            e.ma_temperature, 60.0,
+            "the injected 50C must have been retained in the boxcar"
+        );
     }
 
     // --- Step 4: in-place curve edit ---------------------------------------
@@ -395,16 +421,29 @@ mod emulator_tests {
         e.tick(SensorRead::Ok(65.0));
         let before = e.view(t0).unwrap();
         assert_eq!(before.strategy, "cool16");
-        assert_eq!(before.curve, vec![(0.0, 20), (50.0, 20), (60.0, 30), (70.0, 42), (85.0, 100)]);
+        assert_eq!(
+            before.curve,
+            vec![(0.0, 20), (50.0, 20), (60.0, 30), (70.0, 42), (85.0, 100)]
+        );
 
         let new_points = vec![(0.0, 10), (50.0, 10), (60.0, 50), (85.0, 90)];
         e.edit_curve_in_place(new_points.clone()).unwrap();
         e.tick(SensorRead::Ok(65.0));
         let t1 = t0 + Duration::from_secs(5);
         let after = e.view(t1).unwrap();
-        assert_eq!(after.strategy, "cool16", "strategy name must not change on an in-place edit");
-        assert_eq!(after.curve, new_points, "the emitted view must carry the new points");
-        assert_eq!(after.all_observed_at, Some(t1), "a later view() call reflects a later stamp");
+        assert_eq!(
+            after.strategy, "cool16",
+            "strategy name must not change on an in-place edit"
+        );
+        assert_eq!(
+            after.curve, new_points,
+            "the emitted view must carry the new points"
+        );
+        assert_eq!(
+            after.all_observed_at,
+            Some(t1),
+            "a later view() call reflects a later stamp"
+        );
         assert_eq!(e.strategy_name(), "cool16");
         assert_eq!(e.ma_interval(), 60);
     }
@@ -412,10 +451,15 @@ mod emulator_tests {
     #[test]
     fn edit_curve_in_place_rejects_an_invalid_curve_and_keeps_the_old_one() {
         let mut e = cool16();
-        let err = e.edit_curve_in_place(vec![(0.0, 50), (10.0, 30)]).unwrap_err();
+        let err = e
+            .edit_curve_in_place(vec![(0.0, 50), (10.0, 30)])
+            .unwrap_err();
         assert_eq!(err, CurveError::DescendingSegment { at_index: 0 });
         let view = e.view(Instant::now()).unwrap();
-        assert_eq!(view.curve, vec![(0.0, 20), (50.0, 20), (60.0, 30), (70.0, 42), (85.0, 100)]);
+        assert_eq!(
+            view.curve,
+            vec![(0.0, 20), (50.0, 20), (60.0, 30), (70.0, 42), (85.0, 100)]
+        );
     }
 
     // --- socket death / active toggling feed wants_ec_autofan --------------
@@ -430,7 +474,11 @@ mod emulator_tests {
         assert!(!e.wants_ec_autofan());
         e.kill_socket();
         assert!(e.wants_ec_autofan());
-        assert_eq!(e.view(Instant::now()), None, "a dead socket has no view at all");
+        assert_eq!(
+            e.view(Instant::now()),
+            None,
+            "a dead socket has no view at all"
+        );
         e.revive_socket();
         assert!(!e.wants_ec_autofan());
         assert!(e.view(Instant::now()).is_some());
@@ -443,7 +491,10 @@ mod emulator_tests {
         let ma_before = e.ma_temperature;
         e.kill_socket();
         e.tick(SensorRead::Ok(90.0));
-        assert_eq!(e.ma_temperature, ma_before, "a dead socket's internal loop is not running either");
+        assert_eq!(
+            e.ma_temperature, ma_before,
+            "a dead socket's internal loop is not running either"
+        );
     }
 }
 
@@ -461,6 +512,82 @@ const THERMAL_TAU_S: f64 = 35.0;
 const THERMAL_THETA_S: f64 = 20.0;
 /// FOPDT steady-state gain, °C per drawn watt.
 const THERMAL_K_C_PER_W: f64 = 0.8;
+
+/// CPU raw EC-group plant parameters.  Kept public so robustness scenarios
+/// can perturb the physical plant without changing controller defaults.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CpuPlantParams {
+    pub tau_s: f64,
+    pub k_c_per_w: f64,
+    pub theta_eff_s: f64,
+}
+
+impl Default for CpuPlantParams {
+    fn default() -> Self {
+        Self {
+            tau_s: THERMAL_TAU_S,
+            k_c_per_w: THERMAL_K_C_PER_W,
+            theta_eff_s: THERMAL_THETA_S,
+        }
+    }
+}
+
+/// GPU raw EC-group parameters. `k_c_per_mhz` is the controller-facing
+/// small-signal gain; its default maps through the physical 0.4 C/W path.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GpuPlantParams {
+    pub tau_s: f64,
+    pub k_c_per_mhz: f64,
+    pub theta_eff_s: f64,
+}
+
+impl GpuPlantParams {
+    pub const fn nominal() -> Self {
+        Self {
+            tau_s: 15.0,
+            k_c_per_mhz: 0.02,
+            theta_eff_s: 90.0,
+        }
+    }
+}
+
+impl Default for GpuPlantParams {
+    fn default() -> Self {
+        Self::nominal()
+    }
+}
+
+/// Per-sample physical fault injection, used internally by [`ChainedPlant`]
+/// and exposed for focused plant tests.  Every value is applied before the
+/// production EC parser sees the scratch hwmon tree.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThermalFaults {
+    pub cpu_group_present: bool,
+    pub gpu_group_present: bool,
+    pub cpu_stuck_c: Option<f64>,
+    pub gpu_stuck_c: Option<f64>,
+    pub ambient_c: Option<f64>,
+    pub charger_c: Option<f64>,
+    pub raw_only_c: Option<f64>,
+    pub unknown_c: Option<f64>,
+    pub ec_invalid: bool,
+}
+
+impl Default for ThermalFaults {
+    fn default() -> Self {
+        Self {
+            cpu_group_present: true,
+            gpu_group_present: true,
+            cpu_stuck_c: None,
+            gpu_stuck_c: None,
+            ambient_c: None,
+            charger_c: None,
+            raw_only_c: None,
+            unknown_c: None,
+            ec_invalid: false,
+        }
+    }
+}
 
 /// watts -> controllable EC °C (design doc §5: first order, τ 35 s, θ 20 s,
 /// K 0.8 °C/W, plus an ambient offset), with separately labelled
@@ -481,14 +608,18 @@ const THERMAL_K_C_PER_W: f64 = 0.8;
 /// tie-break rule the replica applies is *exactly* production's, not a
 /// second copy of it that could drift.
 pub struct ThermalPlant {
-    tau_s: f64,
-    theta_ticks: usize,
-    k_c_per_w: f64,
+    cpu_params: CpuPlantParams,
+    gpu_params: GpuPlantParams,
     /// Steady-state controllable temperature at zero drawn watts.
     ambient_base_c: f64,
     /// Pending watts inputs not yet past the dead time, oldest first.
-    delay: VecDeque<f64>,
+    cpu_delay: VecDeque<(f64, f64)>,
+    gpu_delay: VecDeque<(f64, f64)>,
+    /// Exact carried scalar delay for cap/fraction scripts.  It remains
+    /// separate from the elapsed-time per-device queues by design.
+    legacy_delay: VecDeque<f64>,
     controllable_c: f64,
+    gpu_group_c: f64,
     ambient_c: f64,
     charger_c: f64,
     /// A single representative EC `gpu_*` channel (labelled
@@ -508,22 +639,37 @@ impl ThermalPlant {
     pub fn new(ambient_base_c: f64) -> Self {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "bzf-plant-thermal-{}-{n}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("bzf-plant-thermal-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch hwmon dir must be creatable");
-        std::fs::write(dir.join("temp1_label"), "cpu@4c\n").unwrap();
-        std::fs::write(dir.join("temp2_label"), "ambient_f75303@4d\n").unwrap();
-        std::fs::write(dir.join("temp3_label"), "charger_f75303@4d\n").unwrap();
-        std::fs::write(dir.join("temp4_label"), "gpu_amb_f75303@4d\n").unwrap();
+        for (n, label) in [
+            "cpu@4c",
+            "apu_f75303@4d",
+            "ambient_f75303@4d",
+            "charger_f75303@4d",
+            "gpu_vr_f75303@4d",
+            "gpu_vram_f75303@4d",
+            "gpu_amb_f75303@4d",
+            "gpu_temp@40",
+        ]
+        .iter()
+        .enumerate()
+        {
+            std::fs::write(
+                dir.join(format!("temp{}_label", n + 1)),
+                format!("{label}\n"),
+            )
+            .unwrap();
+        }
         ThermalPlant {
-            tau_s: THERMAL_TAU_S,
-            theta_ticks: (THERMAL_THETA_S / TICK_S).round() as usize,
-            k_c_per_w: THERMAL_K_C_PER_W,
+            cpu_params: CpuPlantParams::default(),
+            gpu_params: GpuPlantParams::nominal(),
             ambient_base_c,
-            delay: VecDeque::new(),
+            cpu_delay: VecDeque::new(),
+            gpu_delay: VecDeque::new(),
+            legacy_delay: VecDeque::new(),
             controllable_c: ambient_base_c,
+            gpu_group_c: ambient_base_c,
             ambient_c: ambient_base_c - 2.0,
             charger_c: ambient_base_c - 4.0,
             gpu_ec_c: None,
@@ -547,6 +693,18 @@ impl ThermalPlant {
         self.gpu_ec_c = gpu_ec_c;
     }
 
+    pub fn set_cpu_plant_params(&mut self, params: CpuPlantParams) {
+        self.cpu_params = params;
+    }
+
+    pub fn set_gpu_plant_params(&mut self, params: GpuPlantParams) {
+        self.gpu_params = params;
+    }
+
+    pub fn gpu_plant_params(&self) -> GpuPlantParams {
+        self.gpu_params
+    }
+
     pub fn controllable_c(&self) -> f64 {
         self.controllable_c
     }
@@ -557,15 +715,133 @@ impl ThermalPlant {
     /// channels into the scratch hwmon tree, and reads a fresh
     /// [`EcReading`] back.
     pub fn tick(&mut self, watts: f64) -> EcReading {
-        self.delay.push_back(watts);
-        let delayed = if self.delay.len() > self.theta_ticks {
-            self.delay.pop_front().expect("just checked len > 0")
+        self.tick_legacy_scalar(
+            watts,
+            ThermalFaults {
+                gpu_group_present: self.gpu_ec_c.is_some(),
+                ..ThermalFaults::default()
+            },
+        )
+        .expect("legacy thermal tick always has a CPU EC channel")
+    }
+
+    /// The carried scalar plant uses an integer-tick delay and explicit Euler
+    /// update.  Old cap/fraction acceptance traces are phase-sensitive, so
+    /// routing them through the analytic per-device model changes outcomes.
+    fn tick_legacy_scalar(&mut self, watts: f64, faults: ThermalFaults) -> Option<EcReading> {
+        self.legacy_delay.push_back(watts);
+        let delayed = if self.legacy_delay.len() > (THERMAL_THETA_S / TICK_S) as usize {
+            self.legacy_delay
+                .pop_front()
+                .expect("the just-appended scalar delay is nonempty")
         } else {
             0.0
         };
-        let t_ss = self.ambient_base_c + self.k_c_per_w * delayed;
-        self.controllable_c += (t_ss - self.controllable_c) * (TICK_S / self.tau_s);
+        let target = self.ambient_base_c + THERMAL_K_C_PER_W * delayed;
+        self.controllable_c += (target - self.controllable_c) * (TICK_S / THERMAL_TAU_S);
+        self.emit_reading(faults)
+    }
 
+    /// Advances independent CPU/GPU group nodes.  The GPU target deliberately
+    /// computes its heat through `draw_w * 0.4 C/W`: converting the tunable
+    /// MHz gain to a W gain preserves that physical path at every grid point.
+    pub fn tick_nodes(
+        &mut self,
+        cpu_w: f64,
+        gpu_draw_w: f64,
+        dt_s: f64,
+        faults: ThermalFaults,
+    ) -> Option<EcReading> {
+        let dt_s = if dt_s.is_finite() {
+            dt_s.max(0.0)
+        } else {
+            TICK_S
+        };
+        // A delay line holds exactly theta seconds.  Appending this tick's
+        // input then consuming dt yields the delayed waveform over the
+        // interval, including a partial segment when a long backlog crosses
+        // theta (for dt=100, theta=90: 90 s old input, 10 s new input).
+        let delayed_segments =
+            |queue: &mut VecDeque<(f64, f64)>, theta_s: f64, input: f64, dt_s: f64| {
+                let theta_s = theta_s.max(0.0);
+                if queue.is_empty() && theta_s > 0.0 {
+                    queue.push_back((0.0, theta_s));
+                }
+                if dt_s > 0.0 {
+                    queue.push_back((input, dt_s));
+                }
+                let mut remaining_s = dt_s;
+                let mut output = Vec::new();
+                while remaining_s > 0.0 {
+                    let Some((value, duration_s)) = queue.pop_front() else {
+                        break;
+                    };
+                    let slice_s = remaining_s.min(duration_s);
+                    output.push((value, slice_s));
+                    remaining_s -= slice_s;
+                    if duration_s > slice_s {
+                        queue.push_front((value, duration_s - slice_s));
+                    }
+                }
+                output
+            };
+        let cpu_segments = delayed_segments(
+            &mut self.cpu_delay,
+            self.cpu_params.theta_eff_s,
+            cpu_w,
+            dt_s,
+        );
+        let gpu_segments = delayed_segments(
+            &mut self.gpu_delay,
+            self.gpu_params.theta_eff_s,
+            gpu_draw_w,
+            dt_s,
+        );
+        let mut cpu_index = 0;
+        let mut gpu_index = 0;
+        let mut cpu_remaining_s = cpu_segments.first().map_or(0.0, |(_, d)| *d);
+        let mut gpu_remaining_s = gpu_segments.first().map_or(0.0, |(_, d)| *d);
+        while cpu_index < cpu_segments.len() && gpu_index < gpu_segments.len() {
+            let slice_s = cpu_remaining_s.min(gpu_remaining_s);
+            let cpu_input_w = cpu_segments[cpu_index].0;
+            let gpu_input_w = gpu_segments[gpu_index].0;
+            // Both cross-coupling terms use the state at the beginning of
+            // this piecewise segment. Updating one node before reading the
+            // other would let heat cross instantaneously inside a segment.
+            let cpu_before_c = self.controllable_c;
+            let gpu_before_c = self.gpu_group_c;
+            let cpu_cross_c = 0.1 * (gpu_before_c - self.ambient_base_c);
+            let cpu_target =
+                self.ambient_base_c + self.cpu_params.k_c_per_w * cpu_input_w + cpu_cross_c;
+            let cpu_fraction = 1.0 - (-slice_s / self.cpu_params.tau_s.max(f64::EPSILON)).exp();
+            let next_cpu_c = cpu_before_c + (cpu_target - cpu_before_c) * cpu_fraction;
+
+            let gpu_cross_c = 0.1 * (cpu_before_c - self.ambient_base_c);
+            // k=.02 C/MHz corresponds to .4 C/W at the measured 0.05 W/MHz
+            // slope. Keeping 0.4 explicit makes the heat path auditable.
+            let gpu_heat_c = gpu_input_w * 0.4 * (self.gpu_params.k_c_per_mhz / 0.02);
+            let gpu_target = self.ambient_base_c + gpu_heat_c + gpu_cross_c;
+            let gpu_fraction = 1.0 - (-slice_s / self.gpu_params.tau_s.max(f64::EPSILON)).exp();
+            let next_gpu_c = gpu_before_c + (gpu_target - gpu_before_c) * gpu_fraction;
+            self.controllable_c = next_cpu_c;
+            self.gpu_group_c = next_gpu_c;
+
+            cpu_remaining_s -= slice_s;
+            gpu_remaining_s -= slice_s;
+            if cpu_remaining_s <= f64::EPSILON {
+                cpu_index += 1;
+                cpu_remaining_s = cpu_segments.get(cpu_index).map_or(0.0, |(_, d)| *d);
+            }
+            if gpu_remaining_s <= f64::EPSILON {
+                gpu_index += 1;
+                gpu_remaining_s = gpu_segments.get(gpu_index).map_or(0.0, |(_, d)| *d);
+            }
+        }
+
+        self.emit_reading(faults)
+    }
+
+    fn emit_reading(&mut self, faults: ThermalFaults) -> Option<EcReading> {
         let write_milli = |name: &str, c: f64| {
             std::fs::write(
                 self.dir.join(name),
@@ -573,18 +849,56 @@ impl ThermalPlant {
             )
             .unwrap();
         };
-        write_milli("temp1_input", self.controllable_c);
-        write_milli("temp2_input", self.ambient_c);
-        write_milli("temp3_input", self.charger_c);
-        match self.gpu_ec_c {
-            Some(v) => write_milli("temp4_input", v),
+        let write_or_remove = |name: &str, value: Option<f64>| match value {
+            Some(value) => write_milli(name, value),
             None => {
-                let _ = std::fs::remove_file(self.dir.join("temp4_input"));
+                let _ = std::fs::remove_file(self.dir.join(name));
             }
+        };
+        let cpu_c = faults.cpu_stuck_c.unwrap_or(self.controllable_c);
+        let gpu_c = faults
+            .gpu_stuck_c
+            .or(self.gpu_ec_c)
+            .unwrap_or(self.gpu_group_c);
+        write_or_remove(
+            "temp1_input",
+            (!faults.ec_invalid && faults.cpu_group_present).then_some(cpu_c),
+        );
+        write_or_remove(
+            "temp2_input",
+            (!faults.ec_invalid && faults.cpu_group_present).then_some(cpu_c - 0.4),
+        );
+        write_or_remove(
+            "temp3_input",
+            (!faults.ec_invalid).then_some(faults.ambient_c.unwrap_or(self.ambient_c)),
+        );
+        write_or_remove(
+            "temp4_input",
+            (!faults.ec_invalid).then_some(faults.charger_c.unwrap_or(self.charger_c)),
+        );
+        for (index, name) in ["temp5_input", "temp6_input", "temp7_input", "temp8_input"]
+            .iter()
+            .enumerate()
+        {
+            let legacy_only = self.gpu_ec_c.is_some() && index != 2;
+            write_or_remove(
+                name,
+                (!faults.ec_invalid && faults.gpu_group_present && !legacy_only).then_some(gpu_c),
+            );
         }
-        EcReading::read(&self.dir).expect(
-            "the controllable/ambient/charger channels are always written positive above",
-        )
+        // Raw-only values deliberately share a GPU label: the EC parser
+        // excludes them from control while retaining them for reconciliation.
+        if let Some(raw) = faults.raw_only_c {
+            write_milli("temp5_input", raw);
+        }
+        if let Some(unknown_c) = (!faults.ec_invalid).then_some(faults.unknown_c).flatten() {
+            std::fs::write(self.dir.join("temp9_label"), "unknown_thermal\n").unwrap();
+            write_milli("temp9_input", unknown_c);
+        } else {
+            let _ = std::fs::remove_file(self.dir.join("temp9_label"));
+            let _ = std::fs::remove_file(self.dir.join("temp9_input"));
+        }
+        EcReading::read(&self.dir)
     }
 }
 
@@ -636,13 +950,19 @@ mod thermal_plant_tests {
         let reading = p.tick(0.0);
         // Ambient (45.0) exceeds the still-baseline controllable channel
         // (40.0, watts have not reached it yet) and the charger (30.0).
-        assert_eq!(reading.max_c, 45, "ambient should be the argmax before any watts arrive");
+        assert_eq!(
+            reading.max_c, 45,
+            "ambient should be the argmax before any watts arrive"
+        );
         assert_eq!(reading.argmax.as_str(), "ambient_f75303@4d");
         let labels: Vec<&str> = reading.all.iter().map(|(l, _)| l.as_str()).collect();
         assert!(labels.contains(&"cpu@4c"));
         assert!(labels.contains(&"ambient_f75303@4d"));
         assert!(labels.contains(&"charger_f75303@4d"));
-        assert!(!labels.iter().any(|l| l.starts_with("gpu")), "no gpu_* reading was scripted");
+        assert!(
+            !labels.iter().any(|l| l.starts_with("gpu")),
+            "no gpu_* reading was scripted"
+        );
     }
 
     #[test]
@@ -657,7 +977,10 @@ mod thermal_plant_tests {
         p.set_gpu_ec(None);
         let reading = p.tick(0.0);
         assert!(
-            !reading.all.iter().any(|(l, _)| l.as_str().starts_with("gpu")),
+            !reading
+                .all
+                .iter()
+                .any(|(l, _)| l.as_str().starts_with("gpu")),
             "clearing the scripted gpu_* reading must remove it (ENODATA), not zero it"
         );
     }
@@ -822,7 +1145,10 @@ mod fan_plant_tests {
         // A rise to duty 40 is a positive slew: output must exceed
         // base+max noise, which only the kick can explain.
         let base_40 = p.base_rpm_for_duty(40);
-        assert!(base_40 > base_20, "test setup: duty 40 must be a real rise over duty 20");
+        assert!(
+            base_40 > base_20,
+            "test setup: duty 40 must be a real rise over duty 20"
+        );
         let risen = p.tick(40);
         assert!(
             risen > base_40 + FAN_NOISE_RPM,
@@ -856,7 +1182,10 @@ mod fan_plant_tests {
             seq_a.push(a.tick(duty));
             seq_b.push(b.tick(duty));
         }
-        assert_eq!(seq_a, seq_b, "two plants with the same seed and the same duty script must produce identical output");
+        assert_eq!(
+            seq_a, seq_b,
+            "two plants with the same seed and the same duty script must produce identical output"
+        );
 
         let mut c = FanPlant::new(31415);
         let base = c.base_rpm_for_duty(30);
@@ -870,7 +1199,10 @@ mod fan_plant_tests {
         // A different seed must not reproduce the same sequence (sanity:
         // this is really drawing from the RNG, not returning a constant).
         let mut d = FanPlant::new(2718);
-        let seq_d: Vec<f64> = [20, 20, 20, 40, 40, 30, 30].iter().map(|&du| d.tick(du)).collect();
+        let seq_d: Vec<f64> = [20, 20, 20, 40, 40, 30, 30]
+            .iter()
+            .map(|&du| d.tick(du))
+            .collect();
         assert_ne!(seq_a, seq_d, "a different seed must diverge from seq_a");
     }
 
@@ -884,7 +1216,11 @@ mod fan_plant_tests {
         assert_eq!(ec_autofan_rpm_base(70.0), 4748.0);
         assert_eq!(ec_autofan_rpm_base(71.0), 4748.0);
         assert_eq!(ec_autofan_rpm_base(73.0), 4748.0);
-        assert_eq!(ec_autofan_rpm_base(80.0), 4748.0, "plateau assumed to continue past 73C");
+        assert_eq!(
+            ec_autofan_rpm_base(80.0),
+            4748.0,
+            "plateau assumed to continue past 73C"
+        );
     }
 
     #[test]
@@ -948,6 +1284,23 @@ pub struct TickScript {
     pub cpu_util_pct: f64,
     pub gpu_util_pct: f64,
     pub gpu_sm_mhz: f64,
+    /// Measured package draw independent of the sustained cap.  A scripted
+    /// one-sample burst can therefore exceed `cpu_cap_w` like the fixed fast
+    /// CPU limit does on hardware.
+    pub cpu_pkg_w_override: Option<f64>,
+    /// Revision-4 GPU physical model inputs.  When both are `Some`, they
+    /// supersede the legacy cap/fraction pair while preserving it for older
+    /// scenario callers.
+    pub gpu_lock_mhz: Option<f64>,
+    pub gpu_load_level: Option<f64>,
+    /// `None` retains legacy inference from `gpu_temp_c`; `Some(false)`
+    /// explicitly removes the dGPU while leaving group-loss distinct.
+    pub gpu_powered: Option<bool>,
+    /// A draw outage and a clock-read outage are independent sensor faults.
+    pub gpu_clock_available: bool,
+    /// Independent guard-driving die/Tctl inputs.  `None` follows the
+    /// physical node, which keeps old tests deterministic.
+    pub cpu_tctl_c: Option<f64>,
     /// `None` = dGPU unpowered/unsensed this tick — gates `gpu_w`,
     /// `gpu_sm_mhz` and their validity flags to the same "absent" reading
     /// (`Sample`'s own convention: 0.0 + `false`), regardless of
@@ -966,6 +1319,22 @@ pub struct TickScript {
     /// [`FanctrlEmulator::wants_ec_autofan`].
     pub socket_dead: bool,
     pub on_ac: bool,
+    pub cpu_group_present: bool,
+    pub gpu_group_present: bool,
+    pub cpu_stuck_c: Option<f64>,
+    pub gpu_stuck_c: Option<f64>,
+    pub ambient_c: Option<f64>,
+    pub charger_c: Option<f64>,
+    pub raw_only_c: Option<f64>,
+    pub unknown_c: Option<f64>,
+    pub fan_outage: bool,
+    pub ec_invalid: bool,
+    pub force_stale_view: bool,
+    pub force_view_changed: bool,
+    pub gpu_draw_available: bool,
+    /// A scripted monotonic gap for resume/backlog scenarios.  The physical
+    /// nodes use the same elapsed interval and the returned sample carries it.
+    pub elapsed_s: f64,
 }
 
 impl Default for TickScript {
@@ -978,13 +1347,74 @@ impl Default for TickScript {
             cpu_util_pct: 0.0,
             gpu_util_pct: 0.0,
             gpu_sm_mhz: 0.0,
+            cpu_pkg_w_override: None,
+            gpu_lock_mhz: None,
+            gpu_load_level: None,
+            gpu_powered: None,
+            gpu_clock_available: true,
+            cpu_tctl_c: None,
             gpu_temp_c: None,
             nvme_temp_c: None,
             sensor_read_failed: false,
             resumed: false,
             socket_dead: false,
             on_ac: true,
+            cpu_group_present: true,
+            gpu_group_present: true,
+            cpu_stuck_c: None,
+            gpu_stuck_c: None,
+            ambient_c: None,
+            charger_c: None,
+            raw_only_c: None,
+            unknown_c: None,
+            fan_outage: false,
+            ec_invalid: false,
+            force_stale_view: false,
+            force_view_changed: false,
+            gpu_draw_available: true,
+            elapsed_s: TICK_S,
         }
+    }
+}
+
+/// September full-load draw curve.  The final segment represents the power
+/// limit plateau rather than a calibration LUT.
+const GPU_FULL_LOAD_POINTS: [(f64, f64); 8] = [
+    (1000.0, 45.0),
+    (1197.0, 49.3),
+    (1402.0, 53.5),
+    (1612.0, 64.2),
+    (1807.0, 75.9),
+    (1995.0, 90.8),
+    (2143.0, 99.4),
+    (3090.0, 100.0),
+];
+
+/// Full-load GPU draw at a lock.  Values outside the measured range clamp to
+/// its endpoint rather than inventing unmeasured power behavior.
+pub fn gpu_full_load_power_w(clock_mhz: f64) -> f64 {
+    let clock_mhz = clock_mhz.clamp(1000.0, 3090.0);
+    for pair in GPU_FULL_LOAD_POINTS.windows(2) {
+        let [(x0, y0), (x1, y1)] = pair else {
+            unreachable!()
+        };
+        if clock_mhz <= *x1 {
+            let fraction = (clock_mhz - *x0) / (*x1 - *x0);
+            return *y0 + fraction * (*y1 - *y0);
+        }
+    }
+    100.0
+}
+
+/// Clock a power-limited card can report.  Partial work is non-limiting; at
+/// full load the observed RTX trace sat near 2520 MHz despite a 3090 MHz lock,
+/// and every higher lock shares that plateau.
+pub fn gpu_clock_at_power_limit(load_level: f64) -> f64 {
+    let load_level = load_level.clamp(0.0, 1.0);
+    if load_level < 0.9 {
+        3090.0
+    } else {
+        3090.0 - (3090.0 - 2520.0) * ((load_level - 0.9) / 0.1)
     }
 }
 
@@ -1049,6 +1479,18 @@ impl ChainedPlant {
         &mut self.thermal
     }
 
+    pub fn set_gpu_plant_params(&mut self, params: GpuPlantParams) {
+        self.thermal.set_gpu_plant_params(params);
+    }
+
+    pub fn set_cpu_plant_params(&mut self, params: CpuPlantParams) {
+        self.thermal.set_cpu_plant_params(params);
+    }
+
+    pub fn gpu_plant_params(&self) -> GpuPlantParams {
+        self.thermal.gpu_plant_params()
+    }
+
     pub fn fan_mut(&mut self) -> &mut FanPlant {
         &mut self.fan
     }
@@ -1063,7 +1505,12 @@ impl ChainedPlant {
     /// poll cadence, and returns the resulting [`Sample`].
     pub fn tick(&mut self, script: &TickScript) -> Sample {
         self.tick_count += 1;
-        self.t_mono += TICK_S;
+        let elapsed_s = if script.elapsed_s.is_finite() && script.elapsed_s > 0.0 {
+            script.elapsed_s
+        } else {
+            TICK_S
+        };
+        self.t_mono += elapsed_s;
         let now = self.base_instant + Duration::from_secs_f64(self.t_mono);
 
         if script.socket_dead {
@@ -1074,17 +1521,66 @@ impl ChainedPlant {
 
         // Demand model: the caps are what the controller asked for, the
         // draw is what actually happened -- only the draw heats anything.
-        let cpu_pkg_w = script.cpu_cap_w * script.cpu_demand_frac.clamp(0.0, 1.0);
-        let gpu_present = script.gpu_temp_c.is_some();
-        let gpu_w = if gpu_present {
-            script.gpu_cap_w * script.gpu_demand_frac.clamp(0.0, 1.0)
+        let cpu_pkg_w = script
+            .cpu_pkg_w_override
+            .unwrap_or(script.cpu_cap_w * script.cpu_demand_frac.clamp(0.0, 1.0));
+        let gpu_powered = script.gpu_powered.unwrap_or(script.gpu_temp_c.is_some());
+        let gpu_group_present = gpu_powered && script.gpu_group_present;
+        let clock_model = script.gpu_lock_mhz.is_some() && script.gpu_load_level.is_some();
+        let per_device_fault = !script.cpu_group_present
+            || !script.gpu_group_present
+            || script.cpu_stuck_c.is_some()
+            || script.gpu_stuck_c.is_some()
+            || script.ambient_c.is_some()
+            || script.charger_c.is_some()
+            || script.raw_only_c.is_some()
+            || script.unknown_c.is_some()
+            || script.ec_invalid;
+        let (gpu_w, gpu_sm_mhz) = if gpu_powered {
+            if let (Some(lock_mhz), Some(load_level)) = (script.gpu_lock_mhz, script.gpu_load_level)
+            {
+                let load_level = load_level.clamp(0.0, 1.0);
+                (
+                    load_level * gpu_full_load_power_w(lock_mhz),
+                    lock_mhz.min(gpu_clock_at_power_limit(load_level)),
+                )
+            } else {
+                (
+                    script.gpu_cap_w * script.gpu_demand_frac.clamp(0.0, 1.0),
+                    script.gpu_sm_mhz,
+                )
+            }
         } else {
-            0.0
+            (0.0, 0.0)
         };
-        let drawn_w = cpu_pkg_w + gpu_w;
-
-        let ec_reading = self.thermal.tick(drawn_w);
-        let current_c = f64::from(ec_reading.max_c);
+        let faults = ThermalFaults {
+            cpu_group_present: script.cpu_group_present,
+            gpu_group_present,
+            cpu_stuck_c: script.cpu_stuck_c,
+            gpu_stuck_c: script.gpu_stuck_c,
+            ambient_c: script.ambient_c,
+            charger_c: script.charger_c,
+            raw_only_c: script.raw_only_c,
+            unknown_c: script.unknown_c,
+            ec_invalid: script.ec_invalid,
+        };
+        // Existing cap/fraction scripts retain the carried scalar dynamics.
+        // Clock/load and new fault scripts enter the elapsed-time two-node
+        // model, so the two physical contracts cannot perturb each other.
+        let ec_reading = if clock_model || per_device_fault || script.gpu_powered.is_some() {
+            self.thermal.tick_nodes(cpu_pkg_w, gpu_w, elapsed_s, faults)
+        } else {
+            self.thermal.tick_legacy_scalar(
+                cpu_pkg_w + gpu_w,
+                ThermalFaults {
+                    gpu_group_present: self.thermal.gpu_ec_c.is_some(),
+                    ..faults
+                },
+            )
+        };
+        let current_c = ec_reading
+            .as_ref()
+            .map_or(0.0, |reading| f64::from(reading.max_c));
         let sensor = if script.sensor_read_failed {
             SensorRead::Failed
         } else {
@@ -1092,7 +1588,9 @@ impl ChainedPlant {
         };
         self.emulator.tick(sensor);
 
-        let rpm = if self.emulator.wants_ec_autofan() {
+        let rpm = if script.fan_outage {
+            0.0
+        } else if self.emulator.wants_ec_autofan() {
             self.fan.tick_ec_autofan(current_c)
         } else {
             self.fan.tick(self.emulator.speed_pct())
@@ -1122,34 +1620,41 @@ impl ChainedPlant {
             // `UnixFanctrlClient::poll`.
         }
 
-        let fanctrl_freshness =
-            compute_freshness(self.emulator.is_socket_dead(), self.last_view.as_ref(), now);
+        let fanctrl_freshness = if script.force_stale_view {
+            Freshness::Stale
+        } else {
+            compute_freshness(self.emulator.is_socket_dead(), self.last_view.as_ref(), now)
+        };
 
         Sample {
             t_mono: self.t_mono,
             fan1_rpm: rpm,
             fan2_rpm: rpm,
-            cpu_temp_c: self.thermal.controllable_c(),
+            cpu_temp_c: script.cpu_tctl_c.unwrap_or(self.thermal.controllable_c()),
             cpu_pkg_w,
             igpu_w: 0.0,
             gpu_w,
             gpu_temp_c: script.gpu_temp_c.unwrap_or(0.0),
-            gpu_sm_mhz: if gpu_present { script.gpu_sm_mhz } else { 0.0 },
+            gpu_sm_mhz: if gpu_powered && script.gpu_clock_available {
+                gpu_sm_mhz
+            } else {
+                0.0
+            },
             gpu_util_pct: script.gpu_util_pct,
             cpu_util_pct: script.cpu_util_pct,
             cpu_avg_mhz: 0.0,
             resumed: script.resumed,
-            fan_valid: true,
+            fan_valid: !script.fan_outage,
             cpu_temp_valid: true,
-            gpu_w_valid: gpu_present,
-            gpu_temp_valid: gpu_present,
-            gpu_mhz_valid: gpu_present,
-            ec: Some(ec_reading),
-            ec_valid: true,
+            gpu_w_valid: gpu_powered && script.gpu_draw_available,
+            gpu_temp_valid: gpu_powered,
+            gpu_mhz_valid: gpu_powered && script.gpu_clock_available,
+            ec_valid: ec_reading.is_some(),
+            ec: ec_reading,
             nvme_temp_c: script.nvme_temp_c,
             fanctrl: self.last_view.clone(),
             fanctrl_freshness,
-            fanctrl_view_changed,
+            fanctrl_view_changed: fanctrl_view_changed || script.force_view_changed,
             on_ac: script.on_ac,
         }
     }
@@ -1212,10 +1717,22 @@ mod chained_plant_tests {
             p.tick(&script); // ticks 31-34: neither cadence
         }
         let speed_sample = p.tick(&script); // tick 35: Speed-only cadence
-        let view = speed_sample.fanctrl.expect("view must still be carried forward");
-        assert!(!speed_sample.fanctrl_view_changed, "a Speed-only refresh must not set fanctrl_view_changed");
-        assert_eq!(view.all_observed_at, stamp_after_all, "a Speed-only refresh must not bump all_observed_at");
-        assert_eq!(view.speed_pct, p.emulator_mut().speed_pct(), "a Speed-only refresh must still update speed_pct");
+        let view = speed_sample
+            .fanctrl
+            .expect("view must still be carried forward");
+        assert!(
+            !speed_sample.fanctrl_view_changed,
+            "a Speed-only refresh must not set fanctrl_view_changed"
+        );
+        assert_eq!(
+            view.all_observed_at, stamp_after_all,
+            "a Speed-only refresh must not bump all_observed_at"
+        );
+        assert_eq!(
+            view.speed_pct,
+            p.emulator_mut().speed_pct(),
+            "a Speed-only refresh must still update speed_pct"
+        );
     }
 
     #[test]
@@ -1224,7 +1741,10 @@ mod chained_plant_tests {
         let script = TickScript::default();
         for t in 1..30 {
             let sample = p.tick(&script);
-            assert!(sample.fanctrl.is_none(), "no All poll has landed yet at tick {t}");
+            assert!(
+                sample.fanctrl.is_none(),
+                "no All poll has landed yet at tick {t}"
+            );
             assert!(!sample.fanctrl_view_changed);
         }
         let sample = p.tick(&script); // tick 30
@@ -1290,7 +1810,10 @@ mod chained_plant_tests {
         };
         let sample = (0..6).map(|_| p.tick(&script)).last().unwrap();
         assert_eq!(sample.fanctrl_freshness, Freshness::Absent);
-        assert!(sample.fanctrl.is_none(), "a socket that has never once succeeded has no view");
+        assert!(
+            sample.fanctrl.is_none(),
+            "a socket that has never once succeeded has no view"
+        );
         let ec_max_c = f64::from(sample.ec.as_ref().unwrap().max_c);
         let expected = ec_autofan_rpm_base(ec_max_c);
         assert!(
@@ -1372,9 +1895,16 @@ mod chained_plant_tests {
             ..Default::default()
         };
         let sample = p.tick(&script);
-        assert!((sample.cpu_pkg_w - 4.0).abs() < 1e-9, "got {}", sample.cpu_pkg_w);
+        assert!(
+            (sample.cpu_pkg_w - 4.0).abs() < 1e-9,
+            "got {}",
+            sample.cpu_pkg_w
+        );
         assert!((sample.gpu_w - 4.0).abs() < 1e-9, "got {}", sample.gpu_w);
-        assert!(sample.cpu_pkg_w < script.cpu_cap_w / 2.0, "draw must sit well below the cap");
+        assert!(
+            sample.cpu_pkg_w < script.cpu_cap_w / 2.0,
+            "draw must sit well below the cap"
+        );
         assert!(sample.gpu_w < script.gpu_cap_w / 2.0);
     }
 
@@ -1407,7 +1937,10 @@ mod chained_plant_tests {
         assert!(resumed.resumed);
         script.resumed = false;
         let after = p.tick(&script);
-        assert!(!after.resumed, "resumed must not stick past the scripted tick");
+        assert!(
+            !after.resumed,
+            "resumed must not stick past the scripted tick"
+        );
     }
 
     // --- The powered-dGPU EC case (design doc §5: "so the powered-dGPU
@@ -1420,7 +1953,586 @@ mod chained_plant_tests {
         p.thermal_mut().set_gpu_ec(Some(96.0));
         let sample = p.tick(&TickScript::default());
         let ec = sample.ec.expect("ChainedPlant always emits an EcReading");
-        assert_eq!(ec.max_c, 96, "the scripted gpu_* channel must win the max, exactly like §Facts's synthetic case");
+        assert_eq!(
+            ec.max_c, 96,
+            "the scripted gpu_* channel must win the max, exactly like §Facts's synthetic case"
+        );
         assert_eq!(ec.argmax.as_str(), "gpu_amb_f75303@4d");
+    }
+}
+
+/// Revision-4 behavioural contract for the per-device plant.  These tests
+/// deliberately use the public scripts rather than reaching into the plant:
+/// later controller acceptance legs need the same observable seams.
+#[cfg(test)]
+mod per_device_plant_tests {
+    use super::*;
+
+    fn plant() -> ChainedPlant {
+        ChainedPlant::new(
+            "per-device",
+            vec![(0.0, 20), (60.0, 40), (95.0, 100)],
+            1,
+            42.0,
+            77,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn gpu_full_load_plateaus_at_100w_and_reports_the_power_limited_clock() {
+        let mut p = plant();
+        let mut script = TickScript {
+            gpu_lock_mhz: Some(3090.0),
+            gpu_load_level: Some(1.0),
+            gpu_temp_c: Some(42.0),
+            ..Default::default()
+        };
+
+        let plateau = p.tick(&script);
+        assert!(
+            (plateau.gpu_w - 100.0).abs() < 0.01,
+            "got {} W",
+            plateau.gpu_w
+        );
+        assert_eq!(plateau.gpu_sm_mhz, 2520.0);
+
+        script.gpu_lock_mhz = Some(2700.0);
+        assert_eq!(
+            p.tick(&script).gpu_sm_mhz,
+            2520.0,
+            "above-knee lock plateaus"
+        );
+        script.gpu_load_level = Some(0.5);
+        assert_eq!(
+            p.tick(&script).gpu_sm_mhz,
+            2700.0,
+            "partial load is not power-limited"
+        );
+    }
+
+    #[test]
+    fn september_power_curve_preserves_each_knot_and_cpu_bursts_are_not_sustained_draw() {
+        for (clock, expected_w) in GPU_FULL_LOAD_POINTS {
+            assert!(
+                (gpu_full_load_power_w(clock) - expected_w).abs() < f64::EPSILON,
+                "{clock} MHz"
+            );
+        }
+        let mut p = plant();
+        p.set_cpu_plant_params(CpuPlantParams::default());
+        let sustained = TickScript {
+            cpu_cap_w: 40.0,
+            ..Default::default()
+        };
+        assert_eq!(p.tick(&sustained).cpu_pkg_w, 40.0);
+        let burst = TickScript {
+            cpu_cap_w: 70.0,
+            ..Default::default()
+        };
+        assert_eq!(p.tick(&burst).cpu_pkg_w, 70.0);
+        assert_eq!(p.tick(&sustained).cpu_pkg_w, 40.0);
+    }
+
+    #[test]
+    fn separate_gpu_node_uses_the_point_four_heat_path_and_cross_couples_to_cpu() {
+        let mut p = plant();
+        p.set_gpu_plant_params(GpuPlantParams::nominal());
+        let script = TickScript {
+            gpu_lock_mhz: Some(3090.0),
+            gpu_load_level: Some(1.0),
+            gpu_temp_c: Some(42.0),
+            ..Default::default()
+        };
+        let mut sample = p.tick(&script);
+        for _ in 0..900 {
+            sample = p.tick(&script);
+        }
+        let ec = sample.ec.expect("plant has a valid EC reading");
+        assert!((ec.gpu_group_c.expect("GPU group") - 82.0).abs() < 0.6);
+        assert!((ec.cpu_group_c.expect("CPU group") - 46.0).abs() < 0.6);
+    }
+
+    #[test]
+    fn gpu_parameter_grid_and_faults_are_observable_at_the_sample_boundary() {
+        let mut p = plant();
+        for tau_s in [8.0, 15.0, 25.0, 50.0] {
+            for k_c_per_mhz in [0.01, 0.02, 0.03] {
+                for theta_eff_s in [45.0, 90.0, 135.0] {
+                    let params = GpuPlantParams {
+                        tau_s,
+                        k_c_per_mhz,
+                        theta_eff_s,
+                    };
+                    p.set_gpu_plant_params(params);
+                    assert_eq!(p.gpu_plant_params(), params);
+                }
+            }
+        }
+
+        let sample = p.tick(&TickScript {
+            gpu_temp_c: Some(105.0),
+            cpu_tctl_c: Some(105.0),
+            gpu_stuck_c: Some(105.0),
+            ambient_c: Some(105.0),
+            charger_c: Some(105.0),
+            raw_only_c: Some(150.0),
+            unknown_c: Some(76.0),
+            ..Default::default()
+        });
+        let ec = sample.ec.expect("105C is plausible control data");
+        assert_eq!(ec.gpu_group_c, Some(105.0));
+        assert_eq!(ec.reconciliation_max_c, Some(150));
+        assert!(
+            ec.all
+                .iter()
+                .any(|(label, _)| label.as_str() == "unknown_thermal")
+        );
+        assert_eq!(sample.gpu_temp_c, 105.0);
+        assert_eq!(sample.cpu_temp_c, 105.0);
+
+        let lost = p.tick(&TickScript {
+            gpu_temp_c: Some(42.0),
+            ambient_c: Some(-150.0),
+            charger_c: Some(-150.0),
+            ..Default::default()
+        });
+        let ec = lost
+            .ec
+            .expect("the raw sentinel pair does not make EC invalid by itself");
+        assert!(ec.cpu_group_c.is_some());
+        assert!(ec.gpu_group_c.is_some());
+        assert!(lost.ec_valid);
+
+        let group_lost = p.tick(&TickScript {
+            cpu_group_present: false,
+            gpu_group_present: false,
+            gpu_temp_c: Some(42.0),
+            ..Default::default()
+        });
+        let ec = group_lost.ec.expect("ambient/charger keep whole EC valid");
+        assert_eq!(ec.cpu_group_c, None);
+        assert_eq!(ec.gpu_group_c, None);
+    }
+
+    #[test]
+    fn normal_ec_samples_have_no_unknown_label_and_faults_do_not_persist() {
+        let mut p = plant();
+        let normal = p.tick(&TickScript::default());
+        assert!(normal.ec.unwrap().diagnostics.is_empty());
+        let fault = p.tick(&TickScript {
+            unknown_c: Some(76.0),
+            ..Default::default()
+        });
+        assert!(
+            fault
+                .ec
+                .unwrap()
+                .diagnostics
+                .iter()
+                .any(|diagnostic| format!("{diagnostic:?}").contains("unknown_thermal"))
+        );
+        assert!(
+            p.tick(&TickScript::default())
+                .ec
+                .unwrap()
+                .diagnostics
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn powered_gpu_group_loss_and_draw_outage_keep_their_other_streams_independent() {
+        let mut p = plant();
+        let group_lost = p.tick(&TickScript {
+            gpu_powered: Some(true),
+            gpu_temp_c: Some(81.0),
+            gpu_group_present: false,
+            gpu_lock_mhz: Some(3090.0),
+            gpu_load_level: Some(1.0),
+            ..Default::default()
+        });
+        assert_eq!(group_lost.ec.unwrap().gpu_group_c, None);
+        assert!(group_lost.gpu_temp_valid);
+        assert!(group_lost.gpu_w_valid);
+        assert!(group_lost.gpu_mhz_valid);
+        assert_eq!(group_lost.gpu_temp_c, 81.0);
+
+        let draw_out = p.tick(&TickScript {
+            gpu_powered: Some(true),
+            gpu_temp_c: Some(81.0),
+            gpu_draw_available: false,
+            gpu_clock_available: true,
+            gpu_lock_mhz: Some(3090.0),
+            gpu_load_level: Some(1.0),
+            ..Default::default()
+        });
+        assert!(!draw_out.gpu_w_valid);
+        assert!(draw_out.gpu_mhz_valid);
+        assert_eq!(draw_out.gpu_sm_mhz, 2520.0);
+    }
+
+    #[test]
+    fn gpu_device_group_and_sensor_availability_are_independent() {
+        let mut p = plant();
+        let powered_group = p.tick(&TickScript {
+            gpu_powered: Some(true),
+            gpu_temp_c: Some(81.0),
+            gpu_cap_w: 30.0,
+            gpu_sm_mhz: 2100.0,
+            ..Default::default()
+        });
+        assert_eq!(powered_group.ec.unwrap().gpu_group_c, Some(42.0));
+        assert_eq!(powered_group.gpu_w, 30.0);
+        assert_eq!(powered_group.gpu_sm_mhz, 2100.0);
+
+        let group_lost = p.tick(&TickScript {
+            gpu_powered: Some(true),
+            gpu_temp_c: Some(81.0),
+            gpu_cap_w: 30.0,
+            gpu_sm_mhz: 2100.0,
+            gpu_group_present: false,
+            ..Default::default()
+        });
+        assert_eq!(group_lost.ec.unwrap().gpu_group_c, None);
+        assert!(group_lost.gpu_temp_valid && group_lost.gpu_w_valid && group_lost.gpu_mhz_valid);
+        assert_eq!(
+            (
+                group_lost.gpu_temp_c,
+                group_lost.gpu_w,
+                group_lost.gpu_sm_mhz
+            ),
+            (81.0, 30.0, 2100.0)
+        );
+
+        p.thermal_mut().set_gpu_ec(Some(78.0));
+        let ec_label_only = p.tick(&TickScript::default());
+        assert_eq!(ec_label_only.ec.unwrap().gpu_group_c, Some(78.0));
+        assert!(
+            !ec_label_only.gpu_temp_valid
+                && !ec_label_only.gpu_w_valid
+                && !ec_label_only.gpu_mhz_valid
+        );
+        assert_eq!(
+            (
+                ec_label_only.gpu_temp_c,
+                ec_label_only.gpu_w,
+                ec_label_only.gpu_sm_mhz
+            ),
+            (0.0, 0.0, 0.0)
+        );
+
+        let draw_only_out = p.tick(&TickScript {
+            gpu_powered: Some(true),
+            gpu_temp_c: Some(81.0),
+            gpu_cap_w: 30.0,
+            gpu_sm_mhz: 2100.0,
+            gpu_draw_available: false,
+            ..Default::default()
+        });
+        assert!(!draw_only_out.gpu_w_valid);
+        assert!(draw_only_out.gpu_temp_valid && draw_only_out.gpu_mhz_valid);
+
+        let clock_only_out = p.tick(&TickScript {
+            gpu_powered: Some(true),
+            gpu_temp_c: Some(81.0),
+            gpu_cap_w: 30.0,
+            gpu_sm_mhz: 2100.0,
+            gpu_clock_available: false,
+            ..Default::default()
+        });
+        assert!(clock_only_out.gpu_w_valid && clock_only_out.gpu_temp_valid);
+        assert!(!clock_only_out.gpu_mhz_valid);
+        assert_eq!(clock_only_out.gpu_sm_mhz, 0.0);
+    }
+
+    #[test]
+    fn package_power_override_reproduces_bursts_and_square_wave_loads() {
+        let mut p = plant();
+        let sustained = TickScript {
+            cpu_cap_w: 40.0,
+            cpu_pkg_w_override: Some(40.0),
+            ..Default::default()
+        };
+        let burst = TickScript {
+            cpu_cap_w: 40.0,
+            cpu_pkg_w_override: Some(70.0),
+            ..Default::default()
+        };
+        assert_eq!(p.tick(&sustained).cpu_pkg_w, 40.0);
+        assert_eq!(p.tick(&burst).cpu_pkg_w, 70.0);
+        assert_eq!(p.tick(&sustained).cpu_pkg_w, 40.0);
+        let square: Vec<f64> = [20.0, 60.0, 20.0, 60.0]
+            .into_iter()
+            .map(|watts| {
+                p.tick(&TickScript {
+                    cpu_pkg_w_override: Some(watts),
+                    ..sustained
+                })
+                .cpu_pkg_w
+            })
+            .collect();
+        assert_eq!(square, vec![20.0, 60.0, 20.0, 60.0]);
+    }
+
+    #[test]
+    fn elapsed_gpu_delay_integrates_only_after_the_delay_crossing() {
+        let mut p = ThermalPlant::new(42.0);
+        p.set_gpu_plant_params(GpuPlantParams::nominal());
+        let reading = p
+            .tick_nodes(
+                0.0,
+                100.0,
+                100.0,
+                ThermalFaults {
+                    gpu_group_present: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let expected = 42.0 + 40.0 * (1.0 - (-10.0_f64 / 15.0).exp());
+        assert!((reading.gpu_group_c.unwrap() - expected).abs() < 0.1);
+    }
+
+    #[test]
+    fn cross_coupling_uses_each_segments_start_state() {
+        let faults = ThermalFaults {
+            gpu_group_present: true,
+            ..Default::default()
+        };
+        let mut cpu_only = ThermalPlant::new(42.0);
+        cpu_only.set_cpu_plant_params(CpuPlantParams {
+            theta_eff_s: 0.0,
+            ..CpuPlantParams::default()
+        });
+        cpu_only.set_gpu_plant_params(GpuPlantParams {
+            theta_eff_s: 0.0,
+            ..GpuPlantParams::nominal()
+        });
+        let first = cpu_only.tick_nodes(100.0, 0.0, 35.0, faults).unwrap();
+        let cpu_after_first = 42.0 + 80.0 * (1.0 - (-1.0_f64).exp());
+        assert!((cpu_only.controllable_c() - cpu_after_first).abs() < 0.001);
+        assert_eq!(
+            first.gpu_group_c,
+            Some(42.0),
+            "GPU must not see CPU heat from this same segment"
+        );
+        let second = cpu_only.tick_nodes(100.0, 0.0, 15.0, faults).unwrap();
+        let gpu_after_second = 42.0 + 0.1 * (cpu_after_first - 42.0) * (1.0 - (-1.0_f64).exp());
+        assert!((second.gpu_group_c.unwrap() - gpu_after_second).abs() < 0.01);
+
+        let mut gpu_only = ThermalPlant::new(42.0);
+        gpu_only.set_cpu_plant_params(CpuPlantParams {
+            theta_eff_s: 0.0,
+            ..CpuPlantParams::default()
+        });
+        gpu_only.set_gpu_plant_params(GpuPlantParams {
+            theta_eff_s: 0.0,
+            ..GpuPlantParams::nominal()
+        });
+        gpu_only.tick_nodes(0.0, 100.0, 15.0, faults).unwrap();
+        let gpu_after_first = 42.0 + 40.0 * (1.0 - (-1.0_f64).exp());
+        assert_eq!(gpu_only.controllable_c(), 42.0);
+        gpu_only.tick_nodes(0.0, 100.0, 35.0, faults).unwrap();
+        let cpu_after_second = 42.0 + 0.1 * (gpu_after_first - 42.0) * (1.0 - (-1.0_f64).exp());
+        assert!((gpu_only.controllable_c() - cpu_after_second).abs() < 0.01);
+    }
+
+    #[test]
+    fn resumed_backlog_keeps_the_gpu_delay_boundary_and_node_state() {
+        let mut p = plant();
+        let mut script = TickScript {
+            gpu_powered: Some(true),
+            gpu_temp_c: Some(42.0),
+            gpu_lock_mhz: Some(3090.0),
+            gpu_load_level: Some(1.0),
+            elapsed_s: 90.0,
+            ..Default::default()
+        };
+        let before_boundary = p.tick(&script).ec.unwrap();
+        assert_eq!(before_boundary.gpu_group_c, Some(42.0));
+
+        script.elapsed_s = 10.0;
+        script.resumed = true;
+        let resumed = p.tick(&script);
+        assert!(resumed.resumed);
+        let expected = 42.0 + 40.0 * (1.0 - (-10.0_f64 / 15.0).exp());
+        assert!((resumed.ec.unwrap().gpu_group_c.unwrap() - expected).abs() < 0.1);
+    }
+
+    #[test]
+    fn every_gpu_robustness_axis_changes_the_observable_node_response() {
+        for tau_s in [8.0, 15.0, 25.0, 50.0] {
+            for k_c_per_mhz in [0.01, 0.02, 0.03] {
+                for theta_eff_s in [45.0, 90.0, 135.0] {
+                    let params = GpuPlantParams {
+                        tau_s,
+                        k_c_per_mhz,
+                        theta_eff_s,
+                    };
+                    let mut p = ThermalPlant::new(42.0);
+                    p.set_gpu_plant_params(params);
+                    let elapsed_s = theta_eff_s + 10.0;
+                    let reading = p
+                        .tick_nodes(
+                            0.0,
+                            100.0,
+                            elapsed_s,
+                            ThermalFaults {
+                                gpu_group_present: true,
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                    let heat_c = 40.0 * (k_c_per_mhz / 0.02);
+                    let expected = 42.0 + heat_c * (1.0 - (-10.0 / tau_s).exp());
+                    assert!(
+                        (reading.gpu_group_c.unwrap() - expected).abs() < 0.1,
+                        "{params:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn isolated_group_faults_keep_control_and_raw_streams_distinct() {
+        let mut p = plant();
+        let stuck = p.tick(&TickScript {
+            gpu_powered: Some(true),
+            gpu_temp_c: Some(42.0),
+            gpu_stuck_c: Some(105.0),
+            ..Default::default()
+        });
+        let ec = stuck.ec.unwrap();
+        assert_eq!(ec.gpu_group_c, Some(105.0));
+        assert_eq!(ec.reconciliation_max_c, Some(105));
+
+        let raw_only = p.tick(&TickScript {
+            gpu_powered: Some(true),
+            gpu_temp_c: Some(42.0),
+            raw_only_c: Some(150.0),
+            ..Default::default()
+        });
+        let ec = raw_only.ec.unwrap();
+        assert!(ec.gpu_group_c.unwrap() < 110.0);
+        assert_eq!(ec.reconciliation_max_c, Some(150));
+
+        let loss = p.tick(&TickScript {
+            gpu_powered: Some(true),
+            gpu_temp_c: Some(42.0),
+            gpu_group_present: false,
+            ..Default::default()
+        });
+        let ec = loss.ec.unwrap();
+        assert_eq!(ec.gpu_group_c, None);
+        assert!(
+            ec.reconciliation_max_c.is_some(),
+            "CPU/ambient raw data remains observable"
+        );
+    }
+
+    #[test]
+    fn each_105c_and_group_loss_row_preserves_its_control_and_raw_streams() {
+        let mut p = plant();
+        for script in [
+            TickScript {
+                cpu_stuck_c: Some(105.0),
+                ..Default::default()
+            },
+            TickScript {
+                ambient_c: Some(105.0),
+                ..Default::default()
+            },
+            TickScript {
+                charger_c: Some(105.0),
+                ..Default::default()
+            },
+        ] {
+            let sample = p.tick(&script);
+            let ec = sample.ec.unwrap();
+            assert_eq!(ec.reconciliation_max_c, Some(105));
+            assert_eq!(ec.max_c, 105);
+        }
+
+        let cpu_lost = p.tick(&TickScript {
+            gpu_powered: Some(true),
+            gpu_temp_c: Some(81.0),
+            cpu_group_present: false,
+            ..Default::default()
+        });
+        let ec = cpu_lost.ec.unwrap();
+        assert_eq!(ec.cpu_group_c, None);
+        assert!(ec.gpu_group_c.is_some() && ec.reconciliation_max_c.is_some());
+
+        let gpu_lost = p.tick(&TickScript {
+            gpu_powered: Some(true),
+            gpu_temp_c: Some(81.0),
+            gpu_group_present: false,
+            ..Default::default()
+        });
+        let ec = gpu_lost.ec.unwrap();
+        assert!(ec.cpu_group_c.is_some() && ec.reconciliation_max_c.is_some());
+        assert_eq!(ec.gpu_group_c, None);
+    }
+
+    #[test]
+    fn target_and_curve_switches_are_visible_in_the_next_full_view() {
+        let mut p = plant();
+        let script = TickScript::default();
+        for _ in 0..30 {
+            p.tick(&script);
+        }
+        let replacement = vec![(0.0, 10), (60.0, 55), (95.0, 100)];
+        p.emulator_mut()
+            .edit_curve_in_place(replacement.clone())
+            .unwrap();
+        for _ in 0..30 {
+            p.tick(&script);
+        }
+        let view = p.tick(&script).fanctrl.unwrap();
+        assert_eq!(view.curve, replacement);
+        assert_eq!(view.speed_pct, p.emulator_mut().speed_pct());
+    }
+
+    #[test]
+    fn target_switch_updates_the_live_controller_seam() {
+        let runner = crate::actuators::cmd::test_support::FakeRunner::new();
+        let mut ctl = crate::control::controller::Controller::new(
+            crate::actuators::guard::RestoreGuard::new(&runner, None, None, None),
+            crate::state::PersistedState::default(),
+            PathBuf::from("/nonexistent/plant-target-state.json"),
+            crate::config::Config::default(),
+            PathBuf::from("/nonexistent/plant-target-config.toml"),
+        );
+        ctl.on_command(crate::control::Command::SetFanTarget(2500.0));
+        assert_eq!(ctl.status().fan_target_rpm, 2500.0);
+    }
+
+    #[test]
+    fn scripted_outage_ec_loss_and_view_faults_are_visible_without_hardware() {
+        let mut p = plant();
+        let sample = p.tick(&TickScript {
+            fan_outage: true,
+            gpu_draw_available: false,
+            force_stale_view: true,
+            force_view_changed: true,
+            ..Default::default()
+        });
+        assert!(!sample.fan_valid);
+        assert!(!sample.gpu_w_valid);
+        assert_eq!(sample.fanctrl_freshness, Freshness::Stale);
+        assert!(sample.fanctrl_view_changed);
+
+        let invalid = p.tick(&TickScript {
+            ec_invalid: true,
+            resumed: true,
+            elapsed_s: 7200.0,
+            ..Default::default()
+        });
+        assert!(!invalid.ec_valid);
+        assert!(invalid.ec.is_none());
+        assert!(invalid.resumed);
+        assert!((invalid.t_mono - 7201.0).abs() < f64::EPSILON);
     }
 }

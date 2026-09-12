@@ -202,6 +202,50 @@ pub mod test_support {
         Release,
     }
 
+    /// How the fake card reports an accepted clock command.  The modes model
+    /// the two verifier acceptance legs without weakening production policy.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum FakeGpuBehavior {
+        #[default]
+        Immediate,
+        OneCommandLag,
+        Ignore,
+    }
+
+    /// Observable command completion record.  Tests set the logical times so
+    /// histories are deterministic and never depend on wall-clock hardware.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct GpuHistory {
+        pub call: GpuCall,
+        pub acquired_at_s: f64,
+        pub completed_at_s: f64,
+        pub reported_mhz: Option<u32>,
+    }
+
+    /// Cloneable observer retained by tests after a fake moves into a boxed
+    /// controller seam.  It intentionally exposes only observations, never
+    /// a way to alter the fake's actuator behavior.
+    #[derive(Clone)]
+    pub struct FakeGpuHandles {
+        calls: Arc<Mutex<Vec<GpuCall>>>,
+        history: Arc<Mutex<Vec<GpuHistory>>>,
+        reported_mhz: Arc<Mutex<Option<u32>>>,
+    }
+
+    impl FakeGpuHandles {
+        pub fn calls(&self) -> Vec<GpuCall> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        pub fn history(&self) -> Vec<GpuHistory> {
+            self.history.lock().unwrap().clone()
+        }
+
+        pub fn reported_sm_clock(&self) -> Option<u32> {
+            *self.reported_mhz.lock().unwrap()
+        }
+    }
+
     /// Recording stand-in for `GpuActuator`. The call log and the failure
     /// injector are behind `Arc`s so tests keep handles after the fake moves
     /// into the controller's `RestoreGuard`.
@@ -215,11 +259,45 @@ pub mod test_support {
         /// test model a flag flipping WHILE the (real-world untimed) NVML
         /// call is in flight — e.g. main's `shutdown` racing a sample.
         raise_on_set: Option<Arc<std::sync::atomic::AtomicBool>>,
+        behavior: FakeGpuBehavior,
+        reported_mhz: Arc<Mutex<Option<u32>>>,
+        prior_requested_mhz: Option<u32>,
+        command_times: (f64, f64),
+        history: Arc<Mutex<Vec<GpuHistory>>>,
     }
 
     impl FakeGpu {
         pub fn new() -> Self {
             Self::default()
+        }
+
+        pub fn with_behavior(behavior: FakeGpuBehavior) -> Self {
+            Self {
+                behavior,
+                ..Self::default()
+            }
+        }
+
+        /// Timestamp the next command's acquisition and completion in the
+        /// deterministic simulated clock used by acceptance scenarios.
+        pub fn set_command_times(&mut self, acquired_at_s: f64, completed_at_s: f64) {
+            self.command_times = (acquired_at_s, completed_at_s);
+        }
+
+        pub fn handles(&self) -> FakeGpuHandles {
+            FakeGpuHandles {
+                calls: Arc::clone(&self.calls),
+                history: Arc::clone(&self.history),
+                reported_mhz: Arc::clone(&self.reported_mhz),
+            }
+        }
+
+        pub fn reported_sm_clock(&self) -> Option<u32> {
+            *self.reported_mhz.lock().unwrap()
+        }
+
+        pub fn history(&self) -> Vec<GpuHistory> {
+            self.history.lock().unwrap().clone()
         }
 
         /// Arm the mid-call flag raise (see `raise_on_set`).
@@ -258,6 +336,21 @@ pub mod test_support {
             let clamped = clamp_gpu_clock(mhz);
             self.applied = Some(clamped);
             self.calls.lock().unwrap().push(GpuCall::Set(clamped));
+            let reported_mhz = match self.behavior {
+                FakeGpuBehavior::Immediate => Some(clamped),
+                FakeGpuBehavior::OneCommandLag => self.prior_requested_mhz.or(Some(clamped)),
+                // A card that ignores changes keeps its first accepted clock
+                // visible to the verifier across every later descent.
+                FakeGpuBehavior::Ignore => self.reported_sm_clock().or(Some(clamped)),
+            };
+            *self.reported_mhz.lock().unwrap() = reported_mhz;
+            self.prior_requested_mhz = Some(clamped);
+            self.history.lock().unwrap().push(GpuHistory {
+                call: GpuCall::Set(clamped),
+                acquired_at_s: self.command_times.0,
+                completed_at_s: self.command_times.1,
+                reported_mhz,
+            });
             if let Some(flag) = &self.raise_on_set {
                 flag.store(true, std::sync::atomic::Ordering::Relaxed);
             }
@@ -267,6 +360,14 @@ pub mod test_support {
         fn release(&mut self) -> color_eyre::Result<()> {
             self.applied = None;
             self.calls.lock().unwrap().push(GpuCall::Release);
+            *self.reported_mhz.lock().unwrap() = None;
+            self.prior_requested_mhz = None;
+            self.history.lock().unwrap().push(GpuHistory {
+                call: GpuCall::Release,
+                acquired_at_s: self.command_times.0,
+                completed_at_s: self.command_times.1,
+                reported_mhz: None,
+            });
             Ok(())
         }
 
@@ -282,6 +383,7 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::{FakeGpu, FakeGpuBehavior};
     use super::*;
 
     #[test]
@@ -301,6 +403,115 @@ mod tests {
         assert_eq!(clamp_gpu_clock(1500), 1500);
         assert_eq!(clamp_gpu_clock(1000), 1000);
         assert_eq!(clamp_gpu_clock(3090), 3090);
+    }
+
+    #[test]
+    fn fake_gpu_records_timestamped_one_command_lag_and_ignore_histories() {
+        let mut lag = FakeGpu::with_behavior(FakeGpuBehavior::OneCommandLag);
+        lag.set_command_times(10.0, 10.2);
+        lag.set_max_clock(3090).unwrap();
+        lag.set_command_times(11.0, 11.2);
+        lag.set_max_clock(2985).unwrap();
+        lag.set_command_times(12.0, 12.2);
+        lag.set_max_clock(2880).unwrap();
+        assert_eq!(lag.reported_sm_clock(), Some(2985));
+        let history = lag.history();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[1].acquired_at_s, 11.0);
+        assert_eq!(history[1].completed_at_s, 11.2);
+        assert_eq!(history[1].reported_mhz, Some(3090));
+        assert_eq!(history[2].reported_mhz, Some(2985));
+
+        let mut ignoring = FakeGpu::with_behavior(FakeGpuBehavior::Ignore);
+        ignoring.set_max_clock(3090).unwrap();
+        ignoring.set_max_clock(2985).unwrap();
+        ignoring.set_max_clock(2880).unwrap();
+        assert_eq!(ignoring.reported_sm_clock(), Some(3090));
+        let mut verifier = GpuLockVerifier::new(2880);
+        for _ in 0..3 {
+            verifier.verify_lock(100.0, ignoring.reported_sm_clock().unwrap());
+        }
+        assert!(matches!(
+            verifier.verify_lock(100.0, ignoring.reported_sm_clock().unwrap()),
+            WriteVerdict::Mismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn boxed_fake_keeps_shared_lag_and_ignore_histories_for_verifier_pairs() {
+        let fake = FakeGpu::with_behavior(FakeGpuBehavior::OneCommandLag);
+        let handles = fake.handles();
+        let mut gpu: Box<dyn GpuClockCtl> = Box::new(fake);
+        gpu.set_max_clock(3090).unwrap();
+        gpu.set_max_clock(2985).unwrap();
+        assert_eq!(handles.reported_sm_clock(), Some(3090));
+        let mut prior_pair = GpuLockVerifier::new(3090);
+        assert_eq!(
+            prior_pair.verify_lock(100.0, handles.reported_sm_clock().unwrap()),
+            WriteVerdict::Verified(3090.0)
+        );
+        gpu.release().unwrap();
+        gpu.set_max_clock(2880).unwrap();
+        assert_eq!(
+            handles.reported_sm_clock(),
+            Some(2880),
+            "release clears the lag predecessor"
+        );
+        assert_eq!(handles.calls().len(), 4);
+        assert_eq!(handles.history().len(), 4);
+
+        let ignoring = FakeGpu::with_behavior(FakeGpuBehavior::Ignore);
+        let handles = ignoring.handles();
+        let mut gpu: Box<dyn GpuClockCtl> = Box::new(ignoring);
+        gpu.set_max_clock(3090).unwrap();
+        gpu.set_max_clock(2880).unwrap();
+        let mut verifier = GpuLockVerifier::new(2880);
+        assert_eq!(
+            verifier.verify_lock(100.0, handles.reported_sm_clock().unwrap()),
+            WriteVerdict::Unverifiable
+        );
+        assert_eq!(
+            verifier.verify_lock(100.0, handles.reported_sm_clock().unwrap()),
+            WriteVerdict::Unverifiable
+        );
+        assert!(matches!(
+            verifier.verify_lock(100.0, handles.reported_sm_clock().unwrap()),
+            WriteVerdict::Mismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn one_command_lag_descent_never_scores_a_current_lock_mismatch() {
+        let fake = FakeGpu::with_behavior(FakeGpuBehavior::OneCommandLag);
+        let handles = fake.handles();
+        let mut gpu: Box<dyn GpuClockCtl> = Box::new(fake);
+        let mut commands: Vec<u32> = (0..20).map(|step| 3090 - step * 105).collect();
+        commands.push(1000);
+        for (step, command) in commands.iter().copied().enumerate() {
+            gpu.set_max_clock(command).unwrap();
+            let mut verifier = GpuLockVerifier::new(command);
+            let verdict = verifier.verify_lock(100.0, handles.reported_sm_clock().unwrap());
+            assert!(
+                !matches!(verdict, WriteVerdict::Mismatch { .. }),
+                "step {step}: {command} MHz reported {:?}",
+                handles.reported_sm_clock()
+            );
+        }
+        assert_eq!(handles.history().len(), commands.len());
+        assert_eq!(handles.history().last().unwrap().reported_mhz, Some(1095));
+
+        let ignoring = FakeGpu::with_behavior(FakeGpuBehavior::Ignore);
+        let handles = ignoring.handles();
+        let mut gpu: Box<dyn GpuClockCtl> = Box::new(ignoring);
+        for command in [3090, 2985, 2880, 2775] {
+            gpu.set_max_clock(command).unwrap();
+        }
+        assert!(
+            handles
+                .history()
+                .iter()
+                .all(|entry| entry.reported_mhz == Some(3090))
+        );
     }
 
     /// Step 5 (TDD): below the 90% utilisation floor, `Unverifiable` --

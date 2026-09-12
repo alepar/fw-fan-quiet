@@ -77,6 +77,14 @@ const NEEDS_LOAD_EVERY: usize = 10;
 /// the socket or the arbiter itself.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct CalibContext {
+    /// Current successful CPU cap, if the controller has one. The
+    /// per-device calibration algorithm consumes this in task .8; carrying
+    /// it now keeps the controller-to-runner boundary explicit.
+    pub cpu_cap_w: Option<f64>,
+    /// Current successful GPU lock, if a dGPU is present. See
+    /// [`Self::cpu_cap_w`] for why this is a context seam rather than a
+    /// step-test input yet.
+    pub gpu_cap_mhz: Option<u32>,
     /// The live EC moving average (`EcAverage::push`'s output), if seeded.
     pub ec_ma: Option<f64>,
     /// Three-strikes-latched EC/replica disagreement (design §2.6).
@@ -393,6 +401,8 @@ mod tests {
 
     fn happy_ctx() -> CalibContext {
         CalibContext {
+            cpu_cap_w: None,
+            gpu_cap_mhz: None,
             ec_ma: Some(45.0),
             ec_mismatch: false,
             fanctrl_active: true,

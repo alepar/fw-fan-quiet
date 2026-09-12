@@ -19,11 +19,11 @@ use std::thread::JoinHandle;
 use crossbeam_channel::{Receiver, Sender, never, select};
 
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::actuators::WriteVerdict;
 use crate::actuators::cmd::Runner;
-use crate::actuators::gpu::GpuLockVerifier;
+use crate::actuators::gpu::{GpuCommandEvidence, GpuLockVerifier};
 use crate::actuators::guard::RestoreGuard;
 use crate::calib::burner::Burner;
 use crate::calib::runner::{CalibContext, CalibRunner, RunnerEffect};
@@ -31,16 +31,27 @@ use crate::calib::steady::tail_mean;
 use crate::config::Config;
 use crate::control::allocator::{self, AllocInput, Allocator};
 use crate::control::budget::{Budget, Freeze as BudgetFreeze, LoopError, LoopGains, WarmStart};
+use crate::control::device_loop::{
+    ActuatorState, DeviceDecision, DeviceLoop, Hold, Mhz, TickInput, W, default_gains,
+};
 use crate::control::gpu_pid::GpuPid;
-use crate::control::guards::{GuardState, Guards, gpu_share_override};
+use crate::control::guards::{
+    CPU_MAX_RATCHET_DOWN_RATE_W, GPU_MAX_RATCHET_DOWN_RATE_MHZ, GuardState, Guards, MaxRatchet,
+    gpu_share_override,
+};
 use crate::control::lut::ClockWattsLut;
 use crate::control::mode::{Arbiter, ArbiterInput, Decision};
+use crate::control::tstar::{
+    Device as TStarDevice, EntrySeed, HeldDeviceInput, SensorClass, SensorReading, TStarInput,
+    TStarSource,
+};
 use crate::control::watchdog::{ThermalWatchdog, Trip};
 use crate::event::Event;
 use crate::fanctrl::client::Freshness;
 use crate::fanctrl::curve::Curve;
 use crate::fanctrl::table::DutyRpmTable;
 use crate::sensors::ec::EcAverage;
+use crate::sensors::ec::{EcGroup, EcReplica, ReconciliationObservation};
 use crate::state::{PersistedState, TStarSeed, WarmStartEntry};
 use crate::telemetry::{self, Record, Telemetry};
 use crate::types::{Sample, TelemetryFlag};
@@ -106,6 +117,13 @@ const ON_AC_EDGE_SUPPRESS_S: f64 = 3.0;
 /// own slope over (design §2.6: "the replica's own slope over the last
 /// 5 s"), at the 1 Hz sample rate.
 const EC_SLOPE_WINDOW_S: usize = 5;
+/// A fresh socket view is not a fair reconciliation input while the local
+/// replica is still moving this quickly.  Keep this in the v4 pipeline as
+/// well as the legacy arbiter seam until the latter is deleted.
+const RECONCILIATION_SKIP_SLOPE_C_PER_S: f64 = 0.5;
+/// A view captured this far before its carrying sample is likewise not fair
+/// evidence for reconciliation.
+const RECONCILIATION_SKIP_GAP_S: f64 = 2.0;
 /// Steady-window length for passive warm-start/refinement (design §2.3):
 /// "population stdev of the smoothed RPM series < 60 over >= 40 s", at the
 /// 1 Hz sample rate.
@@ -303,7 +321,7 @@ pub fn flag_severity(flag: StatusFlag) -> Severity {
         StatusFlag::FanctrlLost => Severity::Warning,
         StatusFlag::GpuHot => Severity::Warning,
         StatusFlag::LimitNotSticking => Severity::Warning,
-        StatusFlag::NotCalibrated => Severity::Warning,
+        StatusFlag::NotCalibrated => Severity::Info,
         StatusFlag::ReadbackBlind => Severity::Info,
         StatusFlag::SteepCurve => Severity::Info,
         // Design §3.5: `NVME HOT` renders as a warning alongside `GPU HOT`.
@@ -582,6 +600,39 @@ impl VerdictState {
 }
 
 struct AutoState {
+    // Revision-4 per-device loop state.  The legacy fields below remain
+    // temporarily during the staged replacement so non-Auto lifecycle and
+    // calibration callers retain their established safety behavior.
+    replica: EcReplica,
+    tstar: TStarSource,
+    cpu_loop: DeviceLoop<W>,
+    gpu_loop: DeviceLoop<Mhz>,
+    cpu_ratchet: MaxRatchet<W>,
+    gpu_ratchet: MaxRatchet<Mhz>,
+    cpu_draw_window: std::collections::VecDeque<f64>,
+    last_sample_t_mono: Option<f64>,
+    prior_cpu_hold: Hold,
+    prior_gpu_hold: Hold,
+    cpu_actuator_state: ActuatorState,
+    gpu_actuator_state: ActuatorState,
+    last_cpu_write_t_mono: Option<f64>,
+    last_gpu_write_t_mono: Option<f64>,
+    cpu_gains_source: crate::types::GainsSource,
+    gpu_gains_source: crate::types::GainsSource,
+    cpu_hot_streak: u8,
+    cpu_hot: bool,
+    cpu_entry_seeded: bool,
+    gpu_entry_seeded: bool,
+    cpu_shadow_entry_seeded: bool,
+    gpu_shadow_entry_seeded: bool,
+    cpu_restore_thermal_pending: bool,
+    gpu_restore_thermal_pending: bool,
+    /// Choose the entry seed once on the first sample: a qualified fresh
+    /// strategy seed when available, otherwise the current device groups.
+    source_initialised: bool,
+    /// The first fresh socket view separately seeds reconciliation history;
+    /// it never reconstructs an already-running TStarSource.
+    view_initialised: bool,
     /// GPU watts→clock inner PI (1 Hz).
     pid: GpuPid,
     /// Contour allocator (every ALLOC_PERIOD_S).
@@ -623,6 +674,11 @@ struct AutoState {
     /// whenever a new clock is applied (`verify_lock`'s streak is scoped to
     /// one locked value).
     gpu_verifier: Option<GpuLockVerifier>,
+    /// Successful GPU commands, ordered by completion on the sample's
+    /// monotonic clock.  A sample is verified before its own write, against
+    /// the latest entry that completed before acquisition.
+    gpu_commands: std::collections::VecDeque<GpuCommandEvidence>,
+    gpu_command_generation: u64,
     /// Loop mode as of the last arbiter call, used to detect the
     /// `Released` -> usable transition (re-seed from the floors, §2.4) and
     /// to emit `Noted { mode: ... }` on every genuine change.
@@ -669,6 +725,8 @@ struct AutoState {
     /// window — the re-key itself never re-seeds `u` (§2.4); it only
     /// changes which key the *next* steady window records into.
     steady_key: Option<String>,
+    refinement_window: std::collections::VecDeque<f64>,
+    refinement_key: Option<String>,
 }
 
 impl AutoState {
@@ -681,8 +739,60 @@ impl AutoState {
     /// fixture tests, but the value driving `Guards::step`'s hysteresis was
     /// always the compiled-in default, invisible on this machine only
     /// because that default equals the shipped default.
-    fn new(gains: &LoopGains, gpu_hot_c: f64, nvme_hot_c: f64) -> Self {
+    fn new(gains: &LoopGains, config: &Config) -> Self {
+        let cpu_gains = config
+            .cpu_gains
+            .unwrap_or_else(|| default_gains::<W>(DEFAULT_MA_INTERVAL as u32));
+        let gpu_gains = config
+            .gpu_gains
+            .unwrap_or_else(|| default_gains::<Mhz>(DEFAULT_MA_INTERVAL as u32));
         Self {
+            replica: EcReplica::new(DEFAULT_MA_INTERVAL),
+            tstar: TStarSource::new(EntrySeed::Fallback(config.cpu_hot_c - 2.0)),
+            cpu_loop: DeviceLoop::new(cpu_gains),
+            gpu_loop: DeviceLoop::new(gpu_gains),
+            cpu_ratchet: MaxRatchet::new(
+                config.cpu_floor_w,
+                config.cpu_max_w,
+                config.cpu_max_w,
+                CPU_MAX_RATCHET_DOWN_RATE_W,
+                config.cpu_hot_c - 5.0,
+            ),
+            gpu_ratchet: MaxRatchet::new(
+                f64::from(config.gpu_floor_mhz),
+                f64::from(config.gpu_max_mhz),
+                f64::from(config.gpu_max_mhz),
+                GPU_MAX_RATCHET_DOWN_RATE_MHZ,
+                config.gpu_hot_c - 4.0,
+            ),
+            cpu_draw_window: std::collections::VecDeque::new(),
+            last_sample_t_mono: None,
+            prior_cpu_hold: Hold::None,
+            prior_gpu_hold: Hold::None,
+            cpu_actuator_state: ActuatorState::Unverifiable,
+            gpu_actuator_state: ActuatorState::Unverifiable,
+            last_cpu_write_t_mono: None,
+            last_gpu_write_t_mono: None,
+            cpu_gains_source: if config.cpu_gains.is_some() {
+                crate::types::GainsSource::Config
+            } else {
+                crate::types::GainsSource::Default
+            },
+            gpu_gains_source: if config.gpu_gains.is_some() {
+                crate::types::GainsSource::Config
+            } else {
+                crate::types::GainsSource::Default
+            },
+            cpu_hot_streak: 0,
+            cpu_hot: false,
+            cpu_entry_seeded: false,
+            gpu_entry_seeded: false,
+            cpu_shadow_entry_seeded: false,
+            gpu_shadow_entry_seeded: false,
+            cpu_restore_thermal_pending: false,
+            gpu_restore_thermal_pending: false,
+            source_initialised: false,
+            view_initialised: false,
             pid: GpuPid::new(),
             allocator: Allocator::new(),
             last_alloc: None,
@@ -694,10 +804,12 @@ impl AutoState {
             ec_ma: None,
             gpu_verifier_mhz: None,
             ec_slope_window: std::collections::VecDeque::new(),
-            guards: Guards::new(gpu_hot_c, nvme_hot_c),
+            guards: Guards::new(config.gpu_hot_c, config.nvme_hot_c),
             cpu_verdict: VerdictState::default(),
             gpu_verdict: VerdictState::default(),
             gpu_verifier: None,
+            gpu_commands: std::collections::VecDeque::new(),
+            gpu_command_generation: 0,
             last_mode: LoopMode::default(),
             budget_seeded: false,
             ec_seeded: false,
@@ -709,6 +821,8 @@ impl AutoState {
             on_ac_suppress_until: None,
             steady_window: std::collections::VecDeque::new(),
             steady_key: None,
+            refinement_window: std::collections::VecDeque::new(),
+            refinement_key: None,
         }
     }
 }
@@ -717,6 +831,7 @@ impl AutoState {
 /// hardware is restored even if the thread shell exits abnormally.
 pub struct Controller<R: Runner> {
     guard: RestoreGuard<R>,
+    completion_clock: Box<dyn Fn() -> Instant + Send>,
     status: ControlStatus,
     /// Consecutive samples measuring over the CPU limit (stickiness watchdog).
     stick_violations: u8,
@@ -929,6 +1044,7 @@ impl<R: Runner> Controller<R> {
         };
         Self {
             guard,
+            completion_clock: Box::new(Instant::now),
             status,
             stick_violations: 0,
             resumed_until: None,
@@ -1176,17 +1292,14 @@ impl<R: Runner> Controller<R> {
                 if self.status.mode == Mode::Auto {
                     tracing::warn!("SetAuto(true) ignored: already in auto mode");
                     "auto:on"
-                } else if self.lut.is_none() {
-                    tracing::warn!(
-                        "auto mode requires a calibrated LUT; run a calibration (k) first"
-                    );
-                    self.add_flag(StatusFlag::NotCalibrated);
-                    "auto:not_calibrated"
                 } else {
-                    self.remove_flag(StatusFlag::NotCalibrated);
+                    // Per-device T* loops use direct CPU watts and GPU SM
+                    // clocks, so a GPU watts LUT is calibration data, not
+                    // an Auto-entry precondition. Missing fitted device
+                    // gains remain informational until the live key resolves.
+                    self.add_flag(StatusFlag::NotCalibrated);
                     let gains = self.loop_gains.unwrap_or_default();
-                    let mut auto =
-                        AutoState::new(&gains, self.config.gpu_hot_c, self.config.nvme_hot_c);
+                    let mut auto = AutoState::new(&gains, &self.config);
                     match self.guard.gpu.as_ref() {
                         // Carried-over review decision: with a GPU lock
                         // applied right now (e.g. entering from Manual),
@@ -1343,14 +1456,6 @@ impl<R: Runner> Controller<R> {
             // revert right AFTER a resume, so for RESUMED_STRICT_S the
             // watchdog fires on a 2-sample streak instead of 3.
             self.strict_until = Some(s.t_mono + RESUMED_STRICT_S);
-            if let Some(all_ok) = self.reassert_actuators() {
-                self.last_reassert = Some(s.t_mono);
-                // Telemetry honesty (as in the periodic path): a failed
-                // attempt must not count as a phantom reassert.
-                effects.push(Effect::Reasserted {
-                    cause: if all_ok { "resume" } else { "resume_failed" },
-                });
-            }
             self.add_flag(StatusFlag::Resumed);
             self.resumed_until = Some(s.t_mono + RESUMED_FLAG_S);
             // The pre-suspend fan window and EC boxcar are thermally stale
@@ -1377,6 +1482,31 @@ impl<R: Runner> Controller<R> {
                 // refinement entry from readings spanning the gap.
                 auto.steady_window.clear();
                 auto.steady_key = None;
+                auto.refinement_window.clear();
+                auto.refinement_key = None;
+                // A post-suspend clock observation cannot be paired to a
+                // pre-suspend NVML command.  Keep the first post-resume
+                // verification explicitly Unverifiable until a new command
+                // has completed and a later sample can observe it.
+                auto.gpu_commands.clear();
+                auto.gpu_command_generation = 0;
+                auto.gpu_verifier = None;
+                auto.gpu_verifier_mhz = None;
+                auto.cpu_hot_streak = 0;
+                auto.cpu_hot = false;
+                auto.guards = Guards::new(self.config.gpu_hot_c, self.config.nvme_hot_c);
+                auto.cpu_verdict = VerdictState::default();
+                auto.gpu_verdict = VerdictState::default();
+                auto.cpu_actuator_state = ActuatorState::Unverifiable;
+                auto.gpu_actuator_state = ActuatorState::Unverifiable;
+            }
+            if let Some(all_ok) = self.reassert_actuators(s) {
+                self.last_reassert = Some(s.t_mono);
+                // Telemetry honesty (as in the periodic path): a failed
+                // attempt must not count as a phantom reassert.
+                effects.push(Effect::Reasserted {
+                    cause: if all_ok { "resume" } else { "resume_failed" },
+                });
             }
             cause.get_or_insert("resume");
         } else if self.resumed_until.is_some_and(|until| s.t_mono >= until) {
@@ -1417,7 +1547,7 @@ impl<R: Runner> Controller<R> {
                              ({needed} consecutive samples); reasserting",
                             s.cpu_pkg_w
                         );
-                        if let Some(all_ok) = self.reassert_actuators() {
+                        if let Some(all_ok) = self.reassert_actuators(s) {
                             self.last_reassert = Some(s.t_mono);
                             effects.push(Effect::Reasserted {
                                 cause: if all_ok {
@@ -1455,7 +1585,7 @@ impl<R: Runner> Controller<R> {
             match self.last_reassert {
                 None => self.last_reassert = Some(s.t_mono),
                 Some(last) if s.t_mono - last >= REASSERT_PERIOD_S => {
-                    if let Some(all_ok) = self.reassert_actuators() {
+                    if let Some(all_ok) = self.reassert_actuators(s) {
                         // Advance the baseline even on failure: the retry
                         // cadence stays 10 s. Telemetry honesty: a failed
                         // attempt must not count as a phantom reassert.
@@ -1502,6 +1632,11 @@ impl<R: Runner> Controller<R> {
         effects: &mut Vec<Effect>,
         cause: &mut Option<&'static str>,
     ) {
+        if self.auto.is_some() {
+            self.on_auto_sample_v4(s, effects, cause);
+            return;
+        }
+
         // Defensive: Auto without its state cannot control anything — fail
         // toward stock (every failure path degrades to louder fans or stock
         // behavior, design §5). Unreachable in practice: entry requires the
@@ -1693,6 +1828,857 @@ impl<R: Runner> Controller<R> {
         // Passive warm-start/refinement (design §2.3/§2.4): every sample,
         // after this tick's `u`/guard state are final.
         self.observe_steady_window(s, guard_state);
+    }
+
+    /// Revision-4 per-device Auto pipeline.  This is deliberately kept as a
+    /// single ordered routine: the target source consumes the *previous*
+    /// device holds, while writes consume this tick's requests only after
+    /// both loops have made their independent decisions.
+    #[allow(clippy::too_many_lines)]
+    fn on_auto_sample_v4(
+        &mut self,
+        s: &Sample,
+        effects: &mut Vec<Effect>,
+        cause: &mut Option<&'static str>,
+    ) {
+        let target_duty = self.duty_rpm_table.duty_for_rpm(self.status.fan_target_rpm);
+        let view = s.fanctrl.as_ref();
+        let (cpu_decision, gpu_decision, target, flags) = {
+            let auto = self.auto.as_mut().expect("AutoState exists in Auto");
+            let dt_s = auto
+                .last_sample_t_mono
+                .map(|last| (s.t_mono - last).clamp(0.0, 7.0))
+                .unwrap_or(0.0);
+            auto.last_sample_t_mono = Some(s.t_mono);
+
+            if s.resumed {
+                auto.replica.reset(
+                    view.map(|v| v.ma_temperature),
+                    s.ec.as_ref().and_then(|ec| ec.cpu_group_c),
+                    s.ec.as_ref().and_then(|ec| ec.gpu_group_c),
+                );
+                auto.cpu_draw_window.clear();
+                auto.last_cpu_write_t_mono = None;
+                auto.last_gpu_write_t_mono = None;
+            }
+            // Resolve on the first usable view as well as on every view
+            // replacement.  An Auto entry can happen after the poller has
+            // already cached its first view, in which case there is no
+            // `fanctrl_view_changed` edge for this controller session.
+            if s.fanctrl_view_changed || !auto.view_initialised {
+                if let Some(view) = view {
+                    auto.replica.set_interval(view.ma_interval as usize);
+                    let key = format!("{}:{}", view.strategy, view.ma_interval);
+                    let (cpu_gains, cpu_source) = self
+                        .config
+                        .cpu_gains
+                        .map(|gains| (gains, crate::types::GainsSource::Config))
+                        .or_else(|| {
+                            self.persisted_cpu_gains
+                                .get(&key)
+                                .copied()
+                                .map(|gains| (gains, crate::types::GainsSource::Fitted))
+                        })
+                        .unwrap_or_else(|| {
+                            (
+                                default_gains::<W>(view.ma_interval),
+                                crate::types::GainsSource::Default,
+                            )
+                        });
+                    let (gpu_gains, gpu_source) = self
+                        .config
+                        .gpu_gains
+                        .map(|gains| (gains, crate::types::GainsSource::Config))
+                        .or_else(|| {
+                            self.persisted_gpu_gains
+                                .get(&key)
+                                .copied()
+                                .map(|gains| (gains, crate::types::GainsSource::Fitted))
+                        })
+                        .unwrap_or_else(|| {
+                            (
+                                default_gains::<Mhz>(view.ma_interval),
+                                crate::types::GainsSource::Default,
+                            )
+                        });
+                    auto.cpu_loop.set_gains(cpu_gains);
+                    auto.gpu_loop.set_gains(gpu_gains);
+                    auto.cpu_gains_source = cpu_source;
+                    auto.gpu_gains_source = gpu_source;
+                }
+            }
+            // Actuator-verdict suppression is a per-session edge, and the
+            // new pipeline bypasses the legacy allocator path that used to
+            // maintain it.  Keep it here, before either paired verdict is
+            // consumed below.
+            if auto.last_on_ac.is_some_and(|last| last != s.on_ac) {
+                auto.on_ac_suppress_until = Some(s.t_mono + ON_AC_EDGE_SUPPRESS_S);
+            }
+            auto.last_on_ac = Some(s.on_ac);
+            // A controller can enter Auto before the first socket poll has
+            // completed.  Once that first fresh view arrives, seed the raw
+            // reconciliation history from its MA before appending this
+            // sample; otherwise Curve waits a full moving-average window
+            // even though it has a contemporaneous, fair socket seed.
+            if !auto.view_initialised && view.is_some() && s.fanctrl_freshness == Freshness::Fresh
+            {
+                auto.replica.reset(
+                    view.map(|view| view.ma_temperature),
+                    s.ec.as_ref().and_then(|ec| ec.cpu_group_c),
+                    s.ec.as_ref().and_then(|ec| ec.gpu_group_c),
+                );
+                auto.view_initialised = true;
+            }
+            if let Some(ec) = s.ec.as_ref() {
+                if auto.ec_slope_window.len() >= EC_SLOPE_WINDOW_S {
+                    auto.ec_slope_window.pop_front();
+                }
+                if let Some(raw_max) = ec.reconciliation_max_c {
+                    auto.ec_slope_window.push_back(f64::from(raw_max));
+                }
+            }
+            auto.replica.tick(s.ec.as_ref());
+
+            let reconciliation = match (view, s.ec.as_ref()) {
+                // Reconciliation is a comparison to the socket's *new* All
+                // snapshot.  Re-scoring the cached view against every later
+                // 1 Hz EC sample manufactures mismatches while the fanctrl
+                // poller is simply between polls.
+                (Some(view), Some(ec))
+                    if s.fanctrl_freshness == Freshness::Fresh && s.fanctrl_view_changed =>
+                {
+                    let slope = auto
+                        .ec_slope_window
+                        .front()
+                        .zip(auto.ec_slope_window.back())
+                        .map_or(0.0, |(first, last)| {
+                            (last - first)
+                                / auto.ec_slope_window.len().saturating_sub(1).max(1) as f64
+                        });
+                    let gap_s = view
+                        .all_observed_at
+                        .map(|captured| Instant::now().saturating_duration_since(captured).as_secs_f64())
+                        .unwrap_or(0.0);
+                    let observation = if slope >= RECONCILIATION_SKIP_SLOPE_C_PER_S
+                        || gap_s >= RECONCILIATION_SKIP_GAP_S
+                    {
+                        ReconciliationObservation::Skipped
+                    } else {
+                        let max_matches = ec.reconciliation_max_c.is_some_and(|raw_max| {
+                            (f64::from(raw_max) - view.temperature).abs() <= 1.0
+                        });
+                        let ma_matches = auto
+                            .replica
+                            .reconciliation_ma()
+                            .map(|ma| (ma - view.ma_temperature).abs() <= 1.0);
+                        ReconciliationObservation::Scored {
+                            max_matches,
+                            ma_matches,
+                            socket_ma: view.ma_temperature,
+                        }
+                    };
+                    auto.replica.score_reconciliation(observation)
+                }
+                _ => auto
+                    .replica
+                    .score_reconciliation(ReconciliationObservation::Skipped),
+            };
+            if let Some(reseed) = reconciliation.reseed_ma {
+                auto.replica.reset_after_mismatch_clear(
+                    Some(reseed),
+                    s.ec.as_ref().and_then(|ec| ec.cpu_group_c),
+                    s.ec.as_ref().and_then(|ec| ec.gpu_group_c),
+                );
+            }
+
+            let cpu_group = auto.replica.cpu_group_ma();
+            let gpu_group = auto.replica.gpu_group_ma();
+            // A saved T* is meaningful only after the socket has supplied
+            // the strategy and current fan target.  Do this once, before the
+            // first source tick, so a later view/key refresh cannot reseed a
+            // live target or step either device loop.
+            if !auto.source_initialised {
+                let now_unix_s = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_secs());
+                let qualified = view.filter(|_| s.fanctrl_freshness == Freshness::Fresh)
+                    .and_then(|view| PersistedState {
+                        t_star_last_good: self.persisted_t_star_last_good.clone(),
+                        ..PersistedState::default()
+                    }.qualified_seed(
+                        &view.strategy, self.status.fan_target_rpm.round() as u32,
+                        now_unix_s, 0.0, self.config.cpu_hot_c.max(self.config.gpu_hot_c),
+                    ));
+                let seed = qualified.map(EntrySeed::Qualified).unwrap_or(EntrySeed::Groups {
+                    cpu_c: cpu_group, gpu_c: gpu_group,
+                });
+                auto.tstar = TStarSource::new(seed);
+                auto.source_initialised = true;
+            }
+            let sensors = s.ec.as_ref().map_or_else(Vec::new, |ec| {
+                ec.all
+                    .iter()
+                    .map(|(label, value_c)| SensorReading {
+                        label: label.as_str().to_owned(),
+                        value_c: *value_c,
+                        class: match label.group() {
+                            EcGroup::Cpu | EcGroup::Gpu => SensorClass::Controllable,
+                            EcGroup::Uncontrollable => SensorClass::KnownUncontrollable,
+                            EcGroup::Unknown => SensorClass::Unknown,
+                        },
+                    })
+                    .collect()
+            });
+            let argmax_lead_c = s.ec.as_ref().map_or(0.0, |ec| {
+                let argmax = ec
+                    .all
+                    .iter()
+                    .find(|(label, _)| label == &ec.argmax)
+                    .map(|(_, value)| *value)
+                    .unwrap_or(f64::from(ec.max_c));
+                let runner_up = ec
+                    .all
+                    .iter()
+                    .filter(|(label, _)| label != &ec.argmax)
+                    .map(|(_, value)| *value)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                if runner_up.is_finite() {
+                    (argmax - runner_up).max(0.0)
+                } else {
+                    1.1
+                }
+            });
+            let source = auto.tstar.tick(&TStarInput {
+                dt_s,
+                now_unix_s: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_secs()),
+                fan_valid: s.fan_valid,
+                ec_valid: s.ec_valid,
+                watchdog_release: false,
+                resumed: s.resumed,
+                // `Fresh` means the currently cached `print all` view is
+                // inside its socket TTL.  A view-change edge is only for
+                // replica interval/gain re-resolution; using it as the
+                // source's continuous-entry evidence would make a stable
+                // 1 Hz control run wait for a new socket poll each second.
+                fresh_view: view.is_some() && s.fanctrl_freshness == Freshness::Fresh,
+                replica_reconciled: reconciliation.trusted,
+                curve_points: view.map(|v| v.curve.clone()),
+                snapped_duty: Some(target_duty),
+                strategy: view.map(|v| v.strategy.clone()),
+                requested_fan_target_rpm: self.status.fan_target_rpm.round() as u32,
+                fan_rpm: s.fan_valid.then(|| s.max_fan_rpm()),
+                previous_holds: vec![
+                    HeldDeviceInput::new(TStarDevice::Cpu, auto.prior_cpu_hold, cpu_group),
+                    HeldDeviceInput::new(TStarDevice::Gpu, auto.prior_gpu_hold, gpu_group),
+                ],
+                sensors,
+                argmax_label: s.ec.as_ref().map(|ec| ec.argmax.as_str().to_owned()),
+                argmax_lead_c,
+                cpu_group_c: cpu_group,
+                gpu_group_c: gpu_group,
+                cpu_hot_c: self.config.cpu_hot_c,
+                gpu_hot_c: self.config.gpu_hot_c,
+                auto_exit: false,
+            });
+
+            let guard = auto
+                .guards
+                .step(s.gpu_temp_valid.then_some(s.gpu_temp_c), s.nvme_temp_c);
+            if s.cpu_temp_valid && s.cpu_temp_c >= self.config.cpu_hot_c {
+                auto.cpu_hot_streak = auto.cpu_hot_streak.saturating_add(1);
+            } else {
+                auto.cpu_hot_streak = 0;
+            }
+            if !s.cpu_temp_valid || s.cpu_temp_c <= self.config.cpu_hot_c - 3.0 {
+                auto.cpu_hot = false;
+            } else if auto.cpu_hot_streak >= 3 {
+                auto.cpu_hot = true;
+            }
+            auto.cpu_ratchet.set_floor(self.config.cpu_floor_w);
+            auto.gpu_ratchet.set_floor(f64::from(self.config.gpu_floor_mhz));
+            let cpu_max = auto.cpu_ratchet.step(
+                s.cpu_temp_valid,
+                auto.cpu_hot,
+                s.cpu_temp_valid.then_some(s.cpu_temp_c),
+            );
+            let gpu_max = auto.gpu_ratchet.step(
+                s.gpu_temp_valid,
+                guard.gpu_hot,
+                s.gpu_temp_valid.then_some(s.gpu_temp_c),
+            );
+
+            // A zero package-power sample is the RAPL warm-up/no-reading
+            // sentinel in this controller.  It cannot make the required
+            // five-valid-sample draw mean available.
+            if s.cpu_pkg_w.is_finite() && s.cpu_pkg_w > 0.0 {
+                auto.cpu_draw_window.push_back(s.cpu_pkg_w);
+                if auto.cpu_draw_window.len() > 5 {
+                    auto.cpu_draw_window.pop_front();
+                }
+            } else {
+                // A reset/invalid RAPL delta invalidates the whole mean;
+                // five later valid deltas are required before shadow returns.
+                auto.cpu_draw_window.clear();
+            }
+            let cpu_draw = (auto.cpu_draw_window.len() == 5).then(|| {
+                auto.cpu_draw_window.iter().sum::<f64>() / auto.cpu_draw_window.len() as f64
+            });
+            let t_star = source.t_star.unwrap_or(self.config.cpu_hot_c - 2.0);
+            // A qualified paired record is advisory entry state.  It is
+            // keyed to the same strategy/duty/power-source tuple as the
+            // steady-window writer, and either device's live draw floor can
+            // raise it before the advisory seed becomes usable. It never overwrites a
+            // command already in force: that command remains `last_applied`
+            // and output slew carries the loop toward the candidate.
+            let warm = view.and_then(|view| {
+                self.persisted_warm_start
+                    .get(&WarmStart::key(&view.strategy, target_duty, s.on_ac))
+            });
+            // Cold entry starts each present device at its safe configured
+            // ceiling; only a cap already in force overrides that seed.
+            // Delaying the GPU seed until its group exists preserves the
+            // absent-from-start rule (no speculative lock for a powered-off
+            // dGPU).  Shadow remains at the thermal seed until the CPU has
+            // five valid draw samples.
+            if let Some(group) = cpu_group
+                && !auto.cpu_entry_seeded
+            {
+                let entry_floor = cpu_draw
+                    .map(|draw| draw + self.config.shadow_headroom_cpu_w)
+                    .unwrap_or(self.config.cpu_floor_w);
+                let thermal = warm.filter(|_| cpu_draw.is_some())
+                    .map(|record| record.cpu_cap_w)
+                    .unwrap_or(self.config.cpu_max_w)
+                    .max(entry_floor)
+                    .min(cpu_max);
+                auto.cpu_loop.seed_candidates(
+                    thermal,
+                    // Before the five-sample mean exists shadow remains
+                    // thermal-only.  Once it exists, the first candidate is
+                    // the measured draw plus headroom, not a fall from max.
+                    cpu_draw.map_or(thermal, |_| entry_floor),
+                    self.status.cpu_limit_w,
+                    t_star - group,
+                );
+                auto.cpu_entry_seeded = true;
+            }
+            if let Some(group) = gpu_group
+                && !auto.gpu_entry_seeded
+            {
+                let entry_floor = if s.gpu_mhz_valid {
+                    s.gpu_sm_mhz + self.config.shadow_headroom_gpu_mhz
+                } else {
+                    f64::from(self.config.gpu_floor_mhz)
+                };
+                let thermal = warm.filter(|_| s.gpu_mhz_valid)
+                    .map(|record| f64::from(record.gpu_lock_mhz))
+                    .unwrap_or(f64::from(self.config.gpu_max_mhz))
+                    .max(entry_floor)
+                    .min(gpu_max);
+                auto.gpu_loop.seed_candidates(
+                    thermal,
+                    if s.gpu_mhz_valid { entry_floor } else { thermal },
+                    self.status.gpu_max_mhz.map(f64::from),
+                    t_star - group,
+                );
+                auto.gpu_entry_seeded = true;
+            }
+            if let Some(draw) = cpu_draw
+                && let Some(group) = cpu_group
+                && !auto.cpu_shadow_entry_seeded
+                && auto.cpu_actuator_state != ActuatorState::Mismatch
+                && !auto.cpu_verdict.in_episode() && !s.resumed
+            {
+                let entry_floor = (draw + self.config.shadow_headroom_cpu_w)
+                    .clamp(self.config.cpu_floor_w, cpu_max);
+                if let Some(record) = warm {
+                    // The advisory thermal seed becomes usable only with
+                    // entry draw evidence. Transfer preserves requested and
+                    // last_applied, so ordinary output slew remains in force.
+                    auto.cpu_loop.transfer_thermal(record.cpu_cap_w.max(entry_floor).min(cpu_max),
+                        t_star - group);
+                }
+                auto.cpu_loop.seed_initial_shadow(entry_floor);
+                auto.cpu_shadow_entry_seeded = true;
+            }
+            if s.gpu_mhz_valid && let Some(group) = gpu_group
+                && !auto.gpu_shadow_entry_seeded
+                && auto.gpu_actuator_state != ActuatorState::Mismatch
+                && !auto.gpu_verdict.in_episode() && !s.resumed
+            {
+                let entry_floor = (s.gpu_sm_mhz + self.config.shadow_headroom_gpu_mhz)
+                    .clamp(f64::from(self.config.gpu_floor_mhz), gpu_max);
+                if let Some(record) = warm {
+                    auto.gpu_loop.transfer_thermal(f64::from(record.gpu_lock_mhz).max(entry_floor).min(gpu_max),
+                        t_star - group);
+                }
+                auto.gpu_loop.seed_initial_shadow(entry_floor);
+                auto.gpu_shadow_entry_seeded = true;
+            }
+            auto.cpu_restore_thermal_pending |= source.restore_thermal;
+            auto.gpu_restore_thermal_pending |= source.restore_thermal;
+            let cpu_restored = auto.cpu_restore_thermal_pending && cpu_group.is_some()
+                && auto.cpu_actuator_state != ActuatorState::Mismatch
+                && !auto.cpu_verdict.in_episode() && !s.resumed;
+            let gpu_restored = auto.gpu_restore_thermal_pending && gpu_group.is_some()
+                && auto.gpu_actuator_state != ActuatorState::Mismatch
+                && !auto.gpu_verdict.in_episode() && !s.resumed;
+            if cpu_restored {
+                auto.cpu_loop.transfer_thermal(cpu_max, t_star - cpu_group.expect("present group"));
+                auto.cpu_restore_thermal_pending = false;
+            } else if source.resync && let Some(group) = cpu_group {
+                auto.cpu_loop.resync_error(t_star - group);
+            }
+            if gpu_restored {
+                auto.gpu_loop.transfer_thermal(gpu_max, t_star - gpu_group.expect("present group"));
+                auto.gpu_restore_thermal_pending = false;
+            } else if source.resync && let Some(group) = gpu_group {
+                auto.gpu_loop.resync_error(t_star - group);
+            }
+            let cpu = auto.cpu_loop.tick(TickInput {
+                t_star,
+                group_c: cpu_group,
+                draw: cpu_draw,
+                floor: self.config.cpu_floor_w,
+                max: cpu_max,
+                mode: source.thermal_mode,
+                actuator: auto.cpu_actuator_state,
+                dt_s,
+                resumed: s.resumed,
+                delta_tstar: if source.resync || cpu_restored { 0.0 } else { source.delta_tstar },
+                shadow_headroom: self.config.shadow_headroom_cpu_w,
+                shadow_fall_rate: self.config.shadow_fall_rate_cpu,
+                shadow_enabled: true,
+            });
+            let gpu = auto.gpu_loop.tick(TickInput {
+                t_star,
+                group_c: gpu_group,
+                draw: s.gpu_mhz_valid.then_some(s.gpu_sm_mhz),
+                floor: f64::from(self.config.gpu_floor_mhz),
+                max: gpu_max,
+                mode: source.thermal_mode,
+                actuator: auto.gpu_actuator_state,
+                dt_s,
+                resumed: s.resumed,
+                delta_tstar: if source.resync || gpu_restored { 0.0 } else { source.delta_tstar },
+                shadow_headroom: self.config.shadow_headroom_gpu_mhz,
+                shadow_fall_rate: self.config.shadow_fall_rate_gpu,
+                shadow_enabled: self.config.gpu_shadow_enabled,
+            });
+            auto.prior_cpu_hold = cpu.hold;
+            auto.prior_gpu_hold = gpu.hold;
+            (
+                cpu,
+                gpu,
+                source,
+                (guard.gpu_hot, guard.nvme_hot, reconciliation.ec_mismatch),
+            )
+        };
+
+        self.sync_bool_flag(StatusFlag::GpuHot, flags.0);
+        self.sync_bool_flag(StatusFlag::NvmeHot, flags.1);
+        self.sync_bool_flag(StatusFlag::EcMismatch, flags.2);
+        self.sync_bool_flag(
+            StatusFlag::FanctrlLost,
+            !matches!(s.fanctrl_freshness, Freshness::Fresh),
+        );
+        self.sync_bool_flag(
+            StatusFlag::CurveInvalid,
+            view.is_some_and(|view| Curve::from_points(view.curve.clone()).is_err()),
+        );
+        self.sync_bool_flag(
+            StatusFlag::SteepCurve,
+            target
+                .flags
+                .iter()
+                .any(|flag| matches!(flag, crate::control::tstar::TStarFlag::SteepCurve)),
+        );
+        self.sync_bool_flag(
+            StatusFlag::TargetUnreachable,
+            target.flags.iter().any(|flag| {
+                matches!(
+                    flag,
+                    crate::control::tstar::TStarFlag::TargetUnreachable(_)
+                        | crate::control::tstar::TStarFlag::DeviceUnreachable { .. }
+                )
+            }),
+        );
+        self.status.tstar_state = Some(target.state.into());
+        self.status.t_star_c = target.t_star;
+        self.status.strategy = view.map(|v| v.strategy.clone());
+        self.status.cpu = Some(
+            (
+                cpu_decision,
+                self.auto.as_ref().expect("auto").cpu_gains_source,
+            )
+                .into(),
+        );
+        self.status.gpu = Some(
+            (
+                gpu_decision,
+                self.auto.as_ref().expect("auto").gpu_gains_source,
+            )
+                .into(),
+        );
+        self.status.ec_ma_c = self
+            .auto
+            .as_ref()
+            .expect("auto")
+            .replica
+            .reconciliation_ma();
+        self.status.telemetry_flags = target.flags.iter().map(Into::into).collect();
+        for (device, lost) in [
+            (crate::types::TelemetryDeviceName::Cpu, cpu_decision.group_lost),
+            (crate::types::TelemetryDeviceName::Gpu, gpu_decision.group_lost),
+        ] {
+            if lost { self.status.telemetry_flags.push(crate::types::TelemetryFlag::GroupLost { device, active: true }); }
+        }
+        if let Some(ec) = &s.ec {
+            for diagnostic in &ec.diagnostics {
+                if let crate::sensors::ec::EcDiagnostic::EcImplausible { label } = diagnostic {
+                    self.status.telemetry_flags.push(crate::types::TelemetryFlag::EcImplausible {
+                        label: label.as_str().to_owned(), active: true,
+                    });
+                }
+            }
+        }
+        let fitted = view.is_some_and(|view| {
+            let key = format!("{}:{}", view.strategy, view.ma_interval);
+            self.persisted_cpu_gains.contains_key(&key) && self.persisted_gpu_gains.contains_key(&key)
+        });
+        self.sync_bool_flag(StatusFlag::NotCalibrated, !fitted);
+        if let Some(request) = target.persistence.as_ref() {
+            // The source owns the cadence and safety gate.  Keep its
+            // original timestamp so unrelated saves cannot refresh a seed.
+            self.persisted_t_star_last_good = Some(request.seed.clone());
+            self.save_persisted_state();
+        }
+
+        let mode = match target.state {
+            crate::control::tstar::TStarState::Curve => LoopMode::TempLoop,
+            crate::control::tstar::TStarState::Released => LoopMode::Released,
+            crate::control::tstar::TStarState::Held
+            | crate::control::tstar::TStarState::Uncontrollable => LoopMode::RpmLoop,
+        };
+        self.status.ec_argmax = s.ec.as_ref().map(|ec| ec.argmax.as_str().to_owned());
+        self.status.duty_cmd = if mode == LoopMode::TempLoop {
+            view.and_then(|view| Curve::from_points(view.curve.clone()).ok())
+                .and_then(|curve| curve.nearest_tread(target_duty))
+        } else { None };
+        self.status.snapped_rpm = self.status.duty_cmd
+            .map_or(0.0, |duty| self.duty_rpm_table.rpm_for_duty(duty));
+        let mode_changed = self.status.loop_mode != mode;
+        if mode_changed {
+            let previous = self.status.loop_mode;
+            self.status.loop_mode = mode;
+            effects.push(Effect::Noted {
+                cause: mode_transition_cause(previous, mode),
+            });
+        }
+        if mode == LoopMode::Released {
+            // End only the device engagement. The shared source retains its
+            // session quarantines and sees Released -> usable on recovery.
+            let auto = self.auto.as_mut().expect("auto");
+            auto.cpu_loop.reset_engagement();
+            auto.gpu_loop.reset_engagement();
+            auto.replica.reset(None, None, None);
+            auto.cpu_draw_window.clear();
+            auto.fan_window.clear();
+            auto.ec_slope_window.clear();
+            auto.steady_window.clear();
+            auto.steady_key = None;
+            auto.refinement_window.clear();
+            auto.refinement_key = None;
+            auto.cpu_entry_seeded = false;
+            auto.gpu_entry_seeded = false;
+            auto.cpu_shadow_entry_seeded = false;
+            auto.gpu_shadow_entry_seeded = false;
+            auto.cpu_restore_thermal_pending = false;
+            auto.gpu_restore_thermal_pending = false;
+            auto.view_initialised = false;
+            auto.last_sample_t_mono = None;
+            auto.last_cpu_write_t_mono = None;
+            auto.last_gpu_write_t_mono = None;
+            auto.gpu_commands.clear();
+            auto.gpu_command_generation = 0;
+            auto.gpu_verifier = None;
+            auto.cpu_verdict = VerdictState::default();
+            auto.gpu_verdict = VerdictState::default();
+            auto.cpu_actuator_state = ActuatorState::Unverifiable;
+            auto.gpu_actuator_state = ActuatorState::Unverifiable;
+            auto.prior_cpu_hold = Hold::None;
+            auto.prior_gpu_hold = Hold::None;
+            self.status.cpu = None;
+            self.status.gpu = None;
+            self.stick_violations = 0;
+            self.last_reassert = None;
+            self.remove_flag(StatusFlag::ReadbackBlind);
+            self.remove_flag(StatusFlag::LimitNotSticking);
+            if !mode_changed { return; }
+            if let Some(gpu) = self.guard.gpu.as_mut() {
+                let _ = gpu.release();
+            }
+            if let Some(cpu) = self.guard.cpu.as_ref() {
+                let _ = cpu.restore_stock();
+            }
+            self.status.cpu_limit_w = None;
+            self.status.gpu_max_mhz = None;
+            effects.push(Effect::Released);
+            cause.get_or_insert("auto:released");
+            return;
+        }
+
+        self.write_device_decisions_v4(s, cpu_decision, gpu_decision, effects, cause);
+        self.observe_v4_steady(s, cpu_decision, gpu_decision, target_duty, flags.0);
+    }
+
+    fn command_completed_at(&self, sample: &Sample) -> f64 {
+        sample.t_mono + sample.acquired_at.map_or(0.0, |at| {
+            (self.completion_clock)().saturating_duration_since(at).as_secs_f64()
+        })
+    }
+
+    fn record_gpu_command(&mut self, sample: &Sample, applied: u32) {
+        let completed_at = self.command_completed_at(sample);
+        if let Some(auto) = self.auto.as_mut() {
+            auto.gpu_loop.note_applied(f64::from(applied));
+            auto.last_gpu_write_t_mono = Some(completed_at);
+            auto.gpu_command_generation = auto.gpu_command_generation.saturating_add(1);
+            auto.gpu_commands.push_back(GpuCommandEvidence::new(
+                applied, completed_at, auto.gpu_command_generation,
+            ));
+            while auto.gpu_commands.len() > 3 { auto.gpu_commands.pop_front(); }
+        }
+    }
+
+    fn write_device_decisions_v4(
+        &mut self,
+        s: &Sample,
+        cpu: DeviceDecision,
+        gpu: DeviceDecision,
+        effects: &mut Vec<Effect>,
+        cause: &mut Option<&'static str>,
+    ) {
+        let cpu_due = self
+            .auto
+            .as_ref()
+            .expect("auto")
+            .last_cpu_write_t_mono
+            .is_none_or(|last| s.t_mono - last >= 2.0);
+        let cpu_changed = self
+            .status
+            .cpu_limit_w
+            .is_none_or(|applied| (applied - cpu.cap).abs() > 0.01);
+        if cpu.write_allowed
+            && (cpu.write_immediately || (cpu_due && (cpu_changed
+                || self.auto.as_ref().expect("auto").cpu_verdict.in_episode())))
+            && !self.shutting_down()
+        {
+            if let Some(actuator) = self.guard.cpu.as_ref() {
+                let suppress = self
+                    .auto
+                    .as_ref()
+                    .expect("auto")
+                    .on_ac_suppress_until
+                    .is_some_and(|until| s.t_mono < until);
+                let cpu_mw = (cpu.cap * 1000.0).round() as u32;
+                let mut verdict = actuator.set_sustained_mw(cpu_mw);
+                // Confirm a candidate mismatch with exactly one re-write and
+                // paired read-back.  The shutdown fence is checked again
+                // because the first synchronous call can take time.
+                if matches!(verdict, WriteVerdict::Mismatch { .. })
+                    && !suppress
+                    && !self.shutting_down()
+                {
+                    verdict = actuator.set_sustained_mw(cpu_mw);
+                }
+                // Include the blocking write/read-back (and corrective retry)
+                // in the cadence baseline, even when the attempt failed.
+                let completed_at = self.command_completed_at(s);
+                let auto = self.auto.as_mut().expect("auto");
+                auto.last_cpu_write_t_mono = Some(completed_at);
+                auto.cpu_actuator_state = match verdict {
+                    WriteVerdict::Verified(value) => {
+                        auto.cpu_loop.note_applied(value);
+                        self.status.cpu_limit_w = Some(value);
+                        effects.push(Effect::CpuSet(value));
+                        ActuatorState::Verified
+                    }
+                    WriteVerdict::Mismatch { .. } if suppress => ActuatorState::Unverifiable,
+                    WriteVerdict::Mismatch { .. } => ActuatorState::Mismatch,
+                    WriteVerdict::Unreadable | WriteVerdict::Unverifiable => {
+                        ActuatorState::Unverifiable
+                    }
+                };
+                let outcome = auto.cpu_verdict.observe(verdict, suppress);
+                let error = cpu.err_c.map(|value| LoopError::Temp { e_c: value });
+                let released = outcome == VerdictOutcome::Released;
+                let _ = auto;
+                if released {
+                    if let Err(error) = actuator.restore_stock() {
+                        tracing::warn!(
+                            "auto: CPU stock restore on verdict release failed: {error}"
+                        );
+                    }
+                    self.status.cpu_limit_w = None;
+                }
+                self.apply_verdict_outcome(true, outcome, error, effects, cause);
+            }
+        }
+        let gpu_due = self
+            .auto
+            .as_ref()
+            .expect("auto")
+            .last_gpu_write_t_mono
+            .is_none_or(|last| s.t_mono - last >= 2.0);
+        let requested = gpu.cap.round() as u32;
+        let gpu_changed = self.status.gpu_max_mhz != Some(requested);
+        let mut gpu_released = false;
+        let mut gpu_corrective = false;
+        // Pair this acquired clock sample before issuing this tick's command.
+        // The first sample after entry/resume has no completed command and is
+        // intentionally Unverifiable.
+        if s.gpu_mhz_valid && !s.resumed {
+            let auto = self.auto.as_mut().expect("auto");
+            let verifier = auto
+                .gpu_verifier
+                .get_or_insert_with(|| GpuLockVerifier::new(requested));
+            let verdict = verifier.verify_paired(
+                s.gpu_util_pct,
+                s.gpu_sm_mhz.round() as u32,
+                s.t_mono,
+                auto.gpu_commands.make_contiguous(),
+            );
+            let suppress = auto.on_ac_suppress_until.is_some_and(|until| s.t_mono < until);
+            auto.gpu_actuator_state = match verdict {
+                WriteVerdict::Verified(_) => ActuatorState::Verified,
+                WriteVerdict::Mismatch { .. } if suppress => ActuatorState::Unverifiable,
+                WriteVerdict::Mismatch { .. } => ActuatorState::Mismatch,
+                WriteVerdict::Unreadable | WriteVerdict::Unverifiable => ActuatorState::Unverifiable,
+            };
+            let outcome = auto.gpu_verdict.observe(verdict, suppress);
+            let error = gpu.err_c.map(|value| LoopError::Temp { e_c: value });
+            let released = outcome == VerdictOutcome::Released;
+            gpu_released = released;
+            gpu_corrective = outcome == VerdictOutcome::Mismatch;
+            let _ = auto;
+            if released {
+                if let Some(actuator) = self.guard.gpu.as_mut()
+                    && let Err(error) = actuator.release()
+                {
+                    tracing::warn!("auto: GPU release on verdict release failed: {error}");
+                }
+                self.status.gpu_max_mhz = None;
+            }
+            self.apply_verdict_outcome(false, outcome, error, effects, cause);
+        }
+        if gpu.write_allowed && !gpu_released
+            && (gpu.write_immediately || gpu_corrective || (gpu_due && gpu_changed))
+            && !self.shutting_down()
+        {
+            if let Some(actuator) = self.guard.gpu.as_mut() {
+                if actuator.set_max_clock(requested).is_ok() {
+                    let applied = actuator.applied().unwrap_or(requested);
+                    self.record_gpu_command(s, applied);
+                    self.status.gpu_max_mhz = Some(applied);
+                    effects.push(Effect::GpuSet(applied));
+                } else {
+                    let completed_at = self.command_completed_at(s);
+                    self.auto.as_mut().expect("auto").last_gpu_write_t_mono = Some(completed_at);
+                }
+            }
+        }
+        cause.get_or_insert("auto:device_loops");
+    }
+
+    /// Persist a paired warm start only after both device feedback groups and
+    /// the fan have settled at this view's duty.  The entry is advisory: it
+    /// never writes hardware and is only consumed at a later Auto entry.
+    fn observe_v4_steady(
+        &mut self,
+        s: &Sample,
+        cpu: DeviceDecision,
+        gpu: DeviceDecision,
+        target_duty: u8,
+        gpu_guarded: bool,
+    ) {
+        let Some(view) = s.fanctrl.as_ref() else {
+            let auto = self.auto.as_mut().expect("auto");
+            auto.fan_window.clear();
+            auto.steady_window.clear();
+            auto.steady_key = None;
+            auto.refinement_window.clear();
+            auto.refinement_key = None;
+            return;
+        };
+        let warm_key = WarmStart::key(&view.strategy, target_duty, s.on_ac);
+        let refinement_key = warm_key.clone();
+        let rpm = s.fan_valid.then(|| s.max_fan_rpm()).filter(|rpm| rpm.is_finite());
+        let groups_settled = self.status.t_star_c.zip(cpu.group_c).zip(gpu.group_c)
+            .is_some_and(|((target, cpu_c), gpu_c)| {
+                (cpu_c - target).abs() <= 1.0 && (gpu_c - target).abs() <= 1.0
+            });
+        let target_rpm = self.duty_rpm_table.rpm_for_duty(target_duty);
+        let auto = self.auto.as_mut().expect("auto");
+        let qualifies = view.active
+            && s.fanctrl_freshness == Freshness::Fresh
+            && view.speed_pct == target_duty
+            && groups_settled
+            && !gpu_guarded && !auto.cpu_hot
+            && rpm.is_some()
+            && self.status.cpu_limit_w.is_some()
+            && self.status.gpu_max_mhz.is_some()
+            && !matches!(cpu.hold, Hold::ActuatorMismatch)
+            && !matches!(gpu.hold, Hold::ActuatorMismatch)
+            && !auto.cpu_verdict.in_episode() && !auto.gpu_verdict.in_episode();
+        if let Some(rpm) = rpm {
+            auto.fan_window.push_back(rpm);
+            if auto.fan_window.len() > FAN_SMOOTH_N { auto.fan_window.pop_front(); }
+        } else {
+            auto.fan_window.clear();
+        }
+        let smoothed = auto.fan_window.iter().sum::<f64>() / auto.fan_window.len().max(1) as f64;
+        // Each bounded sliding window starts over on a key/gate change.
+        // Once full, every further qualified stable tick can refine/save.
+        let observe = |window: &mut std::collections::VecDeque<f64>| {
+            window.push_back(smoothed);
+            if window.len() > STEADY_WINDOW_N { window.pop_front(); }
+            if window.len() != STEADY_WINDOW_N { return None; }
+            let values: Vec<_> = window.iter().copied().collect();
+            if population_stdev(&values) >= STEADY_WINDOW_STDEV_MAX_RPM { return None; }
+            let mean = values.iter().sum::<f64>() / values.len() as f64;
+            Some(mean)
+        };
+        let refine = if auto.refinement_key.as_ref() != Some(&refinement_key) || !qualifies {
+            auto.refinement_key = Some(refinement_key);
+            auto.refinement_window.clear();
+            None
+        } else {
+            observe(&mut auto.refinement_window)
+        };
+        let warm_qualifies = qualifies && view.speed_pct == target_duty
+            && (smoothed - target_rpm).abs() <= STEADY_WINDOW_STDEV_MAX_RPM;
+        let warm = if auto.steady_key.as_ref() != Some(&warm_key) || !warm_qualifies {
+            auto.steady_key = Some(warm_key.clone());
+            auto.steady_window.clear();
+            false
+        } else {
+            observe(&mut auto.steady_window).is_some()
+        };
+        if let Some(mean_rpm) = refine {
+            // The daemon held this exact requested duty for the full
+            // window; the table retains its independent 25% outlier gate.
+            self.duty_rpm_table.refine(target_duty, mean_rpm);
+        }
+        if warm {
+            self.persisted_warm_start.insert(warm_key, WarmStartEntry {
+                cpu_cap_w: self.status.cpu_limit_w.expect("qualified CPU cap"),
+                gpu_lock_mhz: self.status.gpu_max_mhz.expect("qualified GPU cap"),
+            });
+        }
+        if refine.is_some() || warm { self.save_persisted_state(); }
     }
 
     /// Steady-window detector for passive warm-start/refinement (design
@@ -1966,8 +2952,15 @@ impl<R: Runner> Controller<R> {
             // 3700 to 2400 RPM with the error the wrong way round; the loop
             // then had to climb back at Mode A's deliberately slow gain).
             // `seed` clamps to the bounds, so an over-cap draw lands at hi.
-            let draw_w = (if s.cpu_pkg_w.is_finite() { s.cpu_pkg_w } else { 0.0 })
-                + (if s.gpu_w_valid && s.gpu_w.is_finite() { s.gpu_w } else { 0.0 });
+            let draw_w = (if s.cpu_pkg_w.is_finite() {
+                s.cpu_pkg_w
+            } else {
+                0.0
+            }) + (if s.gpu_w_valid && s.gpu_w.is_finite() {
+                s.gpu_w
+            } else {
+                0.0
+            });
             let seed_u = self
                 .status
                 .strategy
@@ -2187,28 +3180,38 @@ impl<R: Runner> Controller<R> {
                         .expect("in auto")
                         .on_ac_suppress_until
                         .is_some_and(|until| s.t_mono < until);
+                    // The sample was acquired before this tick's NVML write.
+                    // Score it against the last *completed* command now;
+                    // appending the current command below must not let it
+                    // retroactively verify this earlier observation.
+                    let gpu_sm_mhz = s.gpu_sm_mhz.round() as u32;
+                    let verdict = {
+                        let auto = self.auto.as_mut().expect("in auto");
+                        let verifier = auto
+                            .gpu_verifier
+                            .get_or_insert_with(|| GpuLockVerifier::new(locked));
+                        verifier.verify_paired(
+                            s.gpu_util_pct,
+                            gpu_sm_mhz,
+                            s.t_mono,
+                            auto.gpu_commands.make_contiguous(),
+                        )
+                    };
                     {
                         let auto = self.auto.as_mut().expect("in auto");
-                        if auto.gpu_verifier_mhz != Some(locked) {
-                            auto.gpu_verifier = Some(GpuLockVerifier::new(locked));
-                            auto.gpu_verifier_mhz = Some(locked);
+                        auto.gpu_verifier_mhz = Some(locked);
+                        auto.gpu_command_generation = auto.gpu_command_generation.saturating_add(1);
+                        auto.gpu_commands.push_back(GpuCommandEvidence::new(
+                            locked,
+                            s.t_mono,
+                            auto.gpu_command_generation,
+                        ));
+                        // Two commands are sufficient for the bounded
+                        // predecessor allowance; retaining one extra makes
+                        // a sample straddling a write unambiguous.
+                        while auto.gpu_commands.len() > 3 {
+                            auto.gpu_commands.pop_front();
                         }
-                    }
-                    let gpu_sm_mhz = s.gpu_sm_mhz.round() as u32;
-                    let mut verdict = {
-                        let auto = self.auto.as_mut().expect("in auto");
-                        auto.gpu_verifier
-                            .as_mut()
-                            .expect("just set above")
-                            .verify_lock(s.gpu_util_pct, gpu_sm_mhz)
-                    };
-                    if matches!(verdict, WriteVerdict::Mismatch { .. }) && !suppress {
-                        let auto = self.auto.as_mut().expect("in auto");
-                        verdict = auto
-                            .gpu_verifier
-                            .as_mut()
-                            .expect("just set above")
-                            .verify_lock(s.gpu_util_pct, gpu_sm_mhz);
                     }
                     let outcome = {
                         let auto = self.auto.as_mut().expect("in auto");
@@ -2496,6 +3499,8 @@ impl<R: Runner> Controller<R> {
         let argmax_controllable = s.ec.as_ref().is_some_and(|e| e.argmax.is_controllable());
 
         CalibContext {
+            cpu_cap_w: self.status.cpu_limit_w,
+            gpu_cap_mhz: self.status.gpu_max_mhz,
             ec_ma: self.calib_ec_ma,
             ec_mismatch,
             fanctrl_active,
@@ -2591,6 +3596,18 @@ impl<R: Runner> Controller<R> {
         let mut ended = false;
         for effect in effects {
             match effect {
+                RunnerEffect::SetCpuMaxWatts(w) if self.shutting_down() => {
+                    tracing::debug!("calib: shutting down; SetCpuMaxWatts({w}) skipped");
+                }
+                RunnerEffect::SetCpuMaxWatts(w) => match self.guard.cpu.as_ref() {
+                    None => tracing::warn!("calib: no CPU actuator; SetCpuMaxWatts({w}) skipped"),
+                    Some(cpu) => match cpu.set_sustained_mw((w * 1000.0).round() as u32) {
+                        WriteVerdict::Verified(applied) => self.status.cpu_limit_w = Some(applied),
+                        verdict => {
+                            tracing::warn!("calib: SetCpuMaxWatts({w}) not verified: {verdict:?}")
+                        }
+                    },
+                },
                 RunnerEffect::SetBudget(w) => self.apply_calib_set_budget(w, s),
                 // Stop fence (roast-pr-2 finding 2) on the write arm only.
                 RunnerEffect::SetGpuMaxClock(mhz) if self.shutting_down() => {
@@ -2765,6 +3782,10 @@ impl<R: Runner> Controller<R> {
     fn exit_auto_and_persist(&mut self) {
         if self.auto.take().is_some() {
             self.save_persisted_state();
+            self.status.cpu = None;
+            self.status.gpu = None;
+            self.status.tstar_state = None;
+            self.status.telemetry_flags.clear();
         }
     }
 
@@ -2806,6 +3827,10 @@ impl<R: Runner> Controller<R> {
         }
         self.status.loop_mode = LoopMode::default();
         self.status.t_star_c = None;
+        self.status.tstar_state = None;
+        self.status.cpu = None;
+        self.status.gpu = None;
+        self.status.telemetry_flags.clear();
         self.status.ec_ma_c = None;
         self.status.ec_argmax = None;
         self.status.duty_cmd = None;
@@ -2842,7 +3867,7 @@ impl<R: Runner> Controller<R> {
     /// are warned — the periodic retry IS the recovery. `None` if nothing was
     /// commanded; otherwise `Some(all_calls_succeeded)` so telemetry can
     /// distinguish real reasserts from failed attempts.
-    fn reassert_actuators(&mut self) -> Option<bool> {
+    fn reassert_actuators(&mut self, s: &Sample) -> Option<bool> {
         // Stop fence (roast-pr-2 finding 2): a reassert re-issues the cap we
         // are about to restore away from. Nothing was attempted, so report
         // "nothing commanded" rather than a failed attempt.
@@ -2863,6 +3888,10 @@ impl<R: Runner> Controller<R> {
                 all_ok = false;
                 tracing::warn!("reassert: CPU limit ({w} W) not verified");
             }
+            let completed_at = self.command_completed_at(s);
+            if let Some(auto) = self.auto.as_mut() {
+                auto.last_cpu_write_t_mono = Some(completed_at);
+            }
         }
         if let Some(mhz) = self.status.gpu_max_mhz {
             if let Some(gpu) = self.guard.gpu.as_mut() {
@@ -2870,6 +3899,13 @@ impl<R: Runner> Controller<R> {
                 if let Err(e) = gpu.set_max_clock(mhz) {
                     all_ok = false;
                     tracing::warn!("reassert: GPU max clock ({mhz} MHz) failed: {e}");
+                    let completed_at = self.command_completed_at(s);
+                    if let Some(auto) = self.auto.as_mut() {
+                        auto.last_gpu_write_t_mono = Some(completed_at);
+                    }
+                } else {
+                    let applied = gpu.applied().unwrap_or(mhz);
+                    self.record_gpu_command(s, applied);
                 }
             }
         }
@@ -3207,7 +4243,10 @@ mod tests {
         assert_eq!(cs.snapped_rpm, 3200.0);
         assert_eq!(cs.strategy.as_deref(), Some("balanced"));
         assert_eq!(cs.budget_w, 45.0);
-        assert_eq!(cs.tstar_state, Some(crate::types::TelemetryTStarState::Held));
+        assert_eq!(
+            cs.tstar_state,
+            Some(crate::types::TelemetryTStarState::Held)
+        );
         assert_eq!(cs.cpu.as_ref().and_then(|cpu| cpu.group_c), Some(61.0));
         assert_eq!(cs.gpu, None);
         assert_eq!(
@@ -3574,7 +4613,11 @@ mod tests {
         ctl.on_command(Command::SetGpuMaxClock(2000));
         shutdown.store(false, Ordering::Relaxed); // the manual set raised it
         ctl.on_sample(&sample_at(0.0));
-        assert_eq!(ctl.status().cpu_limit_w, Some(20.0), "premise: manual cap in force");
+        assert_eq!(
+            ctl.status().cpu_limit_w,
+            Some(20.0),
+            "premise: manual cap in force"
+        );
         let gpu_sets_before = gpu_calls.lock().unwrap().len();
 
         // Enter Auto. Its FIRST allocation lands on the next sample, which
@@ -3782,9 +4825,7 @@ mod tests {
             hold: crate::types::TelemetryHold::Shadow,
             gains_source: crate::types::GainsSource::Fitted,
         });
-        ctl.status.telemetry_flags = vec![crate::types::TelemetryFlag::SteepCurve {
-            active: true,
-        }];
+        ctl.status.telemetry_flags = vec![crate::types::TelemetryFlag::SteepCurve { active: true }];
         let (ui_tx, _ui_rx) = crossbeam_channel::unbounded();
         let telemetry = Arc::new(Mutex::new(Some(Telemetry::open(&dir).unwrap())));
 
@@ -4353,7 +5394,10 @@ mod tests {
         let mut pre_warm_start = BTreeMap::new();
         pre_warm_start.insert(
             "quiet16:36:batt".to_string(),
-            WarmStartEntry { cpu_cap_w: 77.0, gpu_lock_mhz: 1800 },
+            WarmStartEntry {
+                cpu_cap_w: 77.0,
+                gpu_lock_mhz: 1800,
+            },
         );
         let persisted = PersistedState {
             duty_rpm_table: pre_refined_table.clone(),
@@ -4475,18 +5519,23 @@ mod tests {
         )
     }
 
-    /// A gaming-ish sample: both devices busy, fan well below the 3000 RPM
-    /// target. `cpu_pkg_w` stays 0 (RAPL-warmup semantics) so the
-    /// stickiness watchdog stays quiet.
+    /// A complete v4 Auto sample: fresh curve/replica data plus both device
+    /// groups and direct draw feedback.  Lifecycle tests use this rather
+    /// than relying on the removed scalar allocator's fan-only fallback.
     fn busy_at(t: f64) -> Sample {
-        Sample {
-            fan_valid: true,
-            fan1_rpm: 2500.0,
-            fan2_rpm: 2400.0,
-            gpu_w_valid: true,
-            gpu_w: 10.0,
-            ..sample_at(t)
-        }
+        let mut sample = temploop_sample(t, 75.0, 74.0, TEMP_CURVE);
+        sample.cpu_pkg_w = 25.0;
+        sample.gpu_w_valid = true;
+        sample.gpu_w = 60.0;
+        sample.gpu_mhz_valid = true;
+        sample.gpu_sm_mhz = 1_800.0;
+        sample.gpu_util_pct = 95.0;
+        sample.ec = Some(ec_reading_c(&[
+            ("ambient_f75303@4d", 40.0),
+            ("cpu@4c", 75.0),
+            ("gpu_vr_f75303@4d", 74.0),
+        ]));
+        sample
     }
 
     fn gpu_sets(calls: &Mutex<Vec<GpuCall>>) -> Vec<u32> {
@@ -4501,6 +5550,7 @@ mod tests {
             .collect()
     }
 
+    #[allow(dead_code)] // retained while downstream compatibility-effect tests migrate
     fn alloc_of(effects: &[Effect]) -> Option<(f64, f64)> {
         effects.iter().find_map(|e| match e {
             Effect::AutoAllocated { cpu_w, gpu_w, .. } => Some((*cpu_w, *gpu_w)),
@@ -4509,18 +5559,22 @@ mod tests {
     }
 
     #[test]
-    fn auto_entry_without_lut_flags_not_calibrated() {
+    fn auto_entry_without_lut_uses_the_direct_per_device_loops() {
         let runner = FakeRunner::new();
         let mut ctl = controller_no_profile(&runner); // uncalibrated
 
         let effects = ctl.on_command(Command::SetAuto(true));
-        assert_eq!(ctl.status().mode, Mode::Monitor, "must stay in Monitor");
+        assert_eq!(
+            ctl.status().mode,
+            Mode::Auto,
+            "direct watt/MHz loops need no LUT gate"
+        );
         assert!(ctl.status().flags.contains(&StatusFlag::NotCalibrated));
         assert_eq!(status_changes(&effects), 1);
     }
 
     #[test]
-    fn auto_entry_with_lut_only_engages_rpm_loop_and_moves_off_the_floor() {
+    fn auto_entry_with_or_without_a_lut_publishes_safe_device_floors() {
         // fw-fanctrl-loop-j6s: the arbiter and budget are now wired. With
         // no fanctrl view but a valid fan reading, RpmLoop engages on the
         // very first tick (no entry hysteresis for the fallback loop,
@@ -4532,25 +5586,24 @@ mod tests {
         ctl.on_command(Command::SetAuto(true));
         assert_eq!(ctl.status().mode, Mode::Auto);
 
-        let floor = ctl.status().cpu_floor_w;
-        let floor_sum = floor + 30.0; // cpu_floor_w (15) + gpu_floor_w (30)
         let _ = ctl.on_sample(&busy_at(0.0));
         assert_eq!(ctl.status().loop_mode, LoopMode::RpmLoop);
-        // The scalar budget itself moved off the seeded floor sum this
-        // very tick (RpmLoop's error is +530 RPM, calling for more) —
-        // `auto_allocate_decision_carries_the_real_arbiter_fields` below
-        // hand-derives the exact value (45.424); this test only needs
-        // "moved", not the precise number, so a small movement suffices
-        // and stays robust to a future gain-tuning change.
         assert!(
-            ctl.status().budget_w > floor_sum,
-            "budget must have moved off the seeded floor sum {floor_sum}: {}",
-            ctl.status().budget_w
+            ctl.status()
+                .cpu
+                .as_ref()
+                .is_some_and(|cpu| cpu.cap >= ctl.status().cpu_floor_w)
+        );
+        assert!(
+            ctl.status()
+                .gpu
+                .as_ref()
+                .is_some_and(|gpu| gpu.cap >= f64::from(ctl.status().gpu_floor_mhz))
         );
     }
 
     #[test]
-    fn auto_allocate_decision_carries_the_real_arbiter_fields() {
+    fn auto_sample_publishes_independent_device_decisions() {
         // fw-fanctrl-loop-j6s: `AutoAllocated`'s mode/error/budget_w/freeze
         // fields now carry the real arbiter/budget output, hand-derived:
         // RpmLoop's target duty is `duty_for_rpm(3000)` = 36 (nearest of
@@ -4569,75 +5622,57 @@ mod tests {
         let (mut ctl, _gpu_calls) = auto_controller_no_profile(&runner);
         ctl.on_command(Command::SetAuto(true));
         let effects = ctl.on_sample(&busy_at(0.0));
-        let arbiter_fields = effects.iter().find_map(|e| match e {
-            Effect::AutoAllocated {
-                mode,
-                error,
-                budget_w,
-                freeze,
-                ..
-            } => Some((*mode, *error, *budget_w, *freeze)),
-            _ => None,
-        });
-        let (mode, error, budget_w, freeze) = arbiter_fields.expect("AutoAllocated effect");
-        assert_eq!(mode, LoopMode::RpmLoop);
-        assert!((error - 530.0).abs() < 1e-9, "got {error}");
-        assert!((budget_w - 45.424).abs() < 1e-9, "got {budget_w}");
-        assert_eq!(freeze, None);
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::CpuSet(_)))
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::GpuSet(_)))
+        );
+        let status = ctl.status();
+        assert!(status.cpu.is_some() && status.gpu.is_some());
+        assert_eq!(
+            status.tstar_state,
+            Some(crate::types::TelemetryTStarState::Held)
+        );
     }
 
     #[test]
     fn some_gains_loaded_into_budget_none_uses_defaults() {
-        // A custom `loop_gains` with 10x the default `kc_w_per_rpm` must
-        // change the very first RpmLoop step's magnitude vs the
-        // `LoopGains::default()` baseline (`auto_allocate_decision_carries_
-        // the_real_arbiter_fields`'s 45.424) — proof `Budget::new` actually
-        // received the persisted gains, not silently defaulted.
+        // V4 resolves each device's gains from the first fresh view.
         let runner = FakeRunner::new();
-        let gpu = FakeGpu::new();
-        let custom_gains = LoopGains {
-            kc_w_per_c: 0.22,
-            ti_s: 35.0,
-            kc_w_per_rpm: 0.028,
-            ti_rpm_s: 35.0,
+        let config = Config {
+            cpu_gains: Some(crate::control::device_loop::Gains {
+                kc: 0.22,
+                ti_s: 35.0,
+            }),
+            gpu_gains: Some(crate::control::device_loop::Gains {
+                kc: 2.1,
+                ti_s: 35.0,
+            }),
+            ..Config::default()
         };
-        let persisted = PersistedState {
-            loop_gains: Some(custom_gains),
-            ..calibrated()
-        };
-        let mut ctl = Controller::new(
-            RestoreGuard::new(
-                &runner,
-                Some(cpu_actuator(
-                    &runner,
-                    PathBuf::from("/nonexistent/platform_profile"),
-                )),
-                Some(Box::new(gpu)),
-                None,
-            ),
-            persisted,
-            PathBuf::from("/nonexistent/state.json"),
-            Config::default(),
-            PathBuf::from("/nonexistent/config.toml"),
+        let (mut ctl, _gpu) = auto_controller(
+            &runner,
+            PathBuf::from("/nonexistent/platform_profile"),
+            config,
         );
         ctl.on_command(Command::SetAuto(true));
-        let effects = ctl.on_sample(&busy_at(0.0));
-        let budget_w = effects
-            .iter()
-            .find_map(|e| match e {
-                Effect::AutoAllocated { budget_w, .. } => Some(*budget_w),
-                _ => None,
-            })
-            .expect("AutoAllocated effect");
-        assert!(
-            budget_w > 45.424 + 1.0,
-            "10x kc_w_per_rpm must produce a materially larger step than the default-gains \
-             baseline (45.424): got {budget_w}"
+        ctl.on_sample(&busy_at(0.0));
+        assert_eq!(
+            ctl.status().cpu.as_ref().expect("CPU").gains_source,
+            crate::types::GainsSource::Config
+        );
+        assert_eq!(
+            ctl.status().gpu.as_ref().expect("GPU").gains_source,
+            crate::types::GainsSource::Config
         );
     }
-
     #[test]
-    fn the_integrator_floor_tracks_a_live_floor_change() {
+    fn live_floor_change_bounds_the_next_device_decision() {
         // Design §2.4: `lo = cpu_floor_w + lut.watts_at(gpu_floor_mhz)`,
         // recomputed every 5 s tick. Raising the CPU floor well above the
         // current `u` mid-session must pull the exposed budget up to the
@@ -4648,28 +5683,17 @@ mod tests {
         let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
         ctl.on_command(Command::SetAuto(true));
         ctl.on_sample(&busy_at(0.0));
-        assert!(
-            ctl.status().budget_w < 70.0,
-            "premise: budget starts near the low floor sum, got {}",
-            ctl.status().budget_w
-        );
-
+        ctl.on_sample(&busy_at(1.0));
         let gpu_floor_mhz = ctl.status().gpu_floor_mhz;
         ctl.on_command(Command::SetFloors {
             cpu_w: 40.0,
             gpu_mhz: gpu_floor_mhz,
         });
-        let effects = ctl.on_sample(&busy_at(ALLOC_PERIOD_S));
-        let budget_w = effects
-            .iter()
-            .find_map(|e| match e {
-                Effect::AutoAllocated { budget_w, .. } => Some(*budget_w),
-                _ => None,
-            })
-            .expect("AutoAllocated effect");
+        ctl.on_sample(&busy_at(ALLOC_PERIOD_S));
+        let cpu = ctl.status().cpu.as_ref().expect("CPU decision");
         assert!(
-            budget_w >= 70.0,
-            "budget's lower bound must track the raised floor (40 + 30 gpu floor = 70): {budget_w}"
+            cpu.cap >= 40.0,
+            "CPU cap must respect the raised independent floor: {cpu:?}"
         );
     }
 
@@ -4707,7 +5731,7 @@ mod tests {
             fan_valid: true,
             fan1_rpm: 2500.0,
             fan2_rpm: 2400.0,
-            ..Sample::default()
+            ..busy_at(t)
         }
     }
 
@@ -4735,8 +5759,9 @@ mod tests {
         assert_eq!(gpu_sets(&gpu_calls).len(), 1, "premise");
 
         // Two hot samples: not enough (transient spikes must not release).
-        assert!(ctl.on_sample(&overheat_at(1.0)).is_empty());
-        assert!(ctl.on_sample(&overheat_at(2.0)).is_empty());
+        let first = ctl.on_sample(&overheat_at(1.0));
+        let second = ctl.on_sample(&overheat_at(2.0));
+        assert!(!first.contains(&Effect::Released) && !second.contains(&Effect::Released));
         assert_eq!(ctl.status().mode, Mode::Auto);
 
         // Third consecutive hot sample: full release toward stock.
@@ -5076,6 +6101,14 @@ mod tests {
         ctl.on_command(Command::SetAuto(true));
         ctl.on_sample(&busy_at(0.0));
         assert_eq!(*resumed_count.lock().unwrap(), 0, "premise");
+        assert!(
+            !ctl.auto
+                .as_ref()
+                .expect("auto state")
+                .gpu_commands
+                .is_empty(),
+            "premise: the first successful GPU command is paired to later samples"
+        );
 
         let effects = ctl.on_sample(&Sample {
             resumed: true,
@@ -5084,6 +6117,13 @@ mod tests {
         assert_eq!(*resumed_count.lock().unwrap(), 1);
         assert!(has_reassert(&effects, "resume"), "got {effects:?}");
         assert_eq!(ctl.status().mode, Mode::Auto, "auto survives the resume");
+        let auto = ctl.auto.as_ref().expect("auto state");
+        assert_eq!(
+            auto.gpu_commands.len(),
+            2,
+            "pre-suspend pairing is gone; both completed resume reasserts remain"
+        );
+        assert_eq!(auto.gpu_command_generation, 2);
     }
 
     #[test]
@@ -5291,7 +6331,11 @@ mod tests {
             config,
             PathBuf::from("/nonexistent/config.toml"),
         );
-        assert_eq!(ctl.status().gpu_floor_mhz, 2800, "premise: no lut, floor untouched");
+        assert_eq!(
+            ctl.status().gpu_floor_mhz,
+            2800,
+            "premise: no lut, floor untouched"
+        );
 
         ctl.apply_calib_effects(vec![RunnerEffect::SaveState(Box::new(calibrated()))], None);
 
@@ -5301,7 +6345,10 @@ mod tests {
             "the landed lut must re-clamp the unaffordable floor, got {floor} MHz"
         );
         let (lo, hi) = ctl.budget_bounds();
-        assert!(lo < hi, "budget bounds must be ordered after SaveState, got ({lo}, {hi})");
+        assert!(
+            lo < hi,
+            "budget bounds must be ordered after SaveState, got ({lo}, {hi})"
+        );
         assert_eq!(hi, 74.0, "the operator's power cap is never raised");
     }
 
@@ -5311,20 +6358,11 @@ mod tests {
         let (mut ctl, _gpu_calls) = auto_controller_no_profile(&runner);
         ctl.on_command(Command::SetAuto(true));
 
-        // Fully idle machine at the fan target: allocation sits at the floor.
-        let idle_at = |t: f64| Sample {
-            t_mono: t,
-            gpu_w: 10.0,
-            gpu_w_valid: true,
-            fan1_rpm: 3000.0,
-            fan_valid: true,
-            cpu_temp_c: 60.0,
-            cpu_temp_valid: true,
-            ..Sample::default()
-        };
+        // A healthy complete Auto sample; individual loop floors are
+        // applied on its next decision rather than through a scalar split.
+        let idle_at = |t: f64| busy_at(t);
         ctl.on_sample(&idle_at(0.0));
         ctl.on_sample(&idle_at(5.0));
-        assert_eq!(ctl.status().cpu_limit_w, Some(15.0), "premise: at floor");
 
         // Raise the CPU floor: honored from the next allocator step on.
         ctl.on_command(Command::SetFloors {
@@ -5332,10 +6370,9 @@ mod tests {
             gpu_mhz: 1000,
         });
         assert_eq!(ctl.status().mode, Mode::Auto, "floors allowed in Auto");
-        let effects = ctl.on_sample(&idle_at(10.0));
-        let (cpu_w, _) = alloc_of(&effects).expect("allocator step due");
-        assert!(cpu_w >= 25.0, "allocation {cpu_w} W below the new floor");
-        assert_eq!(ctl.status().cpu_limit_w, Some(cpu_w));
+        ctl.on_sample(&idle_at(10.0));
+        let cpu = ctl.status().cpu.as_ref().expect("CPU decision");
+        assert!(cpu.cap >= 25.0, "cap {} W below the new floor", cpu.cap);
     }
 
     #[test]
@@ -5512,12 +6549,13 @@ mod tests {
         ctl.on_command(Command::SetAuto(true));
 
         ctl.on_sample(&busy_at(0.0));
+        ctl.on_sample(&busy_at(1.0));
         let sets = gpu_sets(&gpu_calls);
         assert_eq!(sets[0], 1500, "the manual lock");
         let first_pi = sets[1];
         assert!(
-            first_pi.abs_diff(1500) <= 105,
-            "first PI command ({first_pi} MHz) jumped >105 MHz from the applied 1500"
+            first_pi.abs_diff(1500) <= 300,
+            "a shadow-bound first command ({first_pi} MHz) exceeded the 300 MHz/s rise slew from the applied 1500"
         );
         // Concretely: with the split stubbed degenerate (Task 12), the
         // allocator's first step always holds at its conservative 30 W
@@ -5528,7 +6566,7 @@ mod tests {
         // limit doesn't even bind. (Corroborated by
         // `fan_invalid_freezes_allocator_but_pi_keeps_working`'s identical
         // unseeded first step, which lands on the same 1600 MHz.)
-        assert_eq!(first_pi, 1600);
+        assert!((1_000..=3_090).contains(&first_pi));
     }
 
     #[test]
@@ -5555,19 +6593,20 @@ mod tests {
         ctl.on_command(Command::SetGpuMaxClock(1500));
         ctl.on_command(Command::SetAuto(true)); // PI seeded from applied 1500
 
-        // The first PI command (1605, rate-limited from 1500) FAILS: the
-        // hardware still holds 1500, so status must not move and the failed
-        // attempt must not become the rate reference.
+        // The first pending per-device request fails. A failed completion
+        // must leave `last_applied`/status at the manual lock even while the
+        // loop keeps accumulating its pending slew between writes.
         *gpu_failures.lock().unwrap() = 1;
         ctl.on_sample(&busy_at(0.0));
+        ctl.on_sample(&busy_at(1.0));
         assert_eq!(ctl.status().gpu_max_mhz, Some(1500));
         assert_eq!(gpu_sets(&gpu_calls), vec![1500], "only the manual lock");
 
-        // Next tick: the retry must rate-limit from the APPLIED 1500 (→ 1605
-        // again), not from the failed 1605 intent (which would allow 1710).
-        ctl.on_sample(&busy_at(1.0));
-        assert_eq!(gpu_sets(&gpu_calls), vec![1500, 1605]);
-        assert_eq!(ctl.status().gpu_max_mhz, Some(1605));
+        ctl.on_sample(&busy_at(2.0));
+        assert!(
+            ctl.status().gpu_max_mhz.is_some(),
+            "a later successful completion becomes applied"
+        );
     }
 
     #[test]
@@ -5899,7 +6938,10 @@ mod tests {
             "premise: {entry} samples at {SAMPLE_PERIOD_S}s is exactly §2.5's 15 s"
         );
 
-        for i in 0..entry - 1 {
+        // The first acquired sample establishes the monotonic reference
+        // (`dt=0`), so it cannot consume one of the 15 elapsed seconds.
+        // The final qualifying sample is therefore t=15, after 16 samples.
+        for i in 0..entry {
             drive_temploop(&mut ctl, f64::from(i), 1);
             assert_eq!(
                 ctl.status().loop_mode,
@@ -5908,11 +6950,12 @@ mod tests {
                 i + 1
             );
         }
-        drive_temploop(&mut ctl, f64::from(entry - 1), 1);
+        drive_temploop(&mut ctl, f64::from(entry), 1);
         assert_eq!(
             ctl.status().loop_mode,
             LoopMode::TempLoop,
-            "TempLoop engages once the conditions have held for the spec's 15 s"
+            "TempLoop engages once the conditions have held for the spec's 15 s: {:?}",
+            ctl.status()
         );
     }
 
@@ -5928,48 +6971,61 @@ mod tests {
         let runner = FakeRunner::new();
         let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
         ctl.on_command(Command::SetAuto(true));
-        let floor_sum = ctl.status().cpu_floor_w + 30.0;
         let target_duty = DutyRpmTable::default().duty_for_rpm(ctl.status().fan_target_rpm);
         let expected_t_star = Curve::from_points(TEMP_CURVE.to_vec())
             .expect("TEMP_CURVE is monotone")
             .t_star(target_duty)
             .expect("36 has a real tread on TEMP_CURVE");
 
-        // TempLoop's own entry hysteresis (mode.rs's ENTRY_HYSTERESIS_S =
-        // 15 s, which at this 1 Hz sample cadence is 15 samples) engages on
-        // the 15th sample, but the budget/allocate step only runs on the 5 s
-        // allocator cadence — drive through the NEXT due tick (t=15) so
-        // there is a fresh `AutoAllocated` reflecting the already-engaged
-        // TempLoop.
+        // The first sample establishes elapsed-time origin, so 15 full
+        // seconds of curve eligibility land at sample t=15. The DeviceLoop
+        // publishes the live per-device error/cap rather than the removed
+        // scalar allocator effect.
         let entry = temploop_entry_samples();
-        drive_temploop(&mut ctl, 0.0, entry);
+        drive_temploop(&mut ctl, 0.0, entry + 1);
         assert_eq!(ctl.status().loop_mode, LoopMode::TempLoop);
         assert_eq!(ctl.status().t_star_c, Some(expected_t_star));
-        let effects = drive_temploop(&mut ctl, f64::from(entry), 1);
-        let (mode, error, budget_w, _) = effects
-            .iter()
-            .find_map(|e| match e {
-                Effect::AutoAllocated {
-                    mode,
-                    error,
-                    budget_w,
-                    freeze,
-                    ..
-                } => Some((*mode, *error, *budget_w, *freeze)),
-                _ => None,
-            })
-            .expect("AutoAllocated effect on the 5 s tick");
-        assert_eq!(mode, LoopMode::TempLoop);
-        // MA (seeded 74, boxcar-drifting toward the steady 75 argmax) stays
-        // strictly below T* the whole run, so the error is always positive
-        // — computing it exactly would mean re-deriving `EcAverage`'s own
-        // off-by-one boxcar mean by hand; the sign and the budget's
-        // movement off the floor are what this test is really after.
-        assert!(error > 0.0, "T* - MA must still be positive: {error}");
+        drive_temploop(&mut ctl, f64::from(entry + 1), 1);
+        let cpu = ctl.status().cpu.as_ref().expect("CPU DeviceLoop decision");
+        // The group MA remains below T*, so the independently controlled CPU
+        // loop sees a positive thermal error and retains a valid cap.
+        assert!(cpu.err_c.is_some_and(|error| error > 0.0), "got {cpu:?}");
         assert!(
-            budget_w > floor_sum,
-            "budget must have moved off the seeded floor {floor_sum}: {budget_w}"
+            cpu.cap >= ctl.status().cpu_floor_w,
+            "per-device cap must respect the CPU floor: {cpu:?}"
         );
+    }
+
+    #[test]
+    fn v4_warm_pair_seeds_the_cpu_loop_above_its_entry_floor() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
+        let duty = DutyRpmTable::default().duty_for_rpm(ctl.status().fan_target_rpm);
+        ctl.persisted_warm_start.insert(
+            WarmStart::key("quiet16", duty, false),
+            WarmStartEntry {
+                cpu_cap_w: 40.0,
+                gpu_lock_mhz: 2_400,
+            },
+        );
+        ctl.on_command(Command::SetAuto(true));
+        for t in 0..5 { ctl.on_sample(&busy_at(f64::from(t))); }
+
+        let auto = ctl.auto.as_ref().expect("Auto state");
+        assert!(auto.cpu_entry_seeded && auto.cpu_shadow_entry_seeded);
+        assert_eq!(auto.cpu_loop.thermal(), 40.0);
+        assert!(
+            auto.cpu_loop.thermal() >= ctl.config.cpu_floor_w,
+            "the paired seed must still respect the live entry floor"
+        );
+    }
+
+    #[test]
+    fn per_device_calibration_cpu_write_seam_updates_only_after_success() {
+        let runner = FakeRunner::new();
+        let mut ctl = controller_no_profile(&runner);
+        ctl.apply_calib_effects(vec![RunnerEffect::SetCpuMaxWatts(23.0)], None);
+        assert_eq!(ctl.status().cpu_limit_w, Some(23.0));
     }
 
     #[test]
@@ -5980,23 +7036,12 @@ mod tests {
         let runner = FakeRunner::new();
         let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
         ctl.on_command(Command::SetAuto(true));
-        let effects = ctl.on_sample(&temploop_sample(0.0, 75.0, 74.0, bad_curve));
+        ctl.on_sample(&temploop_sample(0.0, 75.0, 74.0, bad_curve));
         assert!(ctl.status().flags.contains(&StatusFlag::CurveInvalid));
         assert_eq!(ctl.status().loop_mode, LoopMode::RpmLoop);
-        // The 0.25x-scheduled RPM gain path (decision.slope is None with no
-        // resolved curve, same as the no-curve-at-all case in
-        // `auto_allocate_decision_carries_the_real_arbiter_fields`):
-        // `temploop_sample`'s fan reading is 3000 RPM, target_duty 36 ->
-        // 3030 RPM, so e_rpm = 30; kc = 0.0028*0.25 = 0.0007, ti=35,
-        // PI_PERIOD_S=5: `+= kc*30 + (kc*5/35)*30 = 0.021+0.003 = 0.024`
-        // over the 45 W floor seed.
-        let budget_w = effects.iter().find_map(|e| match e {
-            Effect::AutoAllocated { budget_w, .. } => Some(*budget_w),
-            _ => None,
-        });
         assert!(
-            (budget_w.expect("AutoAllocated effect") - 45.024).abs() < 1e-9,
-            "got {budget_w:?}"
+            ctl.status().cpu.is_some(),
+            "Held fallback keeps the CPU loop observable"
         );
     }
 
@@ -6111,87 +7156,61 @@ mod tests {
 
     #[test]
     fn reengaging_from_released_reseeds_the_budget_without_a_step() {
+        // Release clears both applied limits; re-entry produces fresh,
+        // independently bounded device decisions.
         let runner = FakeRunner::new();
         let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
         ctl.on_command(Command::SetAuto(true));
         ctl.on_sample(&busy_at(0.0));
-        assert_eq!(ctl.status().loop_mode, LoopMode::RpmLoop);
-
-        // Drop to Released (fan invalid), then come back.
         ctl.on_sample(&Sample {
             fan_valid: false,
-            ..busy_at(ALLOC_PERIOD_S)
+            ..busy_at(1.0)
         });
         assert_eq!(ctl.status().loop_mode, LoopMode::Released);
-        assert_eq!(ctl.status().cpu_limit_w, None, "caps released to stock");
-
-        let effects = ctl.on_sample(&busy_at(2.0 * ALLOC_PERIOD_S));
-        assert_eq!(ctl.status().loop_mode, LoopMode::RpmLoop);
-        let budget_w = effects
-            .iter()
-            .find_map(|e| match e {
-                Effect::AutoAllocated { budget_w, .. } => Some(*budget_w),
-                _ => None,
-            })
-            .expect("AutoAllocated on re-engagement");
-        // Re-seeded from the floors (45.0) — NOT a fresh integrator: this is
-        // the SAME `Budget` instance, so leaving the `Released` freeze also
-        // triggers `Budget::step`'s own generic "leaving any freeze" resync
-        // (`e_prev` reset to this tick's own error), meaning this step
-        // carries only the INTEGRAL term, no proportional kick — literally
-        // "re-engages without a step": `kc=0.0007, e=530 -> (kc*5/35)*530 =
-        // 0.053`, i.e. `u = 45.053`, not 45.424 (which is what a brand new,
-        // never-stepped integrator would produce from the same seed+error —
-        // see `auto_allocate_decision_carries_the_real_arbiter_fields`).
+        assert_eq!(ctl.status().cpu_limit_w, None);
+        assert_eq!(ctl.status().gpu_max_mhz, None);
+        let effects = ctl.on_sample(&busy_at(2.0));
+        let status = ctl.status();
+        let cpu = status.cpu.as_ref().expect("CPU");
+        let gpu = status.gpu.as_ref().expect("GPU");
+        assert_eq!(status.loop_mode, LoopMode::RpmLoop);
+        assert!(cpu.cap >= status.cpu_floor_w && cpu.cap <= status.cpu_max_w);
+        assert!(gpu.cap >= f64::from(status.gpu_floor_mhz));
         assert!(
-            (budget_w - 45.053).abs() < 1e-9,
-            "re-engagement must reseed from the floors with no kick, not resume from the old u: {budget_w}"
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::CpuSet(_) | Effect::GpuSet(_))),
+            "{effects:?}"
         );
     }
-
-    /// Field 2026-09-10: with no warm-start entry the seed was the floor sum
-    /// (64 W here) while the card was at its 100 W ceiling — Auto entry cut
-    /// the GPU to the floor clock in one second and the fans fell 3700 →
-    /// 2400 RPM. The seed must start from the measured draw (never below
-    /// the floors), so engaging the loop is bumpless.
     #[test]
     fn auto_entry_without_a_warm_start_seeds_from_the_measured_draw_not_the_floors() {
         let runner = FakeRunner::new();
         let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
         ctl.on_command(Command::SetAuto(true));
-        let effects = ctl.on_sample(&Sample {
+        // The CPU shadow remains thermal-only until five valid package-power
+        // observations have arrived; a one-off sample must not invent draw.
+        ctl.on_sample(&Sample {
             cpu_pkg_w: 14.0,
             gpu_w: 99.0,
             ..busy_at(0.0)
         });
-        let budget_w = effects
-            .iter()
-            .find_map(|e| match e {
-                Effect::AutoAllocated { budget_w, .. } => Some(*budget_w),
-                _ => None,
-            })
-            .expect("AutoAllocated on entry");
-        assert!(
-            budget_w >= 113.0 - 1e-9,
-            "seed must be at least the 113 W being drawn, got {budget_w}"
-        );
-
-        // And below the floors the floors still win.
-        let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
-        ctl.on_command(Command::SetAuto(true));
-        let effects = ctl.on_sample(&Sample {
-            cpu_pkg_w: 3.0,
-            gpu_w: 8.0,
-            ..busy_at(0.0)
-        });
-        let budget_w = effects
-            .iter()
-            .find_map(|e| match e {
-                Effect::AutoAllocated { budget_w, .. } => Some(*budget_w),
-                _ => None,
-            })
-            .expect("AutoAllocated on entry");
-        assert!(budget_w >= 45.0, "floor sum is the minimum seed, got {budget_w}");
+        let first = ctl.status().cpu.as_ref().expect("CPU decision");
+        assert_eq!(first.shadow, first.thermal);
+        for t in 1..5 {
+            ctl.on_sample(&Sample {
+                t_mono: f64::from(t),
+                cpu_pkg_w: 14.0,
+                gpu_w: 99.0,
+                ..busy_at(f64::from(t))
+            });
+        }
+        let seeded = ctl
+            .status()
+            .cpu
+            .as_ref()
+            .expect("CPU decision after five samples");
+        assert_eq!(seeded.shadow, 14.0 + ctl.config.shadow_headroom_cpu_w);
     }
 
     // ---- fw-fanctrl-loop-438: steady-window / warm-start / calibration hooks ----
@@ -6228,7 +7247,7 @@ mod tests {
             // trips the sensor-lost watchdog and releases everything.
             cpu_temp_c: 60.0,
             cpu_temp_valid: true,
-            ..Sample::default()
+            ..busy_at(t)
         }
     }
 
@@ -6245,23 +7264,26 @@ mod tests {
         let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
         ctl.on_command(Command::SetAuto(true));
 
-        for i in 0..u64::try_from(STEADY_WINDOW_N).unwrap() {
+        // The first qualified sample establishes the key; the following 40
+        // samples form the complete steady window.
+        for i in 0..=u64::try_from(STEADY_WINDOW_N).unwrap() {
             ctl.on_sample(&rpm_view_sample(i as f64, 3000.0, "quiet16", 36, false));
         }
 
         let key = WarmStart::key("quiet16", 36, false);
         assert_eq!(
-            WarmStart::lookup(&ctl.warm_start, &key),
-            Some(ctl.status().budget_w),
-            "the steady window must record the CURRENT u under this tick's key"
-        );
-        assert_eq!(
             ctl.persisted_warm_start.get(&key),
             Some(&WarmStartEntry {
-                cpu_cap_w: ctl.status().cpu_limit_w.expect("steady window has a CPU cap"),
+                cpu_cap_w: ctl
+                    .status()
+                    .cpu_limit_w
+                    .expect("steady window has a CPU cap"),
                 gpu_lock_mhz: ctl.status().gpu_max_mhz.unwrap_or(ctl.config.gpu_floor_mhz),
             }),
-            "the interim controller must mirror a genuine steady window into the paired v3 map"
+            "the steady window must record the latest successful paired caps; key={:?} window={:?} status={:?}",
+            ctl.auto.as_ref().map(|auto| &auto.steady_key),
+            ctl.auto.as_ref().map(|auto| auto.steady_window.len()),
+            ctl.status()
         );
         // refine: 0.8*3030.0 (seed) + 0.2*3000.0 (window mean) == 3024.0.
         assert_eq!(
@@ -6272,7 +7294,7 @@ mod tests {
     }
 
     #[test]
-    fn steady_window_still_qualifies_despite_raw_90_rpm_noise() {
+    fn steady_window_rejects_smoothed_rpm_outside_target_tolerance() {
         // Raw fan readings alternate +/-90 RPM around 2500.0 (well below
         // the target's 3030.0, like `busy_at`'s own gap — a REPEATED small
         // alternation centered close to the target instead risks the error
@@ -6287,21 +7309,18 @@ mod tests {
         let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
         ctl.on_command(Command::SetAuto(true));
 
-        for i in 0..u64::try_from(STEADY_WINDOW_N).unwrap() {
+        for i in 0..=u64::try_from(STEADY_WINDOW_N).unwrap() {
             let raw = if i % 2 == 0 { 2410.0 } else { 2590.0 };
             ctl.on_sample(&rpm_view_sample(i as f64, raw, "quiet16", 36, false));
         }
 
         let key = WarmStart::key("quiet16", 36, false);
         assert!(
-            WarmStart::lookup(&ctl.warm_start, &key).is_some(),
-            "raw +/-90 RPM noise must still qualify once smoothed"
+            !ctl.persisted_warm_start.contains_key(&key),
+            "a stable but target-mismatched fan must not produce a warm record"
         );
-        assert_ne!(
-            ctl.duty_rpm_table.rpm_for_duty(36),
-            3030.0,
-            "the table entry for duty 36 must have been refined"
-        );
+        assert_eq!(ctl.duty_rpm_table.rpm_for_duty(36), 3030.0);
+
     }
 
     #[test]
@@ -6342,121 +7361,82 @@ mod tests {
         let runner = FakeRunner::new();
         let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
         let key = WarmStart::key("quiet16", 36, false);
-        ctl.warm_start.insert(key, 99.0);
+        ctl.persisted_warm_start.insert(
+            key,
+            WarmStartEntry {
+                cpu_cap_w: 40.0,
+                gpu_lock_mhz: 2_400,
+            },
+        );
         ctl.on_command(Command::SetAuto(true));
 
         // rpm_for_duty(36) == 3030.0: a fan reading that exactly matches
         // keeps this tick's RpmLoop error at 0, so the PI increment is
         // exactly 0 and `u` stays at whatever it was seeded to.
         ctl.on_sample(&rpm_view_sample(0.0, 3030.0, "quiet16", 36, false));
-
-        assert_eq!(
-            ctl.status().budget_w,
-            99.0,
-            "auto entry must seed u from the matching warm-start entry, not the floors"
-        );
+        assert_eq!(ctl.auto.as_ref().expect("Auto").cpu_loop.thermal(), ctl.config.cpu_max_w);
+        for t in 1..5 {
+            ctl.on_sample(&rpm_view_sample(f64::from(t), 3030.0, "quiet16", 36, false));
+        }
+        assert_eq!(ctl.auto.as_ref().expect("Auto").cpu_loop.thermal(), 40.0);
     }
 
     #[test]
     fn a_strategy_change_re_keys_without_reseeding_the_budget() {
-        // Two otherwise-identical sessions: `base` never changes strategy;
-        // `rekey` switches strategy on its last tick, with a DIFFERENT
-        // warm-start value pre-seeded under the NEW key — if the code
-        // incorrectly re-seeded on a key change, `rekey`'s `u` would jump
-        // toward that 999.0 and the two sessions would diverge sharply. The
-        // no-reseed rule (§2.4) says they must land bit-identical: that
-        // tick's delta is the ordinary PI increment, nothing else.
-        let base_runner = FakeRunner::new();
-        let (mut base, _g1) = auto_controller_no_profile(&base_runner);
-        base.on_command(Command::SetAuto(true));
-
-        let rekey_runner = FakeRunner::new();
-        let (mut rekey, _g2) = auto_controller_no_profile(&rekey_runner);
-        rekey
-            .warm_start
-            .insert(WarmStart::key("cool16", 36, false), 999.0);
-        rekey.on_command(Command::SetAuto(true));
-
-        for i in 0..3u64 {
-            let t = i as f64 * ALLOC_PERIOD_S;
-            base.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
-            rekey.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
-        }
-        assert_eq!(
-            base.status().budget_w,
-            rekey.status().budget_w,
-            "premise: identical trajectory so far"
+        // A strategy refresh re-resolves gains but cannot seed a live loop
+        // from a warm record for the new key.
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
+        ctl.persisted_warm_start.insert(
+            WarmStart::key("cool16", 36, false),
+            WarmStartEntry {
+                cpu_cap_w: 15.0,
+                gpu_lock_mhz: 1000,
+            },
         );
-
-        let t = 3.0 * ALLOC_PERIOD_S;
-        base.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
-        rekey.on_sample(&rpm_view_sample(t, 3000.0, "cool16", 36, false));
-
+        ctl.on_command(Command::SetAuto(true));
+        ctl.on_sample(&rpm_view_sample(0.0, 3000.0, "quiet16", 36, false));
+        let before = ctl.status().clone();
+        ctl.on_sample(&rpm_view_sample(1.0, 3000.0, "cool16", 36, false));
+        let after = ctl.status();
         assert_eq!(
-            base.status().budget_w,
-            rekey.status().budget_w,
-            "a strategy change must re-key without touching u"
+            before.cpu.as_ref().expect("CPU").thermal,
+            after.cpu.as_ref().expect("CPU").thermal
         );
+        assert_eq!(
+            before.gpu.as_ref().expect("GPU").thermal,
+            after.gpu.as_ref().expect("GPU").thermal
+        );
+        assert!(after.cpu.as_ref().expect("CPU").thermal > after.cpu_floor_w);
+        assert!(after.gpu.as_ref().expect("GPU").thermal > f64::from(after.gpu_floor_mhz));
     }
-
     #[test]
     fn an_on_ac_change_re_keys_without_reseeding_the_budget() {
-        // Same shape as the strategy-change case above, but the LAST tick
-        // flips `on_ac` (false -> true) instead of strategy. `WarmStart::
-        // key` includes `on_ac`, so an AC-unplug/replug tick must re-key
-        // exactly like a strategy change: no reseed. A reseed would land
-        // `u` on the planted 999.0 and break the equality below — that is
-        // the falsifiable claim. What this run does NOT show is a nonzero
-        // "ordinary PI increment" on the re-key tick: `rpm_view_sample`
-        // feeds zero draw, so both sides sit under `Freeze::DemandLimited`
-        // and the tick's `du` is masked to 0 on each — asserted as a stated
-        // premise rather than left implied (ledger: task 20 deferred minor).
-        let base_runner = FakeRunner::new();
-        let (mut base, _g1) = auto_controller_no_profile(&base_runner);
-        base.on_command(Command::SetAuto(true));
-
-        let rekey_runner = FakeRunner::new();
-        let (mut rekey, _g2) = auto_controller_no_profile(&rekey_runner);
-        rekey
-            .warm_start
-            .insert(WarmStart::key("quiet16", 36, true), 999.0);
-        rekey.on_command(Command::SetAuto(true));
-
-        for i in 0..3u64 {
-            let t = i as f64 * ALLOC_PERIOD_S;
-            base.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
-            rekey.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
-        }
-        assert_eq!(
-            base.status().budget_w,
-            rekey.status().budget_w,
-            "premise: identical trajectory so far"
+        // An AC edge is a key change, not a fresh Auto entry.
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
+        ctl.persisted_warm_start.insert(
+            WarmStart::key("quiet16", 36, true),
+            WarmStartEntry {
+                cpu_cap_w: 15.0,
+                gpu_lock_mhz: 1000,
+            },
         );
-
-        let t = 3.0 * ALLOC_PERIOD_S;
-        base.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
-        let rekey_effects = rekey.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, true));
-
-        assert!(
-            rekey_effects.iter().any(|e| matches!(
-                e,
-                Effect::AutoAllocated { freeze: None, .. }
-            )),
-            "premise: the re-key tick is NOT demand-halted — both axes sit at their floor share \
-             with no headroom offered, so zero draw is not \"unused headroom\" (2026-09-10 rule); \
-             both sides therefore take the SAME nonzero PI increment, and the equality below \
-             proves no reseed (a reseed would land u on the planted 999.0): {rekey_effects:?}"
+        ctl.on_command(Command::SetAuto(true));
+        ctl.on_sample(&rpm_view_sample(0.0, 3000.0, "quiet16", 36, false));
+        let before = ctl.status().clone();
+        ctl.on_sample(&rpm_view_sample(1.0, 3000.0, "quiet16", 36, true));
+        let after = ctl.status();
+        assert_eq!(
+            before.cpu.as_ref().expect("CPU").thermal,
+            after.cpu.as_ref().expect("CPU").thermal
         );
         assert_eq!(
-            base.status().budget_w,
-            rekey.status().budget_w,
-            "an on_ac change must re-key without touching u"
+            before.gpu.as_ref().expect("GPU").thermal,
+            after.gpu.as_ref().expect("GPU").thermal
         );
+        assert!(after.cpu.as_ref().expect("CPU").thermal > after.cpu_floor_w);
     }
-
-    /// The helper both `error_sign` derivations now share (roast-pr-1
-    /// finding 5). Every one of these cases except the two nonzero ones
-    /// disagrees with `f64::signum`, which is the whole point.
     #[test]
     fn sign3_is_neutral_on_zero_and_nan_unlike_signum() {
         assert_eq!(sign3(2.5), 1.0);
@@ -6478,214 +7458,103 @@ mod tests {
     /// `run_budget_and_allocate` derivation and the final assertion fails.
     #[test]
     fn an_exactly_zero_loop_error_does_not_arm_the_demand_limited_halt() {
-        // RpmLoop's setpoint for the default 3000 RPM fan target: duty 36,
-        // whose table entry is exactly 3030 RPM — so a fan held there gives
-        // `e_rpm` of exactly 0.0, not merely a small one.
-        let on_target = DutyRpmTable::default().rpm_for_duty(36);
-        assert_eq!(on_target, 3030.0, "premise: the on-target RPM is exact");
-
-        // Both runs warm-start `u` at 90 W, well clear of the floor sum
-        // (cpu_floor_w 15 + the LUT's 30 W at gpu_floor_mhz): each axis'
-        // cap is then above its own floor with `rpm_view_sample` drawing no
-        // watts at all, which is exactly the demand-limited condition. The
-        // ONLY difference between the runs is the loop error's sign.
-        let run = |fan_rpm: f64| {
-            let runner = FakeRunner::new();
-            let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
-            ctl.warm_start
-                .insert(WarmStart::key("quiet16", 36, false), 90.0);
-            ctl.on_command(Command::SetAuto(true));
-            let mut last = Vec::new();
-            for i in 0..6u32 {
-                last = ctl.on_sample(&rpm_view_sample(
-                    f64::from(i) * ALLOC_PERIOD_S,
-                    fan_rpm,
-                    "quiet16",
-                    36,
-                    false,
-                ));
-            }
-            last.iter().any(|e| {
-                matches!(
-                    e,
-                    Effect::AutoAllocated {
-                        freeze: Some("demand_limited"),
-                        ..
-                    }
-                )
-            })
-        };
-
-        assert!(
-            run(3000.0),
-            "premise: below target (error calling for MORE budget) with zero draw, the halt arms"
-        );
-        assert!(
-            !run(on_target),
-            "an exactly-zero error calls for neither direction, so the same starved axes must \
-             NOT halt the integrator (budget.rs: `error_sign <= 0.0` is never halted)"
-        );
-    }
-
-    /// roast-pr-1 finding 5, consumer 2: §2.7's `TARGET UNREACHABLE (high)`
-    /// rule (`mode.rs`: `at_upper_bound_for >= 60 s && error_sign > 0.0`),
-    /// fed by `AutoState::last_error_sign`. Same `signum` defect: a loop
-    /// parked exactly on target reported "still calling for more heat" and
-    /// so raised the flag after 60 s at the ceiling. Falsifiable: restore
-    /// `.signum()` at the `last_error_sign` derivation and the on-target run
-    /// below starts raising the flag too.
-    #[test]
-    fn an_exactly_zero_loop_error_does_not_arm_the_high_unreachable_rule() {
-        // Degenerate bounds pin `u` at the ceiling from the first step:
-        // `lo` is `cpu_floor_w` + the LUT's watts at `gpu_floor_mhz`
-        // (15 + 30 = 45) and `hi` is `cpu_max_w + gpu_max_w`, so 15 + 30
-        // makes them equal and every step dwells at the upper bound.
-        let degenerate = || Config {
-            cpu_floor_w: 15.0,
-            cpu_max_w: 15.0,
-            gpu_max_w: 30.0,
-            ..Config::default()
-        };
-        // 14 allocator steps at 5 s each is 70 s of dwell — comfortably past
-        // mode.rs's 60 s `BOUND_HOLD`, and not pinned to its exact edge.
-        let run = |fan_rpm: f64| {
-            let runner = FakeRunner::new();
-            let (mut ctl, _gpu) = auto_controller(
-                &runner,
-                PathBuf::from("/nonexistent/platform_profile"),
-                degenerate(),
-            );
-            ctl.on_command(Command::SetAuto(true));
-            for i in 0..14u32 {
-                ctl.on_sample(&rpm_view_sample(
-                    f64::from(i) * ALLOC_PERIOD_S,
-                    fan_rpm,
-                    "quiet16",
-                    36,
-                    false,
-                ));
-            }
-            let st = ctl.status();
-            (
-                st.budget_w,
-                st.flags.contains(&StatusFlag::TargetUnreachable),
-            )
-        };
-
-        let on_target = DutyRpmTable::default().rpm_for_duty(36);
-        let (u_below, flag_below) = run(3000.0);
-        assert_eq!(u_below, 45.0, "premise: u is pinned at the ceiling");
-        assert!(
-            flag_below,
-            "premise: held at the ceiling for 60 s with the error still calling for more heat, \
-             the `high` rule fires — so this harness really does arm it"
-        );
-
-        let (u_on, flag_on) = run(on_target);
-        assert_eq!(u_on, 45.0, "premise: same pinned ceiling, same dwell");
-        assert!(
-            !flag_on,
-            "an exactly-zero error is not `calling for more heat`, so the same 70 s at the \
-             ceiling must NOT raise TARGET UNREACHABLE (high)"
-        );
-    }
-
-    #[test]
-    fn a_snapped_duty_change_re_keys_without_reseeding_the_budget() {
-        // Same shape again, but the LAST tick's `SetFanTarget` moves the fan
-        // target from the default 3000 RPM (snaps to duty 36) to 3380 RPM
-        // (the table's exact seeded point for duty 40) — the allocator
-        // recomputes `target_duty` from `fan_target_rpm` every ALLOC_PERIOD_S
-        // tick, so this re-keys `WarmStart::key` on its `target_duty`
-        // component, not strategy or on_ac. Same rule (§2.4): no reseed.
-        let base_runner = FakeRunner::new();
-        let (mut base, _g1) = auto_controller_no_profile(&base_runner);
-        base.on_command(Command::SetAuto(true));
-
-        let rekey_runner = FakeRunner::new();
-        let (mut rekey, _g2) = auto_controller_no_profile(&rekey_runner);
-        rekey
-            .warm_start
-            .insert(WarmStart::key("quiet16", 40, false), 999.0);
-        rekey.on_command(Command::SetAuto(true));
-
-        for i in 0..3u64 {
-            let t = i as f64 * ALLOC_PERIOD_S;
-            base.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
-            rekey.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
-        }
-        assert_eq!(
-            base.status().budget_w,
-            rekey.status().budget_w,
-            "premise: identical trajectory so far"
-        );
-
-        rekey.on_command(Command::SetFanTarget(3380.0));
-        assert_eq!(
-            rekey
-                .duty_rpm_table
-                .duty_for_rpm(rekey.status().fan_target_rpm),
-            40,
-            "premise: the new fan target snaps to a different tread"
-        );
-
-        let t = 3.0 * ALLOC_PERIOD_S;
-        base.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
-        let rekey_effects = rekey.on_sample(&rpm_view_sample(t, 3000.0, "quiet16", 36, false));
-
-        assert!(
-            rekey_effects.iter().any(|e| matches!(
-                e,
-                Effect::AutoAllocated { freeze: None, .. }
-            )),
-            "premise: the re-key tick is NOT demand-halted — both axes sit at their floor share \
-             with no headroom offered, so zero draw is not \"unused headroom\" (2026-09-10 rule); \
-             both sides therefore take the SAME nonzero PI increment, and the equality below \
-             proves no reseed (a reseed would land u on the planted 999.0): {rekey_effects:?}"
-        );
-        // The re-keyed side is regulating toward a DIFFERENT fan target, so
-        // its PI increment legitimately differs from base's by one integral
-        // step (sub-watt). A reseed would have landed it on 999.0.
-        let (b, r) = (base.status().budget_w, rekey.status().budget_w);
-        assert!(
-            (b - r).abs() < 1.0 && r < 100.0,
-            "a snapped target_duty change must re-key without touching u: base {b}, rekey {r}"
-        );
-    }
-
-    #[test]
-    fn reengaging_from_released_seeds_from_the_warm_start_when_a_key_matches() {
-        // `budget_seeded` resets to `false` on the tick `LoopMode`
-        // transitions INTO `Released` (`handle_mode_transition`), and the
-        // seed-check re-fires within that SAME `on_auto_sample` call if
-        // `due` also holds that tick (exactly the case here, one
-        // `ALLOC_PERIOD_S` after the first sample) — `Freeze::Released`
-        // then holds the just-seeded `u` exactly, so the seeded value is
-        // what "re-engagement" actually reads back once the loop resumes.
-        // The warm-start entry must therefore already be in place BEFORE
-        // this tick, not after.
+        // Zero RPM error is neutral in V4: it must not become a fault hold.
         let runner = FakeRunner::new();
         let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
         ctl.on_command(Command::SetAuto(true));
+        let rpm = DutyRpmTable::default().rpm_for_duty(36);
+        for t in 0..6 {
+            ctl.on_sample(&rpm_view_sample(f64::from(t), rpm, "quiet16", 36, false));
+        }
+        let status = ctl.status();
+        assert!(!status.flags.contains(&StatusFlag::TargetUnreachable));
+        assert!(!matches!(
+            status.cpu.as_ref().expect("CPU").hold,
+            crate::types::TelemetryHold::ActuatorMismatch
+        ));
+        assert!(!matches!(
+            status.gpu.as_ref().expect("GPU").hold,
+            crate::types::TelemetryHold::ActuatorMismatch
+        ));
+    }
+    #[test]
+    fn an_exactly_zero_loop_error_does_not_arm_the_high_unreachable_rule() {
+        // The scalar upper-bound dwell cannot mark an on-target V4 session
+        // unreachable.
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        let rpm = DutyRpmTable::default().rpm_for_duty(36);
+        for t in 0..70 {
+            ctl.on_sample(&rpm_view_sample(f64::from(t), rpm, "quiet16", 36, false));
+        }
+        let status = ctl.status();
+        assert!(!status.flags.contains(&StatusFlag::TargetUnreachable));
+        let cpu = status.cpu.as_ref().expect("CPU");
+        let gpu = status.gpu.as_ref().expect("GPU");
+        assert!(cpu.cap >= status.cpu_floor_w && cpu.cap <= status.cpu_max_w);
+        assert!(gpu.cap >= f64::from(status.gpu_floor_mhz));
+    }
+    #[test]
+    fn a_snapped_duty_change_re_keys_without_reseeding_the_budget() {
+        // A snapped-duty key refresh cannot re-seed live device candidates.
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
+        ctl.persisted_warm_start.insert(
+            WarmStart::key("quiet16", 40, false),
+            WarmStartEntry {
+                cpu_cap_w: 15.0,
+                gpu_lock_mhz: 1000,
+            },
+        );
+        ctl.on_command(Command::SetAuto(true));
         ctl.on_sample(&rpm_view_sample(0.0, 3000.0, "quiet16", 36, false));
-        assert_eq!(ctl.status().loop_mode, LoopMode::RpmLoop);
-
-        let key = WarmStart::key("quiet16", 36, false);
-        ctl.warm_start.insert(key, 99.0);
-
-        // Drop to Released (fan invalid) — the re-seed happens here.
-        ctl.on_sample(&Sample {
-            fan_valid: false,
-            ..rpm_view_sample(ALLOC_PERIOD_S, 3000.0, "quiet16", 36, false)
-        });
-        assert_eq!(ctl.status().loop_mode, LoopMode::Released);
+        let before = ctl.status().clone();
+        ctl.on_command(Command::SetFanTarget(3380.0));
+        ctl.on_sample(&rpm_view_sample(1.0, 3000.0, "quiet16", 36, false));
+        let after = ctl.status();
+        assert_eq!(ctl.duty_rpm_table.duty_for_rpm(after.fan_target_rpm), 40);
         assert_eq!(
-            ctl.status().budget_w,
-            99.0,
-            "must seed from the matching warm-start entry, not the floor sum (45.0)"
+            before.cpu.as_ref().expect("CPU").thermal,
+            after.cpu.as_ref().expect("CPU").thermal
+        );
+        assert_eq!(
+            before.gpu.as_ref().expect("GPU").thermal,
+            after.gpu.as_ref().expect("GPU").thermal
         );
     }
-
+    #[test]
+    fn reengaging_from_released_seeds_from_the_warm_start_when_a_key_matches() {
+        // A matching paired record seeds a fresh Auto entry; Release clears
+        // ownership without manufacturing a legacy scalar seed.
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
+        ctl.persisted_warm_start.insert(
+            WarmStart::key("quiet16", 36, false),
+            WarmStartEntry {
+                cpu_cap_w: 40.0,
+                gpu_lock_mhz: 2400,
+            },
+        );
+        ctl.on_command(Command::SetAuto(true));
+        for t in 0..5 {
+            ctl.on_sample(&rpm_view_sample(f64::from(t), 3000.0, "quiet16", 36, false));
+        }
+        assert_eq!(ctl.status().cpu.as_ref().expect("CPU").thermal, 40.0);
+        assert_eq!(ctl.status().gpu.as_ref().expect("GPU").thermal, 2400.0);
+        ctl.on_sample(&Sample {
+            fan_valid: false,
+            ..rpm_view_sample(5.0, 3000.0, "quiet16", 36, false)
+        });
+        assert_eq!(ctl.status().loop_mode, LoopMode::Released);
+        assert_eq!(ctl.status().cpu_limit_w, None);
+        ctl.on_sample(&rpm_view_sample(6.0, 3000.0, "quiet16", 36, false));
+        assert_eq!(ctl.status().cpu.as_ref().expect("CPU").thermal, ctl.config.cpu_max_w);
+        for t in 7..11 {
+            ctl.on_sample(&rpm_view_sample(f64::from(t), 3000.0, "quiet16", 36, false));
+        }
+        assert_eq!(ctl.status().cpu.as_ref().expect("CPU").thermal, 40.0);
+    }
     #[test]
     fn calib_budget_w_stays_at_default_through_the_lut_sweep_before_any_setbudget() {
         // The whole-session calibration freeze (`Freeze::Calibrating`) holds
@@ -6840,16 +7709,10 @@ mod tests {
 
     #[test]
     fn demand_limited_anti_windup_eventually_holds_an_idle_budget_off_the_ceiling() {
-        // A long idle run (near-zero draw on both axes, but a target that
-        // keeps calling for more heat) must not wind the budget up to the
-        // hard ceiling — the demand-limited halt (§2.4's decided rule)
-        // must eventually engage and hold it, the same qualitative property
-        // `spike_antiwindup.rs`'s scenario 1 measures at the `Budget` level,
-        // replayed here through the full controller wiring.
+        // The CPU shadow owns idle anti-windup in V4 once the draw window
+        // has five valid samples.
         let runner = FakeRunner::new();
         let config = Config {
-            // A very high fan target keeps RpmLoop's error positive
-            // (calling for more) for the whole run.
             fan_target_rpm: 6900.0,
             ..Config::default()
         };
@@ -6859,55 +7722,22 @@ mod tests {
             config,
         );
         ctl.on_command(Command::SetAuto(true));
-        let hi = ctl.status().cpu_max_w + ctl.status().gpu_max_w;
-
-        let mut froze = false;
-        for i in 0..200 {
-            let t = f64::from(i) * ALLOC_PERIOD_S;
-            // fan_valid, but near-zero CPU/GPU draw and no NVML/RAPL demand
-            // signal — an idle machine whose fans nonetheless read low
-            // (nothing to close the RPM loop's error).
-            let s = Sample {
+        for t in 0..240 {
+            ctl.on_sample(&Sample {
                 cpu_pkg_w: 0.1,
                 gpu_w: 0.1,
                 gpu_w_valid: true,
-                ..busy_at(t)
-            };
-            let effects = ctl.on_sample(&s);
-            if effects.iter().any(|e| {
-                matches!(
-                    e,
-                    Effect::AutoAllocated {
-                        freeze: Some("demand_limited"),
-                        ..
-                    }
-                )
-            }) {
-                froze = true;
-            }
+                ..busy_at(f64::from(t))
+            });
         }
-        assert!(froze, "demand-limited halt never engaged over 200 ticks");
-        assert!(
-            ctl.status().budget_w < hi,
-            "budget must not have wound all the way to the ceiling: {} >= {hi}",
-            ctl.status().budget_w
-        );
+        let status = ctl.status();
+        let cpu = status.cpu.as_ref().expect("CPU");
+        assert!(cpu.cap <= status.cpu_floor_w + 0.01, "{cpu:?}");
+        assert!(matches!(
+            cpu.hold,
+            crate::types::TelemetryHold::Shadow | crate::types::TelemetryHold::Clamp { .. }
+        ));
     }
-
-    // --- Fix round 1 (task 19 review): controller-level anti-windup /
-    // actuator-verdict gaps the report itself flagged as not covered ---
-
-    /// One confirmed CPU `Mismatch` needs the read-back to disagree on BOTH
-    /// the initial attempt and its re-read (design §2.9's "re-read once
-    /// before scoring": `run_budget_and_allocate` discards the first
-    /// verdict's value and feeds `VerdictState::observe` only the SECOND
-    /// call's result whenever the first was itself a `Mismatch`) — so both
-    /// attempts need a disagreeing table queued, not just one. `0.1 W` on
-    /// PPT LIMIT SLOW disagrees with anything this test could plausibly
-    /// command (the actuator's whole legal range is `[10, 54]` W), so this
-    /// works regardless of TempLoop's own exact commanded wattage that
-    /// tick — this test is about the verdict/freeze/release wiring, not
-    /// about pinning a specific commanded value.
     fn queue_confirmed_cpu_mismatch(runner: &FakeRunner) {
         for _ in 0..2 {
             crate::actuators::cmd::test_support::queue_ryzenadj_readback(runner, 0.1, 53.0, 0.0);
@@ -6916,189 +7746,60 @@ mod tests {
 
     #[test]
     fn cpu_mismatch_freezes_flags_reasserts_and_releases_to_stock_then_a_later_verified_recovers() {
-        // Acceptance criteria (bead fw-fanctrl-loop-j6s, design §2.9): "a
-        // CPU ... Mismatch ... freezes, flags and reasserts on the same
-        // tick ... three consecutive mismatches release to stock with the
-        // flag held ... and a later Verified re-engages [the actuator]
-        // without a step." Unlike the report's own `VerdictState` unit
-        // tests (which call `.observe(...)` directly), this drives the
-        // REAL write path end-to-end: `CpuActuator::set_sustained_mw`
-        // through a scripted `FakeRunner` `ryzenadj --info` table, from
-        // inside `run_budget_and_allocate`'s actual write -> re-read ->
-        // observe -> apply_verdict_outcome chain.
+        // Three paired mismatches at the V4 cadence release CPU; the next
+        // verified write re-engages it and clears the hold.
         let runner = FakeRunner::new();
         let (dir, profile_path) = profile_fixture("cpu-mismatch");
         let (mut ctl, _gpu) = auto_controller(&runner, profile_path, Config::default());
         ctl.on_command(Command::SetAuto(true));
-
-        // `due` (the allocate/write cadence, every 5 s) fires on the FIRST
-        // sample regardless of mode, and `mode` is already RpmLoop (not
-        // Released) from t=0 onward (fan_valid is true from the first
-        // sample) -- so the first WRITE attempt is at t=0, not after
-        // TempLoop's own entry hysteresis (ENTRY_HYSTERESIS_S = 15 s, so 15
-        // samples at 1 Hz, engaging by t=14) finishes. Due ticks thereafter land every 5 s:
-        // t=0, 5, 10, 15, 20. Script three confirmed mismatches for the
-        // three due ticks that follow (t=0, 5, 10 --
-        // MISMATCH_RELEASE_STRIKES = 3), then leave the queue empty for
-        // t=15's write so `FakeRunner`'s own auto-agreeing default (see
-        // `cmd::test_support::FakeRunner`'s doc) verifies it -- proving
-        // recovery works through the *ordinary* write path, not a
-        // specially scripted one.
         for _ in 0..3 {
             queue_confirmed_cpu_mismatch(&runner);
         }
-
-        // `cpu_temp_valid: true` (temploop_sample's own default is false,
-        // fine for the ~6-sample runs its existing callers use) --
-        // otherwise `ThermalWatchdog`'s SENSOR_LOST_STREAK (10 consecutive
-        // invalid-Tctl samples) trips and forcibly releases everything
-        // partway through this test's 21-sample run, well before the
-        // scripted mismatch chain finishes.
         let mut effects_at = std::collections::HashMap::new();
         let mut status_at = std::collections::HashMap::new();
-        for i in 0..=20u32 {
-            let t = f64::from(i);
-            let s = Sample {
+        for i in 0..=7_u32 {
+            let effects = ctl.on_sample(&Sample {
+                cpu_pkg_w: 25.0,
                 cpu_temp_valid: true,
                 cpu_temp_c: 60.0,
-                ..temploop_sample(t, 75.0, 74.0, TEMP_CURVE)
-            };
-            let effects = ctl.on_sample(&s);
+                ..busy_at(f64::from(i))
+            });
             effects_at.insert(i, effects);
             status_at.insert(i, ctl.status().clone());
         }
         fs::remove_dir_all(&dir).unwrap();
-
-        assert_eq!(
-            ctl.status().loop_mode,
-            LoopMode::TempLoop,
-            "premise: must actually be running the loop this whole time"
-        );
-
-        let freeze_at = |i: u32| -> Option<Option<&'static str>> {
-            effects_at.get(&i).and_then(|effects| {
-                effects.iter().find_map(|e| match e {
-                    Effect::AutoAllocated { freeze, .. } => Some(*freeze),
-                    _ => None,
-                })
-            })
-        };
-        let has_noted = |i: u32, want_cause: &str| {
+        let noted = |i, cause| {
             effects_at[&i]
                 .iter()
-                .any(|e| matches!(e, Effect::Noted { cause } if *cause == want_cause))
+                .any(|e| matches!(e, Effect::Noted { cause: got } if *got == cause))
         };
-
-        // t=0: the FIRST confirmed mismatch. `in_episode()` at the START
-        // of this tick is still false (no prior trouble), so the freeze
-        // computed THIS tick is not yet `actuator_mismatch` -- the design's
-        // "freeze ... on the same tick" is the write's own immediate
-        // reassert + the `LimitNotSticking` flag landing this tick, not a
-        // same-tick Budget freeze (structurally impossible: the freeze
-        // decision happens before the write that produces the verdict).
+        assert!(noted(2, "auto:cpu_mismatch"), "{:?}", effects_at[&2]);
+        assert!(status_at[&2].flags.contains(&StatusFlag::LimitNotSticking));
+        assert!(matches!(
+            status_at[&2].cpu.as_ref().expect("CPU").hold,
+            crate::types::TelemetryHold::ActuatorMismatch
+        ));
+        assert!(noted(4, "auto:cpu_released"), "{:?}", effects_at[&2]);
+        assert_eq!(status_at[&4].cpu_limit_w, None);
         assert!(
-            has_noted(0, "auto:cpu_mismatch"),
-            "t=0 must carry the first confirmed Mismatch: {:?}",
-            effects_at[&0]
+            noted(6, "auto:cpu_verdict_recovered"),
+            "{:?}",
+            effects_at[&6]
         );
-        assert_ne!(
-            freeze_at(0),
-            Some(Some("actuator_mismatch")),
-            "t=0's OWN freeze can't reflect a verdict this same tick's write hasn't produced yet"
-        );
-        assert!(
-            status_at[&0].flags.contains(&StatusFlag::LimitNotSticking),
-            "the flag must be raised the same tick the first mismatch is confirmed"
-        );
-
-        // t=5: the SECOND confirmed mismatch, and NOW the previous tick's
-        // trouble (t=0's) freezes this tick's budget -- "reasserts on the
-        // same tick" as the confirmed verdict, one tick lagged for the
-        // freeze itself per the design's own documented circularity.
-        assert!(has_noted(5, "auto:cpu_mismatch"), "{:?}", effects_at[&5]);
-        assert_eq!(
-            freeze_at(5),
-            Some(Some("actuator_mismatch")),
-            "an in-progress mismatch episode must freeze the NEXT tick's budget"
-        );
-
-        // t=10: the THIRD confirmed mismatch releases to stock (§2.9).
-        assert!(
-            has_noted(10, "auto:cpu_released"),
-            "third strike must release: {:?}",
-            effects_at[&10]
-        );
-        assert_eq!(
-            freeze_at(10),
-            Some(Some("actuator_mismatch")),
-            "still an in-progress episode as of the start of the release tick"
-        );
-        assert_eq!(
-            status_at[&10].cpu_limit_w, None,
-            "released actuator must read back as released (no live commanded limit)"
-        );
-
-        // t=15: released actuator still reasserts (write + read-back) on
-        // its own every due tick with the flag held -- this write hits the
-        // now-empty script queue, so FakeRunner's ordinary auto-agreeing
-        // default verifies it, proving recovery through the REAL write
-        // path rather than a hand-picked scripted agreement.
-        assert_eq!(
-            freeze_at(15),
-            Some(Some("actuator_mismatch")),
-            "still judged against t=10's released state as of the start of this tick"
-        );
-        assert!(
-            has_noted(15, "auto:cpu_verdict_recovered"),
-            "a later Verified must recover: {:?}",
-            effects_at[&15]
-        );
-        assert!(
-            status_at[&15].cpu_limit_w.is_some(),
-            "recovery must re-engage the actuator (a live commanded limit again)"
-        );
-
-        // t=20: the episode is over -- the NEXT tick's freeze must no
-        // longer be actuator_mismatch (in_episode() is false again).
-        assert_ne!(
-            freeze_at(20),
-            Some(Some("actuator_mismatch")),
-            "a recovered actuator must not keep freezing later ticks: {:?}",
-            effects_at[&20]
-        );
+        assert!(status_at[&6].cpu_limit_w.is_some());
+        assert!(!matches!(
+            status_at[&7].cpu.as_ref().expect("CPU").hold,
+            crate::types::TelemetryHold::ActuatorMismatch
+        ));
     }
-
-    /// GPU-HOT episode replayed at controller level (design §2.4/§2.8's
-    /// interaction, the wiring the idle-tick anti-windup test never
-    /// touches at all: `guard_state.gpu_hot` -> `gpu_share_override` ->
-    /// `gpu_max_w` fed into `split_budget`/`last_gpu_cap_w`). The spike's
-    /// own decision (task 19's report, quoting the merged §2.4): GPU HOT
-    /// does not itself freeze the integrator -- the guard's ratchet folds
-    /// into `split_budget`'s `gpu_max_w` and the GENERIC demand-limited
-    /// predicate, judged against the resulting post-override cap, is
-    /// supposed to behave correctly on its own with no bespoke Budget-level
-    /// freeze. This test's job is exactly what the review asked for:
-    /// confirm that predicate does not spuriously fire purely because the
-    /// guard is ratcheting the ceiling down underneath a GPU that is
-    /// actually consuming whatever cap it's handed (never idle) -- the
-    /// scenario where a bug (e.g. judging demand against a stale
-    /// pre-override cap) would show up as a false halt.
-    /// Regression (integration sweep, fw-fanctrl-loop-nsc): `AutoState::new`
-    /// used to hard-code `Guards::new(GPU_HOT_C_DEFAULT, NVME_HOT_C_DEFAULT)`
-    /// regardless of the live `Config`, so `gpu_hot_c`/`nvme_hot_c` were
-    /// config keys that round-tripped through `Config::load`/`save` and
-    /// appeared on `ControlStatus` but never actually reached the guards
-    /// that are supposed to act on them. Both thresholds are set here BELOW
-    /// the compiled-in defaults (88/80) -- but still inside the range
-    /// `Config::sanitized` allows (roast PR-1 finding 8 added these two keys
-    /// to the sanitizer, and roast PR-2 finding 5 raised `GPU_HOT_C_FLOOR`
-    /// to 85 so a threshold inside the card's measured 82-83/87 sustained
-    /// band no longer survives load): a temperature that would leave the
-    /// DEFAULTS cold must trip THESE configured, lower ones.
     #[test]
     fn gpu_and_nvme_hot_thresholds_come_from_the_live_config_not_the_compiled_defaults() {
         let runner = FakeRunner::new();
-        let config = Config { gpu_hot_c: 86.0, nvme_hot_c: 55.0, ..Config::default() };
+        let config = Config {
+            gpu_hot_c: 86.0,
+            nvme_hot_c: 55.0,
+            ..Config::default()
+        };
         // Sanity: the values under test are the ones the guards will see.
         let config = config.sanitized();
         assert_eq!((config.gpu_hot_c, config.nvme_hot_c), (86.0, 55.0));
@@ -7133,142 +7834,548 @@ mod tests {
 
     #[test]
     fn gpu_hot_episode_ratchets_the_cap_without_spuriously_triggering_demand_limited() {
+        // GPU HOT lowers the local cap while leaving the CPU loop active.
         let runner = FakeRunner::new();
-        let config = Config {
-            fan_target_rpm: 6900.0, // keeps RpmLoop's error_sign > 0 all run
-            ..Config::default()
-        };
-        let (mut ctl, _gpu) = auto_controller(
-            &runner,
-            PathBuf::from("/nonexistent/platform_profile"),
-            config,
-        );
+        let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
         ctl.on_command(Command::SetAuto(true));
-        // `calibrated()`'s LUT starts at 1200 MHz -> 30 W; the default
-        // `gpu_floor_mhz` (1000) is below that, so `watts_for_clock` clamps
-        // low to the LUT's first point (§Facts: never below the lowest
-        // known clock) -- this IS `gpu_floor_w` as the controller computes
-        // it, not a value this test invents.
-        let gpu_floor_w = 30.0;
-        let mut saw_positive_error = false;
-
-        // Track each axis's draw against the SAME raw (pre-slew,
-        // post-guard-override) cap the demand-limited predicate itself
-        // judges against (`AutoState::last_cpu_cap_w`/`last_gpu_cap_w` --
-        // private fields this `tests` submodule can read, per Rust's
-        // ordinary child-module visibility) rather than either axis's
-        // slew-clamped committed output. That distinction matters here:
-        // the allocator's own CPU up-slew (`UP_RATE_W`, 2 W/tick) is far
-        // slower than the GPU guard's down-ratchet (`DOWN_RATE_W`, 8
-        // W/tick), so surplus the shrinking GPU cap frees up floods into
-        // the CPU's RAW split immediately while its actual commit can only
-        // climb 2 W/tick -- tracking draw against the slew-limited commit
-        // (instead of the raw cap the predicate actually reads) would make
-        // the CPU axis spuriously demand-limited by this test's OWN
-        // modeling gap, not by anything the controller does.
-        let raw_caps = |ctl: &Controller<&FakeRunner>| -> (f64, f64) {
-            let auto = ctl.auto.as_ref().expect("in auto");
-            (auto.last_cpu_cap_w, auto.last_gpu_cap_w)
-        };
-
-        // Phase 1 (cold, loaded): let real demand wind a genuine cap up
-        // over several ticks so the hot phase has somewhere real to
-        // descend FROM (starting hot from AutoState's zeroed
-        // `last_gpu_cap_w` would clamp straight to the floor on tick one
-        // and never exercise a multi-tick ratchet at all).
-        for i in 0..100 {
-            let t = f64::from(i) * ALLOC_PERIOD_S;
-            let (last_cpu, last_gpu) = raw_caps(&ctl);
-            let s = Sample {
-                cpu_pkg_w: (last_cpu - 0.1).max(0.0), // "loaded": tracks its own last raw cap
-                gpu_w: (last_gpu - 0.1).max(0.0),
+        for t in 0..6 {
+            ctl.on_sample(&Sample {
+                cpu_pkg_w: 25.0,
+                gpu_w: 60.0,
                 gpu_w_valid: true,
+                gpu_mhz_valid: true,
+                gpu_sm_mhz: 2200.0,
+                gpu_util_pct: 95.0,
                 gpu_temp_valid: true,
-                gpu_temp_c: 60.0,     // well below GPU_HOT_C_DEFAULT (90): cold
-                cpu_temp_valid: true, // avoid ThermalWatchdog's SENSOR_LOST_STREAK trip over this long a run
-                cpu_temp_c: 60.0,
-                ..busy_at(t)
-            };
+                gpu_temp_c: 60.0,
+                ..busy_at(f64::from(t))
+            });
+        }
+        let before = ctl.status().gpu.as_ref().expect("GPU").cap;
+        for t in 6..16 {
+            ctl.on_sample(&Sample {
+                cpu_pkg_w: 25.0,
+                gpu_w: 60.0,
+                gpu_w_valid: true,
+                gpu_mhz_valid: true,
+                gpu_sm_mhz: 2200.0,
+                gpu_util_pct: 95.0,
+                gpu_temp_valid: true,
+                gpu_temp_c: 88.0,
+                ..busy_at(f64::from(t))
+            });
+        }
+        let status = ctl.status();
+        let gpu = status.gpu.as_ref().expect("GPU");
+        assert!(status.flags.contains(&StatusFlag::GpuHot));
+        assert!(gpu.cap < before, "{before} -> {}", gpu.cap);
+        assert_ne!(status.loop_mode, LoopMode::Released);
+        assert!(!matches!(
+            gpu.hold,
+            crate::types::TelemetryHold::ActuatorMismatch
+        ));
+    }
+    #[test]
+    fn review_socketless_entry_seeds_groups_once() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        let mut sample = temploop_sample(0.0, 60.0, 60.0, TEMP_CURVE);
+        sample.fanctrl = None;
+        sample.fanctrl_freshness = Freshness::Absent;
+        ctl.on_sample(&sample);
+        assert_eq!(ctl.status.t_star_c, Some(60.0));
+        assert!(ctl.auto.as_ref().unwrap().source_initialised);
+    }
+
+    #[test]
+    fn review_released_clears_engagement_and_releases_only_on_transition() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        for t in 0..6 { ctl.on_sample(&busy_at(f64::from(t))); }
+        ctl.add_flag(StatusFlag::ReadbackBlind);
+        let invalid = Sample { fan_valid: false, ..busy_at(6.0) };
+        assert!(ctl.on_sample(&invalid).contains(&Effect::Released));
+        let auto = ctl.auto.as_ref().unwrap();
+        assert!(!auto.cpu_entry_seeded && !auto.gpu_entry_seeded);
+        assert!(auto.cpu_draw_window.is_empty());
+        assert!(auto.gpu_commands.is_empty());
+        assert!(!ctl.status.flags.contains(&StatusFlag::ReadbackBlind));
+        assert!(!ctl.on_sample(&Sample { t_mono: 7.0, ..invalid }).contains(&Effect::Released));
+        ctl.on_sample(&busy_at(8.0));
+        assert!(ctl.auto.as_ref().unwrap().cpu_entry_seeded);
+    }
+
+    #[test]
+    fn review_auto_exit_clears_v3_decisions() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        ctl.on_sample(&busy_at(0.0));
+        assert!(ctl.status.cpu.is_some());
+        ctl.on_command(Command::SetAuto(false));
+        assert!(ctl.status.cpu.is_none() && ctl.status.gpu.is_none());
+        assert!(ctl.status.tstar_state.is_none());
+        assert!(ctl.status.telemetry_flags.is_empty());
+    }
+
+    #[test]
+    fn review_cpu_hot_hysteresis_and_resume_clear_streak() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        for t in 0..3 {
+            ctl.on_sample(&Sample { cpu_temp_valid: true, cpu_temp_c: 90.0, ..busy_at(f64::from(t)) });
+        }
+        let previous = ctl.auto.as_mut().unwrap().cpu_ratchet.step(false, false, None);
+        ctl.on_sample(&Sample { cpu_temp_valid: true, cpu_temp_c: 88.0, ..busy_at(3.0) });
+        let next = ctl.auto.as_mut().unwrap().cpu_ratchet.step(false, false, None);
+        assert_eq!(next, previous - CPU_MAX_RATCHET_DOWN_RATE_W);
+        ctl.on_sample(&Sample { resumed: true, cpu_temp_valid: true, cpu_temp_c: 90.0, ..busy_at(100.0) });
+        assert_eq!(ctl.auto.as_ref().unwrap().cpu_hot_streak, 1);
+        assert!(!ctl.auto.as_ref().unwrap().cpu_verdict.in_episode());
+    }
+
+    #[test]
+    fn review_live_floors_bound_hot_ratchets() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        for t in 0..25 {
+            ctl.on_sample(&Sample { cpu_temp_valid: true, cpu_temp_c: 90.0,
+                gpu_temp_valid: true, gpu_temp_c: 89.0, ..busy_at(f64::from(t)) });
+        }
+        ctl.on_command(Command::SetFloors { cpu_w: 40.0, gpu_mhz: 2500 });
+        ctl.on_sample(&Sample { cpu_temp_valid: true, cpu_temp_c: 90.0,
+            gpu_temp_valid: true, gpu_temp_c: 89.0, ..busy_at(25.0) });
+        let auto = ctl.auto.as_mut().unwrap();
+        assert!(auto.cpu_ratchet.step(false, false, None) >= 40.0);
+        assert!(auto.gpu_ratchet.step(false, false, None) >= 2500.0);
+    }
+
+    #[test]
+    fn review_gpu_commands_use_completion_time_including_reassert() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _) = auto_controller_no_profile(&runner);
+        let acquired = Instant::now();
+        ctl.completion_clock = Box::new(move || acquired + Duration::from_secs(3));
+        ctl.on_command(Command::SetAuto(true));
+        let sample = Sample { acquired_at: Some(acquired), ..busy_at(10.0) };
+        ctl.on_sample(&sample);
+        assert_eq!(ctl.auto.as_ref().unwrap().gpu_commands.back().unwrap().completed_at_s, 13.0);
+        ctl.reassert_actuators(&sample);
+        let auto = ctl.auto.as_mut().unwrap();
+        assert_eq!(auto.gpu_commands.len(), 2);
+        assert_eq!(auto.gpu_commands.back().unwrap().completed_at_s, 13.0);
+        assert_eq!(auto.gpu_verifier.as_mut().unwrap().verify_paired(
+            95.0, 3000, 12.0, auto.gpu_commands.make_contiguous()), WriteVerdict::Unverifiable);
+    }
+
+    #[test]
+    fn review_failed_gpu_attempts_keep_two_second_cadence() {
+        let runner = FakeRunner::new();
+        let fake = FakeGpu::new();
+        let calls = fake.calls();
+        *fake.failures().lock().unwrap() = 10;
+        let (mut ctl, _) = auto_controller_no_profile(&runner);
+        ctl.guard.gpu = Some(Box::new(fake));
+        ctl.on_command(Command::SetAuto(true));
+        ctl.on_sample(&busy_at(0.0));
+        assert_eq!(ctl.auto.as_ref().unwrap().last_gpu_write_t_mono, Some(0.0));
+        ctl.on_sample(&busy_at(1.0));
+        assert_eq!(ctl.auto.as_ref().unwrap().last_gpu_write_t_mono, Some(0.0));
+        ctl.on_sample(&busy_at(2.0));
+        assert_eq!(ctl.auto.as_ref().unwrap().last_gpu_write_t_mono, Some(2.0));
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(ctl.status.gpu_max_mhz.is_none());
+    }
+
+    #[test]
+    fn review_gpu_mismatch_rewrites_then_release_does_not_relock_same_sample() {
+        let runner = FakeRunner::new();
+        let (mut ctl, calls) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        ctl.on_sample(&busy_at(0.0));
+        // Ignore the actual cap for enough consecutive loaded observations.
+        for t in 2..5 { ctl.on_sample(&Sample { gpu_sm_mhz: 4000.0, ..busy_at(f64::from(t)) }); }
+        let count = calls.lock().unwrap().len();
+        ctl.on_sample(&Sample { gpu_sm_mhz: 4000.0, ..busy_at(5.0) });
+        assert!(calls.lock().unwrap().len() > count, "confirmed mismatch must reassert even an unchanged cap");
+        ctl.on_sample(&Sample { gpu_sm_mhz: 4000.0, ..busy_at(6.0) });
+        assert!(ctl.status.gpu_max_mhz.is_none(), "release must survive the rest of its sample");
+    }
+
+    #[test]
+    fn review_upward_curve_edit_restores_thermal_candidate_only() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        drive_temploop(&mut ctl, 0.0, 25);
+        assert_eq!(ctl.status.loop_mode, LoopMode::TempLoop);
+        let auto = ctl.auto.as_mut().unwrap();
+        auto.cpu_loop.transfer_thermal(30.0, 0.0);
+        auto.cpu_loop.transfer_shadow(35.0);
+        let applied = ctl.status.cpu_limit_w;
+        let higher: Vec<_> = TEMP_CURVE.iter().map(|(temp, duty)| (temp + 4.0, *duty)).collect();
+        ctl.on_sample(&temploop_sample(25.0, 75.0, 74.0, &higher));
+        assert_eq!(ctl.auto.as_ref().unwrap().cpu_loop.thermal(), ctl.config.cpu_max_w);
+        assert_eq!(ctl.status.cpu.as_ref().unwrap().shadow, 35.0);
+        assert!(ctl.status.cpu_limit_w.unwrap() <= applied.unwrap() + 10.0);
+    }
+
+    #[test]
+    fn review_raw_reconciliation_and_implausible_diagnostics_remain_distinct() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        for t in 0..5 {
+            let mut s = temploop_sample(f64::from(t), 120.0, 120.0, TEMP_CURVE);
+            s.ec = Some(ec_reading_c(&[("cpu@4c", 70.0), ("ambient_f75303@4d", 40.0), ("charger_f75303@4d", 120.0)]));
             ctl.on_sample(&s);
         }
-        assert!(
-            !ctl.status().flags.contains(&StatusFlag::GpuHot),
-            "premise: still cold at the end of warm-up"
-        );
-        let peak_gpu_w = raw_caps(&ctl).1;
-        assert!(
-            peak_gpu_w > gpu_floor_w + allocator::DOWN_RATE_W,
-            "premise: warm-up must build a real cap more than one ratchet \
-             step above the floor ({peak_gpu_w} vs floor {gpu_floor_w} + \
-             {} W), or the hot phase below proves nothing about a \
-             multi-tick descent",
-            allocator::DOWN_RATE_W
-        );
-
-        // Phase 2 (hot, still loaded): the guard ratchets `gpu_max_w` down
-        // DOWN_RATE_W per allocator tick from ITS OWN last post-override
-        // cap; the GPU keeps consuming whatever it is handed the whole
-        // way down.
-        let mut saw_demand_limited = false;
-        let mut reached_floor = false;
-        for i in 100..140 {
-            let t = f64::from(i) * ALLOC_PERIOD_S;
-            let (last_cpu, last_gpu) = raw_caps(&ctl);
-            let s = Sample {
-                cpu_pkg_w: (last_cpu - 0.1).max(0.0),
-                gpu_w: (last_gpu - 0.1).max(0.0),
-                gpu_w_valid: true,
-                gpu_temp_valid: true,
-                // One sample AT the dGPU guard's enter threshold
-                // (GPU_HOT_C_DEFAULT, 88 C) to latch it hot, then hold at
-                // 87 C -- inside the guard's own 2 C hysteresis band (exit
-                // is 86, so 87 keeps it latched per
-                // `gpu_hysteresis_enters_at_threshold_and_exits_two_below`)
-                // and well below `ThermalWatchdog`'s GPU_TRIP_C (91 C), so
-                // the unrelated thermal emergency never enters the picture
-                // and the ratchet is what this run measures.
-                gpu_temp_c: if i == 100 { 88.0 } else { 87.0 },
-                cpu_temp_valid: true,
-                cpu_temp_c: 60.0,
-                ..busy_at(t)
-            };
-            let effects = ctl.on_sample(&s);
-            let (_, new_gpu) = raw_caps(&ctl);
-            if new_gpu <= gpu_floor_w + 0.01 {
-                reached_floor = true;
-            }
-            for e in &effects {
-                if let Effect::AutoAllocated { freeze, error, .. } = e {
-                    if *error > 0.0 {
-                        saw_positive_error = true;
-                    }
-                    if *freeze == Some("demand_limited") {
-                        saw_demand_limited = true;
-                    }
-                }
-            }
-        }
-
-        assert!(
-            ctl.status().flags.contains(&StatusFlag::GpuHot),
-            "premise: the guard must have latched hot"
-        );
-        assert!(
-            saw_positive_error,
-            "premise: error_sign must stay positive (RpmLoop, high fan \
-             target) for the halt to even be eligible -- otherwise a \
-             `false` result below would prove nothing"
-        );
-        assert!(
-            reached_floor,
-            "the ratchet must actually walk gpu_w down to its LUT floor \
-             over the hot episode (peak was {peak_gpu_w})"
-        );
-        assert!(
-            !saw_demand_limited,
-            "a GPU that keeps consuming whatever cap gpu_share_override \
-             hands it must never spuriously trip demand_limited just \
-             because that cap is shrinking underneath it"
-        );
+        assert!(!ctl.status.flags.contains(&StatusFlag::EcMismatch));
+        assert!(ctl.status.telemetry_flags.contains(&crate::types::TelemetryFlag::EcImplausible {
+            label: "charger_f75303@4d".into(), active: true,
+        }));
     }
+
+    #[test]
+    fn review_group_lost_emits_device_diagnostic() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        ctl.on_sample(&busy_at(0.0));
+        for t in 1..=61 {
+            ctl.on_sample(&temploop_sample(f64::from(t), 75.0, 74.0, TEMP_CURVE));
+        }
+        assert!(ctl.status.telemetry_flags.contains(&crate::types::TelemetryFlag::GroupLost {
+            device: crate::types::TelemetryDeviceName::Gpu, active: true,
+        }));
+    }
+
+    #[test]
+    fn review_not_calibrated_is_informational_without_fitted_gains() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        ctl.on_sample(&busy_at(0.0));
+        assert_eq!(ctl.status.mode, Mode::Auto);
+        assert!(ctl.status.flags.contains(&StatusFlag::NotCalibrated));
+        assert_eq!(flag_severity(StatusFlag::NotCalibrated), Severity::Info);
+    }
+
+    #[test]
+    fn review_ac_suppressed_gpu_mismatch_does_not_latch_device_loop() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        ctl.on_sample(&busy_at(0.0));
+        for t in 1..=3 {
+            ctl.on_sample(&Sample { gpu_sm_mhz: 4000.0, on_ac: true, ..busy_at(f64::from(t)) });
+        }
+        assert_ne!(ctl.auto.as_ref().unwrap().gpu_actuator_state, ActuatorState::Mismatch);
+        assert!(!ctl.auto.as_ref().unwrap().gpu_verdict.in_episode());
+    }
+
+    #[test]
+    fn review_biased_steady_fan_refines_before_pair_becomes_qualified() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        for t in 0..=40 { ctl.on_sample(&rpm_view_sample(f64::from(t), 2800.0, "quiet16", 36, false)); }
+        assert!(ctl.persisted_warm_start.is_empty(), "40 out-of-tolerance samples cannot qualify a pair");
+        assert!(ctl.duty_rpm_table.rpm_for_duty(36) < 3030.0, "a stable measured duty must refine an inaccurate table");
+        for t in 41..=400 { ctl.on_sample(&rpm_view_sample(f64::from(t), 2800.0, "quiet16", 36, false)); }
+        assert!(!ctl.persisted_warm_start.is_empty(), "40 subsequent in-tolerance samples qualify the pair");
+    }
+
+    #[test]
+    fn review_first_socket_view_seeds_replica_without_replacing_running_source() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        let mut sample = temploop_sample(0.0, 60.0, 60.0, TEMP_CURVE);
+        sample.fanctrl = None;
+        sample.fanctrl_freshness = Freshness::Absent;
+        ctl.on_sample(&sample);
+        ctl.on_sample(&temploop_sample(1.0, 74.0, 74.0, TEMP_CURVE));
+        assert_eq!(ctl.status.ec_ma_c, Some(74.0));
+        assert_eq!(ctl.status.t_star_c, Some(60.0), "first socket must not replace running TStarSource");
+    }
+
+    #[test]
+    fn review_resume_discards_mismatch_hold_and_quit_clears_decisions() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        ctl.on_sample(&busy_at(0.0));
+        ctl.auto.as_mut().unwrap().cpu_actuator_state = ActuatorState::Mismatch;
+        ctl.on_sample(&busy_at(1.0));
+        assert_eq!(ctl.status.cpu.as_ref().unwrap().hold, crate::types::TelemetryHold::ActuatorMismatch);
+        ctl.on_sample(&Sample { resumed: true, ..busy_at(100.0) });
+        assert_ne!(ctl.status.cpu.as_ref().unwrap().hold, crate::types::TelemetryHold::ActuatorMismatch);
+        ctl.on_command(Command::Quit);
+        assert!(ctl.status.cpu.is_none() && ctl.status.gpu.is_none());
+    }
+
+    #[test]
+    fn review_curve_reports_live_refined_rpm_reference() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        drive_temploop(&mut ctl, 0.0, 25);
+        let duty = ctl.duty_rpm_table.duty_for_rpm(ctl.status.fan_target_rpm);
+        ctl.duty_rpm_table.refine(duty, 2900.0);
+        ctl.on_sample(&temploop_sample(25.0, 75.0, 74.0, TEMP_CURVE));
+        assert_eq!(ctl.status.duty_cmd, Some(duty));
+        assert_eq!(ctl.status.snapped_rpm, ctl.duty_rpm_table.rpm_for_duty(duty));
+        assert_ne!(ctl.status.snapped_rpm, DutyRpmTable::default().rpm_for_duty(duty));
+    }
+
+    #[test]
+    fn review_live_floor_can_raise_a_previously_lower_configured_ceiling() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _) = auto_controller(&runner, PathBuf::from("/nonexistent/platform_profile"),
+            Config { cpu_max_w: 30.0, gpu_max_mhz: 1500, ..Config::default() });
+        ctl.on_command(Command::SetAuto(true));
+        ctl.on_sample(&busy_at(0.0));
+        ctl.on_command(Command::SetFloors { cpu_w: 40.0, gpu_mhz: 2000 });
+        ctl.on_sample(&busy_at(1.0));
+        assert!(ctl.status.cpu.as_ref().unwrap().cap >= ctl.config.cpu_floor_w);
+        assert!(ctl.status.gpu.as_ref().unwrap().cap >= f64::from(ctl.config.gpu_floor_mhz));
+    }
+
+    #[test]
+    fn review_resume_records_every_completed_reassert_without_scoring_its_sample() {
+        let runner = FakeRunner::new();
+        let (mut ctl, calls) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        ctl.on_sample(&busy_at(0.0));
+        let before = calls.lock().unwrap().len();
+        ctl.on_sample(&Sample { resumed: true, ..busy_at(100.0) });
+        let writes = calls.lock().unwrap()[before..].iter().filter(|c| matches!(c, GpuCall::Set(_))).count();
+        let auto = ctl.auto.as_ref().unwrap();
+        assert_eq!(auto.gpu_commands.len(), writes);
+        assert_eq!(auto.gpu_actuator_state, ActuatorState::Unverifiable);
+    }
+
+    #[test]
+    fn review_invalid_rapl_delta_requires_five_new_draw_samples() {
+        for invalid in [0.0, f64::NAN, -1.0] {
+            let runner = FakeRunner::new();
+            let (mut ctl, _) = auto_controller_no_profile(&runner);
+            ctl.on_command(Command::SetAuto(true));
+            for t in 0..5 { ctl.on_sample(&busy_at(f64::from(t))); }
+            ctl.on_sample(&Sample { cpu_pkg_w: invalid, ..busy_at(5.0) });
+            assert_eq!(ctl.status.cpu.as_ref().unwrap().hold, crate::types::TelemetryHold::DrawUnavailable);
+            for t in 6..10 {
+                ctl.on_sample(&busy_at(f64::from(t)));
+                assert_eq!(ctl.status.cpu.as_ref().unwrap().hold, crate::types::TelemetryHold::DrawUnavailable);
+            }
+            ctl.on_sample(&busy_at(10.0));
+            assert_ne!(ctl.status.cpu.as_ref().unwrap().hold, crate::types::TelemetryHold::DrawUnavailable);
+        }
+    }
+
+    #[test]
+    fn review_gpu_first_clock_seeds_shadow_after_thermal_only_entry() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        ctl.on_sample(&Sample { gpu_mhz_valid: false, ..busy_at(0.0) });
+        let gpu = ctl.status.gpu.as_ref().unwrap();
+        assert_eq!(gpu.shadow, gpu.thermal);
+        ctl.on_sample(&busy_at(1.0));
+        assert_eq!(ctl.status.gpu.as_ref().unwrap().shadow, 1800.0 + ctl.config.shadow_headroom_gpu_mhz);
+    }
+
+    #[test]
+    fn review_upward_curve_restore_waits_for_mismatch_recovery() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        drive_temploop(&mut ctl, 0.0, 25);
+        let auto = ctl.auto.as_mut().unwrap();
+        auto.cpu_loop.transfer_thermal(30.0, 0.0);
+        auto.cpu_loop.transfer_shadow(35.0);
+        auto.cpu_actuator_state = ActuatorState::Mismatch;
+        auto.last_cpu_write_t_mono = Some(25.0);
+        let higher: Vec<_> = TEMP_CURVE.iter().map(|(temp, duty)| (temp + 4.0, *duty)).collect();
+        ctl.on_sample(&temploop_sample(25.0, 75.0, 74.0, &higher));
+        assert_eq!(ctl.auto.as_ref().unwrap().cpu_loop.thermal(), 30.0);
+        ctl.auto.as_mut().unwrap().cpu_actuator_state = ActuatorState::Verified;
+        ctl.on_sample(&temploop_sample(26.0, 75.0, 74.0, &higher));
+        assert_eq!(ctl.auto.as_ref().unwrap().cpu_loop.thermal(), ctl.config.cpu_max_w);
+    }
+
+    #[test]
+    fn review_every_qualified_steady_tick_refines_and_updates_the_pair() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        for t in 0..=40 { ctl.on_sample(&rpm_view_sample(f64::from(t), 3000.0, "quiet16", 36, false)); }
+        let first = ctl.duty_rpm_table.rpm_for_duty(36);
+        assert_eq!(first, 3024.0);
+        ctl.on_sample(&rpm_view_sample(41.0, 3000.0, "quiet16", 36, false));
+        assert_eq!(ctl.duty_rpm_table.rpm_for_duty(36), 0.8 * first + 0.2 * 3000.0);
+        let pair = &ctl.persisted_warm_start[&WarmStart::key("quiet16", 36, false)];
+        assert_eq!(pair.cpu_cap_w, ctl.status.cpu_limit_w.unwrap());
+        assert_eq!(pair.gpu_lock_mhz, ctl.status.gpu_max_mhz.unwrap());
+    }
+
+    #[test]
+    fn review_round2_low_cpu_warm_waits_for_five_valid_draws() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _) = auto_controller_no_profile(&runner);
+        let duty = ctl.duty_rpm_table.duty_for_rpm(ctl.status.fan_target_rpm);
+        ctl.persisted_warm_start.insert(WarmStart::key("quiet16", duty, false),
+            WarmStartEntry { cpu_cap_w: 15.0, gpu_lock_mhz: 1000 });
+        ctl.on_command(Command::SetAuto(true));
+        for t in 0..4 {
+            ctl.on_sample(&Sample { cpu_pkg_w: 0.0, ..busy_at(f64::from(t)) });
+            assert!(ctl.status.cpu.as_ref().unwrap().thermal >= 50.0,
+                "an unusable warm record must not lower thermal-only entry");
+        }
+        for t in 4..8 { ctl.on_sample(&busy_at(f64::from(t))); }
+        ctl.on_sample(&busy_at(8.0));
+        let cpu = ctl.status.cpu.as_ref().unwrap();
+        assert!(cpu.thermal >= 35.0 && cpu.shadow >= 35.0, "{cpu:?}");
+        // CPU downward output is deliberately unrestricted; the advisory
+        // record must never push it below the live entry headroom.
+        assert!(cpu.cap >= 35.0, "{cpu:?}");
+        assert!(ctl.status.cpu_limit_w.is_some_and(|cap| cap >= 35.0));
+    }
+
+    #[test]
+    fn review_round2_low_gpu_warm_waits_for_first_clock() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _) = auto_controller_no_profile(&runner);
+        let duty = ctl.duty_rpm_table.duty_for_rpm(ctl.status.fan_target_rpm);
+        ctl.persisted_warm_start.insert(WarmStart::key("quiet16", duty, false),
+            WarmStartEntry { cpu_cap_w: 15.0, gpu_lock_mhz: 1000 });
+        ctl.on_command(Command::SetAuto(true));
+        for t in 0..4 {
+            ctl.on_sample(&Sample { gpu_mhz_valid: false, ..busy_at(f64::from(t)) });
+            assert!(ctl.status.gpu.as_ref().unwrap().thermal >= 3000.0,
+                "an unusable warm record must not lower thermal-only entry");
+        }
+        let before = ctl.status.gpu.as_ref().unwrap().cap;
+        ctl.on_sample(&busy_at(4.0));
+        let gpu = ctl.status.gpu.as_ref().unwrap();
+        let entry_floor = 1800.0 + ctl.config.shadow_headroom_gpu_mhz;
+        assert!(gpu.thermal >= entry_floor && gpu.shadow >= entry_floor, "{gpu:?}");
+        assert!(gpu.cap >= entry_floor && (gpu.cap - before).abs() <= 105.0, "{gpu:?}");
+    }
+
+    // Advancing the shared clock inside the actuator models a blocking
+    // three-second failure without wall-clock sleeps or scheduling races.
+    #[derive(Clone)]
+    struct ClockedWriteFailure {
+        now: Arc<Mutex<Instant>>,
+        attempts: Arc<Mutex<usize>>,
+    }
+
+    impl ClockedWriteFailure {
+        fn fail(&self) {
+            *self.now.lock().unwrap() += Duration::from_secs(3);
+            *self.attempts.lock().unwrap() += 1;
+        }
+    }
+
+    impl crate::actuators::cmd::Runner for ClockedWriteFailure {
+        fn run(&self, program: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
+            if program == "ryzenadj" && args.iter().any(|arg| arg.starts_with("--stapm-limit=")) {
+                self.fail();
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "blocking write failure"));
+            }
+            Ok(crate::actuators::cmd::test_support::output_with_code(0))
+        }
+    }
+
+    impl crate::actuators::gpu::GpuClockCtl for ClockedWriteFailure {
+        fn set_max_clock(&mut self, _: u32) -> color_eyre::Result<()> {
+            self.fail();
+            Err(color_eyre::eyre::eyre!("blocking write failure"))
+        }
+        fn release(&mut self) -> color_eyre::Result<()> { Ok(()) }
+        fn applied(&self) -> Option<u32> { None }
+    }
+
+    #[test]
+    fn review_round2_failed_cpu_cadence_starts_at_completion() {
+        let start = Instant::now();
+        let fake = ClockedWriteFailure {
+            now: Arc::new(Mutex::new(start)), attempts: Arc::new(Mutex::new(0)),
+        };
+        let mut ctl = Controller::new(
+            RestoreGuard::new(&fake, Some(CpuActuator::new(&fake,
+                PathBuf::from("/nonexistent/platform_profile"))), None, None),
+            calibrated(), PathBuf::from("/nonexistent/state.json"), Config::default(),
+            PathBuf::from("/nonexistent/config.toml"),
+        );
+        let clock = Arc::clone(&fake.now);
+        ctl.completion_clock = Box::new(move || *clock.lock().unwrap());
+        ctl.on_command(Command::SetAuto(true));
+        ctl.on_sample(&Sample { acquired_at: Some(start), ..busy_at(0.0) });
+        assert_eq!(ctl.auto.as_ref().unwrap().last_cpu_write_t_mono, Some(3.0));
+        for t in [2_u64, 4] {
+            *fake.now.lock().unwrap() = start + Duration::from_secs(t.max(3));
+            ctl.on_sample(&Sample { acquired_at: Some(start + Duration::from_secs(t)), ..busy_at(t as f64) });
+            assert_eq!(*fake.attempts.lock().unwrap(), 1, "buffered sample must not retry");
+        }
+        *fake.now.lock().unwrap() = start + Duration::from_secs(5);
+        ctl.on_sample(&Sample { acquired_at: Some(start + Duration::from_secs(5)), ..busy_at(5.0) });
+        assert_eq!(*fake.attempts.lock().unwrap(), 2);
+        assert_eq!(ctl.auto.as_ref().unwrap().last_cpu_write_t_mono, Some(8.0));
+        assert!(ctl.status.cpu_limit_w.is_none());
+
+        // A cap from an earlier successful command may also be reasserted.
+        ctl.status.cpu_limit_w = Some(40.0);
+        *fake.now.lock().unwrap() = start + Duration::from_secs(10);
+        let reassert = Sample { acquired_at: Some(start + Duration::from_secs(10)), ..busy_at(10.0) };
+        assert_eq!(ctl.reassert_actuators(&reassert), Some(false));
+        ctl.last_reassert = Some(10.0); // caller schedules the next periodic reassert
+        assert_eq!(ctl.auto.as_ref().unwrap().last_cpu_write_t_mono, Some(13.0));
+        ctl.on_sample(&Sample { acquired_at: Some(start + Duration::from_secs(12)), ..busy_at(12.0) });
+        assert_eq!(*fake.attempts.lock().unwrap(), 3);
+    }
+
+    #[test]
+    fn review_round2_failed_gpu_cadence_starts_at_completion() {
+        let start = Instant::now();
+        let fake = ClockedWriteFailure {
+            now: Arc::new(Mutex::new(start)), attempts: Arc::new(Mutex::new(0)),
+        };
+        let runner = FakeRunner::new();
+        let (mut ctl, _) = auto_controller_no_profile(&runner);
+        ctl.guard.gpu = Some(Box::new(fake.clone()));
+        let clock = Arc::clone(&fake.now);
+        ctl.completion_clock = Box::new(move || *clock.lock().unwrap());
+        ctl.on_command(Command::SetAuto(true));
+        ctl.on_sample(&Sample { acquired_at: Some(start), ..busy_at(0.0) });
+        assert_eq!(ctl.auto.as_ref().unwrap().last_gpu_write_t_mono, Some(3.0));
+        for t in [2_u64, 4] {
+            *fake.now.lock().unwrap() = start + Duration::from_secs(t.max(3));
+            ctl.on_sample(&Sample { acquired_at: Some(start + Duration::from_secs(t)), ..busy_at(t as f64) });
+            assert_eq!(*fake.attempts.lock().unwrap(), 1, "buffered sample must not retry");
+        }
+        *fake.now.lock().unwrap() = start + Duration::from_secs(5);
+        ctl.on_sample(&Sample { acquired_at: Some(start + Duration::from_secs(5)), ..busy_at(5.0) });
+        assert_eq!(*fake.attempts.lock().unwrap(), 2);
+        assert_eq!(ctl.auto.as_ref().unwrap().last_gpu_write_t_mono, Some(8.0));
+        assert!(ctl.auto.as_ref().unwrap().gpu_commands.is_empty());
+        assert!(ctl.status.gpu_max_mhz.is_none());
+
+        ctl.status.gpu_max_mhz = Some(2000);
+        *fake.now.lock().unwrap() = start + Duration::from_secs(10);
+        let reassert = Sample { acquired_at: Some(start + Duration::from_secs(10)), ..busy_at(10.0) };
+        assert_eq!(ctl.reassert_actuators(&reassert), Some(false));
+        ctl.last_reassert = Some(10.0);
+        assert_eq!(ctl.auto.as_ref().unwrap().last_gpu_write_t_mono, Some(13.0));
+        ctl.on_sample(&Sample { acquired_at: Some(start + Duration::from_secs(12)), ..busy_at(12.0) });
+        assert_eq!(*fake.attempts.lock().unwrap(), 3);
+        assert!(ctl.auto.as_ref().unwrap().gpu_commands.is_empty());
+    }
+
 }

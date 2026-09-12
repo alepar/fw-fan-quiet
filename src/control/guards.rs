@@ -96,6 +96,13 @@ impl<U> MaxRatchet<U> {
         }
     }
 
+    /// Applies a live floor without discarding the current hot ratchet.
+    pub fn set_floor(&mut self, floor: f64) {
+        self.ceiling = self.ceiling.max(floor);
+        self.floor = floor;
+        self.current = self.current.clamp(self.floor, self.ceiling);
+    }
+
     /// Advances one control sample and returns the new device ceiling.
     pub fn step(&mut self, valid_control: bool, active: bool, temperature_c: Option<f64>) -> f64 {
         if !valid_control {

@@ -1628,6 +1628,7 @@ impl ChainedPlant {
 
         Sample {
             t_mono: self.t_mono,
+            acquired_at: None,
             fan1_rpm: rpm,
             fan2_rpm: rpm,
             cpu_temp_c: script.cpu_tctl_c.unwrap_or(self.thermal.controllable_c()),

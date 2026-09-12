@@ -252,6 +252,10 @@ impl From<&crate::control::tstar::TStarFlag> for TelemetryFlag {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Sample {
     pub t_mono: f64, // seconds, monotonic
+    /// Acquisition origin on the same clock as t_mono, for command completion pairing.
+    /// Synthetic samples omit this and use their deterministic t_mono directly.
+    #[serde(skip)]
+    pub acquired_at: Option<std::time::Instant>,
     pub fan1_rpm: f64,
     pub fan2_rpm: f64,
     pub cpu_temp_c: f64, // Tctl
@@ -335,6 +339,7 @@ impl Default for Sample {
     fn default() -> Self {
         Sample {
             t_mono: 0.0,
+            acquired_at: None,
             fan1_rpm: 0.0,
             fan2_rpm: 0.0,
             cpu_temp_c: 0.0,

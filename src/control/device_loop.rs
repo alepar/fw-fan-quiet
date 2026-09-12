@@ -231,6 +231,21 @@ impl<U: DeviceUnit> DeviceLoop<U> {
         }
     }
 
+    /// Re-resolve the PI gains for a strategy or moving-average interval
+    /// change without turning it into a new control entry.  Callers must use
+    /// the same validated gain source as [`Self::new`]; keeping every other
+    /// field intact is what prevents a gain-key change from stepping an
+    /// already-applied cap.
+    pub fn set_gains(&mut self, gains: Gains) {
+        debug_assert!(gains.is_valid());
+        self.gains = gains;
+    }
+
+    /// Clears an ended engagement while preserving the resolved gains.
+    pub fn reset_engagement(&mut self) {
+        *self = Self::new(self.gains);
+    }
+
     /// Seeds the loop from a cap already in force and synchronises its error.
     pub fn seed(&mut self, cap: f64, error: f64) {
         self.seed_candidates(cap, cap, Some(cap), error);
@@ -258,6 +273,14 @@ impl<U: DeviceUnit> DeviceLoop<U> {
     /// Seeds the second candidate without changing thermal PI state.
     pub fn transfer_shadow(&mut self, cap: f64) {
         self.shadow = cap.clamp(self.floor, self.max);
+    }
+
+    /// Installs the first-ever measured draw candidate after thermal-only
+    /// entry. Later draw outages use the ordinary applied-cap recovery seam.
+    pub fn seed_initial_shadow(&mut self, cap: f64) {
+        self.transfer_shadow(cap);
+        self.draw_missing = false;
+        self.draw_missing_s = 0.0;
     }
 
     pub fn resync_error(&mut self, error: f64) {
@@ -325,6 +348,9 @@ impl<U: DeviceUnit> DeviceLoop<U> {
         }
 
         let err = input.group_c.map(|group| input.t_star - group);
+        if input.resumed {
+            self.mismatch_latched = false;
+        }
         let mismatch_recovered = match input.actuator {
             ActuatorState::Mismatch => {
                 self.mismatch_latched = true;
@@ -1703,6 +1729,30 @@ mod tests {
             loop_.tick(input(Some(80.0), dt));
         }
         close(loop_.thermal(), 50.0);
+    }
+
+    #[test]
+    fn replacing_gains_keeps_the_live_candidates_and_pi_history() {
+        let original = Gains {
+            kc: 0.5,
+            ti_s: 20.0,
+        };
+        let replacement = Gains {
+            kc: 1.5,
+            ti_s: 35.0,
+        };
+        let mut loop_ = DeviceLoop::<W>::new(original);
+        loop_.seed_candidates(70.0, 62.0, Some(62.0), 4.0);
+        loop_.elapsed_s = 3.0;
+        loop_.set_gains(replacement);
+
+        assert_eq!(loop_.gains, replacement);
+        assert_eq!(loop_.thermal, 70.0);
+        assert_eq!(loop_.shadow, 62.0);
+        assert_eq!(loop_.requested, Some(62.0));
+        assert_eq!(loop_.last_applied, Some(62.0));
+        assert_eq!(loop_.e_prev, 4.0);
+        assert_eq!(loop_.elapsed_s, 3.0);
     }
 
     #[test]

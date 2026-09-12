@@ -182,6 +182,7 @@ pub struct DeviceLoop<U: DeviceUnit> {
     group_reset_pending: bool,
     group_missing_s: f64,
     draw_missing_s: f64,
+    draw_missing: bool,
     mismatch_latched: bool,
     pending_immediate: bool,
     prev_group: Option<f64>,
@@ -189,6 +190,7 @@ pub struct DeviceLoop<U: DeviceUnit> {
     previous_selected: Option<Selected>,
     hot_episode_armed: bool,
     hot_rearm_s: f64,
+    control_entry_pending: bool,
     last_mode: Option<ThermalMode>,
     unit: std::marker::PhantomData<U>,
 }
@@ -213,6 +215,7 @@ impl<U: DeviceUnit> DeviceLoop<U> {
             group_reset_pending: false,
             group_missing_s: 0.0,
             draw_missing_s: 0.0,
+            draw_missing: false,
             mismatch_latched: false,
             pending_immediate: false,
             prev_group: None,
@@ -220,6 +223,7 @@ impl<U: DeviceUnit> DeviceLoop<U> {
             previous_selected: None,
             hot_episode_armed: true,
             hot_rearm_s: 0.0,
+            control_entry_pending: true,
             last_mode: None,
             unit: std::marker::PhantomData,
         }
@@ -337,6 +341,7 @@ impl<U: DeviceUnit> DeviceLoop<U> {
             self.group_lost = false;
             self.group_reset_pending = false;
             self.draw_missing_s = 0.0;
+            self.draw_missing = false;
             self.hot_rearm_s = 0.0;
             self.prev_group = None;
             self.prev_t_star = None;
@@ -358,7 +363,7 @@ impl<U: DeviceUnit> DeviceLoop<U> {
 
         let Some(error) = err else {
             self.elapsed_s = 0.0;
-            self.draw_missing_s = 0.0;
+            self.hot_rearm_s = 0.0;
             self.group_missing = true;
             if self.group_seen {
                 self.group_missing_s += dt;
@@ -421,6 +426,9 @@ impl<U: DeviceUnit> DeviceLoop<U> {
 
         if self.mismatch_latched {
             self.elapsed_s = 0.0;
+            if error < 0.0 {
+                self.hot_rearm_s = 0.0;
+            }
             let cap = self
                 .requested
                 .unwrap_or(self.max)
@@ -431,7 +439,6 @@ impl<U: DeviceUnit> DeviceLoop<U> {
                 input.t_star,
                 decision.selected,
             );
-            self.last_mode = Some(input.mode);
             return decision;
         }
 
@@ -459,6 +466,7 @@ impl<U: DeviceUnit> DeviceLoop<U> {
             };
             let decision = self.decision(input, cap, thermal, self.shadow, true, false);
             self.record_valid_tick(group, input.t_star, decision.selected);
+            self.control_entry_pending = false;
             self.last_mode = Some(input.mode);
             return decision;
         }
@@ -474,19 +482,24 @@ impl<U: DeviceUnit> DeviceLoop<U> {
             && self.hot_episode_armed
             && self.previous_selected == Some(Selected::Shadow)
             && measured_crossing;
-        let initial_hot_entry = first_group && input.mode == ThermalMode::Regulate && error < 0.0;
+        let initial_hot_entry =
+            self.control_entry_pending && input.mode == ThermalMode::Regulate && error < 0.0;
         if handover || initial_hot_entry {
             let cap = if initial_hot_entry {
-                if input.shadow_enabled {
-                    input
-                        .draw
-                        .map(|draw| {
-                            shadow_target(draw, input.shadow_headroom, self.floor, self.max)
-                        })
-                        .unwrap_or(self.max)
-                } else {
-                    self.max
-                }
+                self.last_applied
+                    .map(|cap| cap.clamp(self.floor, self.max))
+                    .unwrap_or_else(|| {
+                        if input.shadow_enabled {
+                            input
+                                .draw
+                                .map(|draw| {
+                                    shadow_target(draw, input.shadow_headroom, self.floor, self.max)
+                                })
+                                .unwrap_or(self.max)
+                        } else {
+                            self.max
+                        }
+                    })
             } else {
                 self.last_applied
                     .or(self.requested)
@@ -504,6 +517,7 @@ impl<U: DeviceUnit> DeviceLoop<U> {
             self.hot_rearm_s = 0.0;
             let decision = self.decision(input, cap, self.thermal, self.shadow, true, false);
             self.record_valid_tick(group, input.t_star, decision.selected);
+            self.control_entry_pending = false;
             self.last_mode = Some(input.mode);
             return decision;
         }
@@ -521,7 +535,7 @@ impl<U: DeviceUnit> DeviceLoop<U> {
             self.hot_rearm_s = 0.0;
         }
 
-        let draw_returned = input.draw.is_some() && self.draw_missing_s > 0.0;
+        let draw_returned = input.draw.is_some() && self.draw_missing;
         let shadow_target = if input.shadow_enabled {
             input
                 .draw
@@ -531,8 +545,10 @@ impl<U: DeviceUnit> DeviceLoop<U> {
             self.max
         };
         if input.draw.is_none() {
+            self.draw_missing = true;
             self.draw_missing_s += dt;
         } else {
+            self.draw_missing = false;
             self.draw_missing_s = 0.0;
         }
         if draw_returned {
@@ -588,6 +604,7 @@ impl<U: DeviceUnit> DeviceLoop<U> {
         self.requested = Some(cap);
         let decision = self.decision(input, cap, thermal_candidate, self.shadow, true, false);
         self.record_valid_tick(group, input.t_star, decision.selected);
+        self.control_entry_pending = false;
         self.last_mode = Some(input.mode);
         decision
     }
@@ -1147,6 +1164,155 @@ mod tests {
         close(entered.thermal, 50.0);
         close(entered.shadow, 50.0);
         close(entered.cap, 50.0);
+
+        let mut clamped = DeviceLoop::<W>::new(Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        });
+        clamped.seed_candidates(90.0, 50.0, Some(150.0), 10.0);
+        close(clamped.tick(hot).thermal, 100.0);
+    }
+
+    #[test]
+    fn seeded_first_hot_entry_transfers_from_the_successfully_applied_cap() {
+        let mut loop_ = DeviceLoop::<W>::new(Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        });
+        loop_.seed_candidates(90.0, 50.0, Some(50.0), 10.0);
+        let mut hot = input(Some(80.0), 1.0);
+        hot.draw = Some(40.0);
+        hot.shadow_enabled = true;
+
+        let entered = loop_.tick(hot);
+        close(entered.thermal, 50.0);
+        close(entered.shadow, 50.0);
+        close(entered.cap, 50.0);
+    }
+
+    #[test]
+    fn mismatch_defers_mode_transfer_and_negative_samples_break_hot_rearm() {
+        let mut loop_ = DeviceLoop::<W>::new(Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        });
+        loop_.seed_candidates(40.0, 80.0, Some(30.0), 10.0);
+        let mut regulate = input(Some(60.0), 0.0);
+        regulate.draw = Some(70.0);
+        regulate.shadow_enabled = true;
+        loop_.tick(regulate);
+
+        let mut mismatch = regulate;
+        mismatch.mode = ThermalMode::Bypass;
+        mismatch.actuator = ActuatorState::Mismatch;
+        mismatch.group_c = Some(80.0);
+        let held = loop_.tick(mismatch);
+        close(held.thermal, 40.0);
+        close(held.shadow, 80.0);
+        assert_eq!(held.hold, Hold::ActuatorMismatch);
+
+        mismatch.actuator = ActuatorState::Verified;
+        let transferred = loop_.tick(mismatch);
+        close(transferred.cap, 30.0);
+        close(transferred.shadow, 30.0);
+        assert_eq!(transferred.hold, Hold::Bypass);
+
+        mismatch.mode = ThermalMode::Regulate;
+        mismatch.actuator = ActuatorState::Mismatch;
+        let held_exit = loop_.tick(mismatch);
+        close(held_exit.thermal, 40.0);
+        close(held_exit.shadow, 30.0);
+        mismatch.actuator = ActuatorState::Verified;
+        let exited = loop_.tick(mismatch);
+        close(exited.thermal, 30.0);
+        close(exited.cap, 30.0);
+
+        loop_.hot_episode_armed = false;
+        loop_.hot_rearm_s = 4.0;
+        mismatch.actuator = ActuatorState::Mismatch;
+        loop_.tick(mismatch);
+        close(loop_.hot_rearm_s, 0.0);
+    }
+
+    #[test]
+    fn hot_rearm_needs_five_contiguous_seconds_and_missing_draw_presence_reseeds_at_zero_dt() {
+        let gains = Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        };
+        let mut loop_ = DeviceLoop::<W>::new(gains);
+        loop_.seed_candidates(100.0, 50.0, Some(30.0), 10.0);
+        loop_.hot_episode_armed = false;
+        let mut cool = input(Some(60.0), 2.0);
+        cool.shadow_enabled = true;
+        loop_.tick(cool);
+        loop_.tick(cool);
+        assert!(!loop_.hot_episode_armed);
+        cool.dt_s = 1.0;
+        loop_.tick(cool);
+        assert!(loop_.hot_episode_armed);
+
+        loop_.hot_rearm_s = 4.0;
+        loop_.tick(input(None, 0.0));
+        close(loop_.hot_rearm_s, 0.0);
+
+        let mut missing = input(Some(80.0), 0.0);
+        missing.draw = None;
+        missing.shadow_enabled = true;
+        loop_.transfer_shadow(50.0);
+        loop_.tick(missing);
+        missing.draw = Some(80.0);
+        let returned = loop_.tick(missing);
+        close(returned.shadow, 30.0);
+    }
+
+    #[test]
+    fn hot_shadow_cases_keep_pi_state_and_bypass_still_moves_with_jittered_elapsed_time() {
+        let gains = Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        };
+        let mut replay = DeviceLoop::<W>::new(gains);
+        let mut dipped = DeviceLoop::<W>::new(gains);
+        for loop_ in [&mut replay, &mut dipped] {
+            loop_.seed_candidates(80.0, 50.0, Some(50.0), -10.0);
+        }
+        let mut replay_tick = input(Some(80.0), 2.0);
+        replay_tick.draw = Some(40.0);
+        replay_tick.shadow_enabled = true;
+        let mut dipped_tick = replay_tick;
+        for tick in 0..30 {
+            replay.tick(replay_tick);
+            if tick == 5 {
+                dipped_tick.draw = Some(10.0);
+            }
+            dipped.tick(dipped_tick);
+        }
+        close(replay.thermal, dipped.thermal);
+        close(replay.e_prev, dipped.e_prev);
+        close(replay.shadow, dipped.shadow);
+        assert_eq!(replay.requested, dipped.requested);
+        close(replay.elapsed_s, dipped.elapsed_s);
+
+        let mut hot_missing = input(Some(80.0), 2.0);
+        hot_missing.draw = None;
+        hot_missing.shadow_enabled = true;
+        let before_missing = replay.shadow;
+        for _ in 0..29 {
+            close(replay.tick(hot_missing).shadow, before_missing);
+        }
+        assert!(replay.tick(hot_missing).shadow > before_missing);
+
+        let mut bypass = DeviceLoop::<W>::new(gains);
+        bypass.seed_candidates(100.0, 50.0, Some(50.0), -10.0);
+        let mut bypass_tick = input(Some(80.0), 0.4);
+        bypass_tick.mode = ThermalMode::Bypass;
+        bypass_tick.draw = Some(80.0);
+        bypass_tick.shadow_enabled = true;
+        let first = bypass.tick(bypass_tick);
+        close(first.shadow, 54.0);
+        bypass_tick.dt_s = 1.6;
+        close(bypass.tick(bypass_tick).shadow, 70.0);
     }
 
     #[test]

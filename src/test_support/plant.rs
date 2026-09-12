@@ -651,7 +651,6 @@ impl ThermalPlant {
             "gpu_vram_f75303@4d",
             "gpu_amb_f75303@4d",
             "gpu_temp@40",
-            "unknown_thermal",
         ]
         .iter()
         .enumerate()
@@ -758,42 +757,79 @@ impl ThermalPlant {
         } else {
             TICK_S
         };
-        self.cpu_delay.push_back((cpu_w, dt_s));
-        self.gpu_delay.push_back((gpu_draw_w, dt_s));
-        let delayed = |queue: &mut VecDeque<(f64, f64)>, theta_s: f64| {
-            let theta_s = theta_s.max(0.0);
-            let mut elapsed_past_delay_s: f64 =
-                queue.iter().map(|(_, held)| *held).sum::<f64>() - theta_s;
-            let mut output = 0.0;
-            while elapsed_past_delay_s > 0.0 {
-                let Some((value, held)) = queue.pop_front() else {
-                    break;
-                };
-                output = value;
-                if elapsed_past_delay_s < held {
-                    queue.push_front((value, held - elapsed_past_delay_s));
-                    break;
+        // A delay line holds exactly theta seconds.  Appending this tick's
+        // input then consuming dt yields the delayed waveform over the
+        // interval, including a partial segment when a long backlog crosses
+        // theta (for dt=100, theta=90: 90 s old input, 10 s new input).
+        let delayed_segments =
+            |queue: &mut VecDeque<(f64, f64)>, theta_s: f64, input: f64, dt_s: f64| {
+                let theta_s = theta_s.max(0.0);
+                if queue.is_empty() && theta_s > 0.0 {
+                    queue.push_back((0.0, theta_s));
                 }
-                elapsed_past_delay_s -= held;
+                if dt_s > 0.0 {
+                    queue.push_back((input, dt_s));
+                }
+                let mut remaining_s = dt_s;
+                let mut output = Vec::new();
+                while remaining_s > 0.0 {
+                    let Some((value, duration_s)) = queue.pop_front() else {
+                        break;
+                    };
+                    let slice_s = remaining_s.min(duration_s);
+                    output.push((value, slice_s));
+                    remaining_s -= slice_s;
+                    if duration_s > slice_s {
+                        queue.push_front((value, duration_s - slice_s));
+                    }
+                }
+                output
+            };
+        let cpu_segments = delayed_segments(
+            &mut self.cpu_delay,
+            self.cpu_params.theta_eff_s,
+            cpu_w,
+            dt_s,
+        );
+        let gpu_segments = delayed_segments(
+            &mut self.gpu_delay,
+            self.gpu_params.theta_eff_s,
+            gpu_draw_w,
+            dt_s,
+        );
+        let mut cpu_index = 0;
+        let mut gpu_index = 0;
+        let mut cpu_remaining_s = cpu_segments.first().map_or(0.0, |(_, d)| *d);
+        let mut gpu_remaining_s = gpu_segments.first().map_or(0.0, |(_, d)| *d);
+        while cpu_index < cpu_segments.len() && gpu_index < gpu_segments.len() {
+            let slice_s = cpu_remaining_s.min(gpu_remaining_s);
+            let cpu_input_w = cpu_segments[cpu_index].0;
+            let gpu_input_w = gpu_segments[gpu_index].0;
+            let cpu_cross_c = 0.1 * (self.gpu_group_c - self.ambient_base_c);
+            let cpu_target =
+                self.ambient_base_c + self.cpu_params.k_c_per_w * cpu_input_w + cpu_cross_c;
+            let cpu_fraction = 1.0 - (-slice_s / self.cpu_params.tau_s.max(f64::EPSILON)).exp();
+            self.controllable_c += (cpu_target - self.controllable_c) * cpu_fraction;
+
+            let gpu_cross_c = 0.1 * (self.controllable_c - self.ambient_base_c);
+            // k=.02 C/MHz corresponds to .4 C/W at the measured 0.05 W/MHz
+            // slope. Keeping 0.4 explicit makes the heat path auditable.
+            let gpu_heat_c = gpu_input_w * 0.4 * (self.gpu_params.k_c_per_mhz / 0.02);
+            let gpu_target = self.ambient_base_c + gpu_heat_c + gpu_cross_c;
+            let gpu_fraction = 1.0 - (-slice_s / self.gpu_params.tau_s.max(f64::EPSILON)).exp();
+            self.gpu_group_c += (gpu_target - self.gpu_group_c) * gpu_fraction;
+
+            cpu_remaining_s -= slice_s;
+            gpu_remaining_s -= slice_s;
+            if cpu_remaining_s <= f64::EPSILON {
+                cpu_index += 1;
+                cpu_remaining_s = cpu_segments.get(cpu_index).map_or(0.0, |(_, d)| *d);
             }
-            output
-        };
-        let delayed_cpu_w = delayed(&mut self.cpu_delay, self.cpu_params.theta_eff_s);
-        let delayed_gpu_w = delayed(&mut self.gpu_delay, self.gpu_params.theta_eff_s);
-        let cpu_cross_c = 0.1 * (self.gpu_group_c - self.ambient_base_c);
-        let gpu_cross_c = 0.1 * (self.controllable_c - self.ambient_base_c);
-        let cpu_target =
-            self.ambient_base_c + self.cpu_params.k_c_per_w * delayed_cpu_w + cpu_cross_c;
-        // k=.02 C/MHz corresponds to .4 C/W at the measured 0.05 W/MHz
-        // slope.  Keeping 0.4 explicit makes the heat path auditable.
-        let gpu_heat_c = delayed_gpu_w * 0.4 * (self.gpu_params.k_c_per_mhz / 0.02);
-        let gpu_target = self.ambient_base_c + gpu_heat_c + gpu_cross_c;
-        let update = |node: &mut f64, target: f64, tau_s: f64| {
-            let tau_s = tau_s.max(f64::EPSILON);
-            *node += (target - *node) * (1.0 - (-dt_s / tau_s).exp());
-        };
-        update(&mut self.controllable_c, cpu_target, self.cpu_params.tau_s);
-        update(&mut self.gpu_group_c, gpu_target, self.gpu_params.tau_s);
+            if gpu_remaining_s <= f64::EPSILON {
+                gpu_index += 1;
+                gpu_remaining_s = gpu_segments.get(gpu_index).map_or(0.0, |(_, d)| *d);
+            }
+        }
 
         self.emit_reading(faults)
     }
@@ -848,10 +884,13 @@ impl ThermalPlant {
         if let Some(raw) = faults.raw_only_c {
             write_milli("temp5_input", raw);
         }
-        write_or_remove(
-            "temp9_input",
-            (!faults.ec_invalid).then_some(faults.unknown_c).flatten(),
-        );
+        if let Some(unknown_c) = (!faults.ec_invalid).then_some(faults.unknown_c).flatten() {
+            std::fs::write(self.dir.join("temp9_label"), "unknown_thermal\n").unwrap();
+            write_milli("temp9_input", unknown_c);
+        } else {
+            let _ = std::fs::remove_file(self.dir.join("temp9_label"));
+            let _ = std::fs::remove_file(self.dir.join("temp9_input"));
+        }
         EcReading::read(&self.dir)
     }
 }
@@ -1238,11 +1277,20 @@ pub struct TickScript {
     pub cpu_util_pct: f64,
     pub gpu_util_pct: f64,
     pub gpu_sm_mhz: f64,
+    /// Measured package draw independent of the sustained cap.  A scripted
+    /// one-sample burst can therefore exceed `cpu_cap_w` like the fixed fast
+    /// CPU limit does on hardware.
+    pub cpu_pkg_w_override: Option<f64>,
     /// Revision-4 GPU physical model inputs.  When both are `Some`, they
     /// supersede the legacy cap/fraction pair while preserving it for older
     /// scenario callers.
     pub gpu_lock_mhz: Option<f64>,
     pub gpu_load_level: Option<f64>,
+    /// `None` retains legacy inference from `gpu_temp_c`; `Some(false)`
+    /// explicitly removes the dGPU while leaving group-loss distinct.
+    pub gpu_powered: Option<bool>,
+    /// A draw outage and a clock-read outage are independent sensor faults.
+    pub gpu_clock_available: bool,
     /// Independent guard-driving die/Tctl inputs.  `None` follows the
     /// physical node, which keeps old tests deterministic.
     pub cpu_tctl_c: Option<f64>,
@@ -1292,8 +1340,11 @@ impl Default for TickScript {
             cpu_util_pct: 0.0,
             gpu_util_pct: 0.0,
             gpu_sm_mhz: 0.0,
+            cpu_pkg_w_override: None,
             gpu_lock_mhz: None,
             gpu_load_level: None,
+            gpu_powered: None,
+            gpu_clock_available: true,
             cpu_tctl_c: None,
             gpu_temp_c: None,
             nvme_temp_c: None,
@@ -1348,11 +1399,16 @@ pub fn gpu_full_load_power_w(clock_mhz: f64) -> f64 {
     100.0
 }
 
-/// Clock a fully loaded power-limited card can report.  It reaches the knee
-/// at full load, making reported clock `min(lock, power_limit_clock)`.
+/// Clock a power-limited card can report.  Partial work is non-limiting; at
+/// full load the observed RTX trace sat near 2520 MHz despite a 3090 MHz lock,
+/// and every higher lock shares that plateau.
 pub fn gpu_clock_at_power_limit(load_level: f64) -> f64 {
     let load_level = load_level.clamp(0.0, 1.0);
-    3090.0 - (3090.0 - 2143.0) * load_level
+    if load_level < 0.9 {
+        3090.0
+    } else {
+        3090.0 - (3090.0 - 2520.0) * ((load_level - 0.9) / 0.1)
+    }
 }
 
 /// Composes [`FanctrlEmulator`], [`ThermalPlant`] and [`FanPlant`] into a
@@ -1458,9 +1514,13 @@ impl ChainedPlant {
 
         // Demand model: the caps are what the controller asked for, the
         // draw is what actually happened -- only the draw heats anything.
-        let cpu_pkg_w = script.cpu_cap_w * script.cpu_demand_frac.clamp(0.0, 1.0);
-        let gpu_present = (script.gpu_temp_c.is_some() || self.thermal.gpu_ec_c.is_some())
-            && script.gpu_group_present;
+        let cpu_pkg_w = script
+            .cpu_pkg_w_override
+            .unwrap_or(script.cpu_cap_w * script.cpu_demand_frac.clamp(0.0, 1.0));
+        let gpu_powered = script
+            .gpu_powered
+            .unwrap_or(script.gpu_temp_c.is_some() || self.thermal.gpu_ec_c.is_some());
+        let gpu_group_present = gpu_powered && script.gpu_group_present;
         let clock_model = script.gpu_lock_mhz.is_some() && script.gpu_load_level.is_some();
         let per_device_fault = !script.cpu_group_present
             || !script.gpu_group_present
@@ -1471,7 +1531,7 @@ impl ChainedPlant {
             || script.raw_only_c.is_some()
             || script.unknown_c.is_some()
             || script.ec_invalid;
-        let (gpu_w, gpu_sm_mhz) = if gpu_present {
+        let (gpu_w, gpu_sm_mhz) = if gpu_powered {
             if let (Some(lock_mhz), Some(load_level)) = (script.gpu_lock_mhz, script.gpu_load_level)
             {
                 let load_level = load_level.clamp(0.0, 1.0);
@@ -1490,7 +1550,7 @@ impl ChainedPlant {
         };
         let faults = ThermalFaults {
             cpu_group_present: script.cpu_group_present,
-            gpu_group_present: gpu_present,
+            gpu_group_present,
             cpu_stuck_c: script.cpu_stuck_c,
             gpu_stuck_c: script.gpu_stuck_c,
             ambient_c: script.ambient_c,
@@ -1570,7 +1630,7 @@ impl ChainedPlant {
             igpu_w: 0.0,
             gpu_w,
             gpu_temp_c: script.gpu_temp_c.unwrap_or(0.0),
-            gpu_sm_mhz: if gpu_present && script.gpu_draw_available {
+            gpu_sm_mhz: if gpu_powered && script.gpu_clock_available {
                 gpu_sm_mhz
             } else {
                 0.0
@@ -1581,9 +1641,9 @@ impl ChainedPlant {
             resumed: script.resumed,
             fan_valid: !script.fan_outage,
             cpu_temp_valid: true,
-            gpu_w_valid: gpu_present && script.gpu_draw_available,
-            gpu_temp_valid: gpu_present,
-            gpu_mhz_valid: gpu_present && script.gpu_draw_available,
+            gpu_w_valid: gpu_powered && script.gpu_draw_available,
+            gpu_temp_valid: gpu_powered,
+            gpu_mhz_valid: gpu_powered && script.gpu_clock_available,
             ec_valid: ec_reading.is_some(),
             ec: ec_reading,
             nvme_temp_c: script.nvme_temp_c,
@@ -1930,16 +1990,20 @@ mod per_device_plant_tests {
             "got {} W",
             plateau.gpu_w
         );
-        assert_eq!(plateau.gpu_sm_mhz, 2143.0);
+        assert_eq!(plateau.gpu_sm_mhz, 2520.0);
 
-        script.gpu_lock_mhz = Some(1995.0);
-        let below_knee = p.tick(&script);
-        assert!(
-            (below_knee.gpu_w - 90.8).abs() < 0.01,
-            "got {} W",
-            below_knee.gpu_w
+        script.gpu_lock_mhz = Some(2700.0);
+        assert_eq!(
+            p.tick(&script).gpu_sm_mhz,
+            2520.0,
+            "above-knee lock plateaus"
         );
-        assert_eq!(below_knee.gpu_sm_mhz, 1995.0);
+        script.gpu_load_level = Some(0.5);
+        assert_eq!(
+            p.tick(&script).gpu_sm_mhz,
+            2700.0,
+            "partial load is not power-limited"
+        );
     }
 
     #[test]
@@ -2044,6 +2108,224 @@ mod per_device_plant_tests {
         let ec = group_lost.ec.expect("ambient/charger keep whole EC valid");
         assert_eq!(ec.cpu_group_c, None);
         assert_eq!(ec.gpu_group_c, None);
+    }
+
+    #[test]
+    fn normal_ec_samples_have_no_unknown_label_and_faults_do_not_persist() {
+        let mut p = plant();
+        let normal = p.tick(&TickScript::default());
+        assert!(normal.ec.unwrap().diagnostics.is_empty());
+        let fault = p.tick(&TickScript {
+            unknown_c: Some(76.0),
+            ..Default::default()
+        });
+        assert!(
+            fault
+                .ec
+                .unwrap()
+                .diagnostics
+                .iter()
+                .any(|diagnostic| format!("{diagnostic:?}").contains("unknown_thermal"))
+        );
+        assert!(
+            p.tick(&TickScript::default())
+                .ec
+                .unwrap()
+                .diagnostics
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn powered_gpu_group_loss_and_draw_outage_keep_their_other_streams_independent() {
+        let mut p = plant();
+        let group_lost = p.tick(&TickScript {
+            gpu_powered: Some(true),
+            gpu_temp_c: Some(81.0),
+            gpu_group_present: false,
+            gpu_lock_mhz: Some(3090.0),
+            gpu_load_level: Some(1.0),
+            ..Default::default()
+        });
+        assert_eq!(group_lost.ec.unwrap().gpu_group_c, None);
+        assert!(group_lost.gpu_temp_valid);
+        assert!(group_lost.gpu_w_valid);
+        assert!(group_lost.gpu_mhz_valid);
+        assert_eq!(group_lost.gpu_temp_c, 81.0);
+
+        let draw_out = p.tick(&TickScript {
+            gpu_powered: Some(true),
+            gpu_temp_c: Some(81.0),
+            gpu_draw_available: false,
+            gpu_clock_available: true,
+            gpu_lock_mhz: Some(3090.0),
+            gpu_load_level: Some(1.0),
+            ..Default::default()
+        });
+        assert!(!draw_out.gpu_w_valid);
+        assert!(draw_out.gpu_mhz_valid);
+        assert_eq!(draw_out.gpu_sm_mhz, 2520.0);
+    }
+
+    #[test]
+    fn package_power_override_reproduces_bursts_and_square_wave_loads() {
+        let mut p = plant();
+        let sustained = TickScript {
+            cpu_cap_w: 40.0,
+            cpu_pkg_w_override: Some(40.0),
+            ..Default::default()
+        };
+        let burst = TickScript {
+            cpu_cap_w: 40.0,
+            cpu_pkg_w_override: Some(70.0),
+            ..Default::default()
+        };
+        assert_eq!(p.tick(&sustained).cpu_pkg_w, 40.0);
+        assert_eq!(p.tick(&burst).cpu_pkg_w, 70.0);
+        assert_eq!(p.tick(&sustained).cpu_pkg_w, 40.0);
+        let square: Vec<f64> = [20.0, 60.0, 20.0, 60.0]
+            .into_iter()
+            .map(|watts| {
+                p.tick(&TickScript {
+                    cpu_pkg_w_override: Some(watts),
+                    ..sustained
+                })
+                .cpu_pkg_w
+            })
+            .collect();
+        assert_eq!(square, vec![20.0, 60.0, 20.0, 60.0]);
+    }
+
+    #[test]
+    fn elapsed_gpu_delay_integrates_only_after_the_delay_crossing() {
+        let mut p = ThermalPlant::new(42.0);
+        p.set_gpu_plant_params(GpuPlantParams::nominal());
+        let reading = p
+            .tick_nodes(
+                0.0,
+                100.0,
+                100.0,
+                ThermalFaults {
+                    gpu_group_present: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let expected = 42.0 + 40.0 * (1.0 - (-10.0_f64 / 15.0).exp());
+        assert!((reading.gpu_group_c.unwrap() - expected).abs() < 0.1);
+    }
+
+    #[test]
+    fn resumed_backlog_keeps_the_gpu_delay_boundary_and_node_state() {
+        let mut p = plant();
+        let mut script = TickScript {
+            gpu_powered: Some(true),
+            gpu_temp_c: Some(42.0),
+            gpu_lock_mhz: Some(3090.0),
+            gpu_load_level: Some(1.0),
+            elapsed_s: 90.0,
+            ..Default::default()
+        };
+        let before_boundary = p.tick(&script).ec.unwrap();
+        assert_eq!(before_boundary.gpu_group_c, Some(42.0));
+
+        script.elapsed_s = 10.0;
+        script.resumed = true;
+        let resumed = p.tick(&script);
+        assert!(resumed.resumed);
+        let expected = 42.0 + 40.0 * (1.0 - (-10.0_f64 / 15.0).exp());
+        assert!((resumed.ec.unwrap().gpu_group_c.unwrap() - expected).abs() < 0.1);
+    }
+
+    #[test]
+    fn every_gpu_robustness_axis_changes_the_observable_node_response() {
+        for tau_s in [8.0, 15.0, 25.0, 50.0] {
+            for k_c_per_mhz in [0.01, 0.02, 0.03] {
+                for theta_eff_s in [45.0, 90.0, 135.0] {
+                    let params = GpuPlantParams {
+                        tau_s,
+                        k_c_per_mhz,
+                        theta_eff_s,
+                    };
+                    let mut p = ThermalPlant::new(42.0);
+                    p.set_gpu_plant_params(params);
+                    let elapsed_s = theta_eff_s + 10.0;
+                    let reading = p
+                        .tick_nodes(
+                            0.0,
+                            100.0,
+                            elapsed_s,
+                            ThermalFaults {
+                                gpu_group_present: true,
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                    let heat_c = 40.0 * (k_c_per_mhz / 0.02);
+                    let expected = 42.0 + heat_c * (1.0 - (-10.0 / tau_s).exp());
+                    assert!(
+                        (reading.gpu_group_c.unwrap() - expected).abs() < 0.1,
+                        "{params:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn isolated_group_faults_keep_control_and_raw_streams_distinct() {
+        let mut p = plant();
+        let stuck = p.tick(&TickScript {
+            gpu_powered: Some(true),
+            gpu_temp_c: Some(42.0),
+            gpu_stuck_c: Some(105.0),
+            ..Default::default()
+        });
+        let ec = stuck.ec.unwrap();
+        assert_eq!(ec.gpu_group_c, Some(105.0));
+        assert_eq!(ec.reconciliation_max_c, Some(105));
+
+        let raw_only = p.tick(&TickScript {
+            gpu_powered: Some(true),
+            gpu_temp_c: Some(42.0),
+            raw_only_c: Some(150.0),
+            ..Default::default()
+        });
+        let ec = raw_only.ec.unwrap();
+        assert!(ec.gpu_group_c.unwrap() < 110.0);
+        assert_eq!(ec.reconciliation_max_c, Some(150));
+
+        let loss = p.tick(&TickScript {
+            gpu_powered: Some(true),
+            gpu_temp_c: Some(42.0),
+            gpu_group_present: false,
+            ..Default::default()
+        });
+        let ec = loss.ec.unwrap();
+        assert_eq!(ec.gpu_group_c, None);
+        assert!(
+            ec.reconciliation_max_c.is_some(),
+            "CPU/ambient raw data remains observable"
+        );
+    }
+
+    #[test]
+    fn target_and_curve_switches_are_visible_in_the_next_full_view() {
+        let mut p = plant();
+        let script = TickScript::default();
+        for _ in 0..30 {
+            p.tick(&script);
+        }
+        let replacement = vec![(0.0, 10), (60.0, 55), (95.0, 100)];
+        p.emulator_mut()
+            .edit_curve_in_place(replacement.clone())
+            .unwrap();
+        for _ in 0..30 {
+            p.tick(&script);
+        }
+        let view = p.tick(&script).fanctrl.unwrap();
+        assert_eq!(view.curve, replacement);
+        assert_eq!(view.speed_pct, p.emulator_mut().speed_pct());
     }
 
     #[test]

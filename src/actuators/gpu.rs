@@ -222,6 +222,30 @@ pub mod test_support {
         pub reported_mhz: Option<u32>,
     }
 
+    /// Cloneable observer retained by tests after a fake moves into a boxed
+    /// controller seam.  It intentionally exposes only observations, never
+    /// a way to alter the fake's actuator behavior.
+    #[derive(Clone)]
+    pub struct FakeGpuHandles {
+        calls: Arc<Mutex<Vec<GpuCall>>>,
+        history: Arc<Mutex<Vec<GpuHistory>>>,
+        reported_mhz: Arc<Mutex<Option<u32>>>,
+    }
+
+    impl FakeGpuHandles {
+        pub fn calls(&self) -> Vec<GpuCall> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        pub fn history(&self) -> Vec<GpuHistory> {
+            self.history.lock().unwrap().clone()
+        }
+
+        pub fn reported_sm_clock(&self) -> Option<u32> {
+            *self.reported_mhz.lock().unwrap()
+        }
+    }
+
     /// Recording stand-in for `GpuActuator`. The call log and the failure
     /// injector are behind `Arc`s so tests keep handles after the fake moves
     /// into the controller's `RestoreGuard`.
@@ -236,10 +260,10 @@ pub mod test_support {
         /// call is in flight — e.g. main's `shutdown` racing a sample.
         raise_on_set: Option<Arc<std::sync::atomic::AtomicBool>>,
         behavior: FakeGpuBehavior,
-        reported_mhz: Option<u32>,
+        reported_mhz: Arc<Mutex<Option<u32>>>,
         prior_requested_mhz: Option<u32>,
         command_times: (f64, f64),
-        history: Vec<GpuHistory>,
+        history: Arc<Mutex<Vec<GpuHistory>>>,
     }
 
     impl FakeGpu {
@@ -260,12 +284,20 @@ pub mod test_support {
             self.command_times = (acquired_at_s, completed_at_s);
         }
 
-        pub fn reported_sm_clock(&self) -> Option<u32> {
-            self.reported_mhz
+        pub fn handles(&self) -> FakeGpuHandles {
+            FakeGpuHandles {
+                calls: Arc::clone(&self.calls),
+                history: Arc::clone(&self.history),
+                reported_mhz: Arc::clone(&self.reported_mhz),
+            }
         }
 
-        pub fn history(&self) -> &[GpuHistory] {
-            &self.history
+        pub fn reported_sm_clock(&self) -> Option<u32> {
+            *self.reported_mhz.lock().unwrap()
+        }
+
+        pub fn history(&self) -> Vec<GpuHistory> {
+            self.history.lock().unwrap().clone()
         }
 
         /// Arm the mid-call flag raise (see `raise_on_set`).
@@ -304,19 +336,20 @@ pub mod test_support {
             let clamped = clamp_gpu_clock(mhz);
             self.applied = Some(clamped);
             self.calls.lock().unwrap().push(GpuCall::Set(clamped));
-            self.reported_mhz = match self.behavior {
+            let reported_mhz = match self.behavior {
                 FakeGpuBehavior::Immediate => Some(clamped),
                 FakeGpuBehavior::OneCommandLag => self.prior_requested_mhz.or(Some(clamped)),
                 // A card that ignores changes keeps its first accepted clock
                 // visible to the verifier across every later descent.
-                FakeGpuBehavior::Ignore => self.reported_mhz.or(Some(clamped)),
+                FakeGpuBehavior::Ignore => self.reported_sm_clock().or(Some(clamped)),
             };
+            *self.reported_mhz.lock().unwrap() = reported_mhz;
             self.prior_requested_mhz = Some(clamped);
-            self.history.push(GpuHistory {
+            self.history.lock().unwrap().push(GpuHistory {
                 call: GpuCall::Set(clamped),
                 acquired_at_s: self.command_times.0,
                 completed_at_s: self.command_times.1,
-                reported_mhz: self.reported_mhz,
+                reported_mhz,
             });
             if let Some(flag) = &self.raise_on_set {
                 flag.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -327,8 +360,9 @@ pub mod test_support {
         fn release(&mut self) -> color_eyre::Result<()> {
             self.applied = None;
             self.calls.lock().unwrap().push(GpuCall::Release);
-            self.reported_mhz = None;
-            self.history.push(GpuHistory {
+            *self.reported_mhz.lock().unwrap() = None;
+            self.prior_requested_mhz = None;
+            self.history.lock().unwrap().push(GpuHistory {
                 call: GpuCall::Release,
                 acquired_at_s: self.command_times.0,
                 completed_at_s: self.command_times.1,
@@ -399,6 +433,49 @@ mod tests {
         }
         assert!(matches!(
             verifier.verify_lock(100.0, ignoring.reported_sm_clock().unwrap()),
+            WriteVerdict::Mismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn boxed_fake_keeps_shared_lag_and_ignore_histories_for_verifier_pairs() {
+        let fake = FakeGpu::with_behavior(FakeGpuBehavior::OneCommandLag);
+        let handles = fake.handles();
+        let mut gpu: Box<dyn GpuClockCtl> = Box::new(fake);
+        gpu.set_max_clock(3090).unwrap();
+        gpu.set_max_clock(2985).unwrap();
+        assert_eq!(handles.reported_sm_clock(), Some(3090));
+        let mut prior_pair = GpuLockVerifier::new(3090);
+        assert_eq!(
+            prior_pair.verify_lock(100.0, handles.reported_sm_clock().unwrap()),
+            WriteVerdict::Verified(3090.0)
+        );
+        gpu.release().unwrap();
+        gpu.set_max_clock(2880).unwrap();
+        assert_eq!(
+            handles.reported_sm_clock(),
+            Some(2880),
+            "release clears the lag predecessor"
+        );
+        assert_eq!(handles.calls().len(), 4);
+        assert_eq!(handles.history().len(), 4);
+
+        let ignoring = FakeGpu::with_behavior(FakeGpuBehavior::Ignore);
+        let handles = ignoring.handles();
+        let mut gpu: Box<dyn GpuClockCtl> = Box::new(ignoring);
+        gpu.set_max_clock(3090).unwrap();
+        gpu.set_max_clock(2880).unwrap();
+        let mut verifier = GpuLockVerifier::new(2880);
+        assert_eq!(
+            verifier.verify_lock(100.0, handles.reported_sm_clock().unwrap()),
+            WriteVerdict::Unverifiable
+        );
+        assert_eq!(
+            verifier.verify_lock(100.0, handles.reported_sm_clock().unwrap()),
+            WriteVerdict::Unverifiable
+        );
+        assert!(matches!(
+            verifier.verify_lock(100.0, handles.reported_sm_clock().unwrap()),
             WriteVerdict::Mismatch { .. }
         ));
     }

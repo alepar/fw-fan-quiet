@@ -121,6 +121,12 @@ pub struct TickInput {
     pub dt_s: f64,
     pub resumed: bool,
     pub delta_tstar: f64,
+    /// Draw margin used to form the shadow candidate.
+    pub shadow_headroom: f64,
+    /// Maximum downward shadow movement per second.
+    pub shadow_fall_rate: f64,
+    /// Whether this device's shadow candidate is active.
+    pub shadow_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -176,8 +182,17 @@ pub struct DeviceLoop<U: DeviceUnit> {
     group_reset_pending: bool,
     group_missing_s: f64,
     draw_missing_s: f64,
+    draw_missing: bool,
     mismatch_latched: bool,
     pending_immediate: bool,
+    prev_group: Option<f64>,
+    prev_t_star: Option<f64>,
+    previous_selected: Option<Selected>,
+    hot_episode_armed: bool,
+    hot_rearm_s: f64,
+    control_entry_pending: bool,
+    entry_candidates_seeded: bool,
+    last_mode: Option<ThermalMode>,
     unit: std::marker::PhantomData<U>,
 }
 
@@ -201,8 +216,17 @@ impl<U: DeviceUnit> DeviceLoop<U> {
             group_reset_pending: false,
             group_missing_s: 0.0,
             draw_missing_s: 0.0,
+            draw_missing: false,
             mismatch_latched: false,
             pending_immediate: false,
+            prev_group: None,
+            prev_t_star: None,
+            previous_selected: None,
+            hot_episode_armed: true,
+            hot_rearm_s: 0.0,
+            control_entry_pending: true,
+            entry_candidates_seeded: false,
+            last_mode: None,
             unit: std::marker::PhantomData,
         }
     }
@@ -221,6 +245,7 @@ impl<U: DeviceUnit> DeviceLoop<U> {
         self.e_prev = error;
         self.elapsed_s = 0.0;
         self.group_seen = true;
+        self.entry_candidates_seeded = true;
     }
 
     /// Bumplessly transfers thermal ownership to `cap`.
@@ -319,6 +344,12 @@ impl<U: DeviceUnit> DeviceLoop<U> {
             self.group_lost = false;
             self.group_reset_pending = false;
             self.draw_missing_s = 0.0;
+            self.draw_missing = false;
+            self.hot_rearm_s = 0.0;
+            self.prev_group = None;
+            self.prev_t_star = None;
+            self.previous_selected = None;
+            self.last_mode = Some(input.mode);
             if let Some(error) = err {
                 self.resync_error(error);
             }
@@ -327,6 +358,11 @@ impl<U: DeviceUnit> DeviceLoop<U> {
                 .or(self.requested)
                 .unwrap_or(self.max)
                 .clamp(self.floor, self.max);
+            if !self.entry_candidates_seeded {
+                self.thermal = cap;
+                self.shadow = cap;
+                self.entry_candidates_seeded = true;
+            }
             self.requested = Some(cap);
             let write_allowed = input.group_c.is_some() || self.group_seen;
             self.pending_immediate = write_allowed;
@@ -335,7 +371,7 @@ impl<U: DeviceUnit> DeviceLoop<U> {
 
         let Some(error) = err else {
             self.elapsed_s = 0.0;
-            self.draw_missing_s = 0.0;
+            self.hot_rearm_s = 0.0;
             self.group_missing = true;
             if self.group_seen {
                 self.group_missing_s += dt;
@@ -379,7 +415,14 @@ impl<U: DeviceUnit> DeviceLoop<U> {
         }
         if self.group_reset_pending && !self.mismatch_latched {
             self.thermal = self.max;
-            self.shadow = self.max;
+            self.shadow = if input.shadow_enabled {
+                input
+                    .draw
+                    .map(|draw| shadow_target(draw, input.shadow_headroom, self.floor, self.max))
+                    .unwrap_or(self.max)
+            } else {
+                self.max
+            };
             self.requested = Some(self.quantize(self.max));
             self.group_reset_pending = false;
         }
@@ -391,21 +434,152 @@ impl<U: DeviceUnit> DeviceLoop<U> {
 
         if self.mismatch_latched {
             self.elapsed_s = 0.0;
+            if error < 0.0 {
+                self.hot_rearm_s = 0.0;
+            }
             let cap = self
                 .requested
                 .unwrap_or(self.max)
                 .clamp(self.floor, self.max);
-            return self.decision(input, cap, self.thermal, self.shadow, true, false);
+            let decision = self.decision(input, cap, self.thermal, self.shadow, true, false);
+            self.record_valid_tick(
+                input.group_c.expect("valid group"),
+                input.t_star,
+                decision.selected,
+            );
+            return decision;
         }
 
-        // eb9.4 replaces this explicit max stub with the draw-tracking
-        // candidate. Keeping it as a real candidate makes its selector and
-        // transfer seam independently testable now.
-        self.shadow = self.max;
+        let group = input.group_c.expect("valid group");
+        let mode_changed = self.last_mode.is_some_and(|mode| mode != input.mode);
+        if mode_changed {
+            let cap = self
+                .last_applied
+                .or(self.requested)
+                .unwrap_or(self.max)
+                .clamp(self.floor, self.max);
+            match input.mode {
+                ThermalMode::Bypass => self.transfer_shadow(cap),
+                ThermalMode::Regulate => {
+                    self.transfer_thermal(cap, error);
+                    self.hot_episode_armed = error >= 0.0;
+                    self.hot_rearm_s = 0.0;
+                }
+            }
+            self.requested = Some(self.quantize(cap));
+            let thermal = if input.mode == ThermalMode::Bypass {
+                self.max
+            } else {
+                self.thermal
+            };
+            let decision = self.decision(input, cap, thermal, self.shadow, true, false);
+            self.record_valid_tick(group, input.t_star, decision.selected);
+            self.control_entry_pending = false;
+            self.last_mode = Some(input.mode);
+            return decision;
+        }
+
+        let measured_crossing =
+            self.prev_group
+                .zip(self.prev_t_star)
+                .is_some_and(|(prev_group, prev_t_star)| {
+                    prev_group <= prev_t_star && group > prev_t_star && group > input.t_star
+                });
+        let handover = input.mode == ThermalMode::Regulate
+            && !resynced_error
+            && self.hot_episode_armed
+            && self.previous_selected == Some(Selected::Shadow)
+            && measured_crossing;
+        let initial_hot_entry =
+            self.control_entry_pending && input.mode == ThermalMode::Regulate && error < 0.0;
+        if handover || initial_hot_entry {
+            let cap = if initial_hot_entry {
+                if let Some(cap) = self.last_applied {
+                    cap.clamp(self.floor, self.max)
+                } else if self.entry_candidates_seeded {
+                    self.shadow.clamp(self.floor, self.max)
+                } else if input.shadow_enabled {
+                    input
+                        .draw
+                        .map(|draw| {
+                            shadow_target(draw, input.shadow_headroom, self.floor, self.max)
+                        })
+                        .unwrap_or(self.max)
+                } else {
+                    self.max
+                }
+            } else {
+                self.last_applied
+                    .or(self.requested)
+                    .unwrap_or(self.shadow)
+                    .clamp(self.floor, self.max)
+            };
+            self.thermal = cap;
+            if initial_hot_entry {
+                self.shadow = cap;
+            }
+            self.requested = Some(self.quantize(cap));
+            self.resync_error(error);
+            self.elapsed_s = 0.0;
+            self.hot_episode_armed = false;
+            self.hot_rearm_s = 0.0;
+            let decision = self.decision(input, cap, self.thermal, self.shadow, true, false);
+            self.record_valid_tick(group, input.t_star, decision.selected);
+            self.control_entry_pending = false;
+            self.last_mode = Some(input.mode);
+            return decision;
+        }
+
+        if self.hot_episode_armed {
+            // An idle loop is already armed; no dwell is required until the
+            // first hot episode has consumed the arm.
+        } else if error >= 0.0 {
+            self.hot_rearm_s += dt;
+            if self.hot_rearm_s >= PI_PERIOD_S {
+                self.hot_episode_armed = true;
+                self.hot_rearm_s = 0.0;
+            }
+        } else {
+            self.hot_rearm_s = 0.0;
+        }
+
+        let draw_returned = input.draw.is_some() && self.draw_missing;
+        let shadow_target = if input.shadow_enabled {
+            input
+                .draw
+                .map(|draw| shadow_target(draw, input.shadow_headroom, self.floor, self.max))
+                .unwrap_or(self.max)
+        } else {
+            self.max
+        };
         if input.draw.is_none() {
+            self.draw_missing = true;
             self.draw_missing_s += dt;
         } else {
+            self.draw_missing = false;
             self.draw_missing_s = 0.0;
+        }
+        if draw_returned {
+            self.transfer_shadow(self.last_applied.or(self.requested).unwrap_or(self.shadow));
+        } else if !input.shadow_enabled {
+            self.shadow = self.max;
+        } else if input.draw.is_some() {
+            let moves = input.mode == ThermalMode::Bypass || error >= 0.0;
+            if moves {
+                self.shadow = self.move_shadow_toward(
+                    shadow_target,
+                    dt,
+                    input.shadow_headroom,
+                    input.shadow_fall_rate,
+                );
+            }
+        } else if self.draw_missing_s >= GROUP_UNAVAILABLE_DWELL_S {
+            self.shadow = self.move_shadow_toward(
+                self.max,
+                dt,
+                input.shadow_headroom,
+                input.shadow_fall_rate,
+            );
         }
 
         let thermal_candidate = match input.mode {
@@ -436,7 +610,33 @@ impl<U: DeviceUnit> DeviceLoop<U> {
         let cap =
             self.slew_and_quantize(target, selected, dt, floor_changed || max_request_lowered);
         self.requested = Some(cap);
-        self.decision(input, cap, thermal_candidate, self.shadow, true, false)
+        let decision = self.decision(input, cap, thermal_candidate, self.shadow, true, false);
+        self.record_valid_tick(group, input.t_star, decision.selected);
+        self.control_entry_pending = false;
+        self.last_mode = Some(input.mode);
+        decision
+    }
+
+    fn move_shadow_toward(&self, target: f64, dt: f64, headroom: f64, fall_rate: f64) -> f64 {
+        let rise_rate = if U::GRID == 0.5 {
+            positive_or_zero(headroom)
+        } else {
+            300.0
+        };
+        let fall_rate = positive_or_zero(fall_rate);
+        let delta = target - self.shadow;
+        let step = if delta >= 0.0 {
+            rise_rate * dt
+        } else {
+            fall_rate * dt
+        };
+        (self.shadow + delta.clamp(-step, step)).clamp(self.floor, self.max)
+    }
+
+    fn record_valid_tick(&mut self, group: f64, t_star: f64, selected: Selected) {
+        self.prev_group = Some(group);
+        self.prev_t_star = Some(t_star);
+        self.previous_selected = Some(selected);
     }
 
     fn slew_and_quantize(
@@ -554,6 +754,18 @@ fn finite_or_zero(value: f64) -> f64 {
     if value.is_finite() { value } else { 0.0 }
 }
 
+fn positive_or_zero(value: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        0.0
+    }
+}
+
+fn shadow_target(draw: f64, headroom: f64, floor: f64, max: f64) -> f64 {
+    (draw + positive_or_zero(headroom)).clamp(floor, max)
+}
+
 fn ordered_bounds(floor: f64, max: f64) -> (f64, f64) {
     let max = if max.is_finite() { max } else { 0.0 };
     let floor = if floor.is_finite() {
@@ -601,6 +813,9 @@ mod tests {
             dt_s,
             resumed: false,
             delta_tstar: 0.0,
+            shadow_headroom: 10.0,
+            shadow_fall_rate: 0.33,
+            shadow_enabled: false,
         }
     }
 
@@ -746,6 +961,26 @@ mod tests {
     }
 
     #[test]
+    fn resumed_absent_loop_keeps_its_held_cap_on_first_hot_entry() {
+        let mut loop_ = DeviceLoop::<W>::new(Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        });
+        let mut resumed = input(None, 7_200.0);
+        resumed.resumed = true;
+        resumed.shadow_enabled = true;
+        let held = loop_.tick(resumed);
+        close(held.cap, 100.0);
+
+        let mut hot = input(Some(80.0), 1.0);
+        hot.shadow_enabled = true;
+        let entered = loop_.tick(hot);
+        close(entered.thermal, 100.0);
+        close(entered.cap, 100.0);
+        close(loop_.requested().expect("entry request"), 100.0);
+    }
+
+    #[test]
     fn selector_preserves_bound_identity_and_prefers_thermal_on_interior_ties() {
         assert_eq!(
             select_candidates(10.0, 10.0, 10.0, 100.0),
@@ -763,6 +998,366 @@ mod tests {
             select_candidates(60.0, 50.0, 10.0, 100.0),
             (50.0, Selected::Shadow)
         );
+    }
+
+    #[test]
+    fn shadow_candidate_uses_unit_rise_and_configured_fall_slews() {
+        let gains = Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        };
+        let mut cpu = DeviceLoop::<W>::new(gains);
+        cpu.seed_candidates(100.0, 50.0, Some(50.0), 10.0);
+        let mut cpu_tick = input(Some(60.0), 1.0);
+        cpu_tick.draw = Some(80.0);
+        cpu_tick.shadow_headroom = 10.0;
+        cpu_tick.shadow_fall_rate = 0.5;
+        cpu_tick.shadow_enabled = true;
+        let raised = cpu.tick(cpu_tick);
+        close(raised.shadow, 60.0);
+        close(raised.cap, 60.0);
+        assert_eq!(raised.selected, Selected::Shadow);
+        assert_eq!(raised.hold, Hold::Shadow);
+
+        cpu_tick.draw = Some(20.0);
+        let fallen = cpu.tick(cpu_tick);
+        close(fallen.shadow, 59.5);
+
+        let mut gpu = DeviceLoop::<Mhz>::new(gains);
+        gpu.seed_candidates(3_090.0, 1_000.0, Some(1_000.0), 10.0);
+        let mut gpu_tick = input(Some(60.0), 1.0);
+        gpu_tick.floor = 1_000.0;
+        gpu_tick.max = 3_090.0;
+        gpu_tick.draw = Some(1_500.0);
+        gpu_tick.shadow_headroom = 30.0;
+        gpu_tick.shadow_fall_rate = 10.0;
+        gpu_tick.shadow_enabled = true;
+        let raised = gpu.tick(gpu_tick);
+        close(raised.shadow, 1_300.0);
+        close(raised.cap, 1_300.0);
+
+        gpu_tick.draw = Some(1_000.0);
+        let fallen = gpu.tick(gpu_tick);
+        close(fallen.shadow, 1_290.0);
+    }
+
+    #[test]
+    fn measured_crossing_hands_thermal_over_once_and_rearms_after_five_cool_seconds() {
+        let gains = Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        };
+        let mut loop_ = DeviceLoop::<W>::new(gains);
+        loop_.seed_candidates(100.0, 50.0, Some(50.0), 10.0);
+        let mut cool = input(Some(60.0), 1.0);
+        cool.shadow_enabled = true;
+        assert_eq!(loop_.tick(cool).selected, Selected::Shadow);
+
+        let mut hot = cool;
+        hot.group_c = Some(71.0);
+        let handed = loop_.tick(hot);
+        close(handed.thermal, 50.0);
+        close(handed.cap, 50.0);
+
+        hot.draw = Some(10.0);
+        for _ in 0..3 {
+            assert_eq!(loop_.tick(hot).thermal, 50.0);
+        }
+
+        let mut cool = hot;
+        cool.group_c = Some(60.0);
+        cool.draw = Some(40.0);
+        cool.dt_s = 2.0;
+        loop_.tick(cool);
+        loop_.tick(cool);
+        cool.dt_s = 1.0;
+        loop_.tick(cool);
+
+        loop_.transfer_thermal(100.0, 10.0);
+        loop_.transfer_shadow(50.0);
+        assert_eq!(loop_.tick(cool).selected, Selected::Shadow);
+        hot.dt_s = 1.0;
+        hot.draw = Some(40.0);
+        close(loop_.tick(hot).thermal, 50.0);
+    }
+
+    #[test]
+    fn target_only_hot_sign_change_and_hot_draw_dip_do_not_handover_or_track_thermal() {
+        let gains = Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        };
+        let mut target_only = DeviceLoop::<W>::new(gains);
+        target_only.seed_candidates(100.0, 50.0, Some(50.0), 10.0);
+        let mut cool = input(Some(60.0), 1.0);
+        cool.shadow_enabled = true;
+        assert_eq!(target_only.tick(cool).selected, Selected::Shadow);
+        let mut changed_target = cool;
+        changed_target.t_star = 50.0;
+        changed_target.delta_tstar = -20.0;
+        let unchanged = target_only.tick(changed_target);
+        close(unchanged.thermal, 100.0);
+
+        let mut replay = DeviceLoop::<W>::new(gains);
+        let mut dipped = DeviceLoop::<W>::new(gains);
+        for loop_ in [&mut replay, &mut dipped] {
+            loop_.seed_candidates(80.0, 50.0, Some(50.0), -10.0);
+        }
+        let mut hot = input(Some(80.0), 2.0);
+        hot.draw = Some(40.0);
+        hot.shadow_enabled = true;
+        for tick in 0..30 {
+            replay.tick(hot);
+            if tick == 5 {
+                hot.draw = Some(10.0);
+            }
+            dipped.tick(hot);
+        }
+        close(replay.thermal(), dipped.thermal());
+    }
+
+    #[test]
+    fn missing_draw_dwell_return_and_shadow_toggle_use_slew_without_a_step() {
+        let gains = Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        };
+        let mut loop_ = DeviceLoop::<W>::new(gains);
+        loop_.seed_candidates(100.0, 50.0, Some(50.0), 10.0);
+        let mut missing = input(Some(60.0), 2.0);
+        missing.draw = None;
+        missing.shadow_enabled = true;
+        for _ in 0..29 {
+            close(loop_.tick(missing).shadow, 50.0);
+        }
+        let expired = loop_.tick(missing);
+        close(expired.shadow, 70.0);
+        close(expired.cap, 70.0);
+
+        let mut returned = missing;
+        returned.draw = Some(40.0);
+        let returned = loop_.tick(returned);
+        close(returned.shadow, 50.0);
+        close(returned.cap, 50.0);
+
+        let mut gpu = DeviceLoop::<Mhz>::new(gains);
+        gpu.seed_candidates(3_090.0, 1_000.0, Some(1_000.0), 10.0);
+        let mut toggle = input(Some(60.0), 1.0);
+        toggle.floor = 1_000.0;
+        toggle.max = 3_090.0;
+        toggle.draw = Some(1_000.0);
+        toggle.shadow_headroom = 300.0;
+        toggle.shadow_fall_rate = 10.0;
+        toggle.shadow_enabled = false;
+        let disabled = gpu.tick(toggle);
+        close(disabled.shadow, 3_090.0);
+        close(disabled.cap, 1_105.0);
+        toggle.shadow_enabled = true;
+        let enabled = gpu.tick(toggle);
+        close(enabled.shadow, 3_080.0);
+        close(enabled.cap, 1_405.0);
+    }
+
+    #[test]
+    fn bypass_transfers_unequal_candidates_without_a_step_and_initial_hot_entry_is_bumpless() {
+        let gains = Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        };
+        let mut loop_ = DeviceLoop::<W>::new(gains);
+        loop_.seed_candidates(40.0, 80.0, Some(30.0), 10.0);
+        let mut tick = input(Some(60.0), 0.0);
+        tick.draw = Some(70.0);
+        tick.shadow_enabled = true;
+        close(loop_.tick(tick).cap, 30.0);
+        tick.mode = ThermalMode::Bypass;
+        tick.dt_s = 1.0;
+        let entering = loop_.tick(tick);
+        close(entering.cap, 30.0);
+        assert_eq!(entering.hold, Hold::Bypass);
+        close(entering.shadow, 30.0);
+        let bypassed = loop_.tick(tick);
+        assert!(bypassed.shadow > 30.0);
+
+        tick.mode = ThermalMode::Regulate;
+        let exiting = loop_.tick(tick);
+        close(exiting.cap, 30.0);
+        close(exiting.thermal, 30.0);
+
+        let mut initial_hot = DeviceLoop::<W>::new(gains);
+        let mut hot = input(Some(80.0), 1.0);
+        hot.draw = Some(40.0);
+        hot.shadow_enabled = true;
+        let entered = initial_hot.tick(hot);
+        close(entered.thermal, 50.0);
+        close(entered.shadow, 50.0);
+        close(entered.cap, 50.0);
+
+        let mut clamped = DeviceLoop::<W>::new(Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        });
+        clamped.seed_candidates(90.0, 50.0, Some(150.0), 10.0);
+        close(clamped.tick(hot).thermal, 100.0);
+    }
+
+    #[test]
+    fn seeded_first_hot_entry_transfers_from_the_successfully_applied_cap() {
+        let mut loop_ = DeviceLoop::<W>::new(Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        });
+        loop_.seed_candidates(90.0, 50.0, Some(50.0), 10.0);
+        let mut hot = input(Some(80.0), 1.0);
+        hot.draw = Some(40.0);
+        hot.shadow_enabled = true;
+
+        let entered = loop_.tick(hot);
+        close(entered.thermal, 50.0);
+        close(entered.shadow, 50.0);
+        close(entered.cap, 50.0);
+    }
+
+    #[test]
+    fn initial_hot_entry_without_an_applied_cap_uses_the_seeded_shadow() {
+        let mut loop_ = DeviceLoop::<W>::new(Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        });
+        loop_.seed_candidates(90.0, 50.0, None, 10.0);
+        let mut hot = input(Some(80.0), 1.0);
+        hot.draw = Some(80.0);
+        hot.shadow_enabled = true;
+
+        let entered = loop_.tick(hot);
+        close(entered.thermal, 50.0);
+        close(entered.cap, 50.0);
+        close(loop_.requested().expect("entry request"), 50.0);
+    }
+
+    #[test]
+    fn mismatch_defers_mode_transfer_and_negative_samples_break_hot_rearm() {
+        let mut loop_ = DeviceLoop::<W>::new(Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        });
+        loop_.seed_candidates(40.0, 80.0, Some(30.0), 10.0);
+        let mut regulate = input(Some(60.0), 0.0);
+        regulate.draw = Some(70.0);
+        regulate.shadow_enabled = true;
+        loop_.tick(regulate);
+
+        let mut mismatch = regulate;
+        mismatch.mode = ThermalMode::Bypass;
+        mismatch.actuator = ActuatorState::Mismatch;
+        mismatch.group_c = Some(80.0);
+        let held = loop_.tick(mismatch);
+        close(held.thermal, 40.0);
+        close(held.shadow, 80.0);
+        assert_eq!(held.hold, Hold::ActuatorMismatch);
+
+        mismatch.actuator = ActuatorState::Verified;
+        let transferred = loop_.tick(mismatch);
+        close(transferred.cap, 30.0);
+        close(transferred.shadow, 30.0);
+        assert_eq!(transferred.hold, Hold::Bypass);
+
+        mismatch.mode = ThermalMode::Regulate;
+        mismatch.actuator = ActuatorState::Mismatch;
+        let held_exit = loop_.tick(mismatch);
+        close(held_exit.thermal, 40.0);
+        close(held_exit.shadow, 30.0);
+        mismatch.actuator = ActuatorState::Verified;
+        let exited = loop_.tick(mismatch);
+        close(exited.thermal, 30.0);
+        close(exited.cap, 30.0);
+
+        loop_.hot_episode_armed = false;
+        loop_.hot_rearm_s = 4.0;
+        mismatch.actuator = ActuatorState::Mismatch;
+        loop_.tick(mismatch);
+        close(loop_.hot_rearm_s, 0.0);
+    }
+
+    #[test]
+    fn hot_rearm_needs_five_contiguous_seconds_and_missing_draw_presence_reseeds_at_zero_dt() {
+        let gains = Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        };
+        let mut loop_ = DeviceLoop::<W>::new(gains);
+        loop_.seed_candidates(100.0, 50.0, Some(30.0), 10.0);
+        loop_.hot_episode_armed = false;
+        let mut cool = input(Some(60.0), 2.0);
+        cool.shadow_enabled = true;
+        loop_.tick(cool);
+        loop_.tick(cool);
+        assert!(!loop_.hot_episode_armed);
+        cool.dt_s = 1.0;
+        loop_.tick(cool);
+        assert!(loop_.hot_episode_armed);
+
+        loop_.hot_rearm_s = 4.0;
+        loop_.tick(input(None, 0.0));
+        close(loop_.hot_rearm_s, 0.0);
+
+        let mut missing = input(Some(80.0), 0.0);
+        missing.draw = None;
+        missing.shadow_enabled = true;
+        loop_.transfer_shadow(50.0);
+        loop_.tick(missing);
+        missing.draw = Some(80.0);
+        let returned = loop_.tick(missing);
+        close(returned.shadow, 30.0);
+    }
+
+    #[test]
+    fn hot_shadow_cases_keep_pi_state_and_bypass_still_moves_with_jittered_elapsed_time() {
+        let gains = Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        };
+        let mut replay = DeviceLoop::<W>::new(gains);
+        let mut dipped = DeviceLoop::<W>::new(gains);
+        for loop_ in [&mut replay, &mut dipped] {
+            loop_.seed_candidates(80.0, 50.0, Some(50.0), -10.0);
+        }
+        let mut replay_tick = input(Some(80.0), 2.0);
+        replay_tick.draw = Some(40.0);
+        replay_tick.shadow_enabled = true;
+        let mut dipped_tick = replay_tick;
+        for tick in 0..30 {
+            replay.tick(replay_tick);
+            if tick == 5 {
+                dipped_tick.draw = Some(10.0);
+            }
+            dipped.tick(dipped_tick);
+        }
+        close(replay.thermal, dipped.thermal);
+        close(replay.e_prev, dipped.e_prev);
+        close(replay.shadow, dipped.shadow);
+        assert_eq!(replay.requested, dipped.requested);
+        close(replay.elapsed_s, dipped.elapsed_s);
+
+        let mut hot_missing = input(Some(80.0), 2.0);
+        hot_missing.draw = None;
+        hot_missing.shadow_enabled = true;
+        let before_missing = replay.shadow;
+        for _ in 0..29 {
+            close(replay.tick(hot_missing).shadow, before_missing);
+        }
+        assert!(replay.tick(hot_missing).shadow > before_missing);
+
+        let mut bypass = DeviceLoop::<W>::new(gains);
+        bypass.seed_candidates(100.0, 50.0, Some(50.0), -10.0);
+        let mut bypass_tick = input(Some(80.0), 0.4);
+        bypass_tick.mode = ThermalMode::Bypass;
+        bypass_tick.draw = Some(80.0);
+        bypass_tick.shadow_enabled = true;
+        let first = bypass.tick(bypass_tick);
+        close(first.shadow, 54.0);
+        bypass_tick.dt_s = 1.6;
+        close(bypass.tick(bypass_tick).shadow, 70.0);
     }
 
     #[test]
@@ -1171,6 +1766,9 @@ mod tests {
                 dt_s: 1.0,
                 resumed: false,
                 delta_tstar: 0.0,
+                shadow_headroom: 10.0,
+                shadow_fall_rate: 0.33,
+                shadow_enabled: false,
             });
             loop_.note_applied(decision.cap);
             delayed.push_back(decision.cap);
@@ -1202,6 +1800,9 @@ mod tests {
                 dt_s: 1.0,
                 resumed: false,
                 delta_tstar: 0.0,
+                shadow_headroom: 300.0,
+                shadow_fall_rate: 10.0,
+                shadow_enabled: false,
             });
             loop_.note_applied(decision.cap);
             delayed.push_back(decision.cap);

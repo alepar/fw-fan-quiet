@@ -39,6 +39,26 @@ const VERIFY_CLOCK_SLACK_MHZ: u32 = 30;
 /// over-clock sample is normal boost-clock noise at the pin edge).
 const VERIFY_STRIKES: u32 = 3;
 
+/// A GPU lock command that completed successfully.  The controller records
+/// these from the monotonic sample clock; verification deliberately selects
+/// only commands that were complete before a sample was acquired.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GpuCommandEvidence {
+    pub locked_mhz: u32,
+    pub completed_at_s: f64,
+    pub generation: u64,
+}
+
+impl GpuCommandEvidence {
+    pub const fn new(locked_mhz: u32, completed_at_s: f64, generation: u64) -> Self {
+        Self {
+            locked_mhz,
+            completed_at_s,
+            generation,
+        }
+    }
+}
+
 /// GPU lock read-back verification (design §2.9): there is no NVML read of
 /// the applied lock itself, so verification is indirect -- while the GPU is
 /// under load (`gpu_util` above the floor), the measured SM clock must stay
@@ -48,6 +68,7 @@ const VERIFY_STRIKES: u32 = 3;
 /// building block until then.
 #[derive(Debug, Clone, Copy)]
 pub struct GpuLockVerifier {
+    #[allow(dead_code)] // retained for the direct single-lock compatibility API
     locked_mhz: u32,
     violation_streak: u32,
 }
@@ -70,12 +91,77 @@ impl GpuLockVerifier {
     /// (`Unverifiable` while the streak is building) — only
     /// `VERIFY_STRIKES` CONSECUTIVE overshoots score a `Mismatch`, naming
     /// the pinned clock.
+    #[allow(dead_code)] // exercised by the direct verifier unit contract
     pub fn verify_lock(&mut self, gpu_util: f64, gpu_sm_mhz: u32) -> WriteVerdict {
         if gpu_util <= VERIFY_UTIL_FLOOR_PCT {
             self.violation_streak = 0;
             return WriteVerdict::Unverifiable;
         }
         let ceiling = self.locked_mhz + VERIFY_CLOCK_SLACK_MHZ;
+        if gpu_sm_mhz <= ceiling {
+            self.violation_streak = 0;
+            return WriteVerdict::Verified(f64::from(gpu_sm_mhz));
+        }
+        self.violation_streak += 1;
+        if self.violation_streak >= VERIFY_STRIKES {
+            WriteVerdict::Mismatch {
+                field: "gpu_sm_mhz",
+                commanded: f64::from(ceiling),
+                read: f64::from(gpu_sm_mhz),
+            }
+        } else {
+            WriteVerdict::Unverifiable
+        }
+    }
+
+    /// Scores a clock sample against the command that was actually in force
+    /// when it was acquired.  A just-issued command is not evidence for an
+    /// earlier sample.  During the first second after a downward command, a
+    /// one-command-lag card may still report the immediate predecessor, so
+    /// the larger of those two locks is allowed exactly for that interval.
+    /// The caller retains the history and appends only successful commands.
+    pub fn verify_paired(
+        &mut self,
+        gpu_util: f64,
+        gpu_sm_mhz: u32,
+        sample_acquired_at_s: f64,
+        commands: &[GpuCommandEvidence],
+    ) -> WriteVerdict {
+        let Some((index, paired)) = commands
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, command)| command.completed_at_s <= sample_acquired_at_s)
+        else {
+            return WriteVerdict::Unverifiable;
+        };
+
+        let predecessor = index.checked_sub(1).and_then(|i| commands.get(i));
+        let within_downward_lag_window = predecessor.is_some_and(|previous| {
+            paired.locked_mhz < previous.locked_mhz
+                && sample_acquired_at_s - paired.completed_at_s <= 1.0
+        });
+        let allowed_lock = if within_downward_lag_window {
+            paired
+                .locked_mhz
+                .max(predecessor.expect("checked above").locked_mhz)
+        } else {
+            paired.locked_mhz
+        };
+        self.verify_against_lock(gpu_util, gpu_sm_mhz, allowed_lock)
+    }
+
+    fn verify_against_lock(
+        &mut self,
+        gpu_util: f64,
+        gpu_sm_mhz: u32,
+        locked_mhz: u32,
+    ) -> WriteVerdict {
+        if gpu_util <= VERIFY_UTIL_FLOOR_PCT {
+            self.violation_streak = 0;
+            return WriteVerdict::Unverifiable;
+        }
+        let ceiling = locked_mhz + VERIFY_CLOCK_SLACK_MHZ;
         if gpu_sm_mhz <= ceiling {
             self.violation_streak = 0;
             return WriteVerdict::Verified(f64::from(gpu_sm_mhz));
@@ -403,6 +489,44 @@ mod tests {
         assert_eq!(clamp_gpu_clock(1500), 1500);
         assert_eq!(clamp_gpu_clock(1000), 1000);
         assert_eq!(clamp_gpu_clock(3090), 3090);
+    }
+
+    #[test]
+    fn paired_verifier_uses_only_commands_completed_before_the_sample() {
+        let mut verifier = GpuLockVerifier::new(3_090);
+        let commands = [
+            GpuCommandEvidence::new(3_090, 10.2, 1),
+            GpuCommandEvidence::new(2_985, 11.2, 2),
+        ];
+
+        assert_eq!(
+            verifier.verify_paired(95.0, 3_090, 10.1, &commands),
+            WriteVerdict::Unverifiable,
+            "a command completing after acquisition cannot be paired backwards"
+        );
+        assert_eq!(
+            verifier.verify_paired(95.0, 3_090, 10.3, &commands),
+            WriteVerdict::Verified(3_090.0)
+        );
+    }
+
+    #[test]
+    fn paired_verifier_allows_one_command_lag_only_for_one_second_after_descent() {
+        let mut verifier = GpuLockVerifier::new(3_090);
+        let commands = [
+            GpuCommandEvidence::new(3_090, 10.0, 1),
+            GpuCommandEvidence::new(2_985, 11.0, 2),
+        ];
+
+        assert_eq!(
+            verifier.verify_paired(95.0, 3_090, 11.5, &commands),
+            WriteVerdict::Verified(3_090.0),
+        );
+        assert_eq!(
+            verifier.verify_paired(95.0, 3_090, 12.1, &commands),
+            WriteVerdict::Unverifiable,
+            "outside the bounded grace window the paired descent command scores a strike"
+        );
     }
 
     #[test]

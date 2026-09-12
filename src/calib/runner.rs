@@ -40,6 +40,11 @@ pub enum Phase {
 /// burner, state file and UI by the controller; asserted on in tests.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunnerEffect {
+    /// Direct CPU sustained-cap write for the per-device calibration runner.
+    /// The current budget-based step sequence remains live until task .8
+    /// migrates it; this is the explicit actuator seam it will use.
+    #[allow(dead_code)] // consumed by the per-device step algorithm in task .8
+    SetCpuMaxWatts(f64),
     /// Lock the GPU max clock (MHz).
     SetGpuMaxClock(u32),
     /// Restore stock CPU limits.
@@ -358,6 +363,8 @@ mod tests {
 
     fn happy_ctx() -> CalibContext {
         CalibContext {
+            cpu_cap_w: None,
+            gpu_cap_mhz: None,
             ec_ma: Some(BASE_EC),
             ec_mismatch: false,
             fanctrl_active: true,

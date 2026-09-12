@@ -201,6 +201,7 @@ impl Sampler {
 
         Sample {
             t_mono,
+            acquired_at: Some(now),
             fan1_rpm: fans.map_or(0.0, |(fan1, _)| fan1),
             fan2_rpm: fans.map_or(0.0, |(_, fan2)| fan2),
             fan_valid: fans.is_some(),

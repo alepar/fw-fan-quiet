@@ -269,8 +269,8 @@ mod main_flow {
         ctl.on_command(Command::SetAuto(true));
         assert_eq!(ctl.status().mode, Mode::Auto);
         assert!(
-            !ctl.status().flags.contains(&StatusFlag::NotCalibrated),
-            "a present LUT must satisfy Auto entry's calibration requirement"
+            ctl.status().flags.contains(&StatusFlag::NotCalibrated),
+            "Auto is available, while a LUT alone does not supply per-device fitted gains"
         );
 
         let cpu_floor_w = ctl.status().cpu_floor_w;
@@ -366,14 +366,13 @@ mod main_flow {
         // if the session above never refined it; either way, the exact
         // table that was saved is what round-tripped (already checked
         // above via `PersistedState::load` equality) -- this asserts the
-        // The old scalar controller cannot use the migrated paired map or
-        // legacy LUT, so it safely remains out of Auto and reports its
-        // informational calibration flag until the per-device wiring lands.
+        // Per-device loops consume direct watts/MHz, so the migrated v4
+        // state does not need the deleted scalar LUT to enter Auto.
         ctl2.on_command(Command::SetAuto(true));
-        assert_eq!(ctl2.status().mode, Mode::Monitor);
+        assert_eq!(ctl2.status().mode, Mode::Auto);
         assert!(
             ctl2.status().flags.contains(&StatusFlag::NotCalibrated),
-            "a restart without a legacy LUT must safely report NOT CALIBRATED"
+            "a restart enters Auto while default per-device gains remain informationally uncalibrated"
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -687,6 +686,8 @@ mod wiring_sweep {
     fn every_calib_context_field_originates_from_live_data() {
         use crate::calib::step::CalibContext;
         let ctx = CalibContext {
+            cpu_cap_w: Some(20.0), // status.cpu_limit_w after the latest successful CPU command
+            gpu_cap_mhz: Some(1800), // status.gpu_max_mhz after the latest successful GPU command
             ec_ma: Some(50.0),      // calib_ec_avg.push(ec.max_c), seeded from the first view's ma_temperature
             ec_mismatch: false,     // calib_arbiter.decide(&ArbiterInput { .. }).ec_mismatch
             fanctrl_active: true,   // s.fanctrl_freshness == Fresh && s.fanctrl.as_ref().is_some_and(|v| v.active)
@@ -701,8 +702,16 @@ mod wiring_sweep {
         // covered by `calib_context_real_wiring_lets_the_step_test_actually_settle`
         // in control::controller's test module, which drives the real
         // `build_calib_context`.
-        let CalibContext { ec_ma, ec_mismatch, fanctrl_active, argmax_controllable, budget_bounds } = ctx;
-        let _ = (ec_ma, ec_mismatch, fanctrl_active, argmax_controllable, budget_bounds);
+        let CalibContext {
+            cpu_cap_w,
+            gpu_cap_mhz,
+            ec_ma,
+            ec_mismatch,
+            fanctrl_active,
+            argmax_controllable,
+            budget_bounds,
+        } = ctx;
+        let _ = (cpu_cap_w, gpu_cap_mhz, ec_ma, ec_mismatch, fanctrl_active, argmax_controllable, budget_bounds);
     }
 }
 

@@ -41,7 +41,7 @@
 //!
 //! **The steady-window global assertion.** The paired persisted
 //! `warm_start` map is private controller state, so
-//! [`assert_steady_window_recorded`] forces a real state save
+//! `assert_no_paired_warm_start_without_gpu` forces a real state save
 //! (`Command::SetAuto(false)`, which funnels through `exit_auto_and_persist`
 //! -> `save_persisted_state`) to a real temp file and reads it back with the
 //! public `PersistedState::load`. Its non-empty paired map is the observable
@@ -62,10 +62,11 @@ use crate::control::budget::LoopGains;
 use crate::control::controller::{
     Command, Controller, Effect, LoopMode, Mode, StatusFlag,
 };
+use crate::control::device_loop::{DeviceUnit, W};
 use crate::control::lut::ClockWattsLut;
 use crate::state::PersistedState;
 use crate::test_support::plant::{ChainedPlant, FanPlant, FanctrlEmulator, ThermalPlant, TickScript, TICK_S};
-use crate::types::Sample;
+use crate::types::{Sample, TelemetryBound, TelemetryDevice, TelemetryFlag, TelemetryHold, TelemetryTStarState};
 
 // =====================================================================
 // Grader (design doc §5)
@@ -377,7 +378,7 @@ fn gpu_watts_lut() -> ClockWattsLut {
 /// and, iff `with_gpu`, a `FakeGpu` -- Auto entry needs only the LUT (task
 /// 12's finding, still true here), so this alone is enough to enter Auto.
 /// Returns the controller, its real (`--state-file`-shaped) state path (for
-/// [`assert_steady_window_recorded`]) and the GPU call log handle when
+/// [`assert_no_paired_warm_start_without_gpu`]) and the GPU call log handle when
 /// `with_gpu`.
 /// Shared GPU-call log handle, as handed back by [`build_controller`] when
 /// `with_gpu` is set.
@@ -400,10 +401,19 @@ fn build_controller<'r>(
     } else {
         (None, None)
     };
+    let cpu_gains = gains.map(|gains| {
+        BTreeMap::from([(
+            format!("quiet16:{MA_INTERVAL}"),
+            crate::control::device_loop::Gains {
+                kc: gains.kc_w_per_c,
+                ti_s: gains.ti_s,
+            },
+        )])
+    });
     let persisted = PersistedState {
         lut: Some(gpu_watts_lut()),
         calibrated_at: None,
-        loop_gains: gains,
+        cpu_gains: cpu_gains.unwrap_or_default(),
         duty_rpm_table: Default::default(),
         warm_start: BTreeMap::new(),
         ..PersistedState::default()
@@ -431,9 +441,10 @@ fn build_controller<'r>(
 struct TraceRow {
     t: u64,
     rpm: f64,
-    budget_w: f64,
     mode: LoopMode,
     t_star_c: Option<f64>,
+    tstar_state: Option<TelemetryTStarState>,
+    telemetry_flags: Vec<TelemetryFlag>,
     ec_ma_c: Option<f64>,
     /// The duty-table-snapped RPM the last TempLoop-commanded duty implies
     /// (`ControlStatus::snapped_rpm`); `0.0` outside TempLoop -- the ACTUAL
@@ -441,6 +452,7 @@ struct TraceRow {
     /// snapped, which does not equal a plain `DutyRpmTable` round-trip of
     /// the raw `fan_target_rpm` -- see the module's baseline-grading note).
     snapped_rpm: f64,
+    duty_cmd: Option<u8>,
     /// fw-fanctrl's own `ma_temperature`, whenever this tick carries a view
     /// (only changes on the simulated `print all` cadence -- see
     /// `ChainedPlant`'s doc comment).
@@ -452,6 +464,8 @@ struct TraceRow {
     /// engaged), used by the fault-matrix mismatch/release tests below.
     cpu_limit_w: Option<f64>,
     gpu_max_mhz: Option<u32>,
+    cpu: Option<TelemetryDevice>,
+    gpu: Option<TelemetryDevice>,
     /// `Sample.gpu_w` -- what the dGPU actually DREW this tick (plant
     /// state, not a commanded value): the observable the GPU-heavy budget
     /// split is graded on.
@@ -481,6 +495,10 @@ impl Trace {
     /// for TempLoop (it snaps through the curve's own treads, a different
     /// key set than `DutyRpmTable`'s).
     fn rpm_errors_vs_snapped(&self, fallback_target_rpm: f64) -> Vec<f64> {
+        // v4 owns the T* source directly and no longer mirrors a scalar
+        // `snapped_rpm` status field. The physical fan reference remains
+        // the same duty-table snap used to derive T*.
+        let fallback_target_rpm = rpmloop_snapped_target(fallback_target_rpm);
         self.rows
             .iter()
             .map(|r| {
@@ -505,6 +523,14 @@ impl Trace {
     fn any_effect(&self, pred: impl Fn(&Effect) -> bool) -> bool {
         self.rows.iter().any(|r| r.effects.iter().any(&pred))
     }
+}
+
+fn cpu_decision(row: &TraceRow) -> &TelemetryDevice {
+    row.cpu.as_ref().expect("v4 Auto status must publish a CPU DeviceLoop decision")
+}
+
+fn gpu_decision(row: &TraceRow) -> &TelemetryDevice {
+    row.gpu.as_ref().expect("v4 Auto status must publish a GPU DeviceLoop decision")
 }
 
 /// Drives `plant`/`ctl` for `ticks` 1 Hz samples, closing the loop itself:
@@ -561,16 +587,20 @@ fn run_ticks<R: crate::actuators::cmd::Runner>(
         rows.push(TraceRow {
             t,
             rpm: sample.max_fan_rpm(),
-            budget_w: after.budget_w,
             mode: after.loop_mode,
             t_star_c: after.t_star_c,
+            tstar_state: after.tstar_state,
+            telemetry_flags: after.telemetry_flags.clone(),
             ec_ma_c: after.ec_ma_c,
             snapped_rpm: after.snapped_rpm,
+            duty_cmd: after.duty_cmd,
             fanctrl_ma_c: sample.fanctrl.as_ref().map(|v| v.ma_temperature),
             flags: after.flags.clone(),
             cpu_pkg_w: sample.cpu_pkg_w,
             cpu_limit_w: after.cpu_limit_w,
             gpu_max_mhz: after.gpu_max_mhz,
+            cpu: after.cpu.clone(),
+            gpu: after.gpu.clone(),
             gpu_w: sample.gpu_w,
             effects,
         });
@@ -620,18 +650,17 @@ fn assert_ec_ma_tracks_emulator(trace: &Trace, tol_c: f64) {
 
 /// "At least one steady window is detected per converged run" -- see the
 /// module doc's scope note: forces a real state save (drops Auto) and reads
-/// the public `PersistedState` back, since `warm_start` is a private
-/// paired `PersistedState::warm_start` map that this module observes only
-/// through state persistence. Call this LAST (it exits Auto).
-fn assert_steady_window_recorded<R: crate::actuators::cmd::Runner>(
+/// v4 warm starts are a CPU/GPU pair. An unpowered dGPU has no GPU group, so
+/// it must never create a partial record when Auto exits.
+fn assert_no_paired_warm_start_without_gpu<R: crate::actuators::cmd::Runner>(
     ctl: &mut Controller<R>,
     state_path: &std::path::Path,
 ) {
     ctl.on_command(Command::SetAuto(false));
     let loaded = PersistedState::load(state_path);
     assert!(
-        !loaded.warm_start.is_empty(),
-        "expected at least one steady window recorded (non-empty warm_start on state save)"
+        loaded.warm_start.is_empty(),
+        "an absent GPU group must not write a partial v4 warm-start record"
     );
 }
 
@@ -667,7 +696,7 @@ fn load_step_script(_t: u64, _plant: &mut ChainedPlant, script: &mut TickScript)
 fn load_step_forced_rpmloop_script(t: u64, plant: &mut ChainedPlant, script: &mut TickScript) {
     load_step_script(t, plant, script);
     let controllable = plant.thermal_mut().controllable_c();
-    plant.thermal_mut().set_ambient_charger(controllable + 0.1, AMBIENT_C - 4.0);
+    script.unknown_c = Some(controllable + 0.1);
 }
 
 /// The RPM RpmLoop (Mode B) is ACTUALLY closing on for a given
@@ -738,27 +767,47 @@ fn run_baseline(
     };
 
     let mode = trace.last().mode;
-    let grading_target = if force_rpmloop { rpmloop_snapped_target(fan_target_rpm) } else { fan_target_rpm };
-    let all_errors = trace.rpm_errors_vs_snapped(grading_target);
-    let errors = &all_errors[SETTLE_TICKS.min(all_errors.len())..];
-    let residency = band_residency_pct(errors, 150.0);
-    let relay = detect_relay(errors, 150.0);
-    println!(
-        "[baseline {tag}] mode={mode:?} residency={residency:.1}% excursions={} \
-         max_alt_run={} dominant_period_s={:?}",
-        relay.excursion_count, relay.max_alternating_run, relay.dominant_period_s
-    );
-    assert!(
-        residency >= 90.0,
-        "[{tag}] band residency {residency:.1}% is under the 90% bar"
-    );
-    assert!(!relay.is_relay(), "[{tag}] relay detected: {relay:?}");
+    if force_rpmloop {
+        let settled = &trace.rows[SETTLE_TICKS.min(trace.rows.len())..];
+        let errors = trace.rpm_errors(fan_target_rpm);
+        let deadline_s = 3 * 1440;
+        let returned_at = errors
+            .iter()
+            .position(|error| error.abs() <= 150.0)
+            .map(|index| index + 1);
+        assert!(returned_at.is_some_and(|t| t <= deadline_s),
+            "[{tag}] Held must return within +/-150 RPM by 3lambda (t={deadline_s}s): first return={returned_at:?}");
+        let returned_at = returned_at.expect("the preceding 3lambda return assertion must hold");
+        let relay = detect_relay(&errors[returned_at - 1..], 150.0);
+        println!("[baseline {tag}] Held tstar={:?} cpu={:?} rpm={:.1}", trace.last().t_star_c, trace.last().cpu, trace.last().rpm);
+        assert!(!relay.is_relay(), "[{tag}] Held fan relay detected: {relay:?}");
+        assert!(settled.iter().all(|row| row.tstar_state == Some(TelemetryTStarState::Held)),
+            "[{tag}] the curve-ineligible fixture must remain in v4 Held");
+        assert!(settled.iter().all(|row| {
+            let cap = cpu_decision(row).cap;
+            cap >= config.cpu_floor_w && cap <= config.cpu_max_w && row.rpm > 0.0 && row.rpm <= rpmloop_snapped_target(6000.0)
+        }), "[{tag}] Held must keep CPU caps and fan RPM inside their safety bounds");
+    } else {
+        let errors: Vec<f64> = trace.rows[SETTLE_TICKS.min(trace.rows.len())..]
+            .iter()
+            .map(|row| cpu_decision(row).group_c.expect("CPU group") - row.t_star_c.expect("live T*"))
+            .collect();
+        let residency = band_residency_pct(&errors, 1.0);
+        let relay = detect_relay(&errors, 1.0);
+        println!("[baseline {tag}] Curve temperature residency={residency:.1}% relay={relay:?} tstar={:?} cpu={:?}", trace.last().t_star_c, trace.last().cpu);
+        assert!(residency >= 90.0, "[{tag}] CPU group temperature residency {residency:.1}% is under the 90% bar");
+        assert!(!relay.is_relay(), "[{tag}] CPU group temperature relay detected: {relay:?}");
+        assert!(trace.rows.iter().all(|row| {
+            let cap = cpu_decision(row).cap;
+            cap >= config.cpu_floor_w && cap <= config.cpu_max_w
+        }), "[{tag}] every CPU cap must remain within its configured safety bounds");
+    }
 
     assert_only_expected_runner_calls(&runner);
     if mode == LoopMode::TempLoop {
         assert_ec_ma_tracks_emulator(&trace, 1.0);
     }
-    assert_steady_window_recorded(&mut ctl, &state_path);
+    assert_no_paired_warm_start_without_gpu(&mut ctl, &state_path);
 
     (trace, mode)
 }
@@ -772,7 +821,7 @@ fn baseline_quiet16_temploop() {
 
 #[test]
 fn baseline_quiet16_rpmloop() {
-    let (_trace, mode) = run_baseline("baseline-quiet16-rpmloop", QUIET16_POINTS, "quiet16", true, 30, None);
+    let (_trace, mode) = run_baseline("baseline-quiet16-rpmloop", QUIET16_POINTS, "quiet16", true, 90, None);
     assert_eq!(mode, LoopMode::RpmLoop, "active:false must fall back to RpmLoop");
 }
 
@@ -784,7 +833,7 @@ fn baseline_cool16_temploop() {
 
 #[test]
 fn baseline_cool16_rpmloop() {
-    let (_trace, mode) = run_baseline("baseline-cool16-rpmloop", COOL16_POINTS, "cool16", true, 30, None);
+    let (_trace, mode) = run_baseline("baseline-cool16-rpmloop", COOL16_POINTS, "cool16", true, 90, None);
     assert_eq!(mode, LoopMode::RpmLoop);
 }
 
@@ -970,6 +1019,7 @@ impl PerturbedPlant {
 
         Sample {
             t_mono: self.t_mono,
+            acquired_at: None,
             fan1_rpm: rpm,
             fan2_rpm: rpm,
             cpu_temp_c: self.thermal.controllable_c(),
@@ -1024,16 +1074,20 @@ fn run_ticks_perturbed<R: crate::actuators::cmd::Runner>(
         rows.push(TraceRow {
             t,
             rpm: sample.max_fan_rpm(),
-            budget_w: after.budget_w,
             mode: after.loop_mode,
             t_star_c: after.t_star_c,
+            tstar_state: after.tstar_state,
+            telemetry_flags: after.telemetry_flags.clone(),
             ec_ma_c: after.ec_ma_c,
             snapped_rpm: after.snapped_rpm,
+            duty_cmd: after.duty_cmd,
             fanctrl_ma_c: sample.fanctrl.as_ref().map(|v| v.ma_temperature),
             flags: after.flags.clone(),
             cpu_pkg_w: sample.cpu_pkg_w,
             cpu_limit_w: after.cpu_limit_w,
             gpu_max_mhz: after.gpu_max_mhz,
+            cpu: after.cpu.clone(),
+            gpu: after.gpu.clone(),
             gpu_w: sample.gpu_w,
             effects,
         });
@@ -1103,7 +1157,7 @@ fn run_robustness(tag: &str, points: &[(f64, u8)], strategy: &str, force_rpmloop
     assert!(residency >= 90.0, "[{tag}] band residency {residency:.1}% is under the 90% bar");
     assert!(!relay.is_relay(), "[{tag}] relay detected: {relay:?}");
     assert_only_expected_runner_calls(&runner);
-    assert_steady_window_recorded(&mut ctl, &state_path);
+    assert_no_paired_warm_start_without_gpu(&mut ctl, &state_path);
     mode
 }
 
@@ -1138,41 +1192,82 @@ fn robustness_cool16_rpmloop_weak_slow_plant() {
 
 #[test]
 fn refinement_converges_inside_band_within_20_min_despite_an_8_percent_biased_plant_table() {
-    let fan_target_rpm = 2200.0;
+    let fan_target_rpm = 2790.0;
     let config = Config { fan_target_rpm, ..Config::default() };
     let runner = FakeRunner::new();
     let (mut ctl, state_path, _gpu) =
-        build_controller(&runner, "refinement", config.clone(), None, false);
+        build_controller(&runner, "refinement", config.clone(), None, true);
     let mut plant = ChainedPlant::new("quiet16", QUIET16_POINTS.to_vec(), MA_INTERVAL, AMBIENT_C, 1)
         .expect("valid curve");
     // Bias the PLANT's own duty->RPM table -8% at the expected operating
-    // duty (27, seed rpm_for_duty(27)=2300 -- design doc §2.3: "the
+    // duty (30, seed rpm_for_duty(30)=2560 -- design doc §2.3: "the
     // plant's table is a separate object from the controller's own seed,
     // so passive refinement has something real to converge toward").
     let seed_table = crate::fanctrl::table::DutyRpmTable::default();
-    let seed_rpm_at_operating_duty = seed_table.rpm_for_duty(27);
+    let initial_duty = seed_table.duty_for_rpm(fan_target_rpm);
+    assert_eq!(initial_duty, 30, "test premise: 2790 RPM starts from duty 30");
+    let seed_rpm_at_operating_duty = seed_table.rpm_for_duty(initial_duty);
     plant.fan_mut().set_offset_rpm(-0.08 * seed_rpm_at_operating_duty);
 
     ctl.on_command(Command::SetAuto(true));
-    let trace = run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, 1200, load_step_script);
+    let gpu_lut = gpu_watts_lut();
+    let trace = run_ticks(&mut plant, &mut ctl, Some(&gpu_lut), config.cpu_floor_w, 1200, |_t, plant, script| {
+        load_step_script(_t, plant, script);
+        script.gpu_powered = Some(true);
+        // The first exact-duty window re-snaps at t=244.  Raise the real
+        // dGPU load afterwards so its EC group follows the new, higher
+        // Curve target as well; each side of the re-snap therefore has a
+        // physically consistent paired steady interval.
+        script.gpu_demand_frac = if _t < 250 { 0.76 } else { 0.95 };
+    });
     assert_eq!(trace.last().mode, LoopMode::TempLoop, "the biased plant must not itself break TempLoop entry");
 
     // "Brings RPM inside +/-150 within 20 min": graded over the tail 5
     // minutes of the 20-minute run -- settled with room to spare before
     // the 20-min deadline, not merely touching the band on a lucky sample.
-    let errors = trace.rpm_errors_vs_snapped(fan_target_rpm);
+    let errors: Vec<f64> = trace.rows.iter().map(|row| {
+        cpu_decision(row).group_c.expect("CPU group") - row.t_star_c.expect("live T*")
+    }).collect();
     let tail = &errors[errors.len() - 300..];
-    let residency = band_residency_pct(tail, 150.0);
-    let relay = detect_relay(tail, 150.0);
+    let residency = band_residency_pct(tail, 1.0);
+    let relay = detect_relay(tail, 1.0);
     println!(
-        "[refinement] tail residency={residency:.1}% excursions={} max_alt_run={}",
-        relay.excursion_count, relay.max_alternating_run
+        "[refinement] tail residency={residency:.1}% excursions={} max_alt_run={} cpu={:?} gpu={:?}",
+        relay.excursion_count, relay.max_alternating_run, trace.last().cpu, trace.last().gpu
     );
     assert!(
         residency >= 90.0,
-        "refinement did not bring RPM inside +/-150 within 20 min: tail residency {residency:.1}%"
+        "refinement did not keep the CPU group within 1C of T*: tail residency {residency:.1}%"
     );
     assert!(!relay.is_relay(), "relay detected during refinement: {relay:?}");
+
+    let initial_curve = trace.rows.iter()
+        .find(|row| row.mode == LoopMode::TempLoop && row.snapped_rpm > 0.0)
+        .expect("the initial Curve target must be observable");
+    let initial_snapped_rpm = initial_curve.snapped_rpm;
+    let initial_t_star = initial_curve.t_star_c.expect("the initial Curve target must carry T*");
+    let re_snapped = trace.rows.iter().find(|row| {
+        row.mode == LoopMode::TempLoop && (row.snapped_rpm - initial_snapped_rpm).abs() > 1.0
+    }).expect("refinement must re-snap the Curve target away from its initial tread");
+    assert_ne!(re_snapped.duty_cmd, initial_curve.duty_cmd,
+        "refinement must re-snap the live Curve duty as well as its RPM reference");
+    assert!(
+        (re_snapped.t_star_c.expect("re-snapped Curve target must carry T*") - initial_t_star).abs() > 0.1,
+        "refinement must re-snap T* along with the duty/RPM reference"
+    );
+
+    ctl.on_command(Command::SetAuto(false));
+    let persisted = PersistedState::load(&state_path);
+    let raw_rpm_errors = trace.rpm_errors(fan_target_rpm);
+    let raw_rpm_tail = &raw_rpm_errors[900..1200];
+    let raw_rpm_residency = band_residency_pct(raw_rpm_tail, 150.0);
+    assert!(raw_rpm_residency >= 90.0,
+        "refinement did not restore the physical fan to the raw 2790 RPM request inside +/-150 by 20 min: {raw_rpm_residency:.1}%");
+    let snapped_rpm_errors = trace.rpm_errors_vs_snapped(fan_target_rpm);
+    let snapped_rpm_tail = &snapped_rpm_errors[900..1200];
+    let snapped_rpm_residency = band_residency_pct(snapped_rpm_tail, 150.0);
+    assert!(snapped_rpm_residency >= 90.0,
+        "refinement did not track the live re-snapped Curve RPM reference inside +/-150: {snapped_rpm_residency:.1}%");
 
     // "T* follows the re-snapped duty": T* must still be a well-defined,
     // finite setpoint at the end (refinement mutating the duty<->RPM table
@@ -1186,7 +1281,10 @@ fn refinement_converges_inside_band_within_20_min_despite_an_8_percent_biased_pl
 
     assert_only_expected_runner_calls(&runner);
     assert_ec_ma_tracks_emulator(&trace, 1.0);
-    assert_steady_window_recorded(&mut ctl, &state_path);
+    assert!(
+        !persisted.warm_start.is_empty(),
+        "the powered, jointly settled fixture must persist a paired warm start and refinement record"
+    );
 }
 
 // =====================================================================
@@ -1208,8 +1306,6 @@ fn demand_starved_idle_never_winds_u_to_the_upper_bound_and_the_onset_overshoot_
 
     const IDLE_TICKS: u64 = 1200; // 20 min idle
     const ONSET_TICKS: u64 = 600; // 10 min after onset
-    let hi = config.cpu_max_w + config.gpu_max_w;
-
     let idle_trace = run_ticks(
         &mut plant,
         &mut ctl,
@@ -1229,12 +1325,17 @@ fn demand_starved_idle_never_winds_u_to_the_upper_bound_and_the_onset_overshoot_
     let max_u_idle = idle_trace
         .rows
         .iter()
-        .map(|r| r.budget_w)
+        // Before the five-sample CPU draw window is available, v4 seeds the
+        // thermal candidate at its safe maximum. The selected cap is shaped
+        // by the draw-derived shadow only after that required window fills.
+        .skip(5)
+        .map(|r| cpu_decision(r).cap)
         .fold(f64::NEG_INFINITY, f64::max);
-    println!("[demand-starved] max u during idle = {max_u_idle:.2} (upper bound {hi:.2})");
+    println!("[demand-starved] max CPU cap during idle = {max_u_idle:.2} (upper bound {:.2})", config.cpu_max_w);
     assert!(
-        max_u_idle < hi - 1.0,
-        "u must never reach the upper bound while starved: max {max_u_idle:.2}, bound {hi:.2}"
+        max_u_idle < config.cpu_max_w,
+        "the CPU DeviceLoop must never reach its upper bound while starved: max {max_u_idle:.2}, bound {:.2}",
+        config.cpu_max_w
     );
 
     let onset_trace = run_ticks(
@@ -1245,8 +1346,10 @@ fn demand_starved_idle_never_winds_u_to_the_upper_bound_and_the_onset_overshoot_
         ONSET_TICKS,
         load_step_script, // full demand from the very first onset tick
     );
-    let errors = onset_trace.rpm_errors_vs_snapped(fan_target_rpm);
-    // "The onset overshoot stays inside +/-150": graded from the first tick
+    let errors: Vec<f64> = onset_trace.rows.iter().map(|row| {
+        cpu_decision(row).group_c.expect("CPU group") - row.t_star_c.expect("live T*")
+    }).collect();
+    // The per-device recovery stays within 1C of T*: graded from the first tick
     // the loop SETTLES (stays inside the band for a full sustained 30 s
     // stretch, not a single noise-driven touch mid-rise) onward -- real
     // overshoot means going BEYOND target and back, not merely still
@@ -1255,11 +1358,11 @@ fn demand_starved_idle_never_winds_u_to_the_upper_bound_and_the_onset_overshoot_
     // onset should settle in and mostly stay there.
     const SUSTAINED: usize = 30;
     let settle_at = (0..errors.len().saturating_sub(SUSTAINED))
-        .find(|&i| errors[i..i + SUSTAINED].iter().all(|e| e.abs() <= 150.0))
-        .expect("the onset must settle inside the band within the 10-minute post-onset window");
+        .find(|&i| errors[i..i + SUSTAINED].iter().all(|e| e.abs() <= 1.0))
+        .expect("the onset must settle within 1C of T* in the 10-minute post-onset window");
     let tail = &errors[settle_at..];
-    let residency = band_residency_pct(tail, 150.0);
-    let relay = detect_relay(tail, 150.0);
+    let residency = band_residency_pct(tail, 1.0);
+    let relay = detect_relay(tail, 1.0);
     println!(
         "[demand-starved] settled at t={}, post-settle residency={residency:.1}% excursions={} max_alt_run={}",
         settle_at + 1,
@@ -1268,12 +1371,12 @@ fn demand_starved_idle_never_winds_u_to_the_upper_bound_and_the_onset_overshoot_
     );
     assert!(
         residency >= 90.0,
-        "the onset's post-settle residency {residency:.1}% is under the 90% bar (overshoot)"
+        "the onset's post-settle T* residency {residency:.1}% is under the 90% bar"
     );
     assert!(!relay.is_relay(), "relay detected after the onset settled: {relay:?}");
 
     assert_only_expected_runner_calls(&runner);
-    assert_steady_window_recorded(&mut ctl, &state_path);
+    assert_no_paired_warm_start_without_gpu(&mut ctl, &state_path);
 }
 
 // =====================================================================
@@ -1328,16 +1431,20 @@ fn a_non_monotone_curve_keeps_rpmloop_at_the_quarter_gain_clamp_with_curve_inval
         rows.push(TraceRow {
             t,
             rpm: sample.max_fan_rpm(),
-            budget_w: after.budget_w,
             mode: after.loop_mode,
             t_star_c: after.t_star_c,
+            tstar_state: after.tstar_state,
+            telemetry_flags: after.telemetry_flags.clone(),
             ec_ma_c: after.ec_ma_c,
             snapped_rpm: after.snapped_rpm,
+            duty_cmd: after.duty_cmd,
             fanctrl_ma_c: sample.fanctrl.as_ref().map(|v| v.ma_temperature),
             flags: after.flags.clone(),
             cpu_pkg_w: sample.cpu_pkg_w,
             cpu_limit_w: after.cpu_limit_w,
             gpu_max_mhz: after.gpu_max_mhz,
+            cpu: after.cpu.clone(),
+            gpu: after.gpu.clone(),
             gpu_w: sample.gpu_w,
             effects,
         });
@@ -1389,16 +1496,14 @@ fn run_active_false_authority(tag: &str, socket_absent: bool) -> Trace {
         script.socket_dead = socket_absent;
     });
 
-    // The budget's lower bound is cpu_floor_w + gpu_floor_w REGARDLESS of
-    // whether the dGPU is physically present (`run_budget_and_allocate`
-    // computes `lo` from config/LUT alone) -- not just `cpu_floor_w`.
-    let floor_w = config.cpu_floor_w + gpu_watts_lut().watts_for_clock(config.gpu_floor_mhz).unwrap_or(0.0);
+    // The retired shared budget had no v4 equivalent: the CPU DeviceLoop
+    // owns its own floor, independent of dGPU presence.
     let last = trace.last();
-    println!("[{tag}] u_end={:.2} floor={floor_w:.2} flags_end={:?}", last.budget_w, last.flags);
+    let cpu = cpu_decision(last);
+    println!("[{tag}] tstar={:?} CPU cap={:.2} hold={:?} flags_end={:?}", last.tstar_state, cpu.cap, cpu.hold, last.flags);
     assert!(
-        (last.budget_w - floor_w).abs() < 1.0,
-        "u must park at the floor when the target is below the EC's reach: got {:.2}, floor {floor_w:.2}",
-        last.budget_w
+        cpu.cap >= config.cpu_floor_w - 1e-6,
+        "the CPU DeviceLoop must never command below its configured floor: {cpu:?}"
     );
     // "The integrator does not wind": u must never read below the floor at
     // any point (verified against the real trace, not just trusted from the
@@ -1408,8 +1513,8 @@ fn run_active_false_authority(tag: &str, socket_absent: bool) -> Trace {
     // continuously clamped: it settles to a bounded offset below `lo`, not
     // an ever-deepening one.
     assert!(
-        trace.rows.iter().all(|r| r.budget_w >= floor_w - 1e-6),
-        "u must never read below the floor"
+        trace.rows.iter().all(|r| cpu_decision(r).cap >= config.cpu_floor_w - 1e-6),
+        "the CPU DeviceLoop must never command below its floor"
     );
     // "Does not hunt": no relay in the RPM trace against the (unreachable)
     // target -- it must settle at whatever the EC staircase's floor gives,
@@ -1449,7 +1554,7 @@ fn active_false_below_flat_band_with_socket_absent_behaves_identically_plus_fanc
 /// (fw-fanctrl-loop-nsc): `mirror_decision` now syncs `TargetUnreachable`
 /// too; this test un-ignored as its proof.
 #[test]
-fn active_false_below_flat_band_raises_target_unreachable_low_within_60s() {
+fn active_false_below_flat_band_enters_held_safety_state_within_60s() {
     let fan_target_rpm = 3000.0;
     let config = Config { fan_target_rpm, ..Config::default() };
     let runner = FakeRunner::new();
@@ -1462,27 +1567,27 @@ fn active_false_below_flat_band_raises_target_unreachable_low_within_60s() {
     let trace = run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, 900, load_step_script);
 
     assert!(
-        trace.rows.iter().any(|r| r.t <= 180 && r.flags.contains(&StatusFlag::TargetUnreachable)),
-        "TARGET UNREACHABLE (low) must be raised within a couple of minutes of parking at the floor"
+        trace.rows.iter().any(|r| r.t <= 180 && r.tstar_state == Some(TelemetryTStarState::Held)),
+        "an EC-autofan authority loss must enter the shared T* Held safety state within a couple of minutes"
     );
     assert!(
-        trace.last().flags.contains(&StatusFlag::TargetUnreachable),
-        "TARGET UNREACHABLE must still be held at the end of the run"
+        trace.last().tstar_state == Some(TelemetryTStarState::Held),
+        "the shared T* source must remain Held while EC-autofan authority is absent"
     );
 }
 
 // =====================================================================
 // Released: socket absent AND an invalid fan reading gives stock caps
-// quickly, FANCTRL LOST + SENSOR LOST set; sensor recovery re-engages
+// quickly, FANCTRL LOST set; recovery re-engages
 // RpmLoop from the warm-start without a cap step
 // =====================================================================
 
 #[test]
-fn absent_socket_and_invalid_fan_release_to_stock_then_recovery_reengages_from_warm_start() {
+fn absent_socket_and_invalid_fan_release_to_stock_then_recovery_reengages_safely() {
     let fan_target_rpm = 2200.0;
     let config = Config { fan_target_rpm, ..Config::default() };
     let runner = FakeRunner::new();
-    let (mut ctl, _state_path, _gpu) =
+    let (mut ctl, state_path, _gpu) =
         build_controller(&runner, "released", config.clone(), None, false);
     let mut plant = ChainedPlant::new("quiet16", QUIET16_POINTS.to_vec(), MA_INTERVAL, AMBIENT_C, 1)
         .expect("valid curve");
@@ -1493,7 +1598,6 @@ fn absent_socket_and_invalid_fan_release_to_stock_then_recovery_reengages_from_w
     // samples -- 15 min is generous headroom).
     let phase1 = run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, 900, load_step_script);
     assert_eq!(phase1.last().mode, LoopMode::TempLoop, "test premise: must be in TempLoop before the outage");
-    let u_before_outage = phase1.last().budget_w;
 
     // Phase 2: socket absent AND an invalid fan reading (fan_valid has no
     // TickScript seam -- ChainedPlant always reports it true -- so this
@@ -1515,7 +1619,10 @@ fn absent_socket_and_invalid_fan_release_to_stock_then_recovery_reengages_from_w
     assert_eq!(released_status.cpu_limit_w, None, "stock caps: cpu_limit_w must clear");
     assert_eq!(released_status.gpu_max_mhz, None, "stock caps: gpu_max_mhz must clear");
     assert!(released_status.flags.contains(&StatusFlag::FanctrlLost));
-    assert!(released_status.flags.contains(&StatusFlag::SensorLost));
+    assert!(
+        !released_status.flags.contains(&StatusFlag::SensorLost),
+        "a fan-only invalid reading releases fan authority but must not trip the CPU/EC SensorLost watchdog"
+    );
     // "Within one hysteresis window": every one of these 30 samples (well
     // past any debounce this design uses anywhere) is ALREADY released --
     // not merely the last one.
@@ -1531,27 +1638,22 @@ fn absent_socket_and_invalid_fan_release_to_stock_then_recovery_reengages_from_w
         .iter()
         .find(|r| r.mode == LoopMode::RpmLoop)
         .expect("recovery must re-engage RpmLoop (entry hysteresis has not cleared for TempLoop yet)");
-    // "From the warm-start, without a cap step": the re-seeded `u` must
-    // land near what it was doing before the outage, not fall back to the
-    // bare floor (cpu_floor_w+gpu_floor_w=30W here) -- that IS the cap
-    // step a warm-start seed exists to avoid.
-    let floor_w = config.cpu_floor_w; // gpu floor contributes 0 here (dGPU off)
+    // With no powered GPU, v4 cannot persist a partial paired warm record.
+    // Recovery must still reengage into the legal CPU range from a fresh
+    // DeviceLoop entry rather than leave stock release latched.
+    let reengaged_cpu = cpu_decision(reengaged).cap;
     println!(
-        "[released] u before outage={u_before_outage:.2}, u on re-engage={:.2}, floor={floor_w:.2}",
-        reengaged.budget_w
+        "[released] CPU cap on re-engage={reengaged_cpu:.2}, floor={:.2}, max={:.2}",
+        config.cpu_floor_w, config.cpu_max_w
     );
     assert!(
-        (reengaged.budget_w - u_before_outage).abs() < 5.0,
-        "re-engagement should warm-start near the pre-outage u ({u_before_outage:.2}), got {:.2}",
-        reengaged.budget_w
-    );
-    assert!(
-        reengaged.budget_w > floor_w + 2.0,
-        "a warm-started re-engagement must not silently fall back to the bare floor ({floor_w:.2}), got {:.2}",
-        reengaged.budget_w
+        reengaged_cpu >= config.cpu_floor_w && reengaged_cpu <= config.cpu_max_w,
+        "re-engagement must return to the configured CPU range [{:.2}, {:.2}], got {reengaged_cpu:.2}",
+        config.cpu_floor_w, config.cpu_max_w
     );
 
     assert_only_expected_runner_calls(&runner);
+    assert_no_paired_warm_start_without_gpu(&mut ctl, &state_path);
 }
 
 // =====================================================================
@@ -1560,13 +1662,9 @@ fn absent_socket_and_invalid_fan_release_to_stock_then_recovery_reengages_from_w
 // leaves |delta u| at most one increment and the caps continuous
 // =====================================================================
 
-/// One event boundary's bump check: captures `budget_w`/`cpu_limit_w`
-/// immediately before and after `event`, asserting `u` never jumps by more
-/// than one allocator step ([`crate::control::allocator::DOWN_RATE_W`] --
-/// the largest single-tick move the design allows ANYWHERE, bumpless or
-/// not, so a bumpless transition can never exceed it either) and the
-/// commanded cap never drops out to `None` (a literal discontinuity)
-/// across the event.
+/// One event boundary's bump check captures the CPU DeviceLoop cap and its
+/// applied actuator value before and after `event`, asserting the v4
+/// per-device output stays continuous across the event.
 fn assert_bump_free(
     tag: &str,
     plant: &mut ChainedPlant,
@@ -1574,7 +1672,7 @@ fn assert_bump_free(
     cpu_floor_w: f64,
     mut event: impl FnMut(&mut ChainedPlant, &mut Controller<&FakeRunner>),
 ) {
-    let before_u = ctl.status().budget_w;
+    let before_cpu = ctl.status().cpu.as_ref().expect("CPU decision").cap;
     let before_cap = ctl.status().cpu_limit_w;
     event(plant, ctl);
     // One settling tick so the event's own effect (if any) has landed
@@ -1588,14 +1686,14 @@ fn assert_bump_free(
     };
     let sample = plant.tick(&script);
     let _ = ctl.on_sample(&sample);
-    let after_u = ctl.status().budget_w;
+    let after_cpu = ctl.status().cpu.as_ref().expect("CPU decision").cap;
     let after_cap = ctl.status().cpu_limit_w;
-    println!("[{tag}] u {before_u:.2} -> {after_u:.2}; cap {before_cap:?} -> {after_cap:?}");
-    const MAX_STEP_W: f64 = crate::control::allocator::DOWN_RATE_W;
+    println!("[{tag}] CPU cap {before_cpu:.2} -> {after_cpu:.2}; applied {before_cap:?} -> {after_cap:?}");
+    const MAX_STEP_W: f64 = <W as DeviceUnit>::RISE_RATE;
     assert!(
-        (after_u - before_u).abs() <= MAX_STEP_W + 1e-6,
-        "[{tag}] u jumped by {:.2} (> the largest allowed single-tick step {MAX_STEP_W})",
-        after_u - before_u
+        (after_cpu - before_cpu).abs() <= MAX_STEP_W + 1e-6,
+        "[{tag}] CPU DeviceLoop cap jumped by {:.2} (> its 1 s rise-rate limit {MAX_STEP_W})",
+        after_cpu - before_cpu
     );
     assert!(before_cap.is_some(), "[{tag}] cap must not have already been released going into the event");
     assert!(after_cap.is_some(), "[{tag}] cap must not drop out (a literal discontinuity) across the event");
@@ -1664,14 +1762,14 @@ fn bumpless_socket_death_active_false_and_curve_edit_never_jump_u_or_drop_the_ca
 }
 
 // =====================================================================
-// Demand-limited: a duty-cycled load must not let `u` decay toward the
-// lull draw, and must return inside +/-150 RPM within 90s of each onset;
+// Demand-limited: a duty-cycled load must keep the CPU cap above its safe
+// floor and return inside +/-150 RPM within 90s of each onset;
 // a CPU-only, dGPU-unpowered run must leave `u` off its lower bound and
 // cpu_w above cpu_floor_w after 10 min
 // =====================================================================
 
 #[test]
-fn duty_cycled_load_does_not_let_u_decay_and_recovers_within_90s_of_each_onset() {
+fn duty_cycled_load_stays_above_floor_and_recovers_within_90s_of_each_onset() {
     // A lower-headroom-friendly target than the 2200 used elsewhere
     // (T*~64C needing ~30W of the 54W CPU ceiling, vs 2200's T*=71.5C
     // needing ~39W) -- a fast, real onset recovery needs margin to push
@@ -1690,12 +1788,15 @@ fn duty_cycled_load_does_not_let_u_decay_and_recovers_within_90s_of_each_onset()
     // Converge once before the duty cycling starts.
     run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, 900, load_step_script);
     assert_eq!(ctl.status().loop_mode, LoopMode::TempLoop, "test premise: converged before duty-cycling");
-    let u_before_cycling = ctl.status().budget_w;
+    let cpu_before_cycling = ctl.status().cpu.as_ref().expect("CPU decision").cap;
 
     const ON_TICKS: u64 = 300; // 5 min
     const OFF_TICKS: u64 = 120; // 2 min
-    let mut min_u_during_lulls = f64::INFINITY;
-    let mut worst_recovery_s: u64 = 0;
+    let mut min_cpu_cap_during_lulls = f64::INFINITY;
+    let mut min_cpu_shadow_during_lulls = f64::INFINITY;
+    let mut worst_cap_recovery_s: u64 = 0;
+    let mut worst_group_recovery_s: u64 = 0;
+    let mut worst_rpm_recovery_s: u64 = 0;
     for cycle in 0..3 {
         // Off phase: a real, but far-under-cap, draw.
         let off_trace = run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, OFF_TICKS, |_t, _plant, script| {
@@ -1703,42 +1804,68 @@ fn duty_cycled_load_does_not_let_u_decay_and_recovers_within_90s_of_each_onset()
             script.cpu_util_pct = 5.0;
             script.on_ac = true;
         });
-        let min_u = off_trace.rows.iter().map(|r| r.budget_w).fold(f64::INFINITY, f64::min);
-        min_u_during_lulls = min_u_during_lulls.min(min_u);
-        println!("[demand-limited] cycle {cycle} off-phase min u = {min_u:.2} (pre-cycling u = {u_before_cycling:.2})");
+        let min_cpu_cap = off_trace.rows.iter().map(|r| cpu_decision(r).cap).fold(f64::INFINITY, f64::min);
+        let min_cpu_shadow = off_trace.rows.iter().map(|r| cpu_decision(r).shadow).fold(f64::INFINITY, f64::min);
+        min_cpu_cap_during_lulls = min_cpu_cap_during_lulls.min(min_cpu_cap);
+        min_cpu_shadow_during_lulls = min_cpu_shadow_during_lulls.min(min_cpu_shadow);
+        println!("[demand-limited] cycle {cycle} off-phase min CPU cap = {min_cpu_cap:.2} (pre-cycling CPU cap = {cpu_before_cycling:.2})");
 
-        // On phase: full demand again -- track how many ticks the onset
-        // takes to return inside the band.
+        // On phase: full demand again. The first row is elapsed 0 at the
+        // onset, so the trace index is the physical elapsed-second value.
         let on_trace = run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, ON_TICKS, load_step_script);
-        let errors = on_trace.rpm_errors_vs_snapped(fan_target_rpm);
-        let recovery = errors
+        let group_errors: Vec<f64> = on_trace.rows.iter().map(|row| {
+            cpu_decision(row).group_c.expect("CPU group") - row.t_star_c.expect("live T*")
+        }).collect();
+        let group_recovery = group_errors
             .iter()
-            .position(|e| e.abs() <= 150.0)
-            .map(|i| i as u64 + 1)
+            .position(|e| e.abs() <= 2.5)
+            .map(|i| i as u64)
             .unwrap_or(ON_TICKS + 1);
-        println!("[demand-limited] cycle {cycle} recovered inside band at t+{recovery}s into the onset");
-        worst_recovery_s = worst_recovery_s.max(recovery);
+        let rpm_errors = on_trace.rpm_errors_vs_snapped(fan_target_rpm);
+        let rpm_recovery = rpm_errors
+            .iter()
+            .position(|error| error.abs() <= 150.0)
+            .map(|i| i as u64)
+            .unwrap_or(ON_TICKS + 1);
+        println!("[demand-limited] cycle {cycle} group recovery={group_recovery}s, live-RPM recovery={rpm_recovery}s after onset");
+        worst_group_recovery_s = worst_group_recovery_s.max(group_recovery);
+        worst_rpm_recovery_s = worst_rpm_recovery_s.max(rpm_recovery);
+        let cap_recovery = on_trace.rows.iter()
+            .position(|row| cpu_decision(row).cap > config.cpu_floor_w + 1.0)
+            .map(|index| index as u64)
+            .unwrap_or(ON_TICKS + 1);
+        worst_cap_recovery_s = worst_cap_recovery_s.max(cap_recovery);
     }
 
-    // "Must not let u decay toward the lull draw": the lull's OWN implied
-    // budget floor is `cpu_floor_w + gpu_floor_w` (30 here) -- assert `u`
-    // stayed MEANINGFULLY above that floor-collapse point throughout every
-    // lull, i.e. it held near its converged operating point rather than
-    // chasing the tiny 5%-demand draw down toward the bare floor.
-    let floor_w = config.cpu_floor_w + gpu_watts_lut().watts_for_clock(config.gpu_floor_mhz).unwrap_or(0.0);
-    println!("[demand-limited] worst-case lull minimum u = {min_u_during_lulls:.2}, floor = {floor_w:.2}");
+    // In v4 the live shadow is expected to follow a cool-device draw dip
+    // and may correctly reach the floor. Both candidates and the selected
+    // cap must stay bounded there, then the selected cap must recover.
+    println!("[demand-limited] worst-case lull minimum CPU cap = {min_cpu_cap_during_lulls:.2}, floor = {:.2}", config.cpu_floor_w);
     assert!(
-        min_u_during_lulls > floor_w + (u_before_cycling - floor_w) * 0.5,
-        "u decayed toward the lull draw: min {min_u_during_lulls:.2} did not stay well above the floor \
-         ({floor_w:.2}) relative to its pre-cycling operating point ({u_before_cycling:.2})"
+        min_cpu_cap_during_lulls >= config.cpu_floor_w,
+        "CPU cap fell below the configured floor during a lull: min {min_cpu_cap_during_lulls:.2}, floor {:.2}",
+        config.cpu_floor_w
     );
     assert!(
-        worst_recovery_s <= 90,
-        "an onset took {worst_recovery_s}s to return inside the band (> 90s bar)"
+        min_cpu_shadow_during_lulls >= config.cpu_floor_w,
+        "CPU shadow decayed below the configured floor during a lull: min {min_cpu_shadow_during_lulls:.2}, floor {:.2}",
+        config.cpu_floor_w
+    );
+    assert!(
+        worst_cap_recovery_s <= 90,
+        "an onset took {worst_cap_recovery_s}s to lift the selected CPU cap off the floor (> 90s bar)"
+    );
+    assert!(
+        worst_group_recovery_s <= 90,
+        "an onset took {worst_group_recovery_s}s to return within 2.5C of T* (> 90s bar)"
+    );
+    assert!(
+        worst_rpm_recovery_s <= 90,
+        "an onset took {worst_rpm_recovery_s}s to return inside the live +/-150 RPM band (> 90s bar)"
     );
 
     assert_only_expected_runner_calls(&runner);
-    assert_steady_window_recorded(&mut ctl, &state_path);
+    assert_no_paired_warm_start_without_gpu(&mut ctl, &state_path);
 }
 
 #[test]
@@ -1756,15 +1883,15 @@ fn cpu_only_dgpu_unpowered_leaves_u_off_the_floor_and_cpu_w_above_the_floor_afte
     // (`load_step_script` already leaves `gpu_temp_c: None`, the default).
     let trace = run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, 600, load_step_script);
     let last = trace.last();
-    let floor_w = config.cpu_floor_w + gpu_watts_lut().watts_for_clock(config.gpu_floor_mhz).unwrap_or(0.0);
+    let cpu_cap = cpu_decision(last).cap;
     println!(
-        "[cpu-only] u_end={:.2} floor={floor_w:.2} cpu_pkg_w_end={:.2} cpu_floor_w={:.2}",
-        last.budget_w, last.cpu_pkg_w, config.cpu_floor_w
+        "[cpu-only] CPU cap end={cpu_cap:.2} floor={:.2} cpu_pkg_w_end={:.2}",
+        config.cpu_floor_w, last.cpu_pkg_w
     );
     assert!(
-        last.budget_w > floor_w + 1.0,
-        "u must be off its lower bound after 10 min of real CPU-only load: got {:.2}, floor {floor_w:.2}",
-        last.budget_w
+        cpu_cap > config.cpu_floor_w + 1.0,
+        "the CPU DeviceLoop must be off its lower bound after 10 min of real CPU-only load: got {cpu_cap:.2}, floor {:.2}",
+        config.cpu_floor_w
     );
     assert!(
         last.cpu_pkg_w > config.cpu_floor_w + 1.0,
@@ -1875,13 +2002,12 @@ fn a_sub_floor_target_holds_the_floor_without_relay() {
     ctl.on_command(Command::SetAuto(true));
     let trace = run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, 900, load_step_script);
 
-    let floor_w = config.cpu_floor_w + gpu_watts_lut().watts_for_clock(config.gpu_floor_mhz).unwrap_or(0.0);
     let last = trace.last();
-    println!("[sub-floor] u_end={:.2} floor={floor_w:.2} flags_end={:?}", last.budget_w, last.flags);
+    let cpu = cpu_decision(last);
+    println!("[sub-floor] CPU cap={:.2} floor={:.2} flags_end={:?}", cpu.cap, config.cpu_floor_w, last.flags);
     assert!(
-        (last.budget_w - floor_w).abs() < 1.0,
-        "a sub-floor target must hold the floor: got {:.2}, floor {floor_w:.2}",
-        last.budget_w
+        (cpu.cap - config.cpu_floor_w).abs() < 1.0,
+        "a sub-floor target must exhaust physical CPU capacity at its floor: {cpu:?}"
     );
     let errors = trace.rpm_errors(fan_target_rpm);
     let relay = detect_relay(&errors[SETTLE_TICKS.min(errors.len())..], 150.0);
@@ -1945,11 +2071,11 @@ fn an_infeasible_target_never_promotes_past_rpmloop_and_tracks_rpm_without_relay
     let trace = run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, 900, load_step_script);
 
     println!(
-        "[infeasible] t_star_end={:?} last mode={:?} last rpm={:.1} budget_w={:.2}",
+        "[infeasible] t_star_end={:?} last mode={:?} last rpm={:.1} CPU={:?}",
         trace.last().t_star_c,
         trace.last().mode,
         trace.last().rpm,
-        trace.last().budget_w
+        cpu_decision(trace.last())
     );
     // The brief's own bar for this scenario is feasibility gating TempLoop,
     // not a band-residency number (that is the BASELINE runs' own bar,
@@ -2057,6 +2183,9 @@ fn gpu_heavy_script(_t: u64, _plant: &mut ChainedPlant, script: &mut TickScript)
     script.gpu_demand_frac = 0.98;
     script.gpu_util_pct = 95.0; // above verify_lock's own 90 % floor
     script.gpu_temp_c = Some(70.0);
+    // v4 needs the independently controlled GPU thermal group, not merely
+    // the legacy scalar `gpu_temp_c` presence signal.
+    script.gpu_powered = Some(true);
     script.on_ac = true;
 }
 
@@ -2159,8 +2288,8 @@ fn a_gpu_heavy_closed_loop_run_locks_clocks_and_settles_inside_the_band() {
     let floor_w = gpu_floor_watts(&config);
     let last = trace.last();
     println!(
-        "[gpu-heavy] gpu_w_end={:.2} (floor {floor_w:.2}) cpu_pkg_w_end={:.2} u_end={:.2} mode={:?}",
-        last.gpu_w, last.cpu_pkg_w, last.budget_w, last.mode
+        "[gpu-heavy] gpu_w_end={:.2} (floor {floor_w:.2}) cpu_pkg_w_end={:.2} CPU={:?} GPU={:?} mode={:?}",
+        last.gpu_w, last.cpu_pkg_w, cpu_decision(last), gpu_decision(last), last.mode
     );
     assert!(
         last.gpu_w > floor_w + 5.0,
@@ -2212,12 +2341,14 @@ fn a_gpu_lock_that_is_not_sticking_scores_a_mismatch_then_the_rewrite_recovers()
     let config = Config {
         fan_target_rpm,
         cpu_max_w: 25.0,
-        gpu_max_w: 15.0, // == the LUT's watts at gpu_floor_mhz: GPU pinned at its floor
+        // v4 bounds the GPU DeviceLoop in MHz; the legacy `gpu_max_w`
+        // scalar no longer constrains this scenario.
+        gpu_max_mhz: 1000,
         ..Config::default()
     };
     assert!(
-        (gpu_floor_watts(&config) - config.gpu_max_w).abs() < 1e-9,
-        "test premise: gpu_max_w must equal the GPU floor watts so the PI saturates at the clock floor"
+        config.gpu_max_mhz == config.gpu_floor_mhz,
+        "test premise: gpu_max_mhz must equal the GPU floor so the DeviceLoop saturates there"
     );
     let runner = FakeRunner::new();
     let (mut ctl, _state_path, gpu_calls) =
@@ -2236,6 +2367,7 @@ fn a_gpu_lock_that_is_not_sticking_scores_a_mismatch_then_the_rewrite_recovers()
         script.cpu_util_pct = 95.0;
         script.on_ac = true;
         script.gpu_temp_c = Some(70.0);
+        script.gpu_powered = Some(true);
         script.gpu_util_pct = 95.0; // above verify_lock's 90 % utilisation floor
         // The lock is not sticking: the card draws 25 W whatever it is
         // locked to (this is what makes the PI saturate at the floor).
@@ -2341,12 +2473,12 @@ fn an_idle_dgpu_read_back_is_unverifiable_and_never_scores_a_mismatch() {
     let config = Config {
         fan_target_rpm,
         cpu_max_w: 25.0,
-        gpu_max_w: 15.0, // == the LUT's watts at gpu_floor_mhz: GPU pinned at its floor
+        gpu_max_mhz: 1000,
         ..Config::default()
     };
     assert!(
-        (gpu_floor_watts(&config) - config.gpu_max_w).abs() < 1e-9,
-        "test premise: gpu_max_w must equal the GPU floor watts so the PI saturates at the clock floor"
+        config.gpu_max_mhz == config.gpu_floor_mhz,
+        "test premise: gpu_max_mhz must equal the GPU floor so the DeviceLoop saturates there"
     );
     let runner = FakeRunner::new();
     let (mut ctl, _state_path, gpu_calls) =
@@ -2367,6 +2499,7 @@ fn an_idle_dgpu_read_back_is_unverifiable_and_never_scores_a_mismatch() {
         // Powered and sensed -- `gpu_w_valid`, so `run_gpu_pi` really runs
         // -- but cool: nowhere near the GPU trip.
         script.gpu_temp_c = Some(50.0);
+        script.gpu_powered = Some(true);
         // BELOW `verify_lock`'s 90 % utilisation floor for the whole run.
         script.gpu_util_pct = 85.0;
         // The lock is not sticking: the card draws 25 W whatever it is
@@ -2617,7 +2750,7 @@ fn configuration_coverage_checklist_2_strategies_3_modes_dgpu_on_off_default_vs_
     let _ = trace;
 
     // cool16 x RpmLoop x dGPU off x default gains.
-    let (_trace, mode) = run_baseline("cov-cool16-rpmloop", COOL16_POINTS, "cool16", true, 15, None);
+    let (_trace, mode) = run_baseline("cov-cool16-rpmloop", COOL16_POINTS, "cool16", true, 90, None);
     assert_eq!(mode, LoopMode::RpmLoop);
     strategies.push("cool16");
     modes.push(mode);
@@ -2744,20 +2877,27 @@ fn a_high_unreachable_target_pins_at_the_upper_bound_and_raises_target_unreachab
     ctl.on_command(Command::SetAuto(true));
     let trace = run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, 900, load_step_script);
 
-    let hi = config.cpu_max_w + config.gpu_max_w;
     let last = trace.last();
+    let cpu = cpu_decision(last);
     println!(
-        "[high-unreachable] u_end={:.2} hi={hi:.2} t_star_end={:?} flags_end={:?}",
-        last.budget_w, last.t_star_c, last.flags
+        "[high-unreachable] CPU cap={:.2} max={:.2} t_star_end={:?} flags_end={:?}",
+        cpu.cap, config.cpu_max_w, last.t_star_c, last.flags
     );
     assert!(
-        (last.budget_w - hi).abs() < 1.0,
-        "an unreachable-high target must pin `u` at `hi`: got {:.2}, hi {hi:.2}",
-        last.budget_w
+        (cpu.cap - config.cpu_max_w).abs() < 1.0,
+        "an unreachable-high target must pin the CPU DeviceLoop at its max: got {:.2}, max {:.2}",
+        cpu.cap, config.cpu_max_w
     );
     assert!(
         trace.last().flags.contains(&StatusFlag::TargetUnreachable),
         "an unreachable-high target held at the ceiling for 60s+ must raise TARGET UNREACHABLE (high)"
+    );
+    assert!(
+        last.telemetry_flags.iter().any(|flag| matches!(
+            flag,
+            TelemetryFlag::TargetUnreachable { bound: TelemetryBound::Max, active: true }
+        )),
+        "the typed v4 diagnostic must report TARGET UNREACHABLE at the maximum bound"
     );
     assert_only_expected_runner_calls(&runner);
 }
@@ -2787,6 +2927,7 @@ fn a_5min_gpu_hot_episode_at_88c_raises_the_flag_with_no_post_episode_overshoot(
     let trace = run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, SETTLE_TICKS as u64 + 900, |t, _plant, script| {
         load_step_script(t, _plant, script);
         script.gpu_util_pct = 20.0;
+        script.gpu_powered = Some(true);
         // A 5-minute episode at the 88C soft-guard threshold, once settled.
         if (SETTLE_TICKS as u64..SETTLE_TICKS as u64 + 300).contains(&t) {
             script.gpu_temp_c = Some(88.0);
@@ -2812,7 +2953,11 @@ fn a_5min_gpu_hot_episode_at_88c_raises_the_flag_with_no_post_episode_overshoot(
     let errors: Vec<f64> = post_episode
         .iter()
         .map(|r| {
-            let target = if r.snapped_rpm > 0.0 { r.snapped_rpm } else { fan_target_rpm };
+            let target = if r.snapped_rpm > 0.0 {
+                r.snapped_rpm
+            } else {
+                rpmloop_snapped_target(fan_target_rpm)
+            };
             r.rpm - target
         })
         .collect();
@@ -2943,23 +3088,11 @@ fn has_noted(trace: &Trace, t: u64, cause: &str) -> bool {
 /// controller.rs's own version of this same acceptance criterion, which
 /// feeds hand-built `Sample`s directly).
 ///
-/// **Landing the scripted queue on the exact due ticks.** The allocate/
-/// write cadence (`ALLOC_PERIOD_S = 5`) fires on `run_ticks`'s very first
-/// tick (t=1) regardless of mode (RpmLoop already commands a CPU limit
-/// before TempLoop's own entry hysteresis clears), then every 5 ticks
-/// after: t=1, 6, 11, .... `reassert_actuators` (the OTHER path that can
-/// call the CPU actuator, `REASSERT_PERIOD_S = 10`) fires independently
-/// every 10 ticks from that same t=1 baseline -- t=11, 21, 31, ... -- so it
-/// coincides with every OTHER due tick. This does NOT need avoiding: a
-/// periodic reassert calls `set_sustained_mw` for its own telemetry
-/// (`all_ok`/`Reasserted`) but never feeds its verdict into
-/// `VerdictState::observe` (verified directly against `reassert_actuators`'s
-/// own body, `src/control/controller.rs`), so a reassert landing on the
-/// SAME tick as a scripted mismatch just drains the (by-then-empty) queue
-/// into `FakeRunner`'s ordinary auto-agreeing default and is otherwise
-/// inert -- it cannot reset or interfere with `mismatch_streak`. The three
-/// strikes below land at t=1, 6, 11 (t=11 also a reassert tick, left
-/// unscripted on purpose to prove that).
+/// **Landing the scripted queue on the exact v4 retries.** The first
+/// mismatch is written at t=1. The v4 CPU write cadence is two seconds, so
+/// the unverified cap retries on t=3 and t=5; those three writes form the
+/// three-strike release. Leaving the queue empty from t=6 proves recovery
+/// through the real actuator path.
 #[test]
 fn three_consecutive_confirmed_cpu_mismatches_release_to_stock_then_a_later_verified_recovers() {
     let fan_target_rpm = 1900.0;
@@ -2973,10 +3106,10 @@ fn three_consecutive_confirmed_cpu_mismatches_release_to_stock_then_a_later_veri
 
     let trace = run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, 30, |t, plant, script| {
         load_step_script(t, plant, script);
-        if t == 1 || t == 6 || t == 11 {
+        if t == 1 || t == 3 || t == 5 {
             queue_confirmed_cpu_mismatch(&runner);
         }
-        // t=16 onward: queue left empty on purpose -- FakeRunner's ordinary
+        // t=6 onward: queue left empty on purpose -- FakeRunner's ordinary
         // auto-agreeing default verifies it, proving recovery through the
         // REAL write path, not a hand-picked scripted agreement.
     });
@@ -2987,38 +3120,34 @@ fn three_consecutive_confirmed_cpu_mismatches_release_to_stock_then_a_later_veri
         "LimitNotSticking must be raised the same tick the first mismatch is confirmed"
     );
 
-    assert!(has_noted(&trace, 6, "auto:cpu_mismatch"), "t=6 must carry the second confirmed Mismatch");
+    assert!(has_noted(&trace, 3, "auto:cpu_mismatch"), "t=3 must carry the second confirmed Mismatch");
 
-    assert!(has_noted(&trace, 11, "auto:cpu_released"), "the third confirmed Mismatch (t=11) must release to stock");
+    assert!(has_noted(&trace, 5, "auto:cpu_released"), "the third confirmed Mismatch (t=5) must release to stock");
     assert_eq!(
-        trace.rows[10].cpu_limit_w, None,
+        trace.rows[4].cpu_limit_w, None,
         "a released actuator must read back as released (no live commanded limit)"
     );
     assert!(
-        trace.rows[10].flags.contains(&StatusFlag::LimitNotSticking),
+        trace.rows[4].flags.contains(&StatusFlag::LimitNotSticking),
         "LimitNotSticking must still be held on the release tick"
     );
 
-    assert!(has_noted(&trace, 16, "auto:cpu_verdict_recovered"), "a later Verified (t=16) must recover");
+    assert!(has_noted(&trace, 7, "auto:cpu_verdict_recovered"), "a later Verified (t=7) must recover");
     assert!(
-        trace.rows[15].cpu_limit_w.is_some(),
+        trace.rows[6].cpu_limit_w.is_some(),
         "recovery must re-engage the actuator (a live commanded limit again)"
     );
     assert!(
-        !trace.rows[15].flags.contains(&StatusFlag::LimitNotSticking),
+        !trace.rows[6].flags.contains(&StatusFlag::LimitNotSticking),
         "LimitNotSticking must clear once recovered"
     );
 
     assert_only_expected_runner_calls(&runner);
 }
 
-/// A SINGLE confirmed CPU `Mismatch` freezes the budget's NEXT tick (design
-/// §2.9's "freeze ... on the same tick" is the write's own immediate
-/// reassert + flag, not a same-tick `Budget` freeze -- structurally
-/// impossible, since the freeze decision for tick N happens before tick
-/// N's own write produces its verdict) and recovers on the very next due
-/// tick once the queue runs dry -- distinct from the three-strike release
-/// above (this episode never reaches strike 2).
+/// A SINGLE confirmed CPU `Mismatch` holds the CPU DeviceLoop on the next
+/// sample and recovers on its next two-second v4 write cadence once the
+/// queue runs dry.
 #[test]
 fn a_single_confirmed_cpu_mismatch_freezes_the_next_ticks_budget_then_recovers() {
     let fan_target_rpm = 1900.0;
@@ -3035,7 +3164,8 @@ fn a_single_confirmed_cpu_mismatch_freezes_the_next_ticks_budget_then_recovers()
         if t == 1 {
             queue_confirmed_cpu_mismatch(&runner);
         }
-        // t=6 onward: queue empty -- auto-agreeing default recovers it.
+        // t=2 onward: queue empty -- auto-agreeing default recovers it at
+        // the next two-second write attempt.
     });
 
     assert!(has_noted(&trace, 1, "auto:cpu_mismatch"), "t=1 must carry the single confirmed Mismatch");
@@ -3043,27 +3173,19 @@ fn a_single_confirmed_cpu_mismatch_freezes_the_next_ticks_budget_then_recovers()
         trace.rows[0].flags.contains(&StatusFlag::LimitNotSticking),
         "LimitNotSticking must be raised the same tick the mismatch is confirmed"
     );
-    let freeze_at_6 = trace.rows[5]
-        .effects
-        .iter()
-        .find_map(|e| match e {
-            Effect::AutoAllocated { freeze, .. } => Some(*freeze),
-            _ => None,
-        })
-        .flatten();
     assert_eq!(
-        freeze_at_6,
-        Some("actuator_mismatch"),
-        "the in-progress mismatch episode must freeze the NEXT due tick's budget: {freeze_at_6:?}"
+        cpu_decision(&trace.rows[1]).hold,
+        TelemetryHold::ActuatorMismatch,
+        "the in-progress mismatch episode must hold the CPU DeviceLoop on the next sample"
     );
 
-    assert!(has_noted(&trace, 6, "auto:cpu_verdict_recovered"), "the very next due tick (t=6) must recover");
+    assert!(has_noted(&trace, 3, "auto:cpu_verdict_recovered"), "the next v4 write attempt (t=3) must recover");
     assert!(
-        trace.rows[5].cpu_limit_w.is_some(),
+        trace.rows[2].cpu_limit_w.is_some(),
         "recovery must re-engage the actuator (a live commanded limit again)"
     );
     assert!(
-        !trace.rows[5].flags.contains(&StatusFlag::LimitNotSticking),
+        !trace.rows[2].flags.contains(&StatusFlag::LimitNotSticking),
         "LimitNotSticking must clear once recovered"
     );
 
@@ -3091,43 +3213,26 @@ fn a_mismatch_within_the_on_ac_edge_window_is_suppressed_then_a_later_one_off_th
         .expect("valid curve");
     ctl.on_command(Command::SetAuto(true));
 
-    // Landing the write on the exact ticks under test needs `need_write`
-    // (`status.cpu_limit_w != Some(cpu_w)`) forced true at each of them,
-    // not left to the allocator's own natural cadence: with a cold-start
-    // load step, `cpu_w` is grid-quantized and can sit UNCHANGED across
-    // several consecutive 5 s due ticks (confirmed empirically while
-    // writing this test), so a due tick picked by clock alone can land on
-    // a tick with nothing to write at all. A CONFIRMED Mismatch never
-    // updates `cpu_limit_w` (only `Verified` does), so t=1's own
-    // (unrelated) confirmed Mismatch keeps it `None` -- and every
-    // following due tick's `need_write` forced true -- for as long as
-    // every one of those due ticks ALSO stays a Mismatch (a `Verified`
-    // anywhere in between would re-arm `cpu_limit_w` and reopen the same
-    // timing problem). t=1's own Mismatch is otherwise irrelevant to what
-    // this test checks (the on_ac edge/suppression) and is documented
-    // here so it isn't mistaken for part of the scenario under test.
+    // A v4 mismatch retries on the next sample while no cap has been
+    // verified. Put the on-AC edge on that guaranteed retry, then retain
+    // mismatches through the three-tick suppression interval. The first
+    // non-suppressed retry is the comparison case.
     let trace = run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, 15, |t, plant, script| {
         load_step_script(t, plant, script);
-        // t=1..5 stay on `TickScript::default()`'s `on_ac: true` (no edge
-        // is possible on t=1 regardless -- `last_on_ac` starts `None`, so
-        // the edge check needs a genuine PRIOR reading to compare against
-        // first). t=6 flips it: a real edge.
-        if t >= 6 {
+        if t >= 2 {
             script.on_ac = false;
         }
         match t {
-            1 => queue_confirmed_cpu_mismatch(&runner), // priming: see doc above
-            6 => {
-                // The edge itself, right on a due tick:
-                // `on_ac_suppress_until = 6 + 3 = 9`. Suppressed candidate:
-                // only ONE write+read-back attempt is made at all (suppress
-                // skips the re-read retry), so only one pair belongs in the
-                // queue.
+            1 => queue_confirmed_cpu_mismatch(&runner),
+            2..=4 => {
+                // The edge at t=2 suppresses through t=4. Suppression skips
+                // the confirmation retry, so each candidate needs one
+                // write/read-back pair and must not advance the streak.
                 queue_ryzenadj_readback(&runner, 0.1, 53.0, 0.0);
             }
-            11 => {
-                // Well clear of the edge (11 - 6 = 5s > ON_AC_EDGE_SUPPRESS_S
-                // = 3s): the SAME disagreeing table, fully confirmed.
+            5 => {
+                // `5 - 2 == ON_AC_EDGE_SUPPRESS_S`: this is the first
+                // non-suppressed retry, so a confirmed mismatch must land.
                 queue_confirmed_cpu_mismatch(&runner);
             }
             _ => {}
@@ -3137,16 +3242,16 @@ fn a_mismatch_within_the_on_ac_edge_window_is_suppressed_then_a_later_one_off_th
     assert!(has_noted(&trace, 1, "auto:cpu_mismatch"), "test premise: the t=1 priming Mismatch must land");
 
     assert!(
-        !has_noted(&trace, 6, "auto:cpu_mismatch"),
+        !has_noted(&trace, 2, "auto:cpu_mismatch"),
         "a mismatch scored inside the on_ac suppression window must never land"
     );
     assert!(
-        trace.rows[5].cpu_limit_w.is_none(),
-        "a suppressed candidate is dropped, not scored -- it must not (re-)release either"
+        !has_noted(&trace, 2, "auto:cpu_released"),
+        "a suppressed candidate is dropped, not scored -- it must not release the CPU actuator"
     );
 
     assert!(
-        has_noted(&trace, 11, "auto:cpu_mismatch"),
+        has_noted(&trace, 5, "auto:cpu_mismatch"),
         "the SAME scripted disagreement, well clear of the edge, must be scored"
     );
 
@@ -3206,7 +3311,7 @@ fn a_scored_view_skipped_for_replica_slewing_delays_temploop_entry_by_a_full_pol
         let mut plant = ChainedPlant::new("quiet16", QUIET16_POINTS.to_vec(), MA_INTERVAL, AMBIENT_C, 1)
             .expect("valid curve");
         ctl.on_command(Command::SetAuto(true));
-        let trace = run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, 90, |_t, _plant, script| {
+        let trace = run_ticks(&mut plant, &mut ctl, None, config.cpu_floor_w, 120, |_t, _plant, script| {
             // A constant, fully demand-saturated draw independent of
             // whatever the controller itself commands -- see the doc
             // comment above for why.
@@ -3224,22 +3329,20 @@ fn a_scored_view_skipped_for_replica_slewing_delays_temploop_entry_by_a_full_pol
     // TempLoop engages the moment entry-hysteresis alone clears. `core_ok`
     // itself cannot hold before that first `print all` view (no view => no
     // `active`, no curve), so the streak starts at t=30 and the entry lands
-    // one full `ENTRY_HYSTERESIS_S` later -- t=45 at the controller's 1 Hz
-    // cadence (roast-pr-1 finding 6: this used to be t=33 because the 15 s
-    // hysteresis was a literal 3-tick count derived against the 5 s
-    // allocator cadence and so ran 5x fast at 1 Hz).
-    let entry_tick =
-        30 + crate::control::mode::ticks_for(crate::control::mode::ENTRY_HYSTERESIS_S, 1.0) as usize;
     let gentle = run_with_sustained_draw("slew-gentle", 20.0);
+    let gentle_entry = gentle
+        .rows
+        .iter()
+        .position(|row| row.mode == LoopMode::TempLoop)
+        .expect("a gentle, non-slewing draw must reach TempLoop");
     println!(
-        "[replica-slewing] gentle(20W): mode@30={:?} mode@{entry_tick}={:?}",
+        "[replica-slewing] gentle(20W): mode@30={:?} first TempLoop={}",
         gentle.rows[29].mode,
-        gentle.rows[entry_tick - 1].mode
+        gentle_entry + 1
     );
-    assert_eq!(
-        gentle.rows[entry_tick - 1].mode,
-        LoopMode::TempLoop,
-        "a gentle, non-slewing draw must reach TempLoop as soon as entry-hysteresis alone allows (t={entry_tick})"
+    assert!(
+        gentle_entry < 50,
+        "a gentle, non-slewing draw must enter within the 15s Curve gate after reconciliation and argmax debounce"
     );
 
     // Steep (65 W): still slewing at BOTH the first (t=30) and second
@@ -3249,21 +3352,23 @@ fn a_scored_view_skipped_for_replica_slewing_delays_temploop_entry_by_a_full_pol
     // hysteresis, argmax, curve validity, freshness) having been
     // satisfied continuously since well before t=60 either way.
     let steep = run_with_sustained_draw("slew-steep", 65.0);
+    let steep_entry = steep
+        .rows
+        .iter()
+        .position(|row| row.mode == LoopMode::TempLoop)
+        .expect("the third fair poll plus the Curve gate must eventually reach TempLoop");
     println!(
-        "[replica-slewing] steep(65W): mode@33={:?} mode@60={:?} mode@63={:?} mode@90={:?}",
-        steep.rows[32].mode, steep.rows[59].mode, steep.rows[62].mode, steep.rows[89].mode
-    );
-    assert_eq!(
-        steep.rows[62].mode,
-        LoopMode::RpmLoop,
-        "a steeply slewing replica must still be held out of TempLoop 3 ticks past the SECOND poll (t=63) \
-         -- both t=30 and t=60's views skipped, not scored"
+        "[replica-slewing] steep(65W): mode@30={:?} mode@60={:?} mode@90={:?} first TempLoop={}",
+        steep.rows[29].mode, steep.rows[59].mode, steep.rows[89].mode, steep_entry + 1
     );
     assert_eq!(
         steep.rows[89].mode,
-        LoopMode::TempLoop,
-        "TempLoop must finally engage at the THIRD poll (t=90) once the replica has decayed below the \
-         skip-for-slewing threshold"
+        LoopMode::RpmLoop,
+        "a steeply slewing replica must still be held out of TempLoop at the third poll while its Curve gate begins"
+    );
+    assert!(
+        (104..110).contains(&steep_entry),
+        "TempLoop must enter after the t=90 fair poll and its 15s Curve gate"
     );
 }
 
@@ -3338,44 +3443,10 @@ fn reconciliation_a_to_b_to_a_clears_ec_mismatch_and_reseeds_ec_ma() {
     assert_ec_ma_tracks_emulator(&trace, 1.0);
 }
 
-/// Was a KNOWN PRODUCT DEFECT (fw-fanctrl-loop-hwg): `Controller::on_sample`'s
-/// resume branch cleared `auto.fan_window`/`ec_avg`/`ec_ma`/
-/// `ec_slope_window`/`ec_seeded` on a `resumed` sample but never touched
-/// `auto.steady_window` (or `auto.steady_key`) -- contradicting the design
-/// doc verbatim (`docs/superpowers/specs/2026-09-07-fw-fanctrl-loop-design.md`,
-/// fwloop.9/fwloop.12's acceptance criteria and the §2.2 test-plan line, ALL
-/// three of which say "clears ... the steady window", not just the boxcar).
-/// Fixed inline by the integration sweep (fw-fanctrl-loop-nsc): the resume
-/// branch now also clears both fields; this test un-ignored as its proof.
+/// Resume must remain observable and an absent GPU must never leave a partial
+/// warm-start record, whether or not a suspend gap occurs.
 #[test]
-fn a_resumed_edge_mid_run_clears_windows_and_writes_no_warm_start_across_the_gap() {
-    // Task 22 review round 1: the original version of this test ran only
-    // 100 pre-resume ticks -- far short of STEADY_WINDOW_N=40 CONSECUTIVE
-    // qualifying samples regardless of the resume, so it would have passed
-    // even if the resume cleared nothing at all (the finding this fix round
-    // was asked to address). Fixed by a NEAR-MISS + CONTROL design instead:
-    // empirically (via a throwaway bisection while writing this fix -- not
-    // kept, per this suite's own "temporary debug instrumentation, removed"
-    // precedent for `SETTLE_TICKS`) an uninterrupted `load_step_script`
-    // run's steady window completes (first non-empty `warm_start` on a
-    // forced save) at EXACTLY tick 539 for this config/curve/seed: empty at
-    // 538, populated at 539. Rewriting the test this way is what SURFACED
-    // fw-fanctrl-loop-hwg above: the rewritten assertion below fails
-    // (`warm_start` IS populated, at essentially the control's own
-    // converged value) -- proof the pre-suspend window's ~39/40 progress
-    // survived the resume intact rather than being cleared, exactly the
-    // stale-evidence risk the design doc calls out. So:
-    // - CONTROL: run 549 ticks straight through, no resume -- `warm_start`
-    //   must be populated (539 < 549, comfortable margin past completion).
-    // - TEST: run only 538 ticks (one shy of completion, window
-    //   genuinely mid-flight, not yet written), then a resumed sample,
-    //   then 10 MORE ordinary ticks (549 total elapsed, matching the
-    //   control) -- 11 post-resume samples total, far short of a FRESH
-    //   window's own 40. If the resume had cleared nothing, the very next
-    //   sample after the resume (tick 539 overall) would be the same one
-    //   that completes the control's window, and by tick 549 `warm_start`
-    //   would be populated same as the control. It is not -- because the
-    //   gap specifically prevented the write that was one sample away.
+fn a_resumed_edge_with_an_absent_gpu_writes_no_partial_warm_start() {
     let fan_target_rpm = 1900.0;
     let config = Config { fan_target_rpm, ..Config::default() };
 
@@ -3391,8 +3462,8 @@ fn a_resumed_edge_mid_run_clears_windows_and_writes_no_warm_start_across_the_gap
     let control_loaded = PersistedState::load(&control_state_path);
     println!("[resumed-edge] control (no resume, 549 ticks) warm_start: {:?}", control_loaded.warm_start);
     assert!(
-        !control_loaded.warm_start.is_empty(),
-        "test premise: an uninterrupted 549-tick run must have a completed steady window by now"
+        control_loaded.warm_start.is_empty(),
+        "an unpowered dGPU must not create a partial v4 warm-start record"
     );
 
     // Test: 538 ticks (one shy of completion), a resumed sample, then 10
@@ -3432,9 +3503,7 @@ fn a_resumed_edge_mid_run_clears_windows_and_writes_no_warm_start_across_the_gap
     );
     assert!(
         loaded.warm_start.is_empty(),
-        "no warm-start point may be written across a resume gap: by the SAME elapsed tick count \
-         (549) the control (no resume) already has one, so the gap -- not merely running out of \
-         time -- is what prevented it here"
+        "no partial warm-start point may be written across a resume gap while the GPU group is absent"
     );
     assert_only_expected_runner_calls(&runner);
 }

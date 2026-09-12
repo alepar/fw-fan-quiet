@@ -6,11 +6,15 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Axis, Block, Chart, Dataset, Gauge, GraphType, Paragraph};
+use ratatui::widgets::{Axis, Block, Chart, Dataset, Gauge, GraphType, Paragraph, Wrap};
 
-use crate::control::controller::{CalibProgressLite, LoopMode, Mode, StatusFlag};
+use crate::control::controller::{CalibProgressLite, Mode, StatusFlag};
 use crate::model::{Model, RING_CAP};
 use crate::ring::Ring;
+use crate::types::{
+    GainsSource, TelemetryBound, TelemetryDevice, TelemetryDeviceName, TelemetryFlag,
+    TelemetryHold, TelemetrySelected, TelemetryTStarState,
+};
 
 /// Fixed Y bounds per chart: auto-scaling makes live charts jumpy, and these
 /// cover the hardware's full envelope (fans max ~7000 RPM, package power well
@@ -28,8 +32,11 @@ const GPU_MAX_CLOCK_MHZ: f64 = 3090.0;
 const PCT_BOUNDS: [f64; 2] = [0.0, 100.0];
 
 pub fn view(model: &Model, frame: &mut Frame) {
-    let [header, charts, footer] = Layout::vertical([
+    let [header, control, charts, footer] = Layout::vertical([
         Constraint::Length(1),
+        // Full-width control text keeps every decision field readable on an
+        // ordinary 80-column terminal; the charts use the remaining height.
+        Constraint::Length(8),
         Constraint::Fill(1),
         Constraint::Length(1),
     ])
@@ -39,6 +46,8 @@ pub fn view(model: &Model, frame: &mut Frame) {
         Paragraph::new(header_line(model)).style(Style::default().fg(Color::White)),
         header,
     );
+
+    render_control(model, frame, control);
 
     let [top, bottom] = Layout::vertical([Constraint::Fill(1); 2]).areas(charts);
     let [fans_area, watts_area] = Layout::horizontal([Constraint::Fill(1); 2]).areas(top);
@@ -96,11 +105,6 @@ fn header_line(model: &Model) -> Line<'static> {
             model.fan_target_rpm
         )),
     ];
-    // The Kalman trim/gain readout is removed (`ControlStatus` no longer
-    // carries the old bias/gain fields, Task 4's type surface); the
-    // arbiter/budget segment below (design §3.5) takes its place.
-    spans.push(Span::raw(" | "));
-    spans.push(Span::raw(loop_status_segment(model)));
     // Severity-first render order: the single-line header has no wrap
     // (ratatui clips at the right edge), so an emergency tripping AFTER
     // milder flags must never be pushed out of view by them. The status
@@ -144,37 +148,6 @@ fn header_line(model: &Model) -> Line<'static> {
         Style::default().fg(Color::DarkGray),
     ));
     Line::from(spans)
-}
-
-/// The arbiter/budget segment (design §3.5): `mode A|B|rel · T* · ma ·
-/// duty -> rpm · budget`, in that literal order. Every piece but `mode`
-/// and `budget` is an `Option` on `ControlStatus` (`None` outside the mode
-/// that produces it, or before the arbiter has ever run) and renders as
-/// "–" — the same missing-value convention the `cpu`/`gpu` limit spans
-/// above already use.
-fn loop_status_segment(model: &Model) -> String {
-    let status = &model.status;
-    let mode = match status.loop_mode {
-        LoopMode::TempLoop => "A",
-        LoopMode::RpmLoop => "B",
-        LoopMode::Released => "rel",
-    };
-    let t_star = match status.t_star_c {
-        Some(t) => format!("T* {t:.1}\u{b0}C"),
-        None => "T* \u{2013}".into(),
-    };
-    let ma = match status.ec_ma_c {
-        Some(v) => format!("ma {v:.1}"),
-        None => "ma \u{2013}".into(),
-    };
-    let duty = match status.duty_cmd {
-        Some(d) => format!("duty {d} \u{2192} {:.0} rpm", status.snapped_rpm),
-        None => "duty \u{2013}".into(),
-    };
-    format!(
-        "mode {mode} \u{b7} {t_star} \u{b7} {ma} \u{b7} {duty} \u{b7} budget {:.1} W",
-        status.budget_w
-    )
 }
 
 /// Header render priority: lower sorts (and therefore renders) first, so
@@ -391,26 +364,106 @@ fn render_fans(model: &Model, frame: &mut Frame, area: Rect) {
     render_chart(frame, area, title, datasets, bounds);
 }
 
+/// Renders v3 decisions verbatim; the view never reimplements cap selection.
+fn render_control(model: &Model, frame: &mut Frame, area: Rect) {
+    let status = &model.status;
+    let state = status.tstar_state.map(tstar_state_name).unwrap_or("—");
+    let mut lines = vec![Line::from(format!("T* {} | state {state}", opt_temp(status.t_star_c)))];
+    lines.push(Line::from(device_line(
+        "CPU",
+        status.cpu.as_ref(),
+        status.cpu_limit_w.map(|v| format!("{v:.1}W")),
+    )));
+    lines.push(Line::from(device_line(
+        "GPU",
+        status.gpu.as_ref(),
+        status.gpu_max_mhz.map(|v| format!("{v}MHz")),
+    )));
+    if !status.telemetry_flags.is_empty() {
+        lines.push(Line::from(format!(
+            "flags: {}",
+            status.telemetry_flags.iter().map(flag_text).collect::<Vec<_>>().join(" | ")
+        )));
+    }
+    let block = Block::bordered().title("two-loop control");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+}
+
+fn device_line(
+    name: &str,
+    device: Option<&TelemetryDevice>,
+    applied: Option<String>,
+) -> String {
+    let applied = applied.unwrap_or_else(|| "—".into());
+    match device {
+        Some(d) => format!(
+            "{name} g:{} e:{} th:{} sh:{} cap:{}[{}] app:{applied} h:{} gain:{}",
+            opt_temp(d.group_c), opt_error(d.err_c), d.thermal, d.shadow,
+            d.cap, selected_name(d.selected), hold_name(d.hold), gains_name(d.gains_source),
+        ),
+        None => format!("{name} g:— e:— th:— sh:— cap:—[—] app:{applied} h:— gain:—"),
+    }
+}
+
+fn opt_temp(value: Option<f64>) -> String {
+    value.map(|v| format!("{v:.1}\u{b0}C")).unwrap_or_else(|| "—".into())
+}
+
+fn opt_error(value: Option<f64>) -> String {
+    value.map(|v| format!("{v:+.1}\u{b0}C")).unwrap_or_else(|| "—".into())
+}
+
+// Exhaustive names make a new wire variant a compile error until it gains a
+// readable rendering.
+fn tstar_state_name(value: TelemetryTStarState) -> &'static str {
+    match value { TelemetryTStarState::Curve => "Curve", TelemetryTStarState::Held => "Held", TelemetryTStarState::Uncontrollable => "Uncontrollable", TelemetryTStarState::Released => "Released" }
+}
+fn selected_name(value: TelemetrySelected) -> &'static str {
+    match value { TelemetrySelected::Thermal => "T", TelemetrySelected::Shadow => "S", TelemetrySelected::Floor => "F", TelemetrySelected::Max => "M" }
+}
+fn bound_name(value: TelemetryBound) -> &'static str {
+    match value { TelemetryBound::Floor => "floor", TelemetryBound::Max => "max" }
+}
+fn gains_name(value: GainsSource) -> &'static str {
+    match value { GainsSource::Config => "config", GainsSource::Fitted => "fitted", GainsSource::Default => "default" }
+}
+fn device_name(value: TelemetryDeviceName) -> &'static str {
+    match value { TelemetryDeviceName::Cpu => "CPU", TelemetryDeviceName::Gpu => "GPU" }
+}
+fn polarity(value: bool) -> &'static str { if value { "active" } else { "clear" } }
+fn hold_name(value: TelemetryHold) -> String {
+    match value { TelemetryHold::None => "tracking".into(), TelemetryHold::Shadow => "shadow".into(), TelemetryHold::Clamp { bound } => format!("clamp {}", bound_name(bound)), TelemetryHold::ActuatorMismatch => "actuator mismatch".into(), TelemetryHold::GroupUnavailable => "group unavailable".into(), TelemetryHold::DrawUnavailable => "draw unavailable".into(), TelemetryHold::Bypass => "bypass".into() }
+}
+fn flag_text(value: &TelemetryFlag) -> String { match value {
+    TelemetryFlag::ArgmaxUncontrollable { label, active } => format!("argmax uncontrollable {label} ({})", polarity(*active)),
+    TelemetryFlag::ArgmaxStuck { label, active } => format!("argmax stuck {label} ({})", polarity(*active)),
+    TelemetryFlag::EcUnknownLabel { label, active } => format!("EC unknown label {label} ({})", polarity(*active)),
+    TelemetryFlag::EcImplausible { label, active } => format!("EC implausible {label} ({})", polarity(*active)),
+    TelemetryFlag::EcUncontrollableUnavailable { active } => format!("EC uncontrollable unavailable ({})", polarity(*active)),
+    TelemetryFlag::GroupLost { device, active } => format!("{} group lost ({})", device_name(*device), polarity(*active)),
+    TelemetryFlag::DeviceUnreachable { device, bound, active } => format!("{} unreachable at {} ({})", device_name(*device), bound_name(*bound), polarity(*active)),
+    TelemetryFlag::TargetUnreachable { bound, active } => format!("target unreachable at {} ({})", bound_name(*bound), polarity(*active)),
+    TelemetryFlag::SteepCurve { active } => format!("steep curve ({})", polarity(*active)),
+    TelemetryFlag::Legacy { flag, active } => format!("{flag} ({})", polarity(*active)),
+} }
+
+/// Measured CPU/GPU power history remains useful alongside independent caps;
+/// only the obsolete shared budget and allocation display was removed.
 fn render_watts(model: &Model, frame: &mut Frame, area: Rect) {
     let cpu_max_w = model.status.cpu_max_w;
     let gpu_max_w = model.status.gpu_max_w;
     let cpu_segs = to_percent(&segments(&model.cpu_w), cpu_max_w);
     let gpu_segs = to_percent(&segments(&model.gpu_w), gpu_max_w);
-    // Commanded CPU limit overlay, on the CPU's percent scale.
-    let limit_pts = model
-        .status
-        .cpu_limit_w
-        .map(|w| hline(w / cpu_max_w * 100.0));
+    let limit_pts = model.status.cpu_limit_w.map(|w| hline(w / cpu_max_w * 100.0));
     let title = match &model.latest {
-        Some(s) => format!(
-            "watts cpu {:.1} gpu {:.1} W (% of max)",
-            s.cpu_pkg_w, s.gpu_w
-        ),
+        Some(s) => format!("watts cpu {:.1} gpu {:.1} W (% of max)", s.cpu_pkg_w, s.gpu_w),
         None => "watts (% of max)".into(),
     };
     let mut datasets = Vec::new();
     if let Some(pts) = &limit_pts {
-        datasets.push(line_dataset(Color::DarkGray, pts).name("cpu limit"));
+        datasets.push(line_dataset(Color::DarkGray, pts).name("cpu cap"));
     }
     datasets.extend(series("cpu", Color::Yellow, &cpu_segs));
     datasets.extend(series("gpu", Color::Green, &gpu_segs));
@@ -524,7 +577,11 @@ mod tests {
     /// keeps its own dedicated, narrower terminal — the one test that is
     /// deliberately about clipping.
     fn draw(model: &Model) -> Terminal<TestBackend> {
-        let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
+        draw_size(model, 200, 40)
+    }
+
+    fn draw_size(model: &Model, width: u16, height: u16) -> Terminal<TestBackend> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|f| view(model, f)).unwrap();
         terminal
     }
@@ -953,7 +1010,7 @@ mod tests {
 
     /// All buffer rows joined with newlines (wizard text spans several rows).
     fn all_text(terminal: &Terminal<TestBackend>) -> String {
-        (0..40)
+        (0..terminal.backend().buffer().area.height)
             .map(|y| row_text(terminal, y))
             .collect::<Vec<_>>()
             .join("\n")
@@ -1076,95 +1133,63 @@ mod tests {
         draw(&m);
     }
 
-    // --- Task 15: arbiter/budget header segment ---
+    // --- Task 13: per-device loop panel ---
 
-    /// Asserts every needle appears in `header`, each strictly after the
-    /// previous one ends — the "specified order" the acceptance criteria
-    /// asks for, not just presence. Searching from the previous match's END
-    /// (not its start, and not from 0) both enforces the order and avoids
-    /// matching an earlier, unrelated occurrence of a short needle like
-    /// "rpm" (which also appears in "fan target 3000 rpm", well before the
-    /// arbiter segment this asserts on).
-    fn assert_order(header: &str, needles: &[&str]) {
-        let mut from = 0;
-        for needle in needles {
-            let pos = find_col_from(header, needle, from).unwrap_or_else(|| {
-                panic!("{needle:?} not found at/after column {from} in header: {header:?}")
-            });
-            from = pos + needle.chars().count();
+    fn decision(selected: TelemetrySelected, hold: TelemetryHold, gains_source: GainsSource) -> TelemetryDevice {
+        TelemetryDevice { group_c: Some(72.5), err_c: Some(-1.5), thermal: 31.0, shadow: 36.0, cap: 31.0, selected, hold, gains_source }
+    }
+
+    fn two_loop_status(state: TelemetryTStarState) -> crate::control::ControlStatus {
+        crate::control::ControlStatus {
+            t_star_c: Some(71.0), tstar_state: Some(state), cpu_limit_w: Some(31.0), gpu_max_mhz: Some(2100),
+            cpu: Some(decision(TelemetrySelected::Thermal, TelemetryHold::None, GainsSource::Config)),
+            gpu: Some(decision(TelemetrySelected::Shadow, TelemetryHold::Shadow, GainsSource::Fitted)),
+            ..crate::control::ControlStatus::default()
         }
     }
 
     #[test]
-    fn header_segment_for_temp_loop_mode_a() {
-        use crate::control::ControlStatus;
-        let mut m = Model::new();
-        m.update(Event::Status(ControlStatus {
-            loop_mode: LoopMode::TempLoop,
-            t_star_c: Some(71.5),
-            ec_ma_c: Some(70.8),
-            duty_cmd: Some(31),
-            snapped_rpm: 3050.0,
-            budget_w: 68.0,
-            ..ControlStatus::default()
-        }));
-        let terminal = draw(&m);
-        let header = row_text(&terminal, 0);
-        assert!(
-            header.contains(
-                "mode A \u{b7} T* 71.5\u{b0}C \u{b7} ma 70.8 \u{b7} duty 31 \u{2192} 3050 rpm \u{b7} budget 68.0 W"
-            ),
-            "header was: {header:?}"
-        );
-        assert_order(&header, &["mode A", "T*", "ma", "duty", "rpm", "budget"]);
+    fn two_loop_panel_is_legible_at_80x24_and_complete_at_120x40() {
+        for state in [TelemetryTStarState::Curve, TelemetryTStarState::Held, TelemetryTStarState::Uncontrollable, TelemetryTStarState::Released] {
+            let mut model = Model::new(); model.update(Event::Status(two_loop_status(state)));
+            let text = all_text(&draw_size(&model, 80, 24));
+            for expected in ["T* 71.0\u{b0}C", tstar_state_name(state), "CPU g:72.5\u{b0}C e:-1.5\u{b0}C th:31 sh:36 cap:31[T] app:31.0W h:tracking gain:config", "GPU g:72.5\u{b0}C e:-1.5\u{b0}C th:31 sh:36 cap:31[S] app:2100MHz h:shadow gain:fitted"] { assert!(text.contains(expected), "80x24 missing {expected:?}: {text}"); }
+            let wide = all_text(&draw_size(&model, 120, 40));
+            for expected in ["cap:31[T] app:31.0W h:tracking gain:config", "cap:31[S] app:2100MHz h:shadow gain:fitted", "watts"] { assert!(wide.contains(expected), "120x40 clipped {expected:?}: {wide}"); }
+        }
+        let text = all_text(&draw(&Model::new()));
+        for expected in ["T* — | state —", "CPU g:— e:— th:— sh:— cap:—[—] app:— h:— gain:—", "GPU g:— e:— th:— sh:— cap:—[—] app:— h:— gain:—"] { assert!(text.contains(expected), "missing {expected:?}: {text}"); }
+        for obsolete in ["budget", "split", "lut"] { assert!(!text.to_lowercase().contains(obsolete), "obsolete {obsolete:?}: {text}"); }
     }
 
     #[test]
-    fn header_segment_for_rpm_loop_mode_b() {
-        use crate::control::ControlStatus;
-        let mut m = Model::new();
-        m.update(Event::Status(ControlStatus {
-            loop_mode: LoopMode::RpmLoop,
-            t_star_c: None,
-            ec_ma_c: Some(65.2),
-            duty_cmd: None,
-            snapped_rpm: 0.0,
-            budget_w: 40.0,
-            ..ControlStatus::default()
-        }));
-        let terminal = draw(&m);
-        let header = row_text(&terminal, 0);
-        assert!(header.contains("mode B"), "header was: {header:?}");
-        // T* and duty have nothing to show in RpmLoop: the missing-value
-        // dash, not a stale/zero number.
-        assert!(header.contains("T* \u{2013}"), "header was: {header:?}");
-        assert!(header.contains("ma 65.2"), "header was: {header:?}");
-        assert!(header.contains("duty \u{2013}"), "header was: {header:?}");
-        assert!(header.contains("budget 40.0 W"), "header was: {header:?}");
-        assert_order(&header, &["mode B", "T*", "ma", "duty", "budget"]);
-    }
-
-    #[test]
-    fn header_segment_for_released_mode() {
-        use crate::control::ControlStatus;
-        let mut m = Model::new();
-        m.update(Event::Status(ControlStatus {
-            loop_mode: LoopMode::Released,
-            t_star_c: None,
-            ec_ma_c: None,
-            duty_cmd: None,
-            snapped_rpm: 0.0,
-            budget_w: 0.0,
-            ..ControlStatus::default()
-        }));
-        let terminal = draw(&m);
-        let header = row_text(&terminal, 0);
-        assert!(header.contains("mode rel"), "header was: {header:?}");
-        assert!(header.contains("T* \u{2013}"), "header was: {header:?}");
-        assert!(header.contains("ma \u{2013}"), "header was: {header:?}");
-        assert!(header.contains("duty \u{2013}"), "header was: {header:?}");
-        assert!(header.contains("budget 0.0 W"), "header was: {header:?}");
-        assert_order(&header, &["mode rel", "T*", "ma", "duty", "budget"]);
+    fn view_fixtures_cover_each_selected_hold_gains_and_structured_flag() {
+        for (selected, binding) in [(TelemetrySelected::Thermal, "T"), (TelemetrySelected::Shadow, "S"), (TelemetrySelected::Floor, "F"), (TelemetrySelected::Max, "M")] {
+            let mut status = two_loop_status(TelemetryTStarState::Curve);
+            status.cpu = Some(decision(selected, TelemetryHold::None, GainsSource::Default));
+            let mut model = Model::new(); model.update(Event::Status(status));
+            assert!(all_text(&draw_size(&model, 120, 40)).contains(&format!("cap:31[{binding}]")));
+        }
+        for (hold, text) in [(TelemetryHold::None, "tracking"), (TelemetryHold::Shadow, "shadow"), (TelemetryHold::Clamp { bound: TelemetryBound::Floor }, "clamp floor"), (TelemetryHold::Clamp { bound: TelemetryBound::Max }, "clamp max"), (TelemetryHold::ActuatorMismatch, "actuator mismatch"), (TelemetryHold::GroupUnavailable, "group unavailable"), (TelemetryHold::DrawUnavailable, "draw unavailable"), (TelemetryHold::Bypass, "bypass")] {
+            let mut status = two_loop_status(TelemetryTStarState::Held);
+            status.cpu = Some(decision(TelemetrySelected::Thermal, hold, GainsSource::Config));
+            let mut model = Model::new(); model.update(Event::Status(status));
+            assert!(all_text(&draw_size(&model, 120, 40)).contains(&format!("h:{text}")));
+        }
+        for (source, text) in [(GainsSource::Config, "config"), (GainsSource::Fitted, "fitted"), (GainsSource::Default, "default")] {
+            let mut status = two_loop_status(TelemetryTStarState::Uncontrollable);
+            status.cpu = Some(decision(TelemetrySelected::Thermal, TelemetryHold::None, source));
+            let mut model = Model::new(); model.update(Event::Status(status));
+            assert!(all_text(&draw_size(&model, 120, 40)).contains(&format!("gain:{text}")));
+        }
+        for flag in [
+            TelemetryFlag::ArgmaxUncontrollable { label: "ambient".into(), active: true }, TelemetryFlag::ArgmaxStuck { label: "gpu_vr".into(), active: true }, TelemetryFlag::EcUnknownLabel { label: "mystery".into(), active: true }, TelemetryFlag::EcImplausible { label: "gpu_mem".into(), active: true }, TelemetryFlag::EcUncontrollableUnavailable { active: true }, TelemetryFlag::GroupLost { device: TelemetryDeviceName::Gpu, active: true }, TelemetryFlag::DeviceUnreachable { device: TelemetryDeviceName::Cpu, bound: TelemetryBound::Floor, active: true }, TelemetryFlag::TargetUnreachable { bound: TelemetryBound::Max, active: true }, TelemetryFlag::SteepCurve { active: true }, TelemetryFlag::Legacy { flag: "EC MISMATCH".into(), active: false },
+        ] {
+            let expected = super::flag_text(&flag);
+            let mut status = two_loop_status(TelemetryTStarState::Released); status.telemetry_flags = vec![flag];
+            let mut model = Model::new(); model.update(Event::Status(status));
+            assert!(all_text(&draw_size(&model, 80, 24)).contains(&expected), "missing {expected}");
+        }
     }
 
     // --- Task 15: the seven new StatusFlags ---

@@ -152,9 +152,11 @@ impl EcLabel {
     }
 }
 
-/// One `cros_ec` max-temperature reading: the highest positive `tempN`
-/// value across every labelled sensor, plus which sensor produced it and
-/// every positive reading that took part.
+/// One `cros_ec` sensor snapshot with separate control and reconciliation
+/// streams. `max_c`, `argmax`, `all`, and the group maxima contain only
+/// finite readings in `0 < C <= EC_PLAUSIBLE_MAX_C`; `reconciliation_max_c`
+/// instead uses every finite positive reading, including values above that
+/// control ceiling.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EcReading {
     pub max_c: i32,
@@ -176,17 +178,19 @@ pub struct EcReading {
 
 impl EcReading {
     /// Reads every `tempN_label` / `tempN_input` pair under `dir` (a
-    /// `cros_ec` hwmon chip directory), drops readings that are `<= 0`,
-    /// unreadable, or unparsable — that covers both the machine's constant
-    /// `-150` sentinel and a labelled sensor with no `_input` file at all
-    /// (the ENODATA convention) — rounds the surviving max to the nearest
-    /// integer °C, and breaks ties on the max by sysfs order (lowest `N`
-    /// wins, since sensors are scanned in ascending `N` and only a
-    /// strictly greater reading replaces the current argmax).
+    /// `cros_ec` hwmon chip directory). The control stream accepts only
+    /// finite `0 < C <= EC_PLAUSIBLE_MAX_C` readings, while the independent
+    /// reconciliation stream accepts every finite positive value. Unreadable
+    /// or unparsable inputs are omitted from both streams; this covers the
+    /// machine's `-150` sentinel and a labelled sensor with no `_input` file
+    /// (the ENODATA convention). The plausible-control maximum rounds to the
+    /// nearest integer °C and breaks ties by sysfs order (lowest `N` wins,
+    /// because sensors are scanned in ascending `N` and only a strictly
+    /// greater reading replaces the current argmax).
     ///
-    /// Returns `None` if the directory yields no positive reading at all
-    /// (chip present but every sensor dead, or the directory doesn't
-    /// exist) — callers use this to drive `Sample.ec_valid`.
+    /// Returns `None` if the directory yields no plausible control reading
+    /// (including when every value is raw-only, dead, or absent); callers use
+    /// this to drive `Sample.ec_valid`.
     pub fn read(dir: &Path) -> Option<Self> {
         let scan = Self::scan(dir);
         let logger = DIAGNOSTIC_LOGGER.get_or_init(|| Mutex::new(EcDiagnosticLogger::default()));

@@ -215,8 +215,9 @@ pub enum StatusFlag {
     SteepCurve,
     /// The active fw-fanctrl curve is invalid and cannot supply T*.
     CurveInvalid,
-    /// dGPU at/over its hot threshold (design §2.8, default 90 °C, exit
-    /// 84 °C): the GPU maximum ratchets toward its configured floor.
+    /// dGPU at/over its hot threshold (design §2.8, default 88 °C, flag
+    /// exit 86 °C): the GPU maximum ratchets toward its configured floor;
+    /// maximum recovery uses the stricter 84 °C gate.
     GpuHot,
     /// The NVMe `Composite` sensor is at/over its hot threshold (design
     /// §2.8, default 80 °C). Reporting only — no control action.
@@ -572,7 +573,7 @@ struct AutoState {
 
 impl AutoState {
     /// `gpu_hot_c`/`nvme_hot_c` come from the live `Config` (integration
-    /// sweep, fw-fanctrl-loop-nsc): this constructor used to hard-code
+    /// sweep, fw-fanctrl-loop-eb9.17): this constructor used to hard-code
     /// `Guards::new(GPU_HOT_C_DEFAULT, NVME_HOT_C_DEFAULT)`, so an edited
     /// `gpu_hot_c`/`nvme_hot_c` in `config.toml` had zero effect on the
     /// actual guard thresholds — the two keys round-tripped through
@@ -1276,7 +1277,7 @@ impl<R: Runner> Controller<R> {
             if let Some(auto) = &mut self.auto {
                 auto.fan_window.clear();
                 auto.ec_slope_window.clear();
-                // fw-fanctrl-loop-hwg (integration sweep, fw-fanctrl-loop-nsc):
+                // Integration-sweep regression:
                 // the steady-window detector's own accumulated RPM samples
                 // are exactly as stale across a suspend as the fan/EC
                 // windows above -- design §2.2 names it explicitly ("clears
@@ -1439,9 +1440,15 @@ impl<R: Runner> Controller<R> {
         let view = s.fanctrl.as_ref();
         let (cpu_decision, gpu_decision, target, flags) = {
             let auto = self.auto.as_mut().expect("AutoState exists in Auto");
+            // Keep the observed gap intact for TStarSource: it treats a
+            // finite gap over seven seconds as invalid Held control time
+            // and resets its cadence/dwells. DeviceLoop applies its own
+            // two-second control-time bound, so passing the raw delta does
+            // not turn suspend time into PI or slew time there.
             let dt_s = auto
                 .last_sample_t_mono
-                .map(|last| (s.t_mono - last).clamp(0.0, 7.0))
+                .map(|last| s.t_mono - last)
+                .filter(|delta| delta.is_finite() && *delta > 0.0)
                 .unwrap_or(0.0);
             auto.last_sample_t_mono = Some(s.t_mono);
 
@@ -2734,6 +2741,7 @@ impl<R: Runner> Controller<R> {
         // happened to be up at exit (e.g. `GpuHot` mid-episode) would stay
         // stuck forever, since nothing outside Auto ever touches it again.
         for flag in [
+            StatusFlag::NotCalibrated,
             StatusFlag::FanctrlLost,
             StatusFlag::EcMismatch,
             StatusFlag::SteepCurve,
@@ -3044,6 +3052,11 @@ fn decision_telemetry_flags(status: &ControlStatus) -> Vec<TelemetryFlag> {
             .map(|flag| TelemetryFlag::legacy(flag.as_str())),
     );
     flags
+}
+
+#[cfg(test)]
+pub(crate) fn test_decision_telemetry_flags(status: &ControlStatus) -> Vec<TelemetryFlag> {
+    decision_telemetry_flags(status)
 }
 
 /// Map one effect batch to the outside world: status changes go to the UI,
@@ -6380,12 +6393,43 @@ mod tests {
         let runner = FakeRunner::new();
         let (mut ctl, _) = auto_controller_no_profile(&runner);
         ctl.on_command(Command::SetAuto(true));
+        assert!(ctl.status.flags.contains(&StatusFlag::NotCalibrated));
         ctl.on_sample(&busy_at(0.0));
         assert!(ctl.status.cpu.is_some());
         ctl.on_command(Command::SetAuto(false));
         assert!(ctl.status.cpu.is_none() && ctl.status.gpu.is_none());
         assert!(ctl.status.tstar_state.is_none());
         assert!(ctl.status.telemetry_flags.is_empty());
+        assert!(
+            !ctl.status.flags.contains(&StatusFlag::NotCalibrated),
+            "the active-key calibration diagnostic must not leak into Monitor"
+        );
+    }
+
+    #[test]
+    fn unmarked_long_sample_gap_restarts_held_cadence_without_advancing_target() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetAuto(true));
+        let held_sample = |t| {
+            let mut sample = busy_at(t);
+            sample.fan1_rpm = 2_000.0;
+            sample.fan2_rpm = 1_950.0;
+            sample
+        };
+        ctl.on_sample(&held_sample(0.0));
+        ctl.on_sample(&held_sample(1.0));
+        assert_eq!(ctl.status.tstar_state, Some(crate::types::TelemetryTStarState::Held));
+        let before = ctl.status.t_star_c.expect("Held target");
+
+        ctl.on_sample(&held_sample(7_201.0));
+
+        assert_eq!(ctl.status.tstar_state, Some(crate::types::TelemetryTStarState::Held));
+        assert_eq!(
+            ctl.status.t_star_c,
+            Some(before),
+            "wall time is not valid Held PI control time"
+        );
     }
 
     #[test]

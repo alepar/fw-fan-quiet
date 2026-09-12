@@ -315,25 +315,33 @@ impl TStarSource {
     }
 
     pub fn tick(&mut self, input: &TStarInput) -> TStarOutput {
-        let dt = sane_dt(input.dt_s);
         let held_dt = held_control_dt(input.dt_s);
         let held_wall_gap = held_dt == 0.0 && input.dt_s.is_finite() && input.dt_s > 7.0;
+        // A wall gap is observation time, not control time. The fresh sample
+        // may establish the first post-gap label observation, but none of
+        // the gap may advance a dwell, PI cadence, or stuck window.
+        let dt = if held_wall_gap { 0.0 } else { sane_dt(input.dt_s) };
         self.control_s += dt;
         let previous = self.target;
         let state_before = self.state;
         let mut held_fan_rpm = None;
-        let quarantine_recovered = self.update_quarantine_recovery(input);
+        let continuity_gap = input.resumed || held_wall_gap;
+        if continuity_gap {
+            for (_, recovery_streak) in self.quarantines.values_mut() {
+                *recovery_streak = 0;
+            }
+        }
+        let quarantine_recovered =
+            !continuity_gap && self.update_quarantine_recovery(input);
         let reconciliation_recovered =
             self.last_reconciled == Some(false) && input.replica_reconciled;
         self.last_reconciled = Some(input.replica_reconciled);
-        if input.resumed || held_wall_gap {
-            if input.resumed {
-                self.pending_stuck = None;
-                self.gate_label = None;
-                self.gate_elapsed_s = 0.0;
-                self.argmax_label = None;
-                self.argmax_streak = 0;
-            }
+        if continuity_gap {
+            self.pending_stuck = None;
+            self.gate_label = None;
+            self.gate_elapsed_s = 0.0;
+            self.argmax_label = None;
+            self.argmax_streak = 0;
             self.reset_held_state();
         }
         let usable: Vec<&SensorReading> = input
@@ -1613,6 +1621,43 @@ mod tests {
         assert!(s.quarantined("ambient_f75303@4d"));
         s.tick(&i);
         assert!(!s.quarantined("ambient_f75303@4d"));
+    }
+
+    fn quarantine_recovery_gap_case(resumed: bool) {
+        let label = "ambient_f75303@4d";
+        let mut source = TStarSource::new(EntrySeed::Fallback(70.0));
+        source.quarantines.insert(label.into(), (80.0, 0));
+        let mut sample = input();
+        sample.argmax_label = Some(label.into());
+        sample.sensors = vec![ambient(81.0), cpu(70.0)];
+        for _ in 0..29 {
+            source.tick(&sample);
+        }
+        assert!(source.quarantined(label), "premise: 29 matches do not recover");
+
+        sample.dt_s = 7_200.0;
+        sample.resumed = resumed;
+        source.tick(&sample);
+        assert!(source.quarantined(label), "the gap sample cannot complete recovery");
+
+        sample.dt_s = 1.0;
+        sample.resumed = false;
+        for _ in 0..29 {
+            source.tick(&sample);
+        }
+        assert!(source.quarantined(label), "recovery needs 30 new continuous samples after a gap");
+        source.tick(&sample);
+        assert!(!source.quarantined(label));
+    }
+
+    #[test]
+    fn quarantine_recovery_streak_does_not_cross_unmarked_wall_gap() {
+        quarantine_recovery_gap_case(false);
+    }
+
+    #[test]
+    fn quarantine_recovery_streak_does_not_cross_resumed_gap() {
+        quarantine_recovery_gap_case(true);
     }
     #[test]
     fn persistence_is_rate_limited_and_rejects_uncontrolled_state() {

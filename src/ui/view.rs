@@ -243,6 +243,11 @@ fn flag_span(flag: StatusFlag, with_hint: bool) -> Span<'static> {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_status_flag_text(flag: StatusFlag) -> String {
+    flag_span(flag, false).content.into_owned()
+}
+
 /// Ring -> chart points split into contiguous valid runs, X = sample index.
 /// NaN (invalid reading) ends the current run: rendering each run as its own
 /// dataset keeps outages as visible gaps (a `GraphType::Line` dataset would

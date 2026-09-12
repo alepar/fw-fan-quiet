@@ -96,7 +96,8 @@ pub struct Config {
     pub cpu_gains: Option<Gains>,
     /// Optional operator overrides, taking precedence over fitted gains.
     pub gpu_gains: Option<Gains>,
-    /// dGPU guard enter threshold (°C, exit is this − 5). See
+    /// dGPU guard enter threshold (°C, flag exit is this − 2; the separate
+    /// maximum-ratchet recovery gate is this − 4). See
     /// [`crate::control::guards`] for the hysteresis and the 87 °C
     /// card-spec derivation of the default.
     pub gpu_hot_c: f64,

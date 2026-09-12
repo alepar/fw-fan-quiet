@@ -209,8 +209,9 @@ impl TelemetryFlag {
 }
 
 /// Converts a live T* diagnostic into its labelled, active v3 wire
-/// representation. Clearing transitions are carried by the same variant
-/// with `active: false` at the controller emission boundary.
+/// representation. A diagnostic clears by disappearing from the next
+/// decision snapshot; `active` remains on the wire for consumers that merge
+/// snapshots with standalone flag events.
 impl From<&crate::control::tstar::TStarFlag> for TelemetryFlag {
     fn from(flag: &crate::control::tstar::TStarFlag) -> Self {
         use crate::control::tstar::TStarFlag;

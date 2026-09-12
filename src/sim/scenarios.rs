@@ -2519,6 +2519,65 @@ fn run_behavioral_smoke() {
             "[sim8/tstar] missing {expected:?}; observed={states:?}"
         );
     }
+    let unknown_rows = trace
+        .rows
+        .iter()
+        .filter(|row| (40.0..=80.0).contains(&row.time_s))
+        .collect::<Vec<_>>();
+    assert!(!unknown_rows.is_empty(), "[sim8/unknown] scripted window missing");
+    assert!(
+        unknown_rows.iter().all(|row| {
+            row.tstar_state == Some(TelemetryTStarState::Held)
+                && row.cpu.hold != TelemetryHold::Bypass
+                && row.gpu.hold != TelemetryHold::Bypass
+        }),
+        "[sim8/unknown] unknown argmax must causally select Held/Regulate"
+    );
+    assert!(
+        trace.rows.iter().any(|row| {
+            (100.0..=180.0).contains(&row.time_s)
+                && row.tstar_state == Some(TelemetryTStarState::Uncontrollable)
+                && row.cpu.hold == TelemetryHold::Bypass
+                && row.gpu.hold == TelemetryHold::Bypass
+        }),
+        "[sim8/uncontrollable] known ambient/charger argmax never drove both loops to Bypass"
+    );
+    assert!(
+        trace.rows.iter().any(|row| {
+            (300.0..360.0).contains(&row.time_s)
+                && row.gpu.hold == TelemetryHold::GroupUnavailable
+        }),
+        "[sim8/group-loss] missing pre-dwell GroupUnavailable phase"
+    );
+    assert!(
+        trace.rows.iter().any(|row| {
+            (360.0..=370.0).contains(&row.time_s)
+                && row.telemetry_flags.iter().any(|flag| matches!(
+                    flag,
+                    TelemetryFlag::GroupLost {
+                        device: TelemetryDeviceName::Gpu,
+                        active: true
+                    }
+                ))
+        }),
+        "[sim8/group-loss] missing post-dwell GroupLost phase"
+    );
+    assert!(
+        trace.rows.iter().any(|row| {
+            (371.0..400.0).contains(&row.time_s)
+                && row.gpu.group_c.is_some()
+                && row.gpu.cap.is_finite()
+                && row.gpu.hold != TelemetryHold::GroupUnavailable
+                && !row.telemetry_flags.iter().any(|flag| matches!(
+                    flag,
+                    TelemetryFlag::GroupLost {
+                        device: TelemetryDeviceName::Gpu,
+                        active: true
+                    }
+                ))
+        }),
+        "[sim8/group-loss] returned GPU group never cleared the loss and resumed finite regulation"
+    );
     let state_keys = trace
         .statuses
         .iter()

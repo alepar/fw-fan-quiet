@@ -1,4 +1,4 @@
-//! Integration sweep (task `fw-fanctrl-loop-nsc`), the epic's root
+//! Integration sweep (task `fw-fanctrl-loop-eb9.17`), the epic's root
 //! integration task. `cfg(test)` only, declared from `main.rs`. Three jobs,
 //! one section each:
 //!
@@ -136,6 +136,9 @@ fn drive_ticks<R: crate::actuators::cmd::Runner>(
 mod main_flow {
     use super::*;
     use crate::actuators::gpu::test_support::FakeGpu;
+    use crate::fanctrl::client::{FanctrlView, Freshness};
+    use crate::state::warm_start_key;
+    use crate::types::GainsSource;
 
     /// Drives shared settle and both device steps with a REAL `ChainedPlant` (the same
     /// FOPDT physics `control::sim_tests`'s own off-controller calibration
@@ -311,14 +314,66 @@ mod main_flow {
             "a landed calibration must keep NOT CALIBRATED clear: {persisted_after_calibration:?}"
         );
 
-        // The calibration's own effects saved state as it went (design
-        // §2.4/§3.3: `SaveState` fires on the landed fit); re-derive the
-        // warm-start entry the walk above should ALSO have written, by
-        // running Auto again briefly and forcing a save through the public
-        // `SetAuto(false)` exit path (mirrors every sim_tests acceptance
-        // run's own `assert_steady_window_recorded` pattern).
+        let target_duty = persisted_after_calibration
+            .duty_rpm_table
+            .duty_for_rpm(Config::default().fan_target_rpm);
+        let warm_key = warm_start_key("quiet16", target_duty, true);
+
+        // Produce the warm pair through the live controller path. Start from
+        // deliberately interior manual caps, then hold both feedback groups
+        // and the fan on target for the complete qualification window.
+        ctl.on_command(Command::SetCpuW(31.0));
+        ctl.on_command(Command::SetGpuMaxClock(2_100));
         ctl.on_command(Command::SetAuto(true));
-        drive_ticks(&mut plant, &mut ctl, cpu_floor_w, 60, |_, _| {});
+        for i in 0..45 {
+            let target_c = ctl
+                .status()
+                .t_star_c
+                .or_else(|| persisted_after_calibration.t_star_last_good.as_ref().map(|seed| seed.value_c))
+                .expect("calibration must provide a qualified target");
+            let mut sample = calib_plant.tick(&TickScript {
+                cpu_cap_w: 31.0,
+                cpu_demand_frac: 0.45,
+                cpu_util_pct: 95.0,
+                gpu_lock_mhz: Some(2_100.0),
+                gpu_load_level: Some(0.45),
+                gpu_powered: Some(true),
+                gpu_util_pct: 95.0,
+                gpu_temp_c: Some(target_c),
+                on_ac: true,
+                ..TickScript::default()
+            });
+            sample.fanctrl = Some(FanctrlView {
+                strategy: "quiet16".into(),
+                active: true,
+                speed_pct: target_duty,
+                temperature: target_c,
+                ma_temperature: target_c,
+                ma_interval: MA_INTERVAL,
+                curve: QUIET16_POINTS.to_vec(),
+                observed_at: std::time::Instant::now(),
+                all_observed_at: Some(std::time::Instant::now()),
+            });
+            sample.fanctrl_freshness = Freshness::Fresh;
+            sample.fanctrl_view_changed = i == 0;
+            sample.fan1_rpm = Config::default().fan_target_rpm;
+            sample.fan2_rpm = Config::default().fan_target_rpm;
+            sample.cpu_temp_c = target_c;
+            sample.cpu_temp_valid = true;
+            sample.cpu_pkg_w = 20.0;
+            sample.gpu_mhz_valid = true;
+            sample.gpu_sm_mhz = 1_800.0;
+            if let Some(ec) = sample.ec.as_mut() {
+                ec.max_c = target_c.round() as i32;
+                ec.reconciliation_max_c = Some(target_c.round() as i32);
+                ec.cpu_group_c = Some(target_c);
+                ec.gpu_group_c = Some(target_c);
+                for (label, value) in &mut ec.all {
+                    *value = if label.is_controllable() { target_c } else { 40.0 };
+                }
+            }
+            ctl.on_sample(&sample);
+        }
         ctl.on_command(Command::SetAuto(false));
 
         let after_session = PersistedState::load(&state_path);
@@ -327,17 +382,62 @@ mod main_flow {
             "a landed calibration must stamp calibrated_at: {after_session:?}"
         );
         let saved_table = after_session.duty_rpm_table.clone();
-        let saved_warm_start = after_session.warm_start.clone();
+        let gains_key = "quiet16:60";
+        let cpu_gains = after_session
+            .cpu_gains
+            .get(gains_key)
+            .expect("CPU calibration must save fitted gains under the live strategy/interval key");
+        let gpu_gains = after_session
+            .gpu_gains
+            .get(gains_key)
+            .expect("GPU calibration must save fitted gains under the live strategy/interval key");
+        assert!(cpu_gains.is_valid() && gpu_gains.is_valid());
+        let saved_warm_start = *after_session
+            .warm_start
+            .get(&warm_key)
+            .expect("qualified live samples must persist a paired warm start");
+        assert!(saved_warm_start.cpu_cap_w.is_finite());
+        assert!(saved_warm_start.gpu_lock_mhz > 0);
+        assert_ne!(saved_warm_start.cpu_cap_w, Config::default().cpu_floor_w);
+        assert_ne!(saved_warm_start.cpu_cap_w, Config::default().cpu_max_w);
+        assert_ne!(saved_warm_start.gpu_lock_mhz, Config::default().gpu_floor_mhz);
+        assert_ne!(saved_warm_start.gpu_lock_mhz, Config::default().gpu_max_mhz);
+        let saved_seed = after_session
+            .t_star_last_good
+            .clone()
+            .expect("the live Curve session must save a qualified T* seed");
+        assert_eq!(saved_seed.strategy, "quiet16");
+        assert_eq!(saved_seed.fan_target_rpm, Config::default().fan_target_rpm as u32);
 
         // ---- "Restart the daemon": a brand-new Controller from the same
         // state.json, exactly main.rs's own startup sequence ----
         let reloaded = PersistedState::load(&state_path);
         assert_eq!(reloaded, after_session, "load must reproduce exactly what was saved");
         assert_eq!(reloaded.duty_rpm_table, saved_table);
-        assert_eq!(reloaded.warm_start, saved_warm_start);
+        assert_eq!(reloaded.warm_start.get(&warm_key), Some(&saved_warm_start));
+        assert_eq!(
+            reloaded.t_star_last_good.as_ref().map(|seed| seed.saved_at_unix_s),
+            Some(saved_seed.saved_at_unix_s),
+            "loading must preserve the qualification timestamp"
+        );
+        let mut default_gain_state = reloaded.clone();
+        default_gain_state.cpu_gains.clear();
+        default_gain_state.gpu_gains.clear();
         let runner2 = FakeRunner::new();
-        let mut ctl2 =
-            build_controller(&runner2, &profile_path, &state_path, reloaded, Config::default());
+        let mut cpu2 = CpuActuator::new(&runner2, profile_path.clone());
+        cpu2.toggle_delay = std::time::Duration::from_millis(1);
+        let mut ctl2 = Controller::new(
+            RestoreGuard::new(
+                &runner2,
+                Some(cpu2),
+                Some(Box::new(FakeGpu::new())),
+                Some(SmuModule::assume_unloaded()),
+            ),
+            reloaded,
+            state_path.clone(),
+            Config::default(),
+            PathBuf::from("/nonexistent/config.toml"),
+        );
 
         // Table reload: a default-constructed table's `DutyRpmTable` must
         // equal what a fresh `PersistedState::default()` would carry ONLY
@@ -348,12 +448,195 @@ mod main_flow {
         // state does not need the deleted legacy table to enter Auto.
         ctl2.on_command(Command::SetAuto(true));
         assert_eq!(ctl2.status().mode, Mode::Auto);
+        let restart_group_c = (saved_seed.value_c - 10.0).max(50.0);
+        let mut restart_plant =
+            ChainedPlant::new("quiet16", QUIET16_POINTS.to_vec(), MA_INTERVAL, AMBIENT_C, 3)
+                .expect("valid restart curve");
+        let mut restart_sample = restart_plant.tick(&TickScript {
+            cpu_cap_w: saved_warm_start.cpu_cap_w,
+            cpu_demand_frac: 1.0,
+            cpu_util_pct: 95.0,
+            gpu_lock_mhz: Some(f64::from(saved_warm_start.gpu_lock_mhz)),
+            gpu_load_level: Some(1.0),
+            gpu_powered: Some(true),
+            gpu_util_pct: 95.0,
+            gpu_temp_c: Some(42.0),
+            on_ac: true,
+            ..TickScript::default()
+        });
+        restart_sample.fanctrl = Some(FanctrlView {
+            strategy: "quiet16".into(),
+            active: true,
+            speed_pct: target_duty,
+            temperature: restart_group_c,
+            ma_temperature: restart_group_c,
+            ma_interval: MA_INTERVAL,
+            curve: QUIET16_POINTS.to_vec(),
+            observed_at: std::time::Instant::now(),
+            all_observed_at: Some(std::time::Instant::now()),
+        });
+        restart_sample.fanctrl_freshness = Freshness::Fresh;
+        restart_sample.fanctrl_view_changed = true;
+        restart_sample.fan1_rpm = Config::default().fan_target_rpm;
+        restart_sample.fan2_rpm = Config::default().fan_target_rpm;
+        restart_sample.cpu_pkg_w = 10.0;
+        restart_sample.gpu_mhz_valid = true;
+        restart_sample.gpu_sm_mhz = 1_500.0;
+        if let Some(ec) = restart_sample.ec.as_mut() {
+            ec.max_c = restart_group_c.round() as i32;
+            ec.reconciliation_max_c = Some(restart_group_c.round() as i32);
+            ec.cpu_group_c = Some(restart_group_c);
+            ec.gpu_group_c = Some(restart_group_c);
+            for (label, value) in &mut ec.all {
+                *value = if label.is_controllable() {
+                    restart_group_c
+                } else {
+                    40.0
+                };
+            }
+        }
+        ctl2.on_sample(&restart_sample);
+        assert_eq!(
+            ctl2.status()
+                .gpu
+                .as_ref()
+                .expect("GPU decision on keyed entry")
+                .thermal
+                .round() as u32,
+            saved_warm_start.gpu_lock_mhz,
+            "the first valid clock sample must consume the GPU half of the pair"
+        );
+        for i in 1..5 {
+            let mut sample = restart_sample.clone();
+            sample.t_mono += f64::from(i);
+            sample.fanctrl_view_changed = false;
+            ctl2.on_sample(&sample);
+        }
+        let cpu = ctl2.status().cpu.as_ref().expect("CPU decision after restart");
+        let gpu = ctl2.status().gpu.as_ref().expect("GPU decision after restart");
+        assert_eq!((cpu.gains_source, gpu.gains_source), (GainsSource::Fitted, GainsSource::Fitted));
+        assert_eq!(cpu.thermal, saved_warm_start.cpu_cap_w);
+        assert_eq!(ctl2.status().t_star_c, Some(saved_seed.value_c));
+        assert_eq!(ctl2.status().tstar_state, Some(TelemetryTStarState::Held));
+        assert!(!ctl2.status().flags.contains(&StatusFlag::NotCalibrated));
+
+        // Prove the fitted label above reflects the gains actually installed
+        // in DeviceLoop. A control controller gets the same pair, target and
+        // samples but has no persisted gains. After one PI update its thermal
+        // candidate must diverge; a missing/no-op `set_gains` would make the
+        // two traces identical while still reporting `Fitted`.
+        let runner3 = FakeRunner::new();
+        let mut cpu3 = CpuActuator::new(&runner3, profile_path.clone());
+        cpu3.toggle_delay = std::time::Duration::from_millis(1);
+        let mut default_ctl = Controller::new(
+            RestoreGuard::new(
+                &runner3,
+                Some(cpu3),
+                Some(Box::new(FakeGpu::new())),
+                Some(SmuModule::assume_unloaded()),
+            ),
+            default_gain_state,
+            dir.join("default-gain-control-state.json"),
+            Config::default(),
+            PathBuf::from("/nonexistent/config.toml"),
+        );
+        default_ctl.on_command(Command::SetAuto(true));
+        for i in 0..10 {
+            let mut sample = restart_sample.clone();
+            sample.t_mono += f64::from(i);
+            sample.fanctrl_view_changed = i == 0;
+            default_ctl.on_sample(&sample);
+            if i >= 5 {
+                ctl2.on_sample(&sample);
+            }
+        }
+        assert_eq!(
+            default_ctl
+                .status()
+                .cpu
+                .as_ref()
+                .expect("default CPU decision")
+                .gains_source,
+            GainsSource::Default
+        );
+        let fitted_thermal = ctl2.status().cpu.as_ref().expect("fitted CPU decision").thermal;
+        let default_thermal = default_ctl
+            .status()
+            .cpu
+            .as_ref()
+            .expect("default CPU decision")
+            .thermal;
         assert!(
-            ctl2.status().flags.contains(&StatusFlag::NotCalibrated),
-            "a restart enters Auto while default per-device gains remain informationally uncalibrated"
+            (fitted_thermal - default_thermal).abs() > 0.01,
+            "persisted fitted gains must change the live PI response: fitted={fitted_thermal}, default={default_thermal}"
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn long_gap_resume_reasserts_and_holds_both_live_device_caps() {
+        let (dir, profile_path, state_path) = fixture_paths("long-gap-resume");
+        let runner = FakeRunner::new();
+        let mut cpu = CpuActuator::new(&runner, profile_path);
+        cpu.toggle_delay = std::time::Duration::from_millis(1);
+        let mut ctl = Controller::new(
+            RestoreGuard::new(
+                &runner,
+                Some(cpu),
+                Some(Box::new(FakeGpu::new())),
+                Some(SmuModule::assume_unloaded()),
+            ),
+            PersistedState::default(),
+            state_path,
+            Config::default(),
+            PathBuf::from("/nonexistent/config.toml"),
+        );
+        ctl.on_command(Command::SetAuto(true));
+        let mut plant =
+            ChainedPlant::new("quiet16", QUIET16_POINTS.to_vec(), MA_INTERVAL, AMBIENT_C, 4)
+                .expect("valid curve");
+        let cpu_floor_w = ctl.status().cpu_floor_w;
+        drive_ticks(&mut plant, &mut ctl, cpu_floor_w, 30, |_, script| {
+            script.gpu_lock_mhz = Some(1_800.0);
+            script.gpu_load_level = Some(1.0);
+            script.gpu_powered = Some(true);
+            script.gpu_util_pct = 95.0;
+            script.gpu_temp_c = Some(42.0);
+        });
+        let before_cpu = ctl.status().cpu_limit_w.expect("CPU cap before resume");
+        let before_gpu = ctl.status().gpu_max_mhz.expect("GPU cap before resume");
+        let mut resumed = plant.tick(&TickScript {
+            cpu_cap_w: before_cpu,
+            cpu_demand_frac: 1.0,
+            cpu_util_pct: 95.0,
+            gpu_lock_mhz: Some(f64::from(before_gpu)),
+            gpu_load_level: Some(1.0),
+            gpu_powered: Some(true),
+            gpu_util_pct: 95.0,
+            gpu_temp_c: Some(42.0),
+            on_ac: true,
+            ..TickScript::default()
+        });
+        resumed.t_mono += 7_200.0;
+        resumed.resumed = true;
+
+        let effects = ctl.on_sample(&resumed);
+
+        assert!(
+            effects.iter().any(|effect| matches!(effect, Effect::Reasserted { cause: "resume" })),
+            "resume must immediately reassert the applied pair: {effects:?}"
+        );
+        assert_eq!(ctl.status().cpu_limit_w, Some(before_cpu));
+        assert_eq!(ctl.status().gpu_max_mhz, Some(before_gpu));
+        let cpu = ctl.status().cpu.as_ref().expect("CPU resume decision");
+        let gpu = ctl.status().gpu.as_ref().expect("GPU resume decision");
+        assert_eq!(cpu.cap, before_cpu);
+        assert_eq!(gpu.cap.round() as u32, before_gpu);
+        assert_ne!(cpu.hold, crate::types::TelemetryHold::ActuatorMismatch);
+        assert_ne!(gpu.hold, crate::types::TelemetryHold::ActuatorMismatch);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 
@@ -370,6 +653,17 @@ mod wiring_sweep {
     use super::*;
     use crate::config::LedConfig;
 
+    fn code(source: &str) -> String {
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// Every `Config` key.
     #[test]
     fn every_config_key_is_read_somewhere() {
@@ -378,27 +672,49 @@ mod wiring_sweep {
             cpu_floor_w,    // CPU DeviceLoop and hot-guard lower bound
             gpu_floor_mhz,  // GPU DeviceLoop, actuator, and hot-guard lower bound
             fast_limit_mw,  // control/controller.rs Controller::new -> CpuActuator.fast_limit_mw -> actuators/cpu.rs --fast-limit=
-            cpu_max_w,      // CPU DeviceLoop and actuator ceiling
-            // Reached AutoState::new -> Guards::new only as of this sweep
-            // (fw-fanctrl-loop-nsc): previously hard-coded to
-            // GPU_HOT_C_DEFAULT/NVME_HOT_C_DEFAULT regardless of config,
-            // fixed inline (see the regression test
-            // `gpu_and_nvme_hot_thresholds_come_from_the_live_config_not_the_compiled_defaults`
-            // in control::controller's own test module).
-            gpu_hot_c,
-            nvme_hot_c,
+            cpu_max_w,               // CPU DeviceLoop and actuator ceiling
+            gpu_max_mhz,             // GPU DeviceLoop, actuator, and hot-guard ceiling
+            shadow_headroom_cpu_w,   // CPU DeviceLoop shadow ceiling
+            shadow_headroom_gpu_mhz, // GPU DeviceLoop shadow ceiling
+            shadow_fall_rate_cpu,    // CPU DeviceLoop shadow down-slew
+            shadow_fall_rate_gpu,    // GPU DeviceLoop shadow down-slew
+            gpu_shadow_enabled,      // GPU DeviceLoop shadow selector
+            cpu_hot_c,               // T* feasibility, CPU hot debounce and ratchet
+            cpu_gains,               // CPU DeviceLoop gains source
+            gpu_gains,               // GPU DeviceLoop gains source
+            gpu_hot_c,               // GPU hot guard and ratchet recovery threshold
+            nvme_hot_c,              // NVMe reporting guard threshold
             leds,           // main.rs: led::spawn(config.leds.clone(), ...)
             fanctrl_socket, // main.rs: UnixFanctrlClient::new(config.fanctrl_socket.clone())
-            ..
         } = Config::default();
-        assert!(fan_target_rpm > 0.0);
-        assert!(cpu_floor_w >= 0.0);
-        assert!(gpu_floor_mhz > 0);
-        assert!(fast_limit_mw > 0);
-        assert!(cpu_max_w > 0.0);
-        assert!(gpu_hot_c > 0.0);
-        assert!(nvme_hot_c > 0.0);
-        assert!(!fanctrl_socket.as_os_str().is_empty());
+        let controller = code(include_str!("control/controller.rs"));
+        let main = code(include_str!("main.rs"));
+        for (field, production_use) in [
+            ("fan_target_rpm", "self.config.fan_target_rpm"),
+            ("cpu_floor_w", "floor: self.config.cpu_floor_w"),
+            ("gpu_floor_mhz", "floor: f64::from(self.config.gpu_floor_mhz)"),
+            ("fast_limit_mw", "cpu.fast_limit_mw = config.fast_limit_mw"),
+            ("cpu_max_w", "cpu.set_sustained_max_mw((config.cpu_max_w * 1000.0) as u32)"),
+            ("gpu_max_mhz", "f64::from(config.gpu_max_mhz)"),
+            ("shadow_headroom_cpu_w", "shadow_headroom: self.config.shadow_headroom_cpu_w"),
+            ("shadow_headroom_gpu_mhz", "shadow_headroom: self.config.shadow_headroom_gpu_mhz"),
+            ("shadow_fall_rate_cpu", "shadow_fall_rate: self.config.shadow_fall_rate_cpu"),
+            ("shadow_fall_rate_gpu", "shadow_fall_rate: self.config.shadow_fall_rate_gpu"),
+            ("gpu_shadow_enabled", "shadow_enabled: self.config.gpu_shadow_enabled"),
+            ("cpu_hot_c", "cpu_hot_c: self.config.cpu_hot_c"),
+            ("cpu_gains", "cpu_gains_source: if config.cpu_gains.is_some()"),
+            ("gpu_gains", "gpu_gains_source: if config.gpu_gains.is_some()"),
+            ("gpu_hot_c", "Guards::new(config.gpu_hot_c, config.nvme_hot_c)"),
+            ("nvme_hot_c", "Guards::new(config.gpu_hot_c, config.nvme_hot_c)"),
+        ] {
+            assert!(controller.contains(production_use), "Config::{field} lost its controller consumer: {production_use}");
+        }
+        assert!(main.contains("config.leds.clone()"), "Config::leds lost its runtime consumer");
+        assert!(main.contains("config.fanctrl_socket.clone()"), "Config::fanctrl_socket lost its runtime consumer");
+        let _ = (fan_target_rpm, cpu_floor_w, gpu_floor_mhz, fast_limit_mw, cpu_max_w,
+            gpu_max_mhz, shadow_headroom_cpu_w, shadow_headroom_gpu_mhz,
+            shadow_fall_rate_cpu, shadow_fall_rate_gpu, gpu_shadow_enabled, cpu_hot_c,
+            cpu_gains, gpu_gains, gpu_hot_c, nvme_hot_c, fanctrl_socket);
 
         let LedConfig {
             enabled,        // led/mod.rs: master switch, gates spawn() entirely
@@ -409,13 +725,19 @@ mod wiring_sweep {
             cpu_flip_watts, // led/mod.rs -> Orientation::flip_watts (CPU side)
             gpu_flip_watts, // led/mod.rs -> Orientation::flip_watts (GPU side)
         } = leds;
-        assert!(enabled);
-        assert!(!cpu_port.is_empty());
-        assert!(!gpu_port.is_empty());
-        assert!(brightness > 0);
-        assert!(!flip_time);
-        assert!(cpu_flip_watts);
-        assert!(!gpu_flip_watts);
+        let led = code(include_str!("led/mod.rs"));
+        for (field, production_use) in [
+            ("enabled", "if !config.enabled"),
+            ("cpu_port", "open_side(\"CPU\", &config.cpu_port"),
+            ("gpu_port", "open_side(\"GPU\", &config.gpu_port"),
+            ("brightness", "Matrix::open(Path::new(path), config.brightness)"),
+            ("flip_time", "flip_time: config.flip_time"),
+            ("cpu_flip_watts", "flip_watts: config.cpu_flip_watts"),
+            ("gpu_flip_watts", "flip_watts: config.gpu_flip_watts"),
+        ] {
+            assert!(led.contains(production_use), "LedConfig::{field} lost its runtime consumer: {production_use}");
+        }
+        let _ = (enabled, cpu_port, gpu_port, brightness, flip_time, cpu_flip_watts, gpu_flip_watts);
     }
 
     /// Every `StatusFlag` variant: where it is raised, and where it is
@@ -440,66 +762,32 @@ mod wiring_sweep {
             StatusFlag::ReadbackBlind,
         ];
         for flag in all {
-            let (raised_where, rendered_where) = match flag {
-                StatusFlag::LimitNotSticking => (
-                    "control/controller.rs: the RAPL-vs-commanded read-back watchdog",
-                    "ui/view.rs: \"LIMIT-SLIP!\", red bold",
-                ),
-                StatusFlag::Resumed => (
-                    "control/controller.rs: on_sample's s.resumed branch",
-                    "ui/view.rs: \"resumed\", yellow",
-                ),
-                StatusFlag::NotCalibrated => (
-                    "control/controller.rs: active strategy/interval has no fitted device gains",
-                    "ui/view.rs: not-calibrated hint",
-                ),
-                StatusFlag::TargetUnreachable => (
-                    "control/tstar.rs and per-device unreachable diagnostics",
-                    "ui/view.rs: \"TARGET UNREACHABLE\", red bold",
-                ),
-                StatusFlag::ThermalEmergency => (
-                    "control/controller.rs: ThermalWatchdog thermal trip",
-                    "ui/view.rs: red bold + acknowledge hint",
-                ),
-                StatusFlag::SensorLost => (
-                    "control/controller.rs: ThermalWatchdog sensor-lost trip",
-                    "ui/view.rs: red bold + acknowledge hint",
-                ),
-                StatusFlag::FanctrlLost => (
-                    "control/controller.rs fresh-view availability",
-                    "ui/view.rs: \"FANCTRL LOST\", yellow",
-                ),
-                StatusFlag::EcMismatch => (
-                    "sensors/ec.rs three-strike reconciliation",
-                    "ui/view.rs: \"EC MISMATCH\", yellow",
-                ),
-                StatusFlag::SteepCurve => (
-                    "control/tstar.rs curve slope classification",
-                    "ui/view.rs: \"STEEP CURVE\", gray/info",
-                ),
-                StatusFlag::CurveInvalid => (
-                    "control/controller.rs Curve::from_points validation",
-                    "ui/view.rs: \"CURVE INVALID\"",
-                ),
-                StatusFlag::GpuHot => (
-                    "control/guards.rs Guards::step, synced every on_auto_sample tick",
-                    "ui/view.rs: \"GPU HOT\", yellow",
-                ),
-                StatusFlag::NvmeHot => (
-                    "control/guards.rs Guards::step, synced every on_auto_sample tick",
-                    "ui/view.rs: \"NVME HOT\", yellow",
-                ),
-                StatusFlag::ReadbackBlind => (
-                    "control/controller.rs VerdictState (6 consecutive Unreadable/Unverifiable read-backs)",
-                    "ui/view.rs: \"READBACK BLIND\", info",
-                ),
+            let producer = match flag {
+                StatusFlag::LimitNotSticking => "self.add_flag(StatusFlag::LimitNotSticking)",
+                StatusFlag::Resumed => "self.add_flag(StatusFlag::Resumed)",
+                StatusFlag::NotCalibrated => "self.sync_bool_flag(StatusFlag::NotCalibrated, !fitted)",
+                StatusFlag::TargetUnreachable => "self.sync_bool_flag( StatusFlag::TargetUnreachable, target.flags.iter()",
+                StatusFlag::ThermalEmergency => "Trip::Thermal => (StatusFlag::ThermalEmergency",
+                StatusFlag::SensorLost => "Trip::SensorLost => (StatusFlag::SensorLost",
+                StatusFlag::FanctrlLost => "self.sync_bool_flag( StatusFlag::FanctrlLost, !matches!",
+                StatusFlag::EcMismatch => "self.sync_bool_flag(StatusFlag::EcMismatch, flags.2)",
+                StatusFlag::SteepCurve => "self.sync_bool_flag( StatusFlag::SteepCurve, target .flags",
+                StatusFlag::CurveInvalid => "self.sync_bool_flag( StatusFlag::CurveInvalid, view.is_some_and",
+                StatusFlag::GpuHot => "self.sync_bool_flag(StatusFlag::GpuHot, flags.0)",
+                StatusFlag::NvmeHot => "self.sync_bool_flag(StatusFlag::NvmeHot, flags.1)",
+                StatusFlag::ReadbackBlind => "self.sync_bool_flag(StatusFlag::ReadbackBlind, blind)",
             };
-            // The exhaustive `match` above IS the verification: a new
-            // `StatusFlag` variant fails the build until its raise/render
-            // sites are named. These two strings are documentation, not
-            // evidence — `!literal.is_empty()` cannot fail — so they are
-            // bound here rather than asserted on (ledger: task 24 minor).
-            let _ = (raised_where, rendered_where);
+            let controller = code(include_str!("control/controller.rs"));
+            assert!(controller.contains(producer), "{flag:?} lost its production raise path: {producer}");
+
+            let mut status = crate::control::ControlStatus::default();
+            status.flags.push(flag);
+            let wire = crate::control::controller::test_decision_telemetry_flags(&status);
+            assert_eq!(wire, vec![crate::types::TelemetryFlag::legacy(flag.as_str())]);
+            let json = serde_json::to_string(&wire).expect("status flag telemetry serializes");
+            assert!(json.contains(flag.as_str()), "{flag:?} missing from serialized Decision flags: {json}");
+            let rendered = crate::ui::view::test_status_flag_text(flag);
+            assert!(!rendered.is_empty(), "{flag:?} rendered an empty TUI label");
         }
     }
 
@@ -727,7 +1015,7 @@ mod real_types {
     #[test]
     fn config_fanctrl_socket_flows_into_real_poller_construction() {
         let config = Config {
-            fanctrl_socket: PathBuf::from("/tmp/bazerame-fanctrl-loop-nsc-test.sock"),
+            fanctrl_socket: PathBuf::from("/tmp/bazerame-fanctrl-loop-eb9-17-test.sock"),
             ..Config::default()
         };
         let client = Box::new(UnixFanctrlClient::new(config.fanctrl_socket.clone()))

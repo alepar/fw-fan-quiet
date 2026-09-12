@@ -412,8 +412,10 @@ conditions have not yet held for the hysteresis window — and the RPM PI runs i
   reference slope, Ti = 35 s; output step bounded to 0.5 °C per PI tick. The plant gain
   K ≈ 78 RPM/°C holds at the curve's reference slope only, so the prior design's **slope
   schedule is retained for this loop**: Kc is scaled by `slope_ref / max(slope_at(T*),
-  slope_ref)` clamped to `[0.25, 1]`, with the `0.25×` floor when no curve resolves a slope
-  (the EC-autofan case has a near-zero slope in 67–73 °C and 140–420 RPM/°C below 64 °C). The
+  slope_ref)` clamped to `[0.25, 1]`, with the `0.25×` floor when no curve resolves a slope.
+  The physical EC-autofan response is a separate plant property: its measured plateau has a
+  near-zero slope in 67–73 °C and its rising branch is 140–420 RPM/°C below 64 °C. A resolved
+  near-zero commanded-curve slope selects `1×`, not the `0.25×` floor. The
   effective closed-loop constant is therefore `λ_eff = λ_held / schedule` — up to ~96 min with
   the floor engaged — and §4 sim 6's bar is written against `λ_eff`, not λ_held (roast d2).
   Output clamped to `[T*_floor, T*_ceiling]`. For the nonempty set of plausible, known,
@@ -714,22 +716,33 @@ budget, split, LUT, Mode A/Mode B.
      and assert no output jump at disable/dwell/return. These are offline
      acceptance requirements, not measured passes.
   5. Auto entry under a steady heavy load: neither device's draw changes by more than 1.5 W /
-     30 MHz in the first 10 s and neither cap starts below `draw + headroom`; fans do not fall.
-  6. Curve loss mid-session from a converged state on the EC-autofan curve (near-zero slope in
-     67–73 °C, so the slope schedule's 0.25× floor is engaged — this **is** the EC-autofan leg
-     the d1 escalation asked for): `Held` entered, T\* moves from the last good value, fans
-     return within ±150 RPM within 3 λ_eff (λ_eff = λ_held / 0.25 = 96 min, simulated offline at
-     plant speed) with a period-agnostic hunting check over the run; the same leg on the
-     quiet16 curve (schedule 1×) returns within 3 λ_held = 72 min; curve return → `Curve` with
+     30 MHz in the first 10 s and, when the corresponding measurement exists, neither cap starts
+     below `min(draw + headroom, active guard/config ceiling)`; fans do not fall. The absent-draw
+     variant instead seeds from the applied cap without a step and remains thermal-only until the
+     measurement returns.
+  6. Curve loss mid-session from a converged state on the measured EC-autofan plateau uses the
+     resolved near-zero commanded-curve slope's `1×` schedule: `Held` enters, T\* moves from the
+     last good value, and fans return within ±150 RPM within 3 λ_held = 72 min. A distinct
+     unresolvable-curve or genuinely steep (`slope >= 4 × slope_ref`) EC-autofan leg engages the
+     `0.25×` floor and must return within 3 λ_eff = 288 min (λ_eff = 96 min), simulated offline at
+     plant speed. Run the same period-agnostic hunting check over both clocks; curve return → `Curve` with
      no step in either cap. Restart variants use a matching fresh seed, a different strategy,
      a changed requested fan target, an expired (>6 h) timestamp and a future timestamp with
      no curve available: only the matching fresh record is accepted, every other variant
      starts from the current controllable-group max/clamp, and the per-group first averages
      equal their own instantaneous maxima rather than the socket argmax MA.
-  7. Unreachable device: a GPU that cannot reach T\* never changes the CPU cap.
+  7. Unreachable device: compare against an identical thermal/load replay without the GPU fault;
+     a GPU that cannot reach T\* leaves every CPU decision and cap equal to that reference while
+     raising `DeviceUnreachable` only for the GPU.
   8. Configuration smoke: each `TStarSource` state (incl. `Uncontrollable`, via an
      ambient-dominated argmax leg) and each `Hold` / `Selected` value is reached at least once
-     across the sims (the checklist is behavioural, not self-pushed vectors).
+     across the sims (the checklist is behavioural, not self-pushed vectors). Cover semantic
+     variant keys exhaustively for `TStarFlag`, `Hold`, `Selected` and schema-v3 `TelemetryFlag`:
+     label strings are payloads, finite device/bound combinations are separate where behavior
+     differs, and `Legacy` is one semantic key with a representative payload. Exercise active and
+     clearing polarity for dynamic structured flags where the emission boundary supports both;
+     legacy controller `StatusFlag` is covered by its own exhaustive tests. Expected-key mappings
+     use no-wildcard exhaustive matches, while observed keys come only from real outputs.
   9. Hot-guard episodes: (a) GPU — a 5-min die-temperature excursion above 88 °C: the ratchet
      reaches the floor, recovery of `max` starts only below 84 °C, no re-trip within the
      episode's tail, post-episode fan overshoot ≤ 150 RPM (the prior design's bar) and the
@@ -743,7 +756,7 @@ budget, split, LUT, Mode A/Mode B.
      one-command-lag verifier in both and assert zero mismatch strikes or
      mismatch-driven releases. A separate ignoring-card leg must still trip; (b) CPU — the mirror on Tctl with
      `cpu_hot_c` 90: a 3-sample streak trips, a 1-sample spike does not, recovery uses the same eligibility and 3λ bar as the GPU. With a
-     sustained positive error e_min, separately bound the first full 0.5 W
+     positive error held constant (or nondecreasing at PI sample instants) at e_min, separately bound the first full 0.5 W
      rise by 0.5/(Kc/Ti*e_min) plus one PI period and write interval; do not
      promise a 60 s floor exit for an arbitrarily small positive error.
   10. Robustness: sims 1–3 repeated with the CPU plant's K, τ and θ each

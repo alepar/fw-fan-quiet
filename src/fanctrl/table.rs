@@ -26,7 +26,7 @@ const SEED_POINTS: [(u8, f64); 10] = [
 /// A refinement is rejected outright (no update at all, existing/absent
 /// entry untouched) when the observed mean is further than this fraction of
 /// the entry's current value — design doc §2.3's guard against a `GPU HOT`
-/// or budget-bound window (duty fw-fanctrl actually ran a tread away from
+/// or device-bound window (duty fw-fanctrl actually ran a tread away from
 /// the target's) corrupting the table by a full tread.
 const REFINE_REJECT_FRACTION: f64 = 0.25;
 
@@ -44,10 +44,8 @@ const MONOTONE_MARGIN_RPM: f64 = 1e-6;
 
 /// Piecewise-linear duty (%) -> RPM map, flat-clamped outside its known
 /// range. `Default` is the ten seeded points (§Facts) and is also this
-/// type's serde default, so a legacy `state.json` predating this field
-/// loads the seed unchanged (see the `serde_default_...` test below, which
-/// exercises that specifically via `#[serde(default)]` on a field of this
-/// type — this module does not own `state.json` itself, Task 13 does).
+/// type's serde default, so a `state.json` predating this field loads the
+/// seed unchanged.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DutyRpmTable {
     points: BTreeMap<u8, f64>,
@@ -172,7 +170,7 @@ impl DutyRpmTable {
 
     /// True iff this table satisfies every invariant the rest of the code
     /// assumes: non-empty (`duty_for_rpm` panics on an empty map), every RPM
-    /// finite (a NaN propagates straight into the RPM loop error), and
+    /// finite (a NaN would propagate into target-RPM comparisons), and
     /// strictly increasing in duty (`refine`'s `clamp(lo + m, hi - m)` panics
     /// with `min > max` on a non-monotone table).
     ///
@@ -214,8 +212,7 @@ mod tests {
 
     #[test]
     fn json_missing_the_field_deserialises_to_default() {
-        // This is the exact shape Task 13's PersistedState relies on: a
-        // legacy state.json predating this field must load the seed.
+        // Persisted state predating this field must load the seed.
         let host: HostWithDefault = serde_json::from_str("{}").unwrap();
         assert_eq!(host.duty_rpm_table, DutyRpmTable::default());
     }

@@ -247,6 +247,7 @@ impl<U: DeviceUnit> DeviceLoop<U> {
     }
 
     /// Seeds the loop from a cap already in force and synchronises its error.
+    #[cfg(test)]
     pub fn seed(&mut self, cap: f64, error: f64) {
         self.seed_candidates(cap, cap, Some(cap), error);
     }
@@ -291,10 +292,12 @@ impl<U: DeviceUnit> DeviceLoop<U> {
         self.last_applied = Some(cap.clamp(self.floor, self.max));
     }
 
+    #[cfg(test)]
     pub fn thermal(&self) -> f64 {
         self.thermal
     }
 
+    #[cfg(test)]
     pub fn requested(&self) -> Option<f64> {
         self.requested
     }

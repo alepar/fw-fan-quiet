@@ -237,6 +237,7 @@ pub mod test_support {
     /// specific scripted read-back needs its own call to this (the
     /// re-read `CpuActuator::set_sustained_mw` makes when the first result
     /// comes back `Mismatch` is a second, independent call).
+    #[allow(dead_code)]
     pub fn queue_ryzenadj_readback(runner: &FakeRunner, slow_w: f64, fast_w: f64, stapm_w: f64) {
         runner.push_result(Ok(output_with_code(0))); // the write
         runner.push_result(Ok(output_with_stdout(&ryzenadj_info_table(

@@ -15,9 +15,7 @@
 use std::fmt;
 
 /// `Curve::from_points` rejects a curve whose duty is not non-decreasing in
-/// file order. A domain error only — see design doc §2.1: reusing a flag
-/// here (`STEEP CURVE` or inventing one) is explicitly Task 16's job
-/// (`CURVE INVALID`), not this constructor's.
+/// file order. The controller reports this domain error as `CURVE INVALID`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CurveError {
     /// No points at all: `duty_at`/`tread` would have nothing to clamp to.
@@ -84,12 +82,7 @@ impl Curve {
     /// outside `[first.0, last.0]`. Internal: `duty_at` truncates this;
     /// `tread`'s search inverts it.
     ///
-    /// No production call site today (integration sweep, `fw-fanctrl-loop-nsc`):
-    /// only `duty_at` calls it, and `duty_at` has the same note (this
-    /// direction — temperature to duty — is fw-fanctrl's own job; the
-    /// controller only ever runs the inverse via `tread`/`t_star`). Covered
-    /// directly by `Curve`'s own tests.
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn continuous_duty_at(&self, t: f64) -> f64 {
         let first = self.points[0];
         let last = self.points[self.points.len() - 1];
@@ -122,15 +115,9 @@ impl Curve {
     /// `int()` truncation, matching `FanController.py` (verified on cool16:
     /// `T_eff` 51.8 -> 21, not 22).
     ///
-    /// No production call site today (integration sweep, `fw-fanctrl-loop-nsc`):
-    /// the controller only ever runs the *inverse* direction
-    /// (`tread`/`t_star`, duty -> temperature) since fw-fanctrl itself
-    /// already commands the forward direction and this client only reads
-    /// its output. `duty_at`'s consumers are this module's own tests and
-    /// the `FanctrlEmulator` test plant (`fw-fanctrl-loop-iym`, cfg(test)),
-    /// which stands in for the real fw-fanctrl daemon and therefore does
-    /// need the forward direction.
-    #[allow(dead_code)]
+    /// Test-plant forward direction; production reads fw-fanctrl's output
+    /// and uses the inverse `tread`/`t_star` direction.
+    #[cfg(test)]
     pub fn duty_at(&self, t: f64) -> u8 {
         // continuous_duty_at is always within [0, 100] (points are u8), so
         // this cast neither truncates a huge magnitude nor needs a manual
@@ -542,7 +529,7 @@ mod tests {
         assert_eq!(c.nearest_tread(12), Some(10));
     }
 
-    // ---- fw-fanctrl-loop-nez: the curve/arbiter seam — no ±inf tread ----
+    // Curve endpoint semantics: no infinite tread.
 
     #[test]
     fn tread_at_min_and_max_duty_matches_the_decided_semantics() {

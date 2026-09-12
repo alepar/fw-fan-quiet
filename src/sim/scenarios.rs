@@ -8,13 +8,11 @@ use crate::actuators::gpu::test_support::{FakeGpu, GpuCall};
 use crate::actuators::guard::RestoreGuard;
 use crate::actuators::smu_module::SmuModule;
 use crate::config::Config;
-use crate::control::budget::WarmStart;
 use crate::control::controller::{Command, ControlStatus, Controller, Effect, Mode, StatusFlag};
 use crate::control::device_loop::{
     ActuatorState, DeviceLoop, Gains, Mhz, Selected, ThermalMode, TickInput, W, default_gains,
 };
-use crate::control::lut::ClockWattsLut;
-use crate::state::{PersistedState, TStarSeed, WarmStartEntry};
+use crate::state::{PersistedState, TStarSeed, WarmStartEntry, warm_start_key};
 use crate::test_support::plant::{
     ChainedPlant, CpuPlantParams, GpuPlantParams, TickScript, gpu_full_load_power_w,
 };
@@ -133,22 +131,6 @@ fn scratch_path(tag: &str, file: &str) -> PathBuf {
     dir.join(file)
 }
 
-fn gpu_watts_lut() -> ClockWattsLut {
-    let mut lut = ClockWattsLut::new();
-    for (mhz, watts) in [
-        (1000, 45.0),
-        (1197, 49.3),
-        (1402, 53.5),
-        (1612, 64.2),
-        (1807, 75.9),
-        (1995, 90.8),
-        (2143, 99.4),
-        (3090, 100.0),
-    ] {
-        lut.insert(mhz, watts);
-    }
-    lut
-}
 
 type SimController<'a> = Controller<&'a FakeRunner>;
 
@@ -295,7 +277,6 @@ fn run_profile_control(
         ambient_c,
         seconds,
         PersistedState {
-            lut: Some(gpu_watts_lut()),
             duty_rpm_table: Default::default(),
             ..PersistedState::default()
         },
@@ -1722,7 +1703,6 @@ fn run_bumpless_entry_matrix() {
     let table = crate::fanctrl::table::DutyRpmTable::default();
     let duty = table.duty_for_rpm(FAN_TARGET_RPM);
     let mut persisted = PersistedState {
-        lut: Some(gpu_watts_lut()),
         duty_rpm_table: table,
         t_star_last_good: Some(TStarSeed {
             strategy: "quiet16".into(),
@@ -1733,7 +1713,7 @@ fn run_bumpless_entry_matrix() {
         ..PersistedState::default()
     };
     persisted.warm_start.insert(
-        WarmStart::key("quiet16", duty, true),
+        warm_start_key("quiet16", duty, true),
         WarmStartEntry {
             cpu_cap_w: 55.0,
             gpu_lock_mhz: 3090,
@@ -1772,7 +1752,6 @@ fn run_bumpless_entry_matrix() {
         AMBIENT_C,
         AUTO_AT + 15,
         PersistedState {
-            lut: Some(gpu_watts_lut()),
             ..PersistedState::default()
         },
         AUTO_AT + 100,
@@ -1850,7 +1829,6 @@ fn run_bumpless_entry_matrix() {
         AMBIENT_C,
         AUTO_AT + 75,
         PersistedState {
-            lut: Some(gpu_watts_lut()),
             ..PersistedState::default()
         },
         AUTO_AT,
@@ -2248,8 +2226,7 @@ fn run_curve_loss_and_restart_matrix() {
             AMBIENT_C,
             32,
             PersistedState {
-                lut: Some(gpu_watts_lut()),
-                t_star_last_good: seed,
+                    t_star_last_good: seed,
                 ..PersistedState::default()
             },
             30,

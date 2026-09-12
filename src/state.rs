@@ -1,42 +1,21 @@
-//! Calibration state persistence (JSON, `/var/lib/bazerame-fans/state.json`
-//! in production, `--state-file` overridable). Holds the GPU clock→watts
-//! LUT, the fitted loop PI gains, the duty↔RPM table and the warm-start
-//! budget seeds so a reboot skips recalibration and resumes near its last
-//! working point. Loading NEVER crashes: missing or corrupt state just means
-//! "not calibrated yet". Cargo.toml enables serde_json's `float_roundtrip`
-//! so this file's f64 fields (LUT watts, gains, warm-start budgets) survive
-//! save→load bit-exact.
-//!
-//! Schema v2 (`fw-fanctrl-loop-dsh`): the old `model` field and its two
-//! Kalman-correction scalars (the learned thermal model's bias and gain
-//! terms) are gone along with the adaptation tier that used them
-//! (`fw-fanctrl-loop-24s`). A v1 file's `model` and bias/gain correction
-//! keys are simply unknown fields to this schema and are ignored by serde;
-//! `duty_rpm_table`, `loop_gains` and `warm_start` are missing from a v1 file
-//! and come back at their `#[serde(default)]` values (the ten seeded points,
-//! `None` and empty respectively) via `PersistedState`'s own `Default`.
+//! Revision-4 controller state persistence. The JSON stores the duty/RPM
+//! relation, per-strategy CPU and GPU gains, paired device caps, and a
+//! qualified last-good shared target. Loading is tolerant: corrupt files
+//! fall back to defaults and explicitly recognized older keys are ignored
+//! with migration warnings.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::config::write_atomic;
-use crate::control::budget::LoopGains;
 use crate::control::device_loop::Gains;
-use crate::control::lut::ClockWattsLut;
 use crate::fanctrl::table::DutyRpmTable;
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct PersistedState {
-    /// Temporary old-controller compatibility only. It is never serialized
-    /// and legacy on-disk values are discarded at the load boundary.
-    #[serde(skip, default)]
-    pub lut: Option<ClockWattsLut>,
     /// When calibration finished, as a unix-seconds string.
     pub calibrated_at: Option<String>,
-    /// Temporary old-controller compatibility only. It is never serialized.
-    #[serde(skip, default)]
-    pub loop_gains: Option<LoopGains>,
     /// Fitted per-device gains keyed by `<strategy>:<ma_interval>`.
     pub cpu_gains: BTreeMap<String, Gains>,
     /// Fitted per-device gains keyed by `<strategy>:<ma_interval>`.
@@ -45,7 +24,7 @@ pub struct PersistedState {
     /// Its own `Default`/serde default is the ten seeded points, so a
     /// legacy file predating this field loads the seed unchanged.
     pub duty_rpm_table: DutyRpmTable,
-    /// Paired per-device warm-start caps, keyed by `WarmStart::key`.
+    /// Paired per-device entry caps, keyed by [`warm_start_key`].
     pub warm_start: BTreeMap<String, WarmStartEntry>,
     /// Last qualified setpoint for Held-mode startup.
     pub t_star_last_good: Option<TStarSeed>,
@@ -55,6 +34,11 @@ pub struct PersistedState {
 pub struct WarmStartEntry {
     pub cpu_cap_w: f64,
     pub gpu_lock_mhz: u32,
+}
+
+/// Stable key for paired device-loop warm starts.
+pub fn warm_start_key(strategy: &str, duty: u8, on_ac: bool) -> String {
+    format!("{strategy}:{duty}:{}", if on_ac { "ac" } else { "battery" })
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -233,27 +217,7 @@ impl PersistedState {
         }
     }
 
-    /// Enforce, on the way in from disk, the invariants the in-process
-    /// constructors hold by construction. Serde checks the JSON *shape*, not
-    /// the values, and a schema-skewed or hand-edited `state.json` otherwise
-    /// panics the control loop several layers away from here:
-    ///
-    /// - an empty `duty_rpm_table` panics `DutyRpmTable::duty_for_rpm`'s
-    ///   `best.expect(...)`, and a non-monotone one panics `refine`'s
-    ///   `f64::clamp(lo + margin, hi - margin)` with `min > max`;
-    /// - `loop_gains` with a zero/negative/non-finite integral time makes
-    ///   `Budget::step` divide by zero and drives the commanded budget
-    ///   permanently to NaN;
-    /// - a `lut` with a non-finite watts entry feeds `Budget::set_bounds`'s
-    ///   `f64::clamp` a non-finite bound, which panics, and one whose clocks
-    ///   are out of order or duplicated silently mis-answers both lookups;
-    /// - a non-finite `warm_start` value seeds `u`/`v` to NaN, which the
-    ///   velocity-form update never recovers from.
-    ///
-    /// Each invalid field is dropped back to its "not calibrated" value with
-    /// a warning — never a panic, per this module's "Loading NEVER crashes"
-    /// contract. Fields are validated independently: a bad table does not
-    /// throw away good gains.
+    /// Enforce current-schema value invariants that serde cannot express.
     fn validated(mut self) -> PersistedState {
         if !self.duty_rpm_table.is_valid() {
             tracing::warn!(
@@ -261,17 +225,6 @@ impl PersistedState {
                  increasing; falling back to the seeded table"
             );
             self.duty_rpm_table = DutyRpmTable::default();
-        }
-        if let Some(lut) = &self.lut
-            && !lut.is_valid()
-        {
-            tracing::warn!(
-                "state lut ({} points) is empty, has a non-finite or negative \
-                 watts entry, or its clocks are not strictly increasing; \
-                 discarding it (uncalibrated, recalibration required)",
-                lut.len()
-            );
-            self.lut = None;
         }
         self.cpu_gains.retain(|key, gains| {
             let valid = !key.is_empty() && gains.is_valid();
@@ -432,66 +385,13 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v1_file_ignores_lut_and_seeds_new_fields() {
-        // tests/fixtures/state_v1.json (fw-fanctrl-loop-blm) is a real pre-
-        // migration file: it carries the old `model` field and its bias/gain
-        // correction scalars, none of which this schema has any more.
-        let path = crate::test_support::fixtures::path("state_v1.json");
-        let state = PersistedState::load(&path);
-
-        assert_eq!(state.lut, None, "the legacy LUT is intentionally ignored");
-
-        assert_eq!(
-            state.duty_rpm_table,
-            DutyRpmTable::default(),
-            "a v1 file predates duty_rpm_table: it must come back as the ten seeded points"
-        );
-        assert!(
-            state.warm_start.is_empty(),
-            "a v1 file predates warm_start: it must come back empty"
-        );
-        assert_eq!(
-            state.loop_gains, None,
-            "a v1 file predates loop_gains: it must come back None"
-        );
-        assert_eq!(state.calibrated_at, Some("1783230048".to_string()));
-    }
-
-    #[test]
-    fn new_schema_round_trips_populated_warm_start_and_gains() {
-        let dir = fixture_dir("roundtrip-v2");
+    fn legacy_controller_fields_are_ignored_while_current_fields_survive() {
+        let dir = fixture_dir("legacy-controller-fields");
         let path = dir.join("state.json");
-        let mut table = DutyRpmTable::default();
-        table.refine(30, 2600.0); // differs from the untouched seed
-        let mut warm_start = BTreeMap::new();
-        warm_start.insert(
-            "quiet16|30|ac".to_string(),
-            WarmStartEntry { cpu_cap_w: 45.5, gpu_lock_mhz: 1800 },
-        );
-        warm_start.insert(
-            "cool16|20|bat".to_string(),
-            WarmStartEntry { cpu_cap_w: 12.0, gpu_lock_mhz: 1200 },
-        );
-        let state = PersistedState {
-            calibrated_at: Some("1751500000".to_string()),
-            cpu_gains: BTreeMap::from([("quiet16:60".into(), Gains { kc: 0.2, ti_s: 35.0 })]),
-            gpu_gains: BTreeMap::from([("quiet16:60".into(), Gains { kc: 2.1, ti_s: 15.0 })]),
-            duty_rpm_table: table,
-            warm_start,
-            t_star_last_good: Some(TStarSeed {
-                strategy: "quiet16".into(),
-                fan_target_rpm: 3000,
-                value_c: 70.0,
-                saved_at_unix_s: 100,
-            }),
-            ..PersistedState::default()
-        };
-
-        state.save(&path).unwrap();
-        let back = PersistedState::load(&path);
-
-        assert_eq!(back, state);
-        fs::remove_dir_all(&dir).unwrap();
+        fs::write(&path, r#"{"lut":{"points":[]},"loop_gains":{"ti_s":0},"calibrated_at":"7","cpu_gains":{},"gpu_gains":{},"warm_start":{}}"#).unwrap();
+        let state = PersistedState::load(&path);
+        assert_eq!(state.calibrated_at.as_deref(), Some("7"));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -602,128 +502,6 @@ mod tests {
         );
         assert_ne!(state.duty_rpm_table, DutyRpmTable::default());
         assert_eq!(state.duty_rpm_table.rpm_for_duty(15), 1200.0);
-    }
-
-    /// A `loop_gains` JSON object with the four fields set as given.
-    fn gains_json(kc_c: &str, ti_s: &str, kc_rpm: &str, ti_rpm: &str) -> String {
-        format!(
-            r#"{{ "loop_gains": {{ "kc_w_per_c": {kc_c}, "ti_s": {ti_s},
-                 "kc_w_per_rpm": {kc_rpm}, "ti_rpm_s": {ti_rpm} }} }}"#
-        )
-    }
-
-    #[test]
-    fn zero_integral_time_drops_the_persisted_gains() {
-        // ti_s == 0 => `Budget::step`'s `kc * PI_PERIOD_S / ti` is inf and
-        // `u` goes permanently NaN.
-        for json in [
-            gains_json("0.31", "0.0", "0.0041", "28.0"),
-            gains_json("0.31", "42.0", "0.0041", "0.0"),
-        ] {
-            let state = load_json("zero-ti", &json);
-            assert_eq!(state.loop_gains, None, "zero integral time must be dropped");
-        }
-    }
-
-    #[test]
-    fn negative_or_non_finite_gains_are_dropped() {
-        for json in [
-            gains_json("0.31", "-42.0", "0.0041", "28.0"),
-            gains_json("-0.31", "42.0", "0.0041", "28.0"),
-            gains_json("0.31", "1e400", "0.0041", "28.0"),
-            gains_json("0.31", "42.0", "0.0", "28.0"),
-        ] {
-            let state = load_json("bad-gains", &json);
-            assert_eq!(state.loop_gains, None, "rejected: {json}");
-        }
-    }
-
-    #[test]
-    fn legacy_gains_are_ignored_and_a_bad_table_falls_back_independently() {
-        let json = r#"{ "loop_gains": { "kc_w_per_c": 0.31, "ti_s": 42.0,
-                        "kc_w_per_rpm": 0.0041, "ti_rpm_s": 28.0 },
-                        "duty_rpm_table": { "points": {} } }"#;
-        let state = load_json("gains-kept", json);
-        assert_eq!(state.loop_gains, None);
-        assert_eq!(state.duty_rpm_table, DutyRpmTable::default());
-    }
-
-    // --- finding 4: the other two fields (lut, warm_start) ----------------
-    //
-    // On non-finite values reaching `load`: they cannot, on this crate's
-    // serde_json configuration. `float_roundtrip` (Cargo.toml:17) swaps in
-    // the lossless float parser, which returns `Error("number out of
-    // range")` for `1e400`/`1e309`/`1.8e308` rather than saturating to
-    // `inf`, and `to_string` writes a non-finite f64 as `null`, which
-    // deserializes back as a type error — so an infinity can neither be
-    // written by `save` nor read by `load`; both routes land in the
-    // "corrupt state, starting uncalibrated" branch instead. The finiteness
-    // half of each guard is therefore defense-in-depth against a future
-    // parser/feature change, and is pinned where it can actually be
-    // exercised — `ClockWattsLut::is_valid` and `WarmStart::drop_non_finite`
-    // unit tests, which build the bad values in Rust. What a hand edit CAN
-    // produce is well-formed JSON with the values in the wrong order; that
-    // is what the load-path tests below drive.
-
-    #[test]
-    fn out_of_order_lut_clocks_discard_the_lut() {
-        // `insert` keeps points sorted and unique by mhz; `watts_for_clock`
-        // `binary_search_by_key`s on that and `clock_for_watts` scans
-        // `windows(2)` assuming ascending clocks, so a hand-edited
-        // descending pair silently mis-answers both — and a wrong watts
-        // answer is what sets `Budget`'s bounds.
-        let state = load_json(
-            "unsorted-lut",
-            r#"{ "lut": { "points": [[2800, 100.0], [1200, 30.0]] } }"#,
-        );
-        assert_eq!(state.lut, None, "out-of-order clocks discard the LUT");
-    }
-
-    #[test]
-    fn duplicate_or_empty_lut_points_discard_the_lut() {
-        let dup = load_json(
-            "dup-lut",
-            r#"{ "lut": { "points": [[1200, 30.0], [1200, 40.0]] } }"#,
-        );
-        assert_eq!(dup.lut, None, "duplicate clocks discard the LUT");
-
-        // An empty points array is not "a calibration with no points", it is
-        // "not calibrated" — every lookup on it returns None anyway.
-        let empty = load_json("empty-lut", r#"{ "lut": { "points": [] } }"#);
-        assert_eq!(empty.lut, None, "an empty LUT is not a calibration");
-    }
-
-    #[test]
-    fn a_negative_lut_watts_entry_discards_the_lut() {
-        // Negative watts are physically impossible from the sweep and would
-        // drag `set_bounds`' `lo` below `cpu_floor_w`.
-        let state = load_json(
-            "negative-lut",
-            r#"{ "lut": { "points": [[1200, 30.0], [2000, -60.0]] } }"#,
-        );
-        assert_eq!(state.lut, None, "a negative watts entry discards the LUT");
-    }
-
-    #[test]
-    fn legacy_lut_and_scalar_warm_start_are_ignored_independently() {
-        let state = load_json(
-            "lut-kept",
-            r#"{ "lut": { "points": [[1200, 30.0], [2000, 60.0], [2800, 100.0]] },
-                 "warm_start": { "quiet16:30:ac": 45.5, "cool16:20:batt": 12.0 },
-                 "duty_rpm_table": { "points": {} } }"#,
-        );
-        assert_eq!(state.lut, None);
-        assert!(state.warm_start.is_empty());
-        assert_eq!(state.duty_rpm_table, DutyRpmTable::default());
-    }
-
-    #[test]
-    fn legacy_lut_is_ignored_regardless_of_its_shape() {
-        let state = load_json(
-            "dip-lut",
-            r#"{ "lut": { "points": [[1200, 60.0], [2000, 50.0], [2800, 100.0]] } }"#,
-        );
-        assert_eq!(state.lut, None);
     }
 
     #[test]
@@ -871,8 +649,9 @@ mod tests {
                 "gpu_gains": { "quiet16:60": { "kc": 2.1, "ti_s": 15.0 } }
             }"#,
         );
-        assert_eq!(state.lut, None);
-        assert_eq!(state.loop_gains, None);
+        let wire = serde_json::to_value(&state).unwrap();
+        assert!(wire.get("lut").is_none());
+        assert!(wire.get("loop_gains").is_none());
         assert_eq!(state.warm_start.len(), 1);
         assert_eq!(
             state.warm_start["new"],

@@ -196,7 +196,7 @@ fn cpu_limit_step(
     let rapl = rapl.ok_or("RAPL reader unavailable")?;
     // fw-fanctrl-loop-j6s: selftest only cares whether the limit landed, so
     // any non-Verified verdict (Mismatch/Unreadable) is reported as today's
-    // plain failure rather than routed through the freeze/flag machinery.
+    // plain failure rather than routed through the hold/flag machinery.
     let commanded_w = match cpu.set_sustained_mw(CPU_LIMIT_MW) {
         WriteVerdict::Verified(w) => w,
         other => return Err(format!("ryzenadj: not verified: {other:?}")),

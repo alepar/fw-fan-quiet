@@ -20,9 +20,7 @@ use crate::types::{
 /// cover the hardware's full envelope (fans max ~7000 RPM, package power well
 /// under 120 W, temps below the 110 C trip point, GPU boost under 3.2 GHz).
 const FAN_BOUNDS: [f64; 2] = [1000.0, 6000.0];
-// Watts chart is percent-of-max like the clocks chart: 100% = the config
-// operating maxes carried on the status (`cpu_max_w`/`gpu_max_w`), so both
-// series span the full height and the scale matches what control uses.
+// Watts charts use stable presentation scales so live graphs do not jump.
 const TEMP_BOUNDS: [f64; 2] = [20.0, 90.0];
 // The clocks chart normalizes each series to percent of that device's max
 // clock so both use the full chart height ("dual-scale" on one axis: 100% =
@@ -450,16 +448,19 @@ fn flag_text(value: &TelemetryFlag) -> String { match value {
 } }
 
 /// Measured CPU/GPU power history remains useful alongside independent caps;
-/// only the obsolete shared budget and allocation display was removed.
+/// the prior shared-control display was removed.
 fn render_watts(model: &Model, frame: &mut Frame, area: Rect) {
     let cpu_max_w = model.status.cpu_max_w;
-    let gpu_max_w = model.status.gpu_max_w;
+    let gpu_scale_w = crate::config::GPU_POWER_SCALE_W;
     let cpu_segs = to_percent(&segments(&model.cpu_w), cpu_max_w);
-    let gpu_segs = to_percent(&segments(&model.gpu_w), gpu_max_w);
+    let gpu_segs = to_percent(&segments(&model.gpu_w), gpu_scale_w);
     let limit_pts = model.status.cpu_limit_w.map(|w| hline(w / cpu_max_w * 100.0));
     let title = match &model.latest {
-        Some(s) => format!("watts cpu {:.1} gpu {:.1} W (% of max)", s.cpu_pkg_w, s.gpu_w),
-        None => "watts (% of max)".into(),
+        Some(s) => format!(
+            "watts cpu {:.1} gpu {:.1} W (% of display scale)",
+            s.cpu_pkg_w, s.gpu_w
+        ),
+        None => "watts (% of display scale)".into(),
     };
     let mut datasets = Vec::new();
     if let Some(pts) = &limit_pts {
@@ -570,7 +571,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     /// Default test width, 200 cols. Widened from 120 (Task 15): the new
-    /// arbiter/budget segment (design §3.5) always renders ~50 more
+    /// prior shared-control segment always renders ~50 more
     /// characters into the single-line header, on top of what already
     /// filled a 120-col terminal in prior tasks.
     /// `emergency_stays_visible_when_flags_would_overflow_the_header` below
@@ -828,11 +829,8 @@ mod tests {
         // severity-first ordering (and hint dropping) the emergency text
         // starts past the terminal's right edge and ratatui clips it
         // invisible. A dedicated (not the shared `draw()`) 170-col
-        // terminal, deliberately narrow enough that the base header (mode/
-        // limits/Task 15's arbiter segment, ~116 cols here) plus all five
-        // flags (~83 cols) does NOT fit — 120 cols, this test's width
-        // before Task 15, no longer clips anything once the arbiter
-        // segment alone eats 116 of it.
+        // terminal, deliberately narrow enough that the base status fields
+        // plus all five flags do not fit without severity-first ordering.
         let mut m = Model::new();
         m.update(Event::Status(ControlStatus {
             mode: Mode::Auto,
@@ -1302,14 +1300,14 @@ mod tests {
     // --- Task 15: calibration phase renders verbatim ---
 
     #[test]
-    fn calib_wizard_renders_lut_phase_verbatim() {
+    fn calib_wizard_renders_settle_phase_verbatim() {
         use crate::control::ControlStatus;
         use crate::control::controller::{CalibProgressLite, Mode};
         let mut m = Model::new();
         m.update(Event::Status(ControlStatus {
             mode: Mode::Calibrating,
             calib: Some(CalibProgressLite {
-                phase: "lut".into(),
+                phase: "settle".into(),
                 step: 2,
                 total: 10,
                 needs_load: false,
@@ -1318,7 +1316,7 @@ mod tests {
             ..ControlStatus::default()
         }));
         let text = all_text(&draw(&m));
-        assert!(text.contains("calibration \u{2014} lut"), "text: {text}");
+        assert!(text.contains("calibration \u{2014} settle"), "text: {text}");
     }
 
     #[test]
@@ -1359,5 +1357,12 @@ mod tests {
             "test setup: NaN must be present"
         );
         draw(&m);
+    }
+
+    #[test]
+    fn gpu_watts_chart_names_its_fixed_presentation_scale() {
+        let text = all_text(&draw_size(&Model::new(), 120, 40));
+        assert!(text.contains("watts (% of display scale)"), "text: {text}");
+        assert!(!text.contains("watts (% of max)"), "text: {text}");
     }
 }

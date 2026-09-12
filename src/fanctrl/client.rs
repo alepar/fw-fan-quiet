@@ -236,7 +236,7 @@ struct ConfigDataField {
     /// the operator never activates may legitimately omit
     /// `movingAverageInterval`. Deserialising every entry strictly made one
     /// such inactive entry fail the entire poll, which stales
-    /// `all_observed_at` after 90 s and drops the loop out of Mode A for good
+    /// `all_observed_at` after 90 s and drops the loop out of Curve for good
     /// (roast PR-1 finding 9). Only the entry actually being looked up is
     /// parsed into a typed [`StrategyField`], and only that one has to be
     /// complete.
@@ -314,7 +314,7 @@ fn parse_print_all(json: &str) -> Result<ParsedAll, FanctrlError> {
     };
     // Only the *active* strategy has to be complete: the EC moving-average
     // emulator cannot run without its interval, so a missing one here is a
-    // real error (degrading to the designed FANCTRL LOST / Mode B fallback)
+    // real error (degrading to the designed FANCTRL LOST / Held fallback)
     // rather than something to paper over with a guessed default.
     let entry: StrategyField = serde_json::from_value(raw_entry.clone()).map_err(|e| {
         FanctrlError::Other(format!(
@@ -1008,7 +1008,7 @@ mod tests {
     fn an_inactive_strategy_missing_moving_average_interval_does_not_fail_the_poll() {
         // Before the fix every entry in the map was deserialised strictly, so
         // this one unrelated entry failed the whole `print all` -- staling
-        // `all_observed_at` after 90 s and dropping the loop out of Mode A
+        // `all_observed_at` after 90 s and dropping the loop out of Curve
         // permanently, even though only the active strategy's data is used.
         let parsed = parse_print_all(PRINT_ALL_INACTIVE_STRATEGY_MISSING_MA)
             .expect("an incomplete inactive strategy must not fail the poll");
@@ -1028,7 +1028,7 @@ mod tests {
     #[test]
     fn the_active_strategy_missing_moving_average_interval_is_still_an_error() {
         // The EC moving-average emulator cannot run without the interval, so
-        // this degrades to the designed FANCTRL LOST / Mode B fallback rather
+        // this degrades to the designed FANCTRL LOST / Held fallback rather
         // than being papered over with a guessed default.
         let json =
             PRINT_ALL_INACTIVE_STRATEGY_MISSING_MA.replace("\"movingAverageInterval\": 60,", "");

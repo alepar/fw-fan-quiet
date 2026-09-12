@@ -1,5 +1,7 @@
 # Closing the loop on fw-fanctrl (no learned thermal model)
 
+> **Historical / superseded (2026-09-11).** This document describes the retired scalar controller. The current implemented design is [Per-device temperature loops, revision 4](../runs/2026-09-11-per-device-temperature-loops/2026-09-11-per-device-temperature-loops-design.md).
+
 **Date:** 2026-09-07
 **Status:** designed — 2 coverage rounds + 3 super-roast iterations applied
 **Tracker:** beads epic `fw-fanctrl-loop-6ma` (24 tasks, imported from the table below;

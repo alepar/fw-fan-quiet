@@ -3,17 +3,19 @@
 //! one section each:
 //!
 //! 1. [`main_flow`] walks the goal's main flows end to end on a fresh,
-//!    LUT-only `state.json`: `TempLoop -> socket death -> RpmLoop ->
-//!    recovery -> TempLoop`, a real calibration through the controller
+//!    legacy `state.json`: Curve regulation, socket loss into Held, recovery
+//!    to Curve, and a real calibration through the controller
 //!    (not the FOPDT math directly, unlike `control::sim_tests`'s own
 //!    calibration test), then a simulated daemon restart that reloads the
 //!    warm-start, table and gains from the same `state.json`.
-//! 2. [`wiring_sweep`] is the brief's five enumerations: every `Config`
-//!    key, every `StatusFlag`, every telemetry field, every `Effect`
-//!    variant, every `CalibContext` field. Each is an exhaustive
-//!    destructure/match, not prose — a variant/field added later fails
+//! 2. [`wiring_sweep`] contains four local enumerations: every `Config` key,
+//!    every `StatusFlag`, every telemetry field, and every `Effect` variant.
+//!    Each is an exhaustive destructure/match, so a variant or field added later fails
 //!    THIS module to compile until it is named here, which is the
 //!    rot-resistance the brief asks for.
+//!    `control::controller::tests::calibration_context_exhaustively_uses_live_controller_and_sample_sources`
+//!    owns the exhaustive `PerDeviceCalibContext` provenance check because
+//!    the builder is private to the controller.
 //! 3. [`real_types`] is the three integration tests no per-task test
 //!    covers: sampler -> controller -> telemetry with the REAL (non-fake,
 //!    non-`ChainedPlant`) `Sampler`; config -> poller construction; a full
@@ -32,8 +34,8 @@ use crate::actuators::cpu::CpuActuator;
 use crate::actuators::guard::RestoreGuard;
 use crate::actuators::smu_module::SmuModule;
 use crate::config::Config;
-use crate::control::controller::{Command, Controller, Effect, LoopMode, Mode, StatusFlag};
-use crate::control::lut::ClockWattsLut;
+use crate::control::controller::{Command, Controller, Effect, Mode, StatusFlag};
+use crate::types::TelemetryTStarState;
 use crate::state::PersistedState;
 use crate::test_support::plant::{ChainedPlant, TickScript};
 use crate::types::Sample;
@@ -101,22 +103,9 @@ const MA_INTERVAL: u32 = 60;
 /// well inside the default `cpu_max_w` ceiling.
 const AMBIENT_C: f64 = 40.0;
 
-/// A minimal, uncalibrated LUT (three points): enough for `Auto` entry to
-/// require nothing beyond the `Some` check (`gpu_floor_w` resolution needs
-/// at least one point) without pretending to be a real sweep result. Flow 1
-/// starts from exactly this — a fresh `state.json` "with only a LUT".
-fn seed_lut() -> ClockWattsLut {
-    let mut lut = ClockWattsLut::new();
-    lut.insert(1200, 30.0);
-    lut.insert(2000, 60.0);
-    lut.insert(2800, 100.0);
-    lut
-}
-
 /// Drives `plant`/`ctl` for `ticks` 1 Hz samples, closing the loop on the
 /// controller's own last-commanded CPU cap (the same pattern
-/// `control::sim_tests::run_ticks` uses, reimplemented here since that
-/// module is unreachable — see the file doc). `on_tick` gets a mutable
+/// used by the focused controller simulations). `on_tick` gets a mutable
 /// `TickScript` already seeded with the fed-back cap, so a caller can layer
 /// a socket-death/revival edge, a resume, etc. on top before the tick runs.
 fn drive_ticks<R: crate::actuators::cmd::Runner>(
@@ -163,7 +152,7 @@ mod main_flow {
         max_ticks: u64,
     ) {
         // The step test's settle gate reads the RAW `Sample.fan1_rpm`/
-        // `fan2_rpm` (unlike Mode B's `rpm_smoothed`, there is no FAN_SMOOTH_N
+        // `fan2_rpm` (unlike Held's `rpm_smoothed`, there is no FAN_SMOOTH_N
         // tail-mean ahead of it) against a +-100 RPM window
         // (`STEADY_RPM_TOLERANCE`). `FanPlant`'s own +-90 RPM per-tick xorshift
         // noise (design §Facts/§5) is uncorrelated sample to sample, so a raw
@@ -212,55 +201,54 @@ mod main_flow {
     /// Job 1, all three legs in one continuous session (a real daemon
     /// session never resets `state.json` between them either):
     ///
-    /// - Engage Auto from a fresh `state.json` carrying only a LUT; walk
-    ///   `TempLoop -> socket death -> RpmLoop -> recovery -> TempLoop`.
+    /// - Engage Auto from a fresh `state.json` carrying only legacy fields; walk
+    ///   `Curve -> socket death -> Held -> recovery -> Curve`.
     /// - Run a calibration THROUGH THE CONTROLLER (shared settle plus real,
     ///   physically simulated CPU-watt and GPU-clock steps) to landed fits.
     /// - "Restart": load the state through the public surface and confirm
-    ///   the staged migration retains paired/new fields while deliberately
-    ///   withholding legacy LUT/scalar-gain state from the old controller.
+    ///   migration drops retired fields while retaining revision-4 records.
     #[test]
     fn engage_walk_calibrate_and_restart_migrates_legacy_state_safely() {
         let (dir, profile_path, state_path) = fixture_paths("main-flow");
         let runner = FakeRunner::new();
-        let fresh_lut_only = PersistedState { lut: Some(seed_lut()), ..PersistedState::default() };
+        let fresh_state = PersistedState::default();
         let mut ctl = build_controller(
             &runner,
             &profile_path,
             &state_path,
-            fresh_lut_only,
+            fresh_state,
             Config::default(),
         );
 
-        // ---- Engage Auto from the fresh, LUT-only state ----
+        // ---- Engage Auto from the fresh, legacy-only state ----
         ctl.on_command(Command::SetAuto(true));
         assert_eq!(ctl.status().mode, Mode::Auto);
         assert!(
             ctl.status().flags.contains(&StatusFlag::NotCalibrated),
-            "Auto is available, while a LUT alone does not supply per-device fitted gains"
+            "Auto remains available with safe defaults when fitted device gains are absent"
         );
 
         let cpu_floor_w = ctl.status().cpu_floor_w;
         let mut plant = ChainedPlant::new("quiet16", QUIET16_POINTS.to_vec(), MA_INTERVAL, AMBIENT_C, 1)
             .expect("valid curve");
 
-        // ---- Walk into TempLoop ----
+        // ---- Walk into Curve ----
         drive_ticks(&mut plant, &mut ctl, cpu_floor_w, 200, |_, _| {});
         assert_eq!(
-            ctl.status().loop_mode,
-            LoopMode::TempLoop,
-            "premise: a live quiet16 socket must settle into TempLoop before the walk \
+            ctl.status().tstar_state,
+            Some(TelemetryTStarState::Curve),
+            "premise: a live quiet16 socket must settle into Curve before the walk \
              below means anything: {:?}",
             ctl.status()
         );
         assert!(!ctl.status().flags.contains(&StatusFlag::FanctrlLost));
 
-        // ---- Socket death -> RpmLoop ----
+        // ---- Socket death -> Held ----
         drive_ticks(&mut plant, &mut ctl, cpu_floor_w, 30, |_, s| s.socket_dead = true);
         assert_eq!(
-            ctl.status().loop_mode,
-            LoopMode::RpmLoop,
-            "a dead socket must fall the loop back to RpmLoop: {:?}",
+            ctl.status().tstar_state,
+            Some(TelemetryTStarState::Held),
+            "a dead socket must hold the last good target: {:?}",
             ctl.status()
         );
         assert!(
@@ -269,12 +257,12 @@ mod main_flow {
             ctl.status()
         );
 
-        // ---- Recovery -> back to TempLoop ----
+        // ---- Recovery -> back to Curve ----
         drive_ticks(&mut plant, &mut ctl, cpu_floor_w, 120, |_, _| {});
         assert_eq!(
-            ctl.status().loop_mode,
-            LoopMode::TempLoop,
-            "a revived socket must recover the loop to TempLoop: {:?}",
+            ctl.status().tstar_state,
+            Some(TelemetryTStarState::Curve),
+            "a revived socket must recover the loop to Curve: {:?}",
             ctl.status()
         );
         assert!(
@@ -334,8 +322,6 @@ mod main_flow {
         ctl.on_command(Command::SetAuto(false));
 
         let after_session = PersistedState::load(&state_path);
-        assert_eq!(after_session.lut, None, "legacy LUT must not be serialized");
-        assert_eq!(after_session.loop_gains, None, "legacy gains must not be serialized");
         assert!(
             after_session.calibrated_at.is_some(),
             "a landed calibration must stamp calibrated_at: {after_session:?}"
@@ -359,7 +345,7 @@ mod main_flow {
         // table that was saved is what round-tripped (already checked
         // above via `PersistedState::load` equality) -- this asserts the
         // Per-device loops consume direct watts/MHz, so the migrated v4
-        // state does not need the deleted scalar LUT to enter Auto.
+        // state does not need the deleted legacy table to enter Auto.
         ctl2.on_command(Command::SetAuto(true));
         assert_eq!(ctl2.status().mode, Mode::Auto);
         assert!(
@@ -372,18 +358,14 @@ mod main_flow {
 }
 
 // =====================================================================
-// Job 2: the unwired-sweep checklist, as five exhaustive enumerations
+// Job 2: four exhaustive public-surface enumerations
 // =====================================================================
 //
-// Each test below destructures/matches its type with NO wildcard arm, so a
+// Each test below destructures or matches its type with no wildcard arm, so a
 // field or variant added later fails THIS module to compile until it is
 // named here with where it is consulted — the rot-resistance the brief
-// asks for ("prefer writing each enumeration as a test over writing it as
-// prose"). Every claim in a comment below was verified against the source
-// while writing this sweep (task `fw-fanctrl-loop-nsc`); two gaps it found
-// (`gpu_hot_c`/`nvme_hot_c` never reaching `Guards::new`, and
-// `StatusFlag::TargetUnreachable` never reaching `ControlStatus`) are fixed
-// inline in this same task, noted where they were.
+// asks for. The controller's private calibration-context builder is covered
+// exhaustively in its own test module.
 mod wiring_sweep {
     use super::*;
     use crate::config::LedConfig;
@@ -392,12 +374,11 @@ mod wiring_sweep {
     #[test]
     fn every_config_key_is_read_somewhere() {
         let Config {
-            fan_target_rpm, // control/controller.rs: SetFanTarget + the Auto allocator's RPM target
-            cpu_floor_w,    // control/allocator.rs split_budget floor; control/budget.rs Budget's lower bound
-            gpu_floor_mhz,  // control/allocator.rs / actuators/gpu.rs clamp_gpu_clock; Budget's gpu_floor_w resolution
+            fan_target_rpm, // controller target and shared T* source
+            cpu_floor_w,    // CPU DeviceLoop and hot-guard lower bound
+            gpu_floor_mhz,  // GPU DeviceLoop, actuator, and hot-guard lower bound
             fast_limit_mw,  // control/controller.rs Controller::new -> CpuActuator.fast_limit_mw -> actuators/cpu.rs --fast-limit=
-            cpu_max_w,      // control/allocator.rs Input::cpu_max_w (the "100%" ceiling + grid-search bound)
-            gpu_max_w,      // control/allocator.rs Input::gpu_max_w
+            cpu_max_w,      // CPU DeviceLoop and actuator ceiling
             // Reached AutoState::new -> Guards::new only as of this sweep
             // (fw-fanctrl-loop-nsc): previously hard-coded to
             // GPU_HOT_C_DEFAULT/NVME_HOT_C_DEFAULT regardless of config,
@@ -415,7 +396,6 @@ mod wiring_sweep {
         assert!(gpu_floor_mhz > 0);
         assert!(fast_limit_mw > 0);
         assert!(cpu_max_w > 0.0);
-        assert!(gpu_max_w > 0.0);
         assert!(gpu_hot_c > 0.0);
         assert!(nvme_hot_c > 0.0);
         assert!(!fanctrl_socket.as_os_str().is_empty());
@@ -470,13 +450,11 @@ mod wiring_sweep {
                     "ui/view.rs: \"resumed\", yellow",
                 ),
                 StatusFlag::NotCalibrated => (
-                    "control/controller.rs: SetAuto(true) with no LUT present",
+                    "control/controller.rs: active strategy/interval has no fitted device gains",
                     "ui/view.rs: not-calibrated hint",
                 ),
                 StatusFlag::TargetUnreachable => (
-                    "control/mode.rs Arbiter::decide (design §2.7, all three cases); synced into \
-                     ControlStatus by mirror_decision only as of this sweep (fw-fanctrl-loop-nsc, \
-                     was bead fw-fanctrl-loop-a5j -- mirror_decision's flag list never named it)",
+                    "control/tstar.rs and per-device unreachable diagnostics",
                     "ui/view.rs: \"TARGET UNREACHABLE\", red bold",
                 ),
                 StatusFlag::ThermalEmergency => (
@@ -488,19 +466,19 @@ mod wiring_sweep {
                     "ui/view.rs: red bold + acknowledge hint",
                 ),
                 StatusFlag::FanctrlLost => (
-                    "control/mode.rs Arbiter::decide (socket Freshness::Absent/Stale)",
+                    "control/controller.rs fresh-view availability",
                     "ui/view.rs: \"FANCTRL LOST\", yellow",
                 ),
                 StatusFlag::EcMismatch => (
-                    "control/mode.rs Arbiter::decide (3-strike EC/replica reconciliation)",
+                    "sensors/ec.rs three-strike reconciliation",
                     "ui/view.rs: \"EC MISMATCH\", yellow",
                 ),
                 StatusFlag::SteepCurve => (
-                    "control/mode.rs Arbiter::decide (slope_at(T*) > 2%/C)",
+                    "control/tstar.rs curve slope classification",
                     "ui/view.rs: \"STEEP CURVE\", gray/info",
                 ),
                 StatusFlag::CurveInvalid => (
-                    "control/mode.rs Arbiter::decide (Curve::from_points rejects a non-monotone curve)",
+                    "control/controller.rs Curve::from_points validation",
                     "ui/view.rs: \"CURVE INVALID\"",
                 ),
                 StatusFlag::GpuHot => (
@@ -567,19 +545,30 @@ mod wiring_sweep {
             cpu_limit_w: Some(20.0),
             gpu_max_mhz: Some(2000),
             fan_target_rpm: 2600.0,
-            cause: "auto:allocate".to_string(),
+            cause: "auto:device_loops".to_string(),
             flags: vec![crate::types::TelemetryFlag::legacy("steep_curve")],
-            demand_cpu: Some(10.0),
-            demand_gpu: Some(5.0),
-            alloc_cpu_w: Some(9.0),
-            alloc_gpu_w: Some(4.0),
-            pi_target_w: Some(4.0),
             t_star: Some(60.0),
-            tstar_state: None, // DeviceLoop wiring has not landed yet.
-            cpu: None,
-            gpu: None,
-            budget_w: 30.0,
-            freeze: Some("Calibrating".to_string()),
+            tstar_state: Some(crate::types::TelemetryTStarState::Held),
+            cpu: Some(crate::types::TelemetryDevice {
+                group_c: Some(60.0),
+                err_c: Some(0.0),
+                thermal: 20.0,
+                shadow: 21.0,
+                cap: 20.0,
+                selected: crate::types::TelemetrySelected::Thermal,
+                hold: crate::types::TelemetryHold::None,
+                gains_source: crate::types::GainsSource::Config,
+            }),
+            gpu: Some(crate::types::TelemetryDevice {
+                group_c: Some(60.0),
+                err_c: Some(0.0),
+                thermal: 2_000.0,
+                shadow: 2_050.0,
+                cap: 2_000.0,
+                selected: crate::types::TelemetrySelected::Thermal,
+                hold: crate::types::TelemetryHold::None,
+                gains_source: crate::types::GainsSource::Config,
+            }),
         };
         match decision {
             Record::Decision {
@@ -590,17 +579,10 @@ mod wiring_sweep {
                 fan_target_rpm,// status.fan_target_rpm
                 cause,         // the batch's first-claimed cause string
                 flags,         // status.flags, mapped to as_str()
-                demand_cpu,    // Effect::AutoAllocated.demand_cpu, when present in the batch
-                demand_gpu,    // Effect::AutoAllocated.demand_gpu
-                alloc_cpu_w,   // Effect::AutoAllocated.cpu_w
-                alloc_gpu_w,   // Effect::AutoAllocated.gpu_w
-                pi_target_w,   // Effect::AutoAllocated.gpu_w (also the GPU PI's own target)
                 t_star,        // status.t_star_c
-                tstar_state,   // absent until DeviceLoop wiring
-                cpu,           // absent until DeviceLoop wiring
-                gpu,           // absent until DeviceLoop wiring
-                budget_w,      // status.budget_w (always carried, never Option)
-                freeze,        // Effect::AutoAllocated.freeze
+                tstar_state,   // status.tstar_state
+                cpu,           // status.cpu
+                gpu,           // status.gpu
             } => {
                 // Unlike the `Record::sample` half above (a production
                 // builder whose outputs are genuinely checked), this record
@@ -611,9 +593,7 @@ mod wiring_sweep {
                 // with its source. Bound, not asserted (ledger: task 24).
                 let _ = (
                     t_mono, mode, cpu_limit_w, gpu_max_mhz, fan_target_rpm, cause, flags,
-                    demand_cpu, demand_gpu, alloc_cpu_w, alloc_gpu_w, pi_target_w, t_star,
-                    tstar_state, cpu, gpu,
-                    budget_w, freeze,
+                    t_star, tstar_state, cpu, gpu,
                 );
             }
             Record::Flag { .. } | Record::Sample { .. } => {
@@ -637,16 +617,6 @@ mod wiring_sweep {
             Effect::Reasserted { cause: "reassert" },
             Effect::StatusChanged { cause: "command:set_cpu_w" },
             Effect::Noted { cause: "calib:point_recorded" },
-            Effect::AutoAllocated {
-                demand_cpu: 1.0,
-                demand_gpu: 1.0,
-                cpu_w: 1.0,
-                gpu_w: 1.0,
-                mode: LoopMode::TempLoop,
-                error: 0.5,
-                budget_w: 30.0,
-                freeze: None,
-            },
             Effect::Flagged { flag: "gpu_hot", active: true },
             Effect::Quit,
         ];
@@ -664,47 +634,13 @@ mod wiring_sweep {
                 Effect::Reasserted { .. } => {} // apply_effects: claims the batch's Decision cause
                 Effect::StatusChanged { .. } => {} // apply_effects: Event::Status to the UI + Decision cause
                 Effect::Noted { .. } => {}  // apply_effects: Decision cause (telemetry-only, status unchanged)
-                Effect::AutoAllocated { .. } => {} // apply_effects: Decision's demand_*/alloc_*/t_star/budget_w/freeze
                 Effect::Flagged { .. } => {} // apply_effects: a standalone Record::Flag line, in addition to Decision
                 Effect::Quit => {}          // controller::spawn's shell loop breaks on this
             }
         }
     }
 
-    /// Every `CalibContext` field: `build_calib_context`'s own derivation,
-    /// every one of them from that tick's live `Sample`/arbiter output,
-    /// never a stale or default-constructed value.
-    #[test]
-    fn every_calib_context_field_originates_from_live_data() {
-        use crate::calib::step::CalibContext;
-        let ctx = CalibContext {
-            cpu_cap_w: Some(20.0), // status.cpu_limit_w after the latest successful CPU command
-            gpu_cap_mhz: Some(1800), // status.gpu_max_mhz after the latest successful GPU command
-            ec_ma: Some(50.0),      // calib_ec_avg.push(ec.max_c), seeded from the first view's ma_temperature
-            ec_mismatch: false,     // calib_arbiter.decide(&ArbiterInput { .. }).ec_mismatch
-            fanctrl_active: true,   // s.fanctrl_freshness == Fresh && s.fanctrl.as_ref().is_some_and(|v| v.active)
-            argmax_controllable: true, // s.ec.as_ref().is_some_and(|e| e.argmax.is_controllable())
-            budget_bounds: (15.0, 54.0), // self.budget_bounds() (config floors/maxes + the LUT's gpu_floor_w)
-        };
-        // The exhaustive destructure is the verification: a `CalibContext`
-        // field added without a named source here fails the build. The
-        // values are a hand-built literal, so asserting them equal to
-        // themselves cannot fail — bound, not asserted (ledger: task 24).
-        // The runtime claim that each field comes from live data is
-        // covered by `calib_context_real_wiring_lets_the_step_test_actually_settle`
-        // in control::controller's test module, which drives the real
-        // `build_calib_context`.
-        let CalibContext {
-            cpu_cap_w,
-            gpu_cap_mhz,
-            ec_ma,
-            ec_mismatch,
-            fanctrl_active,
-            argmax_controllable,
-            budget_bounds,
-        } = ctx;
-        let _ = (cpu_cap_w, gpu_cap_mhz, ec_ma, ec_mismatch, fanctrl_active, argmax_controllable, budget_bounds);
-    }
+
 }
 
 // =====================================================================
@@ -831,7 +767,7 @@ mod real_types {
         assert_eq!(ctl.status().cpu_floor_w, 20.0);
 
         // SetCpuW is manual actuation, not floor-clamped (the floor is the
-        // Auto allocator's own concept) -- it commands exactly what was
+        // Auto controller's own concept) -- it commands exactly what was
         // asked, verified through the actuator's own read-back.
         let effects = ctl.on_command(Command::SetCpuW(15.0));
         assert!(effects.iter().any(|e| matches!(e, Effect::CpuSet(_))));

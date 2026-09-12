@@ -1,53 +1,11 @@
-//! First-order-plus-dead-time (FOPDT) identification and IMC gain derivation
-//! (design doc §3.3, §2.4). Pure functions, no I/O, no clock reads.
-//!
-//! # The theta trap
-//!
-//! [`derive_gains`] takes `theta` **exactly as fitted**. The §3.3 step-test
-//! fit runs on the already-filtered EC average, so its `theta_hat` already
-//! contains the boxcar; adding `ma_interval/2` again would count the filter
-//! twice and roughly **halve** `Kc`. The `+ ma_interval/2` substitution
-//! belongs only to the raw-domain defaults of §2.4 (`LoopGains::default`) —
-//! never to a fitted `theta_hat` here.
-//!
-//! # Scope note: `fitted_at`
-//!
-//! §2.4 lists a persisted `LoopGains` shape that also carries `tau_s`,
-//! `theta_s`, per-axis plant gains and a `fitted_at` timestamp. The
-//! `LoopGains` type that actually exists on this branch
-//! (`crate::control::budget::LoopGains`, task fwloop.4) has exactly four
-//! fields — `kc_w_per_c`, `ti_s`, `kc_w_per_rpm`, `ti_rpm_s` — and no
-//! `fitted_at` slot. Extending that schema and stamping `fitted_at` is
-//! explicitly owned by the calibration runner (`fw-fanctrl-loop-0nv`, whose
-//! bead text lists "the `fitted_at` stamp" under **owns**), not by this task
-//! (`fw-fanctrl-loop-4aj`, filesTouched `src/calib/fopdt.rs` +
-//! `src/calib/mod.rs` only, deliverable "no calibration wiring"). So
-//! [`derive_gains`] returns a plain `LoopGains` with the four PI-gain fields
-//! it owns; there is no `fitted_at` field to leave `None`. See the task
-//! report for the full reasoning.
-//!
-//! # Scope note: the response-magnitude rejection needs `step_w`
-//!
-//! The magnitude rejection (`< 3 °C` for EC, `< 150 RPM` for the fan) is a
-//! physical response size — gain (°C/W or RPM/W) times the applied step
-//! (W) — and [`Fopdt`] deliberately carries no `step_w` (it's a per-axis fit
-//! result, not a step record). The only place that legitimately has both
-//! the raw data and the applied step is [`fit_fopdt`] itself, so it takes
-//! the domain threshold as a `min_response` parameter rather than guessing
-//! it from a nominal step size (the design doc explicitly warns against
-//! substituting a nominal step for the *measured* one — that warning is
-//! about the gain's denominator, but the same measured-not-nominal step is
-//! what this check needs too). Callers pick [`MIN_EC_RESPONSE_C`] or
-//! [`MIN_RPM_RESPONSE`] depending on which signal they're fitting.
+//! FOPDT identification and IMC gain derivation for the native per-device
+//! calibration steps. Fits operate on the already-filtered device-group
+//! response, so the fitted dead time is used directly.
 
-use crate::control::budget::LoopGains;
 use crate::control::device_loop::Gains;
 
 /// Minimum identifiable EC response, °C (design doc §3.3).
 pub const MIN_EC_RESPONSE_C: f64 = 3.0;
-/// Minimum identifiable fan response, RPM (design doc §3.3).
-#[allow(dead_code)] // legacy scalar fit compatibility until task .12
-pub const MIN_RPM_RESPONSE: f64 = 150.0;
 /// Minimum accepted time constant, s (design doc §3.3) — below this the fit
 /// is too fast to trust (and, degenerate, could drive `lambda` here would
 /// otherwise not run away only by luck).
@@ -221,22 +179,6 @@ fn search_tau_theta(data: &[(f64, f64)]) -> Option<(f64, f64)> {
 /// `None`) if either signal has `k <= 0`, `tau < 5 s` (both re-checked here
 /// defensively — a caller can construct a [`Fopdt`] by hand, not only via
 /// [`fit_fopdt`]), or the resulting `Kc` falls outside `[0.25, 4]x` the
-/// matching field on `defaults`.
-#[allow(dead_code)] // legacy scalar fit compatibility until task .12
-pub fn derive_gains(ec: &Fopdt, rpm: &Fopdt, defaults: &LoopGains) -> Option<LoopGains> {
-    let (kc_c, ti_c) = derive_one(ec, defaults.kc_w_per_c)?;
-    let (kc_rpm, ti_rpm) = derive_one(rpm, defaults.kc_w_per_rpm)?;
-    Some(LoopGains {
-        kc_w_per_c: kc_c,
-        ti_s: ti_c,
-        kc_w_per_rpm: kc_rpm,
-        ti_rpm_s: ti_rpm,
-    })
-}
-
-/// Derive one device loop's native actuator-per-degree gains from its
-/// group-temperature fit. The fitted delay already includes sensor
-/// filtering, so it is used directly.
 pub fn derive_device_gains(fopdt: &Fopdt, defaults: Gains) -> Option<Gains> {
     let (kc, ti_s) = derive_one(fopdt, defaults.kc)?;
     Some(Gains { kc, ti_s })
@@ -381,71 +323,6 @@ mod tests {
     // ---- derive_gains: the theta assertion, written explicitly ----
 
     #[test]
-    fn derive_gains_uses_fitted_theta_as_is_not_plus_ma_interval_half() {
-        let theta_hat = 20.0;
-        let tau = 35.0;
-        let ec = Fopdt {
-            k: 0.8,
-            tau,
-            theta: theta_hat,
-        };
-        let rpm = Fopdt {
-            k: 62.4,
-            tau,
-            theta: theta_hat,
-        };
-        let defaults = LoopGains::default();
-
-        let gains = derive_gains(&ec, &rpm, &defaults).expect("both signals should derive");
-
-        let lambda = (3.0 * theta_hat).max(90.0);
-        let expected_kc = tau / (ec.k * (lambda + theta_hat));
-        assert!(
-            within_pct(gains.kc_w_per_c, expected_kc, 1e-9),
-            "kc_w_per_c = {} != tau/(K*(max(90,3*theta_hat)+theta_hat)) = {expected_kc}",
-            gains.kc_w_per_c
-        );
-
-        // The bug this guards against: re-adding ma_interval/2 (60/2 = 30,
-        // §Facts movingAverageInterval) to an already-filtered theta_hat,
-        // double-counting the boxcar and roughly halving Kc.
-        let ma_interval = 60.0;
-        let theta_double_counted = theta_hat + ma_interval / 2.0;
-        let lambda_wrong = (3.0 * theta_double_counted).max(90.0);
-        let kc_wrong = tau / (ec.k * (lambda_wrong + theta_double_counted));
-        assert!(
-            !within_pct(gains.kc_w_per_c, kc_wrong, 0.30),
-            "kc_w_per_c = {} matches the +ma_interval/2 variant {kc_wrong} \
-             (theta double-counted)",
-            gains.kc_w_per_c
-        );
-    }
-
-    // ---- derive_gains: Ti = tau per signal ----
-
-    #[test]
-    fn derive_gains_sets_ti_equal_to_tau_per_signal() {
-        let ec = Fopdt {
-            k: 0.8,
-            tau: 35.0,
-            theta: 20.0,
-        };
-        let rpm = Fopdt {
-            k: 62.4,
-            tau: 41.0,
-            theta: 12.0,
-        };
-        let defaults = LoopGains::default();
-
-        let gains = derive_gains(&ec, &rpm, &defaults).expect("both signals should derive");
-
-        assert_eq!(gains.ti_s, ec.tau);
-        assert_eq!(gains.ti_rpm_s, rpm.tau);
-    }
-
-    // ---- Rejection rules, one crafted input per rule ----
-
-    #[test]
     fn fit_fopdt_rejects_non_positive_k() {
         let mut rng = Xorshift32(0x1234_5678);
         // Power increasing while the measured value falls: fits to k < 0.
@@ -507,120 +384,21 @@ mod tests {
     }
 
     #[test]
-    fn fit_fopdt_rejects_fan_response_under_150_rpm() {
-        let mut rng = Xorshift32(0x4455_6677);
-        // k*step_w = 2.0*30 = 60 RPM, under the 150 RPM fan floor.
-        let data = synthetic_step(
-            &StepSpec {
-                y0: 1500.0,
-                k: 2.0,
-                tau: 35.0,
-                theta: 20.0,
-                step_w: 30.0,
-                n: 61,
-                dt: 5.0,
-                noise: 1.0,
-            },
-            &mut rng,
-        );
-        assert_eq!(fit_fopdt(&data, 30.0, MIN_RPM_RESPONSE), None);
-    }
-
-    #[test]
-    fn duty_pinned_step_passes_magnitude_but_derive_gains_rejects_the_ratio_band() {
-        let mut rng = Xorshift32(0x5566_7788);
-        // A duty-pinned fan leg: tiny positive K_rpm (0.3 RPM/W, ~200x
-        // smaller than the ~62.4 RPM/W nominal), but with a large enough
-        // applied step that k*step_w = 0.3*1000 = 300 RPM clears the 150
-        // RPM identifiability floor — the fit itself succeeds.
-        let rpm_data = synthetic_step(
-            &StepSpec {
-                y0: 1500.0,
-                k: 0.3,
-                tau: 35.0,
-                theta: 20.0,
-                step_w: 1000.0,
-                n: 61,
-                dt: 5.0,
-                noise: 2.0,
-            },
-            &mut rng,
-        );
-        let rpm_fit = fit_fopdt(&rpm_data, 1000.0, MIN_RPM_RESPONSE)
-            .expect("magnitude floor should be cleared, fit should succeed");
-
-        let mut ec_rng = Xorshift32(0x6677_8899);
-        let ec_data = synthetic_step(
-            &StepSpec {
-                y0: 40.0,
-                k: 0.8,
-                tau: 35.0,
-                theta: 20.0,
-                step_w: 30.0,
-                n: 61,
-                dt: 5.0,
-                noise: 0.2,
-            },
-            &mut ec_rng,
-        );
-        let ec_fit = fit_fopdt(&ec_data, 30.0, MIN_EC_RESPONSE_C).expect("ec leg should fit");
-
-        let defaults = LoopGains::default();
-        assert_eq!(
-            derive_gains(&ec_fit, &rpm_fit, &defaults),
-            None,
-            "tiny positive K_rpm should still be caught by the [0.25, 4]x Kc band"
-        );
-    }
-
-    #[test]
     fn derive_gains_rejects_kc_outside_ratio_band_directly() {
-        // Direct-construction companion to the duty-pinned pipeline test
-        // above: isolates the ratio rule in derive_gains from fit_fopdt's
-        // own behaviour entirely.
-        let ec = Fopdt {
-            k: 0.8,
-            tau: 35.0,
-            theta: 20.0,
-        };
-        let tiny_k_rpm = Fopdt {
-            k: 0.3,
-            tau: 35.0,
-            theta: 20.0,
-        };
-        let defaults = LoopGains::default();
-        assert_eq!(derive_gains(&ec, &tiny_k_rpm, &defaults), None);
+        let fit = Fopdt { k: 0.01, tau: 35.0, theta: 20.0 };
+        let defaults = Gains { kc: 0.4, ti_s: 35.0 };
+        assert_eq!(derive_device_gains(&fit, defaults), None);
     }
 
     #[test]
     fn derive_gains_rejects_non_positive_k_directly() {
-        let bad_ec = Fopdt {
-            k: -0.1,
-            tau: 35.0,
-            theta: 20.0,
-        };
-        let rpm = Fopdt {
-            k: 62.4,
-            tau: 35.0,
-            theta: 20.0,
-        };
-        let defaults = LoopGains::default();
-        assert_eq!(derive_gains(&bad_ec, &rpm, &defaults), None);
+        let fit = Fopdt { k: -0.1, tau: 35.0, theta: 20.0 };
+        assert_eq!(derive_device_gains(&fit, Gains { kc: 0.4, ti_s: 35.0 }), None);
     }
 
     #[test]
     fn derive_gains_rejects_tau_under_5s_directly() {
-        let ec = Fopdt {
-            k: 0.8,
-            tau: 35.0,
-            theta: 20.0,
-        };
-        let bad_rpm = Fopdt {
-            k: 62.4,
-            tau: 4.0,
-            theta: 1.0,
-        };
-        let defaults = LoopGains::default();
-        assert_eq!(derive_gains(&ec, &bad_rpm, &defaults), None);
+        let fit = Fopdt { k: 0.8, tau: 4.0, theta: 1.0 };
+        assert_eq!(derive_device_gains(&fit, Gains { kc: 0.4, ti_s: 35.0 }), None);
     }
 }

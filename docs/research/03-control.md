@@ -1,4 +1,6 @@
 > **2026-09-09 note:** the learned power→RPM thermal model this document designs around
+
+> **Historical / superseded (2026-09-11).** Retained as research evidence. The implemented controller is specified by [Per-device temperature loops, revision 4](../superpowers/runs/2026-09-11-per-device-temperature-loops/2026-09-11-per-device-temperature-loops-design.md).
 > (Section 2's affine-plus-cross-term / softplus model, Section 2's RLS/EWMA online
 > adaptation, and the Section 5 calibration matrix that fit it) has been replaced. The
 > shipped design instead closes the loop through fw-fanctrl's own temperature→RPM curve

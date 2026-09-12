@@ -4,10 +4,6 @@
 //! DeviceLoop calls.  It returns target deltas so ordinary setpoint motion is never mistaken
 //! for an error resync.
 
-// The controller wiring leaf consumes this public seam. Until then, the
-// legacy arbiter remains the only production caller in this binary crate.
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::control::device_loop::{Bound, Hold, ThermalMode};
@@ -305,12 +301,15 @@ impl TStarSource {
     }
 
     /// Reserved for Task 8's Held RPM PI. It produces a normal delta and never a resync.
+    #[cfg(test)]
     pub fn set_held_target(&mut self, target_c: f64) {
         self.held_override = target_c.is_finite().then_some(target_c);
     }
+    #[cfg(test)]
     pub fn state(&self) -> TStarState {
         self.state
     }
+    #[cfg(test)]
     pub fn quarantined(&self, label: &str) -> bool {
         self.quarantines.contains_key(label)
     }

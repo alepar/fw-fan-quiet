@@ -12,29 +12,23 @@ use crate::actuators::gpu::clamp_gpu_clock;
 use crate::control::controller::DEFAULT_FAN_TARGET_RPM;
 use crate::control::device_loop::Gains;
 use crate::control::guards::{GPU_HOT_C_DEFAULT, GPU_HYSTERESIS_C, NVME_HOT_C_DEFAULT};
-use crate::control::lut::ClockWattsLut;
 use crate::control::watchdog::{CPU_TRIP_C, GPU_TRIP_C};
 
-/// CPU sustained hardware ceiling (W), rehomed before allocator deletion.
+/// CPU sustained hardware ceiling (W).
 pub const CPU_MAX_W: f64 = 54.0;
-/// Lowest usable CPU sustained operating ceiling (W), also rehomed before
-/// allocator deletion.
+/// Lowest usable CPU sustained operating ceiling (W).
 pub const CPU_MAX_W_FLOOR: f64 = 10.0;
 /// The maximum lockable GPU clock (MHz).
 pub const GPU_MAX_MHZ: u32 = 3090;
-/// Temporary legacy budget compatibility; removed by the deletion sweep.
-const GPU_MAX_W: f64 = 100.0;
-// The terminal sweep removes allocator's duplicate compatibility constants.
-// Referencing them here keeps this staged branch warning-free meanwhile.
-const _: f64 = crate::control::allocator::CPU_MAX_W;
-const _: f64 = crate::control::allocator::GPU_MAX_W;
+/// GPU power-chart full scale; presentation only, never a control limit.
+pub const GPU_POWER_SCALE_W: f64 = 100.0;
 
 /// Lower bound for `gpu_hot_c`, set at the measured park point minus the
-/// hysteresis band. Design §2.8: under a 100 W gpu-burn the die settles at
+/// hysteresis band. Design §2.8: under a full-load gpu-burn the die settles at
 /// 82–83 °C on `quiet16` with the fans free and parks at 87 °C — that band is
 /// the card's *normal* sustained-load state, not a fault. An enter threshold
 /// inside or below it latches the soft guard hot for the whole session and
-/// ratchets the GPU share to its floor forever, since the guard only clears
+/// ratchets the GPU maximum to its floor forever, since the guard only clears
 /// at `enter − GPU_HYSTERESIS_C` (a temperature the card never reaches under
 /// the load that tripped it). 85 °C = park (87) − `GPU_HYSTERESIS_C` is the
 /// lowest enter threshold whose exit (83 °C) is not *below* the 82–83 °C
@@ -58,7 +52,7 @@ const DEFAULT_FANCTRL_SOCKET: &str = "/run/fw-fanctrl/.fw-fanctrl.commands.sock"
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Steady-state fan RPM the allocator holds the machine at.
+    /// Steady-state fan RPM the controller holds the machine at.
     pub fan_target_rpm: f64,
     /// CPU sustained-watts floor: never allocate below this.
     pub cpu_floor_w: f64,
@@ -74,19 +68,15 @@ pub struct Config {
     // field-disabled after the degenerate-divisor incident) and
     // `nvme_boost_rpm` (never shipped — an early NVMe-guard design that
     // raised the fan target for a hot drive, dropped per §2.8/§Facts:
-    // raising the target raises T* and therefore the CPU/GPU budget,
+    // raising the target raises T* and therefore device heat allowances,
     // injecting more heat into a scenario measured to have nothing to raise
     // it for).
     /// CPU sustained operating max (watts): the single source of truth for the
-    /// "100%" CPU power. The allocator grid-searches up to it, the CPU actuator
+    /// "100%" CPU power. The controller regulates up to it, the CPU actuator
     /// clamps commanded sustained power to it, and the TUI/LED displays scale by
     /// it. Defaults to and is clamped to the HX 370 cTDP ceiling
     /// ([`CPU_MAX_W`]); lower it to soft-cap the CPU (quieter, less power).
     pub cpu_max_w: f64,
-    /// Legacy scalar-budget compatibility, deliberately never read from or
-    /// written to config files. Task .12 removes the Rust field.
-    #[serde(skip, default = "default_gpu_max_w")]
-    pub gpu_max_w: f64,
     /// Maximum GPU clock lock. Bounded below by `gpu_floor_mhz`.
     pub gpu_max_mhz: u32,
     /// Extra CPU watts above the current draw used for the shadow cap.
@@ -130,7 +120,6 @@ impl Default for Config {
             gpu_floor_mhz: 1000,
             fast_limit_mw: 53_000,
             cpu_max_w: CPU_MAX_W,
-            gpu_max_w: GPU_MAX_W,
             gpu_max_mhz: GPU_MAX_MHZ,
             shadow_headroom_cpu_w: 10.0,
             shadow_headroom_gpu_mhz: 300.0,
@@ -234,7 +223,7 @@ impl Config {
     /// Clamp out-of-range floors to the hardware envelope, warning when it
     /// bites. A bad config value must degrade to a sane floor, never panic
     /// the control loop downstream (`f64::clamp` with min > max panics; the
-    /// allocator debug-asserts its floor range). Applied on load AND again
+    /// DeviceLoop requires its floor range). Applied on load AND again
     /// at controller construction (belt and suspenders for programmatic
     /// configs).
     pub fn sanitized(mut self) -> Self {
@@ -257,7 +246,7 @@ impl Config {
         }
         // Operating maxes are the source of truth for CPU/GPU "100%", but they
         // are hard-clamped to the hardware ceilings so a config typo can never
-        // push the allocator/actuator past the silicon (CPU) or module (GPU)
+        // push the controller/actuator past the silicon (CPU) or module (GPU)
         // limit. Non-finite (TOML nan/inf) falls back to the ceiling default.
         let cpu_max = if self.cpu_max_w.is_finite() {
             self.cpu_max_w.clamp(CPU_MAX_W_FLOOR, CPU_MAX_W)
@@ -271,20 +260,8 @@ impl Config {
             );
             self.cpu_max_w = cpu_max;
         }
-        let gpu_max = if self.gpu_max_w.is_finite() {
-            self.gpu_max_w.clamp(1.0, GPU_MAX_W)
-        } else {
-            GPU_MAX_W
-        };
-        if gpu_max != self.gpu_max_w {
-            tracing::warn!(
-                "config gpu_max_w {} outside [1, {GPU_MAX_W}]; clamped to {gpu_max}",
-                self.gpu_max_w
-            );
-            self.gpu_max_w = gpu_max;
-        }
         // Floor is bounded by the (now-sanitized) operating max, not the raw
-        // ceiling: floor ≤ cpu_max_w keeps the allocator's floor-in-range
+        // ceiling: floor ≤ cpu_max_w keeps the DeviceLoop's floor-in-range
         // debug-assert and grid honest. Non-finite falls back to the default.
         let cpu = if self.cpu_floor_w.is_finite() {
             self.cpu_floor_w.clamp(0.0, self.cpu_max_w)
@@ -373,53 +350,6 @@ impl Config {
         self
     }
 
-    /// The cross-field half of [`Config::sanitized`], which needs the
-    /// calibration LUT and so can only run where one is available (the
-    /// controller: on construction and on every live `SetFloors`; plain
-    /// `Config::load` has no LUT and skips it).
-    ///
-    /// Roast PR-2 finding 1: the budget integrator's bounds are
-    /// `lo = cpu_floor_w + watts_for_clock(gpu_floor_mhz)` and
-    /// `hi = cpu_max_w + gpu_max_w`. `sanitized()` clamps all four keys
-    /// independently, so a raised GPU clock floor against a lowered
-    /// `gpu_max_w` inverts the pair — in-range values, panicking
-    /// `f64::clamp` downstream. The invariant enforced here is the tighter,
-    /// per-axis one the allocator already asserts (`allocator::step`:
-    /// `gpu_floor_w <= gpu_max_w`); with `sanitized()`'s
-    /// `cpu_floor_w <= cpu_max_w` it implies `lo <= hi`.
-    ///
-    /// We resolve a violation by **lowering `gpu_floor_mhz`** (through the
-    /// LUT, to the highest clock whose predicted watts still fit under
-    /// `gpu_max_w`) rather than raising `gpu_max_w`: the maxes are the
-    /// operator's power envelope and the actuator's hard ceiling, while the
-    /// clock floor is a performance preference — giving up performance is
-    /// always the safe direction on a thermal controller.
-    /// `clamp_gpu_clock`'s hardware floor (1000 MHz) still applies, so an
-    /// envelope below the cheapest lockable clock stays infeasible; the
-    /// allocator's own `.clamp` and the `Budget`'s bound ordering are what
-    /// make that case degrade instead of panicking.
-    pub fn with_lut_floor_clamp(mut self, lut: Option<&ClockWattsLut>) -> Self {
-        let Some(lut) = lut else { return self };
-        let Some(gpu_floor_w) = lut.watts_for_clock(self.gpu_floor_mhz) else {
-            return self; // empty LUT: nothing to map with
-        };
-        if gpu_floor_w <= self.gpu_max_w {
-            return self;
-        }
-        let lowered = lut
-            .clock_for_watts(self.gpu_max_w)
-            .map_or(self.gpu_floor_mhz, clamp_gpu_clock);
-        if lowered < self.gpu_floor_mhz {
-            tracing::warn!(
-                "config gpu_floor_mhz {} costs {gpu_floor_w:.1} W, above gpu_max_w {}; \
-                 lowered to {lowered} MHz",
-                self.gpu_floor_mhz,
-                self.gpu_max_w
-            );
-            self.gpu_floor_mhz = lowered;
-        }
-        self
-    }
 
     /// Atomic save: write `<path>.tmp`, then rename over `path`. Creates the
     /// parent directory if needed.
@@ -429,9 +359,6 @@ impl Config {
     }
 }
 
-fn default_gpu_max_w() -> f64 {
-    GPU_MAX_W
-}
 
 fn sanitize_positive(value: &mut f64, floor: f64, name: &str) {
     let sanitized = if value.is_finite() { value.max(floor) } else { floor };
@@ -527,7 +454,6 @@ mod tests {
             gpu_floor_mhz: 1200,
             fast_limit_mw: 60_000,
             cpu_max_w: 50.0,
-            gpu_max_w: GPU_MAX_W,
             gpu_max_mhz: 2500,
             shadow_headroom_cpu_w: 12.0,
             shadow_headroom_gpu_mhz: 350.0,
@@ -583,7 +509,7 @@ mod tests {
         let dir = fixture_dir("clamp-floors");
         let path = dir.join("config.toml");
         // Above the hardware envelope: an unclamped 4000 MHz floor would
-        // panic the GPU PI's f64::clamp (min > max) on the first Auto tick.
+        // hand the GPU device loop an inverted clamp range on the first Auto tick.
         fs::write(&path, "gpu_floor_mhz = 4000\ncpu_floor_w = 99.0\n").unwrap();
         let config = Config::load(&path);
         assert_eq!(config.gpu_floor_mhz, 3090);
@@ -606,23 +532,22 @@ mod tests {
     fn operating_maxes_clamp_to_hardware_ceilings() {
         let dir = fixture_dir("clamp-maxes");
         let path = dir.join("config.toml");
-        // Above the silicon/module ceilings: clamped down so the allocator and
-        // actuator can never be told to exceed the hardware.
-        fs::write(&path, "cpu_max_w = 999.0\ngpu_max_w = 999.0\n").unwrap();
+        // Above the silicon/module ceilings: clamp down so an actuator can
+        // never be told to exceed the hardware.
+        fs::write(&path, "cpu_max_w = 999.0\ngpu_max_mhz = 99999\n").unwrap();
         let config = Config::load(&path);
         assert_eq!(config.cpu_max_w, 54.0);
-        assert_eq!(config.gpu_max_w, 100.0);
+        assert_eq!(config.gpu_max_mhz, GPU_MAX_MHZ);
         // A lowered cpu_max also lowers the floor's ceiling: floor can't exceed
-        // the operating max (else the allocator's floor-in-range assert trips).
+        // the operating max so the device loop receives a valid range.
         fs::write(&path, "cpu_max_w = 30.0\ncpu_floor_w = 40.0\n").unwrap();
         let config = Config::load(&path);
         assert_eq!(config.cpu_max_w, 30.0);
         assert_eq!(config.cpu_floor_w, 30.0, "floor clamped to cpu_max_w");
         // Non-finite maxes fall back to the ceilings.
-        fs::write(&path, "cpu_max_w = nan\ngpu_max_w = inf\n").unwrap();
+        fs::write(&path, "cpu_max_w = nan\n").unwrap();
         let config = Config::load(&path);
         assert_eq!(config.cpu_max_w, 54.0);
-        assert_eq!(config.gpu_max_w, 100.0);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -725,7 +650,7 @@ mod tests {
     #[test]
     fn gpu_hot_c_at_or_below_idle_is_raised_to_the_floor() {
         // Below the card's cruising range the guard would latch hot forever
-        // and ratchet the GPU share to its floor for the whole session.
+        // and ratchet the GPU maximum to its floor for the whole session.
         for value in [-10.0, 0.0, 45.0, 84.9] {
             let config = Config {
                 gpu_hot_c: value,
@@ -807,72 +732,6 @@ mod tests {
         }
         .sanitized();
         assert_eq!(high.nvme_hot_c, NVME_HOT_C_CEIL);
-    }
-
-    // --- roast PR-2 finding 1: the cross-field (LUT) floor clamp ----------
-
-    fn test_lut() -> ClockWattsLut {
-        let mut lut = ClockWattsLut::new();
-        lut.insert(1200, 30.0);
-        lut.insert(2000, 60.0);
-        lut.insert(2800, 100.0);
-        lut
-    }
-
-    #[test]
-    fn a_gpu_clock_floor_costing_more_than_gpu_max_w_is_lowered_through_the_lut() {
-        let lut = test_lut();
-        let config = Config {
-            gpu_floor_mhz: 2800, // 100 W
-            gpu_max_w: 35.0,
-            ..Config::default()
-        }
-        .sanitized()
-        .with_lut_floor_clamp(Some(&lut));
-
-        assert!(
-            config.gpu_floor_mhz < 2800,
-            "an unaffordable clock floor must be lowered, got {}",
-            config.gpu_floor_mhz
-        );
-        let floor_w = lut.watts_for_clock(config.gpu_floor_mhz).unwrap();
-        assert!(
-            floor_w <= config.gpu_max_w,
-            "{floor_w} W floor still above the {} W cap",
-            config.gpu_max_w
-        );
-        // The budget bounds the controller derives are ordered as a result.
-        assert!(config.cpu_floor_w + floor_w <= config.cpu_max_w + config.gpu_max_w);
-        // The cap itself is never raised to make the floor fit.
-        assert_eq!(config.gpu_max_w, 35.0);
-    }
-
-    #[test]
-    fn an_affordable_gpu_clock_floor_and_a_missing_lut_are_left_alone() {
-        let base = Config {
-            gpu_floor_mhz: 1200, // 30 W, under the 40 W default cap
-            ..Config::default()
-        }
-        .sanitized();
-        assert_eq!(
-            base.clone().with_lut_floor_clamp(Some(&test_lut())),
-            base,
-            "an affordable floor must not move"
-        );
-        // No LUT (Config::load, or an uncalibrated machine): nothing to map
-        // with, so the config passes through untouched.
-        let high = Config {
-            gpu_floor_mhz: 2800,
-            gpu_max_w: 35.0,
-            ..Config::default()
-        }
-        .sanitized();
-        assert_eq!(high.clone().with_lut_floor_clamp(None), high);
-        assert_eq!(
-            high.clone()
-                .with_lut_floor_clamp(Some(&ClockWattsLut::new())),
-            high
-        );
     }
 
     #[test]
@@ -1018,7 +877,6 @@ mod tests {
         let logs = capture_logs(|| loaded = Some(Config::load(&path)));
         let config = loaded.expect("load ran");
         assert_eq!(config.gpu_max_mhz, 2000);
-        assert_eq!(config.gpu_max_w, Config::default().gpu_max_w);
         assert_eq!(
             logs.matches("config migration: ignoring legacy gpu_max_w").count(),
             1,

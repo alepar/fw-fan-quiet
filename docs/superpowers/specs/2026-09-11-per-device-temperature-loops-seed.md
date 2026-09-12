@@ -1,5 +1,7 @@
 # Seed: replace the budget split with per-device temperature loops
 
+> **Historical / superseded (2026-09-11).** This document describes the retired scalar controller. The current implemented design is [Per-device temperature loops, revision 4](../runs/2026-09-11-per-device-temperature-loops/2026-09-11-per-device-temperature-loops-design.md).
+
 Status: brainstorming seed for a `super-auto` run (2026-09-11). Base branch:
 `epic-fw-fanctrl-loop-6ma-integration` (tip `a8ae29b`). Not a spec — the run's design phase
 produces that.

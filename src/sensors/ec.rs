@@ -1,7 +1,7 @@
 //! `cros_ec` sensor replica: mirrors fw-fanctrl's own `--thermal` sensor
 //! rule (max over every positive reading) closely enough to compare against
 //! the socket's reported `temperature`, plus the boxcar moving average
-//! fw-fanctrl keeps internally (`EcAverage`), off-by-one included.
+//! fw-fanctrl keeps internally, off-by-one included.
 //!
 //! The checked-in idle fixture keeps the dGPU sensors unavailable, while the
 //! loaded fixtures exercise their positive readings. The raw reconciliation
@@ -146,7 +146,7 @@ impl EcLabel {
     }
 
     /// True only for the two known ambient/charger sensors.
-    #[allow(dead_code)] // consumed by the forthcoming T* source
+    #[cfg(test)]
     pub fn is_uncontrollable(&self) -> bool {
         self.group() == EcGroup::Uncontrollable
     }
@@ -309,8 +309,7 @@ impl EcReading {
     }
 }
 
-/// Shared implementation for the scalar compatibility average and the three
-/// per-stream histories in [`EcReplica`].
+/// Shared moving-average implementation for the three streams in [`EcReplica`].
 struct Boxcar {
     /// Retained non-zero samples, oldest first, capped at `interval`.
     buffer: std::collections::VecDeque<f64>,
@@ -325,7 +324,6 @@ struct Boxcar {
 /// what the socket reports.
 pub const MAX_INTERVAL: usize = 100;
 
-#[allow(dead_code)] // EcReplica is wired by fw-fanctrl-loop-eb9.7.
 impl Boxcar {
     fn new(interval: usize) -> Self {
         Self {
@@ -394,19 +392,16 @@ impl Boxcar {
         self.seeded = true;
     }
 
-    fn is_full(&self) -> bool {
-        self.buffer.len() >= self.interval
-    }
 }
 
-/// fw-fanctrl's scalar moving average, retained as a compatibility seam for
-/// the emulator and legacy controller while [`EcReplica`] owns the new
-/// per-group histories. [`Self::push`] returns the mean before appending the
-/// current positive sample.
+/// Test-plant replica of fw-fanctrl's scalar moving average. Production
+/// control uses [`EcReplica`]'s independent reconciliation and group streams.
+#[cfg(test)]
 pub struct EcAverage {
     boxcar: Boxcar,
 }
 
+#[cfg(test)]
 impl EcAverage {
     pub fn new(interval: usize) -> Self {
         Self {
@@ -418,30 +413,17 @@ impl EcAverage {
         self.boxcar.push(sample_c)
     }
 
-    pub fn set_interval(&mut self, n: usize) {
-        self.boxcar.set_interval(n);
-    }
+    pub fn set_interval(&mut self, interval: usize) { self.boxcar.set_interval(interval); }
+    pub fn reseed(&mut self, value: f64) { self.boxcar.reseed(value); }
+    pub fn is_seeded(&self) -> bool { self.boxcar.is_seeded() }
+    pub fn sample_count(&self) -> usize { self.boxcar.sample_count() }
 
-    pub fn reseed(&mut self, value: f64) {
-        self.boxcar.reseed(value);
-    }
-
-    #[allow(dead_code)] // legacy controller / emulator compatibility surface
-    pub fn is_seeded(&self) -> bool {
-        self.boxcar.is_seeded()
-    }
-
-    #[allow(dead_code)] // legacy controller / emulator compatibility surface
-    pub fn sample_count(&self) -> usize {
-        self.boxcar.sample_count()
-    }
 }
 
 /// The controller-facing EC replica: one raw fw-fanctrl reconciliation
 /// history plus independent CPU and GPU group histories. The socket has only
 /// a global moving average, so device groups are always seeded from their own
 /// instantaneous maxima, never from `movingAverageTemperature`.
-#[allow(dead_code)] // public controller seam; wiring arrives in eb9.7
 pub struct EcReplica {
     reconciliation: Boxcar,
     cpu: Boxcar,
@@ -467,7 +449,6 @@ pub struct EcReplica {
 /// the §2.6 slope/timestamp skip rule and compared the instantaneous max and
 /// (when available) moving averages.
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)] // public controller seam; wiring arrives in eb9.7
 pub enum ReconciliationObservation {
     /// The view was absent, stale, or unfair. It advances no state.
     Skipped,
@@ -499,7 +480,6 @@ pub struct ReconciliationOutcome {
     pub reseed_ma: Option<f64>,
 }
 
-#[allow(dead_code)] // public controller seam; wiring arrives in eb9.7
 impl EcReplica {
     pub fn new(interval: usize) -> Self {
         Self {
@@ -685,6 +665,7 @@ impl EcReplica {
         self.ever_scored && !self.ec_mismatch
     }
 
+    #[cfg(test)]
     pub fn ever_scored(&self) -> bool {
         self.ever_scored
     }

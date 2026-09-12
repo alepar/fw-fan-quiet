@@ -30,12 +30,12 @@ pub fn clamp_gpu_clock(mhz: u32) -> u32 {
 /// Utilisation floor (design §2.9): below this, load isn't heavy enough to
 /// trust the SM-clock read-back either way.
 const VERIFY_UTIL_FLOOR_PCT: f64 = 90.0;
-/// LUT-sweep pin-rule slack (design §2.9, reused from the calibration
+/// clock-verification pin-rule slack (design §2.9, reused from the calibration
 /// sweep): the pinned clock may run this many MHz above the locked ceiling
 /// before it counts as a violation.
 const VERIFY_CLOCK_SLACK_MHZ: u32 = 30;
 /// Consecutive violating samples before a `Mismatch` is scored (design
-/// §2.9's "over 3 samples" — matches the LUT sweep's own pin rule; a lone
+/// §2.9's "over 3 samples" — matches the clock-verification's own pin rule; a lone
 /// over-clock sample is normal boost-clock noise at the pin edge).
 const VERIFY_STRIKES: u32 = 3;
 
@@ -82,7 +82,7 @@ impl GpuLockVerifier {
         }
     }
 
-    /// Score one sample against the LUT-sweep pin rule. Below the
+    /// Score one sample against the clock-verification pin rule. Below the
     /// utilisation floor: `Unverifiable` (not a failure — there isn't
     /// enough load to trust the reading), and the streak resets (a lull
     /// tells us nothing about whether the NEXT loaded sample would still
@@ -387,6 +387,7 @@ pub mod test_support {
         }
 
         /// Arm the mid-call flag raise (see `raise_on_set`).
+        #[allow(dead_code)]
         pub fn raise_on_set(&mut self, flag: Arc<std::sync::atomic::AtomicBool>) {
             self.raise_on_set = Some(flag);
         }
@@ -399,12 +400,14 @@ pub mod test_support {
         /// Shared failure injector: set `*handle.lock() = n` to make the
         /// next `n` `set_max_clock` calls fail (like the real actuator, a
         /// failed call leaves `applied` untouched and is not recorded).
+        #[allow(dead_code)]
         pub fn failures(&self) -> Arc<Mutex<usize>> {
             Arc::clone(&self.fail_sets)
         }
 
         /// Shared counter of `resumed()` hook invocations (Task 29): tests
         /// assert the controller pokes the hook exactly once per resume.
+        #[allow(dead_code)]
         pub fn resumed_count(&self) -> Arc<Mutex<usize>> {
             Arc::clone(&self.resumed_count)
         }

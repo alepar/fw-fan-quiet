@@ -1047,7 +1047,7 @@ const FAN_NOISE_RPM: f64 = 90.0;
 /// °C; `ec_autofan_rpm_base` flat-clamps below 61 and above 73.
 ///
 /// **The 67–73 °C plateau (4748 RPM) is well sampled (n=102 at 71 °C) and
-/// load-bearing for the Mode-B-under-`active:false` no-authority result —
+/// load-bearing for the Held-under-`active:false` no-authority result —
 /// treat it as measured.** The 61–64 °C segment is thin (n=4 at 64 °C);
 /// its rising-branch shape and any hysteresis width are **not**
 /// established (§Facts limitation), so callers must not derive claims
@@ -1302,7 +1302,7 @@ mod fan_plant_tests {
 
 // --- ChainedPlant ------------------------------------------------------
 
-/// Simulated `print speed` cadence (design doc §2.1: every allocator tick,
+/// Simulated `print speed` cadence (design doc §2.1: every control tick,
 /// 5 s) — how often [`ChainedPlant::tick`] refreshes only `speed_pct` on
 /// the carried-forward view, leaving every other `All`-only field stale.
 const SPEED_POLL_EVERY_TICKS: u64 = 5;
@@ -1423,7 +1423,7 @@ impl Default for TickScript {
 }
 
 /// September full-load draw curve.  The final segment represents the power
-/// limit plateau rather than a calibration LUT.
+/// limit plateau rather than a calibration state.
 const GPU_FULL_LOAD_POINTS: [(f64, f64); 8] = [
     (1000.0, 45.0),
     (1197.0, 49.3),
@@ -1564,7 +1564,7 @@ impl ChainedPlant {
             self.emulator.revive_socket();
         }
 
-        // Demand model: the caps are what the controller asked for, the
+        // Load model: the caps are what the controller asked for, the
         // draw is what actually happened -- only the draw heats anything.
         let cpu_pkg_w = script
             .cpu_pkg_w_override

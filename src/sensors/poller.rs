@@ -1,5 +1,5 @@
 //! Two background pollers whose I/O must never reach the sampler's 1 Hz tick
-//! or the `print speed` staleness rule that governs Mode A (design doc §3.4):
+//! or the `print speed` staleness rule that governs Curve (design doc §3.4):
 //!
 //! - [`FanctrlPoller`] runs `print speed` every 5 s and `print all` every
 //!   30 s (never faster) against a [`FanctrlSource`] it **owns outright**,
@@ -17,7 +17,7 @@
 //!   `FanctrlPoller`. A SMART admin read can block for the kernel's 60 s
 //!   `admin_timeout`; on the sampler that would stall the control loop, and
 //!   on `FanctrlPoller` it would fake a socket outage through the 15 s
-//!   `print speed` staleness rule and drop the loop out of Mode A. It
+//!   `print speed` staleness rule and drop the loop out of Curve. It
 //!   publishes a stamped last-good value; [`read_nvme`] turns a missing or
 //!   stale one into `None`.
 //!

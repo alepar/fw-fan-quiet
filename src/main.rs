@@ -115,7 +115,7 @@ fn main() -> Result<()> {
     // one; the controller consumes the fan target, floors and fast limit
     // (and saves the fan target back on change).
     let config = config::Config::load(&args.config);
-    // Persisted calibration (model + LUT) seeds the controller; a fresh
+    // Persisted calibration (controller state) seeds the controller; a fresh
     // calibration run overwrites the file through the same path.
     let persisted = state::PersistedState::load(&args.state_file);
 
@@ -195,7 +195,7 @@ fn main() -> Result<()> {
     let led = led::spawn(
         config.leds.clone(),
         config.cpu_max_w,
-        config.gpu_max_w,
+        config::GPU_POWER_SCALE_W,
         led_sample_rx,
     );
     // fw-fanctrl socket poller + NVMe poller (design doc §3.4 / Task 14):

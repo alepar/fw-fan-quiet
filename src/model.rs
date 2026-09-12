@@ -19,7 +19,7 @@ const CPU_SEED_W: f64 = 40.0;
 const CPU_MIN_W: f64 = 10.0;
 // The CPU manual-step ceiling is no longer a const: it comes from the
 // controller's echoed status (`status.cpu_max_w`, the config operating max) so
-// the UI clamps to the same limit the allocator/actuator honor.
+// the UI clamps to the same limit the controller/actuator honor.
 /// ~14 driver bins per press.
 const GPU_STEP_MHZ: u32 = 105;
 /// Stock GPU max boost clock.

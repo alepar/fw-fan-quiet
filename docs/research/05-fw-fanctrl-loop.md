@@ -1,5 +1,7 @@
 # 05 — Closing the loop on fw-fanctrl instead of learning power→RPM
 
+> **Historical / superseded (2026-09-11).** Retained as research evidence. The implemented controller is specified by [Per-device temperature loops, revision 4](../superpowers/runs/2026-09-11-per-device-temperature-loops/2026-09-11-per-device-temperature-loops-design.md).
+
 Research notes, 2026-09-07. Input for a `super-design` run on the refactor. Everything below was
 verified on this machine (bazerame) unless marked *reported*. Motivation for the refactor is
 **robustness**, not loop tightness — the analysis concludes the loop should be *slow*.

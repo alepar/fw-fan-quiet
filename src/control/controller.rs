@@ -41,7 +41,7 @@ use crate::fanctrl::client::Freshness;
 use crate::fanctrl::curve::Curve;
 use crate::fanctrl::table::DutyRpmTable;
 use crate::sensors::ec::EcAverage;
-use crate::state::PersistedState;
+use crate::state::{PersistedState, TStarSeed, WarmStartEntry};
 use crate::telemetry::{self, Record, Telemetry};
 use crate::types::Sample;
 
@@ -734,6 +734,16 @@ pub struct Controller<R: Runner> {
     duty_rpm_table: DutyRpmTable,
     /// Warm-start budget seeds, keyed by `WarmStart::key` (design §2.4).
     warm_start: BTreeMap<String, f64>,
+    /// New paired device-loop warm starts. The old scalar budget loop cannot
+    /// consume these, so this compatibility branch preserves them verbatim
+    /// until the two-loop wiring takes ownership.
+    persisted_warm_start: BTreeMap<String, WarmStartEntry>,
+    /// New per-device fitted gains, retained across interim legacy saves.
+    persisted_cpu_gains: BTreeMap<String, crate::control::device_loop::Gains>,
+    /// New per-device fitted gains, retained across interim legacy saves.
+    persisted_gpu_gains: BTreeMap<String, crate::control::device_loop::Gains>,
+    /// New qualified Held-mode seed, retained without refreshing its age.
+    persisted_t_star_last_good: Option<TStarSeed>,
     /// User config (fan target, floors, fast limit). Mutated + saved when
     /// the fan target changes.
     config: Config,
@@ -885,6 +895,7 @@ impl<R: Runner> Controller<R> {
         let config = config
             .sanitized()
             .with_lut_floor_clamp(persisted.lut.as_ref());
+        let legacy_loop_gains = persisted.loop_gains.filter(LoopGains::is_valid);
         // Config owns the burst ceiling and the sustained operating max; the
         // actuator defaults only cover a hypothetical config-less construction.
         // set_sustained_max_mw re-clamps to the hardware ceiling as a backstop.
@@ -914,9 +925,16 @@ impl<R: Runner> Controller<R> {
             state_path,
             lut: persisted.lut,
             calibrated_at: persisted.calibrated_at,
-            loop_gains: persisted.loop_gains,
+            loop_gains: legacy_loop_gains,
             duty_rpm_table: persisted.duty_rpm_table,
-            warm_start: persisted.warm_start,
+            // Legacy allocation must never interpret a paired two-device
+            // record as a scalar budget. It starts cold while preserving the
+            // new records for the later DeviceLoop controller.
+            warm_start: BTreeMap::new(),
+            persisted_warm_start: persisted.warm_start,
+            persisted_cpu_gains: persisted.cpu_gains,
+            persisted_gpu_gains: persisted.gpu_gains,
+            persisted_t_star_last_good: persisted.t_star_last_good,
             config,
             config_path,
             auto: None,
@@ -1680,6 +1698,9 @@ impl<R: Runner> Controller<R> {
     /// once (§2.4: "the current `u` is written ... whenever the loop has
     /// been steady", i.e. the *latest* settled budget).
     fn observe_steady_window(&mut self, s: &Sample, guard_state: GuardState) {
+        // Compatibility defense for the scalar budget map while this staged
+        // controller still owns it. New paired records are never read here.
+        WarmStart::drop_non_finite(&mut self.warm_start);
         let auto_ref = self.auto.as_ref().expect("called only from on_auto_sample");
         let target_duty = auto_ref.target_duty;
         let rpm_smoothed = self.rpm_smoothed_now(auto_ref);
@@ -1730,7 +1751,20 @@ impl<R: Runner> Controller<R> {
         }
         let mean = values.iter().sum::<f64>() / values.len() as f64;
         let key = key.expect("qualifies requires Some");
-        WarmStart::record(&mut self.warm_start, key, u);
+        WarmStart::record(&mut self.warm_start, key.clone(), u);
+        if let Some(cpu_cap_w) = self.status.cpu_limit_w {
+            // The old loop has no paired GPU write when the dGPU is absent;
+            // its configured floor is the valid current cap in that case.
+            // This writes only a new paired record and never feeds it back
+            // into the scalar budget loop.
+            self.persisted_warm_start.insert(
+                key,
+                WarmStartEntry {
+                    cpu_cap_w,
+                    gpu_lock_mhz: self.status.gpu_max_mhz.unwrap_or(self.config.gpu_floor_mhz),
+                },
+            );
+        }
         self.duty_rpm_table.refine(target_duty, mean);
     }
 
@@ -2687,17 +2721,21 @@ impl<R: Runner> Controller<R> {
         effects
     }
 
-    /// Write the full calibration/loop state to the state file. Called from
-    /// [`exit_auto_and_persist`](Self::exit_auto_and_persist) only — never
-    /// per-update (no disk churn). Save failure is warned, not fatal: the
-    /// in-memory state still carries the session.
+    /// Write the full calibration/loop state to the state file. Called when
+    /// Auto exits through [`exit_auto_and_persist`](Self::exit_auto_and_persist)
+    /// and from the calibration completion paths, never per-update (no disk
+    /// churn). Save failure is warned, not fatal: the in-memory state still
+    /// carries the session.
     fn save_persisted_state(&self) {
         let state = PersistedState {
             lut: self.lut.clone(),
             calibrated_at: self.calibrated_at.clone(),
             loop_gains: self.loop_gains,
+            cpu_gains: self.persisted_cpu_gains.clone(),
+            gpu_gains: self.persisted_gpu_gains.clone(),
             duty_rpm_table: self.duty_rpm_table.clone(),
-            warm_start: self.warm_start.clone(),
+            warm_start: self.persisted_warm_start.clone(),
+            t_star_last_good: self.persisted_t_star_last_good.clone(),
         };
         if let Err(e) = state.save(&self.state_path) {
             tracing::warn!(
@@ -4124,7 +4162,7 @@ mod tests {
     }
 
     #[test]
-    fn full_calibration_persists_the_lut_with_no_gains_when_the_step_test_skips() {
+    fn full_calibration_keeps_lut_only_in_memory_until_the_deletion_sweep() {
         let runner = FakeRunner::new();
         let (dir, profile) = profile_fixture("calib-full");
         let state_path = dir.join("state.json");
@@ -4159,14 +4197,14 @@ mod tests {
             Some(Config::default().cpu_floor_w)
         );
 
-        // The state file exists, parses and carries the LUT (PersistedState
-        // no longer carries a model field, fw-fanctrl-loop-dsh); the
-        // controller kept it, so Auto mode can start right away.
+        // The state file still records the completion stamp, but the
+        // superseded LUT is deliberately not serialized by the staged v3
+        // schema. The interim controller retains it only in memory.
         // `loop_gains` stays None: `settle_sample()` carries no `fanctrl`
         // view, so `fanctrl_active` is always false and the step test's
         // settle gate never clears — it skips and keeps defaults.
         let saved = PersistedState::load(&state_path);
-        assert_eq!(saved.lut.expect("lut persisted").len(), 10);
+        assert_eq!(saved.lut, None);
         assert_eq!(saved.loop_gains, None);
         saved
             .calibrated_at
@@ -4200,7 +4238,10 @@ mod tests {
         let mut pre_refined_table = DutyRpmTable::default();
         pre_refined_table.refine(30, 2600.0); // a real, observable change from the seed
         let mut pre_warm_start = BTreeMap::new();
-        pre_warm_start.insert("quiet16:36:batt".to_string(), 77.0);
+        pre_warm_start.insert(
+            "quiet16:36:batt".to_string(),
+            WarmStartEntry { cpu_cap_w: 77.0, gpu_lock_mhz: 1800 },
+        );
         let persisted = PersistedState {
             duty_rpm_table: pre_refined_table.clone(),
             warm_start: pre_warm_start.clone(),
@@ -4230,7 +4271,7 @@ mod tests {
         );
         // The in-memory controller state agrees too (not just the file).
         assert_eq!(ctl.duty_rpm_table, pre_refined_table);
-        assert_eq!(ctl.warm_start, pre_warm_start);
+        assert!(ctl.warm_start.is_empty(), "legacy budget map starts cold");
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -6100,6 +6141,14 @@ mod tests {
             WarmStart::lookup(&ctl.warm_start, &key),
             Some(ctl.status().budget_w),
             "the steady window must record the CURRENT u under this tick's key"
+        );
+        assert_eq!(
+            ctl.persisted_warm_start.get(&key),
+            Some(&WarmStartEntry {
+                cpu_cap_w: ctl.status().cpu_limit_w.expect("steady window has a CPU cap"),
+                gpu_lock_mhz: ctl.status().gpu_max_mhz.unwrap_or(ctl.config.gpu_floor_mhz),
+            }),
+            "the interim controller must mirror a genuine steady window into the paired v3 map"
         );
         // refine: 0.8*3030.0 (seed) + 0.2*3000.0 (window mean) == 3024.0.
         assert_eq!(

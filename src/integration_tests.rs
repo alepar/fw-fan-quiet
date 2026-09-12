@@ -32,7 +32,6 @@ use crate::actuators::cpu::CpuActuator;
 use crate::actuators::guard::RestoreGuard;
 use crate::actuators::smu_module::SmuModule;
 use crate::config::Config;
-use crate::control::budget::LoopGains;
 use crate::control::controller::{Command, Controller, Effect, LoopMode, Mode, StatusFlag};
 use crate::control::lut::ClockWattsLut;
 use crate::state::PersistedState;
@@ -250,14 +249,11 @@ mod main_flow {
     ///   `TempLoop -> socket death -> RpmLoop -> recovery -> TempLoop`.
     /// - Run a calibration THROUGH THE CONTROLLER (LUT sweep + a real,
     ///   physically-simulated step test) to a landed fit.
-    /// - "Restart": build a brand-new `Controller` from `PersistedState`
-    ///   loaded off the same `state.json` path (exactly `main.rs`'s own
-    ///   startup sequence) and confirm the warm-start, table and gains
-    ///   reloaded — observable only through the public surface
-    ///   (`PersistedState::load` and the second controller's `status()`),
-    ///   since `Controller`'s fields are private to `control::controller`.
+    /// - "Restart": load the state through the public surface and confirm
+    ///   the staged migration retains paired/new fields while deliberately
+    ///   withholding legacy LUT/scalar-gain state from the old controller.
     #[test]
-    fn engage_walk_calibrate_and_restart_reloads_warm_start_table_and_gains() {
+    fn engage_walk_calibrate_and_restart_migrates_legacy_state_safely() {
         let (dir, profile_path, state_path) = fixture_paths("main-flow");
         let runner = FakeRunner::new();
         let fresh_lut_only = PersistedState { lut: Some(seed_lut()), ..PersistedState::default() };
@@ -346,25 +342,21 @@ mod main_flow {
         ctl.on_command(Command::SetAuto(false));
 
         let after_session = PersistedState::load(&state_path);
-        assert!(after_session.lut.is_some(), "the original LUT must still be present");
+        assert_eq!(after_session.lut, None, "legacy LUT must not be serialized");
+        assert_eq!(after_session.loop_gains, None, "legacy gains must not be serialized");
         assert!(
             after_session.calibrated_at.is_some(),
             "a landed calibration must stamp calibrated_at: {after_session:?}"
         );
-        let fitted_gains = after_session
-            .loop_gains
-            .expect("a landed calibration must persist fitted loop_gains");
-        assert_ne!(
-            fitted_gains,
-            LoopGains::default(),
-            "a genuinely fitted gain set is vanishingly unlikely to equal the IMC \
-             defaults bit-for-bit; this guards against a fit that silently fell back"
-        );
+        let saved_table = after_session.duty_rpm_table.clone();
+        let saved_warm_start = after_session.warm_start.clone();
 
         // ---- "Restart the daemon": a brand-new Controller from the same
         // state.json, exactly main.rs's own startup sequence ----
         let reloaded = PersistedState::load(&state_path);
         assert_eq!(reloaded, after_session, "load must reproduce exactly what was saved");
+        assert_eq!(reloaded.duty_rpm_table, saved_table);
+        assert_eq!(reloaded.warm_start, saved_warm_start);
         let runner2 = FakeRunner::new();
         let mut ctl2 =
             build_controller(&runner2, &profile_path, &state_path, reloaded, Config::default());
@@ -374,25 +366,15 @@ mod main_flow {
         // if the session above never refined it; either way, the exact
         // table that was saved is what round-tripped (already checked
         // above via `PersistedState::load` equality) -- this asserts the
-        // SECOND controller's entry behavior actually reflects it: no
-        // NOT CALIBRATED (lut reload) and no fresh-floor budget seed if a
-        // warm-start entry exists for quiet16's snapped duty (gains/table
-        // reload feeding the same key the first session recorded into).
+        // The old scalar controller cannot use the migrated paired map or
+        // legacy LUT, so it safely remains out of Auto and reports its
+        // informational calibration flag until the per-device wiring lands.
         ctl2.on_command(Command::SetAuto(true));
-        assert_eq!(ctl2.status().mode, Mode::Auto);
+        assert_eq!(ctl2.status().mode, Mode::Monitor);
         assert!(
-            !ctl2.status().flags.contains(&StatusFlag::NotCalibrated),
-            "the reloaded LUT must satisfy Auto entry on the restarted controller"
+            ctl2.status().flags.contains(&StatusFlag::NotCalibrated),
+            "a restart without a legacy LUT must safely report NOT CALIBRATED"
         );
-        drive_ticks(&mut plant, &mut ctl2, cpu_floor_w, 1, |_, _| {});
-        if !after_session.warm_start.is_empty() {
-            assert!(
-                ctl2.status().budget_w > 0.0,
-                "a non-empty reloaded warm_start must seed u above the bare floor sum \
-                 on the very first tick: {:?}",
-                ctl2.status()
-            );
-        }
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -435,6 +417,7 @@ mod wiring_sweep {
             nvme_hot_c,
             leds,           // main.rs: led::spawn(config.leds.clone(), ...)
             fanctrl_socket, // main.rs: UnixFanctrlClient::new(config.fanctrl_socket.clone())
+            ..
         } = Config::default();
         assert!(fan_target_rpm > 0.0);
         assert!(cpu_floor_w >= 0.0);

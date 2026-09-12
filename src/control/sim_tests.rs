@@ -39,15 +39,13 @@
 //! allowed to see" that this harness's architecture can observe. See the
 //! task report for the full reasoning.
 //!
-//! **The steady-window global assertion.** `warm_start`/`duty_rpm_table` are
-//! private fields of `Controller` in a different module (`control::sim_tests`
-//! is not a descendant module of `control::controller`), so they cannot be
-//! read directly from here. [`assert_steady_window_recorded`] instead forces
-//! a real state save (`Command::SetAuto(false)`, which funnels through
-//! `exit_auto_and_persist` -> `save_persisted_state`) to a real temp file and
-//! reads it back with the public `PersistedState::load`, asserting the
-//! saved `warm_start` map is non-empty -- an observable proxy for "at least
-//! one steady window was detected", through the same public state-file
+//! **The steady-window global assertion.** The paired persisted
+//! `warm_start` map is private controller state, so
+//! [`assert_steady_window_recorded`] forces a real state save
+//! (`Command::SetAuto(false)`, which funnels through `exit_auto_and_persist`
+//! -> `save_persisted_state`) to a real temp file and reads it back with the
+//! public `PersistedState::load`. Its non-empty paired map is the observable
+//! proof that at least one steady window was detected, through the state-file
 //! contract a real session's UI/restart relies on.
 
 use std::collections::BTreeMap;
@@ -408,6 +406,7 @@ fn build_controller<'r>(
         loop_gains: gains,
         duty_rpm_table: Default::default(),
         warm_start: BTreeMap::new(),
+        ..PersistedState::default()
     };
     let state_path = temp_state_path(tag);
     let ctl = Controller::new(
@@ -622,8 +621,8 @@ fn assert_ec_ma_tracks_emulator(trace: &Trace, tol_c: f64) {
 /// "At least one steady window is detected per converged run" -- see the
 /// module doc's scope note: forces a real state save (drops Auto) and reads
 /// the public `PersistedState` back, since `warm_start` is a private
-/// `Controller` field this module cannot read directly. Call this LAST (it
-/// exits Auto).
+/// paired `PersistedState::warm_start` map that this module observes only
+/// through state persistence. Call this LAST (it exits Auto).
 fn assert_steady_window_recorded<R: crate::actuators::cmd::Runner>(
     ctl: &mut Controller<R>,
     state_path: &std::path::Path,

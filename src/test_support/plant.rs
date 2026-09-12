@@ -534,11 +534,15 @@ impl Default for CpuPlantParams {
 
 /// GPU raw EC-group parameters. `k_c_per_mhz` is the controller-facing
 /// small-signal gain; its default maps through the physical 0.4 C/W path.
+/// `robustness_heat_pivot_w` is a test-only affine heat adapter: it keeps
+/// the externally visible operating point fixed while varying only the
+/// local incremental gain. It never changes reported draw or clock.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GpuPlantParams {
     pub tau_s: f64,
     pub k_c_per_mhz: f64,
     pub theta_eff_s: f64,
+    pub robustness_heat_pivot_w: Option<f64>,
 }
 
 impl GpuPlantParams {
@@ -547,8 +551,16 @@ impl GpuPlantParams {
             tau_s: 15.0,
             k_c_per_mhz: 0.02,
             theta_eff_s: 90.0,
+            robustness_heat_pivot_w: None,
         }
     }
+}
+
+fn gpu_heat_c(draw_w: f64, params: GpuPlantParams) -> f64 {
+    params.robustness_heat_pivot_w.map_or_else(
+        || draw_w * 0.4 * (params.k_c_per_mhz / 0.02),
+        |pivot_w| 0.4 * pivot_w + 20.0 * params.k_c_per_mhz * (draw_w - pivot_w),
+    )
 }
 
 impl Default for GpuPlantParams {
@@ -819,7 +831,7 @@ impl ThermalPlant {
             let gpu_cross_c = 0.1 * (cpu_before_c - self.ambient_base_c);
             // k=.02 C/MHz corresponds to .4 C/W at the measured 0.05 W/MHz
             // slope. Keeping 0.4 explicit makes the heat path auditable.
-            let gpu_heat_c = gpu_input_w * 0.4 * (self.gpu_params.k_c_per_mhz / 0.02);
+            let gpu_heat_c = gpu_heat_c(gpu_input_w, self.gpu_params);
             let gpu_target = self.ambient_base_c + gpu_heat_c + gpu_cross_c;
             let gpu_fraction = 1.0 - (-slice_s / self.gpu_params.tau_s.max(f64::EPSILON)).exp();
             let next_gpu_c = gpu_before_c + (gpu_target - gpu_before_c) * gpu_fraction;
@@ -911,6 +923,39 @@ impl Drop for ThermalPlant {
 #[cfg(test)]
 mod thermal_plant_tests {
     use super::*;
+
+    #[test]
+    fn default_gpu_heat_path_retains_the_original_formula() {
+        let params = GpuPlantParams::nominal();
+        for draw_w in [0.0, 45.0, 99.4, 100.0] {
+            assert_eq!(
+                gpu_heat_c(draw_w, params),
+                draw_w * 0.4 * (params.k_c_per_mhz / 0.02),
+                "default GPU heat changed at {draw_w}W"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_robustness_pivot_has_common_heat_and_the_declared_local_slope() {
+        const PIVOT_W: f64 = 99.4;
+        for k_c_per_mhz in [0.01, 0.02, 0.03] {
+            let params = GpuPlantParams {
+                k_c_per_mhz,
+                robustness_heat_pivot_w: Some(PIVOT_W),
+                ..GpuPlantParams::nominal()
+            };
+            let pivot_heat_c = gpu_heat_c(PIVOT_W, params);
+            assert_eq!(pivot_heat_c, 0.4 * PIVOT_W);
+            for delta_w in [-10.0, 10.0] {
+                let slope = (gpu_heat_c(PIVOT_W + delta_w, params) - pivot_heat_c) / delta_w;
+                assert!(
+                    (slope - 20.0 * k_c_per_mhz).abs() < f64::EPSILON,
+                    "K={k_c_per_mhz} local slope at P0{delta_w:+}W was {slope} C/W"
+                );
+            }
+        }
+    }
 
     // --- Step 6: FOPDT dead time + first-order lag -------------------------
 
@@ -2013,6 +2058,24 @@ mod per_device_plant_tests {
     }
 
     #[test]
+    fn gpu_robustness_heat_pivot_keeps_reported_draw_physical() {
+        let mut p = plant();
+        p.set_gpu_plant_params(GpuPlantParams {
+            k_c_per_mhz: 0.01,
+            robustness_heat_pivot_w: Some(99.4),
+            ..GpuPlantParams::nominal()
+        });
+        let sample = p.tick(&TickScript {
+            gpu_lock_mhz: Some(2143.0),
+            gpu_load_level: Some(0.5),
+            gpu_temp_c: Some(42.0),
+            ..Default::default()
+        });
+        assert_eq!(sample.gpu_w, 0.5 * gpu_full_load_power_w(2143.0));
+        assert_eq!(sample.gpu_sm_mhz, 2143.0);
+    }
+
+    #[test]
     fn september_power_curve_preserves_each_knot_and_cpu_bursts_are_not_sustained_draw() {
         for (clock, expected_w) in GPU_FULL_LOAD_POINTS {
             assert!(
@@ -2064,6 +2127,7 @@ mod per_device_plant_tests {
                         tau_s,
                         k_c_per_mhz,
                         theta_eff_s,
+                        robustness_heat_pivot_w: None,
                     };
                     p.set_gpu_plant_params(params);
                     assert_eq!(p.gpu_plant_params(), params);
@@ -2370,6 +2434,7 @@ mod per_device_plant_tests {
                         tau_s,
                         k_c_per_mhz,
                         theta_eff_s,
+                        robustness_heat_pivot_w: None,
                     };
                     let mut p = ThermalPlant::new(42.0);
                     p.set_gpu_plant_params(params);

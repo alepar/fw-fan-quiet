@@ -486,20 +486,20 @@ impl<U: DeviceUnit> DeviceLoop<U> {
             self.control_entry_pending && input.mode == ThermalMode::Regulate && error < 0.0;
         if handover || initial_hot_entry {
             let cap = if initial_hot_entry {
-                self.last_applied
-                    .map(|cap| cap.clamp(self.floor, self.max))
-                    .unwrap_or_else(|| {
-                        if input.shadow_enabled {
-                            input
-                                .draw
-                                .map(|draw| {
-                                    shadow_target(draw, input.shadow_headroom, self.floor, self.max)
-                                })
-                                .unwrap_or(self.max)
-                        } else {
-                            self.max
-                        }
-                    })
+                if let Some(cap) = self.last_applied {
+                    cap.clamp(self.floor, self.max)
+                } else if self.requested.is_some() {
+                    self.shadow.clamp(self.floor, self.max)
+                } else if input.shadow_enabled {
+                    input
+                        .draw
+                        .map(|draw| {
+                            shadow_target(draw, input.shadow_headroom, self.floor, self.max)
+                        })
+                        .unwrap_or(self.max)
+                } else {
+                    self.max
+                }
             } else {
                 self.last_applied
                     .or(self.requested)
@@ -1188,6 +1188,23 @@ mod tests {
         close(entered.thermal, 50.0);
         close(entered.shadow, 50.0);
         close(entered.cap, 50.0);
+    }
+
+    #[test]
+    fn initial_hot_entry_without_an_applied_cap_uses_the_seeded_shadow() {
+        let mut loop_ = DeviceLoop::<W>::new(Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        });
+        loop_.seed_candidates(90.0, 50.0, None, 10.0);
+        let mut hot = input(Some(80.0), 1.0);
+        hot.draw = Some(80.0);
+        hot.shadow_enabled = true;
+
+        let entered = loop_.tick(hot);
+        close(entered.thermal, 50.0);
+        close(entered.cap, 50.0);
+        close(loop_.requested().expect("entry request"), 50.0);
     }
 
     #[test]

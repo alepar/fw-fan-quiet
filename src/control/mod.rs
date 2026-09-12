@@ -6,6 +6,9 @@
 pub mod allocator;
 pub mod budget;
 pub mod controller;
+// Staged core API: controller/shadow consumers land in the following beads.
+#[allow(dead_code)]
+pub mod device_loop;
 pub mod gpu_pid;
 pub mod guards;
 pub mod lut;

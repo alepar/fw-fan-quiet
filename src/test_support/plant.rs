@@ -1623,9 +1623,15 @@ impl ChainedPlant {
                 },
             )
         };
-        let current_c = ec_reading
-            .as_ref()
-            .map_or(0.0, |reading| f64::from(reading.max_c));
+        // fw-fanctrl consumes every finite positive label.  Keep its
+        // emulator and EC-autofan physics on that raw stream so an
+        // implausible control label (for example 150 C) reconciles exactly
+        // while remaining excluded from device-group control.
+        let current_c = ec_reading.as_ref().map_or(0.0, |reading| {
+            reading
+                .reconciliation_max_c
+                .map_or(f64::from(reading.max_c), f64::from)
+        });
         let sensor = if script.sensor_read_failed {
             SensorRead::Failed
         } else {
@@ -1727,6 +1733,31 @@ mod chained_plant_tests {
             fan_seed,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn raw_positive_fault_drives_emulator_reconciliation_but_not_control_groups() {
+        let mut plant = quiet16_plant(40.0, 0x150);
+        let mut last = None;
+        for _ in 0..30 {
+            last = Some(plant.tick(&TickScript {
+                gpu_powered: Some(true),
+                raw_only_c: Some(150.0),
+                ..TickScript::default()
+            }));
+        }
+        let sample = last.expect("sample");
+        let ec = sample.ec.expect("EC reading");
+        assert!(
+            ec.max_c < 150,
+            "150C raw label must not enter the plausible control max"
+        );
+        assert_eq!(ec.reconciliation_max_c, Some(150));
+        assert_eq!(
+            sample.fanctrl.expect("30s full view").ma_temperature,
+            150.0,
+            "fw-fanctrl emulator must average the same positive-only raw stream as reconciliation"
+        );
     }
 
     // --- Step 5: fanctrl_view_changed set exactly once per new print-all --

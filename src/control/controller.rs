@@ -605,6 +605,8 @@ struct AutoState {
     // temporarily during the staged replacement so non-Auto lifecycle and
     // calibration callers retain their established safety behavior.
     replica: EcReplica,
+    #[cfg(test)]
+    reconciliation_scored_count: u64,
     tstar: TStarSource,
     cpu_loop: DeviceLoop<W>,
     gpu_loop: DeviceLoop<Mhz>,
@@ -749,6 +751,8 @@ impl AutoState {
             .unwrap_or_else(|| default_gains::<Mhz>(DEFAULT_MA_INTERVAL as u32));
         Self {
             replica: EcReplica::new(DEFAULT_MA_INTERVAL),
+            #[cfg(test)]
+            reconciliation_scored_count: 0,
             tstar: TStarSource::new(EntrySeed::Fallback(config.cpu_hot_c - 2.0)),
             cpu_loop: DeviceLoop::new(cpu_gains),
             gpu_loop: DeviceLoop::new(gpu_gains),
@@ -826,6 +830,26 @@ impl AutoState {
             refinement_key: None,
         }
     }
+}
+
+/// Test-only snapshot of internal safety state that is deliberately absent
+/// from runtime status and telemetry.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ControllerDiagnostics {
+    pub(crate) cpu_guard_max: f64,
+    pub(crate) gpu_guard_max: f64,
+    pub(crate) cpu_actuator: ActuatorState,
+    pub(crate) gpu_actuator: ActuatorState,
+    pub(crate) cpu_mismatch_strikes: u8,
+    pub(crate) gpu_mismatch_strikes: u8,
+    pub(crate) cpu_released: bool,
+    pub(crate) gpu_released: bool,
+    pub(crate) reconciliation_ma_c: Option<f64>,
+    pub(crate) reconciliation_ready: bool,
+    pub(crate) reconciliation_ever_scored: bool,
+    pub(crate) reconciliation_mismatch: bool,
+    pub(crate) reconciliation_scored_count: u64,
 }
 
 /// Testable controller core. Owns the actuators through `RestoreGuard`, so
@@ -1133,6 +1157,34 @@ impl<R: Runner> Controller<R> {
     /// Current status (the shell clones it into `Event::Status`).
     pub fn status(&self) -> &ControlStatus {
         &self.status
+    }
+
+    /// Exposes safety internals to closed-loop acceptance tests without
+    /// changing runtime status or serialized telemetry.
+    #[cfg(test)]
+    pub(crate) fn test_diagnostics(&mut self) -> Option<ControllerDiagnostics> {
+        let auto = self.auto.as_mut()?;
+        Some(ControllerDiagnostics {
+            cpu_guard_max: auto.cpu_ratchet.step(false, false, None),
+            gpu_guard_max: auto.gpu_ratchet.step(false, false, None),
+            cpu_actuator: auto.cpu_actuator_state,
+            gpu_actuator: auto.gpu_actuator_state,
+            cpu_mismatch_strikes: auto.cpu_verdict.mismatch_streak,
+            gpu_mismatch_strikes: auto.gpu_verdict.mismatch_streak,
+            cpu_released: auto.cpu_verdict.released,
+            gpu_released: auto.gpu_verdict.released,
+            reconciliation_ma_c: auto.replica.reconciliation_ma(),
+            reconciliation_ready: auto.replica.reconciliation_ready(),
+            reconciliation_ever_scored: auto.replica.ever_scored(),
+            reconciliation_mismatch: auto.replica.ec_mismatch(),
+            reconciliation_scored_count: auto.reconciliation_scored_count,
+        })
+    }
+
+    /// Mirrors the shell's Decision flag composition for acceptance tests.
+    #[cfg(test)]
+    pub(crate) fn test_emitted_telemetry_flags(&self) -> Vec<crate::types::TelemetryFlag> {
+        decision_telemetry_flags(&self.status)
     }
 
     /// Restore stock hardware state (idempotent; delegates to the guard).
@@ -2064,6 +2116,10 @@ impl<R: Runner> Controller<R> {
                     .replica
                     .score_reconciliation(ReconciliationObservation::Skipped),
             };
+            #[cfg(test)]
+            if reconciliation.scored {
+                auto.reconciliation_scored_count += 1;
+            }
             if let Some(reseed) = reconciliation.reseed_ma {
                 auto.replica.reset_after_mismatch_clear(
                     Some(reseed),
@@ -4320,6 +4376,17 @@ pub fn spawn<R: Runner + Send + 'static>(
         .expect("failed to spawn controller thread")
 }
 
+fn decision_telemetry_flags(status: &ControlStatus) -> Vec<TelemetryFlag> {
+    let mut flags = status.telemetry_flags.clone();
+    flags.extend(
+        status
+            .flags
+            .iter()
+            .map(|flag| TelemetryFlag::legacy(flag.as_str())),
+    );
+    flags
+}
+
 /// Map one effect batch to the outside world: status changes go to the UI,
 /// and any batch that changed status or reasserted becomes one telemetry
 /// `Decision` record. Returns true if the shell must quit.
@@ -4378,13 +4445,7 @@ fn apply_effects<R: Runner>(
     }
     // One "main" Decision per batch (whatever claimed the cause first).
     let decision = |cause: &'static str, alloc: Option<AutoAllocation>| {
-        let mut flags = status.telemetry_flags.clone();
-        flags.extend(
-            status
-                .flags
-                .iter()
-                .map(|flag| TelemetryFlag::legacy(flag.as_str())),
-        );
+        let flags = decision_telemetry_flags(status);
         Record::Decision {
             t_mono,
             mode: status.mode.as_str().to_string(),
@@ -8859,4 +8920,43 @@ mod tests {
         assert!(ctl.auto.as_ref().unwrap().gpu_commands.is_empty());
     }
 
+    #[test]
+    fn test_diagnostics_reports_live_guard_and_verdict_state_without_status_changes() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _) = auto_controller_no_profile(&runner);
+        assert!(ctl.test_diagnostics().is_none());
+        ctl.on_command(Command::SetAuto(true));
+        let before = ctl.status().clone();
+        let diagnostics = ctl.test_diagnostics().expect("Auto diagnostics");
+        assert_eq!(diagnostics.cpu_guard_max, ctl.config.cpu_max_w);
+        assert_eq!(diagnostics.gpu_guard_max, f64::from(ctl.config.gpu_max_mhz));
+        assert_eq!(diagnostics.cpu_actuator, ActuatorState::Unverifiable);
+        assert_eq!(diagnostics.gpu_actuator, ActuatorState::Unverifiable);
+        assert_eq!(diagnostics.cpu_mismatch_strikes, 0);
+        assert_eq!(diagnostics.gpu_mismatch_strikes, 0);
+        assert!(!diagnostics.cpu_released && !diagnostics.gpu_released);
+        assert_eq!(diagnostics.reconciliation_ma_c, None);
+        assert!(!diagnostics.reconciliation_ready);
+        assert!(!diagnostics.reconciliation_ever_scored);
+        assert!(!diagnostics.reconciliation_mismatch);
+        assert_eq!(diagnostics.reconciliation_scored_count, 0);
+        assert_eq!(ctl.status(), &before, "diagnostic read changed public status");
+    }
+
+    #[test]
+    fn test_emitted_telemetry_flags_matches_decision_composition_without_mutation() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _) = auto_controller_no_profile(&runner);
+        ctl.status.telemetry_flags = vec![crate::types::TelemetryFlag::SteepCurve { active: true }];
+        ctl.status.flags = vec![StatusFlag::NotCalibrated];
+        let before = ctl.status().clone();
+        assert_eq!(
+            ctl.test_emitted_telemetry_flags(),
+            vec![
+                crate::types::TelemetryFlag::SteepCurve { active: true },
+                crate::types::TelemetryFlag::legacy(StatusFlag::NotCalibrated.as_str()),
+            ]
+        );
+        assert_eq!(ctl.status(), &before, "flag composition changed public status");
+    }
 }

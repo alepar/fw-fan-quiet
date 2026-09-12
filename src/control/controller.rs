@@ -43,7 +43,7 @@ use crate::fanctrl::table::DutyRpmTable;
 use crate::sensors::ec::EcAverage;
 use crate::state::{PersistedState, TStarSeed, WarmStartEntry};
 use crate::telemetry::{self, Record, Telemetry};
-use crate::types::Sample;
+use crate::types::{Sample, TelemetryFlag};
 
 /// UI-facing calibration progress, re-exported so the view/model layers name
 /// it without reaching into `calib::`.
@@ -366,6 +366,16 @@ pub struct ControlStatus {
     /// The single power budget the (not-yet-wired) integrator is holding;
     /// 0.0 until the arbiter/budget machinery (a later task) drives it.
     pub budget_w: f64,
+    /// Shared T* source state for telemetry and the TUI. `None` until the
+    /// per-device controller wiring supplies a live source output.
+    pub tstar_state: Option<crate::types::TelemetryTStarState>,
+    /// Last CPU DeviceLoop decision with its selected gains source.
+    pub cpu: Option<crate::types::TelemetryDevice>,
+    /// Last GPU DeviceLoop decision with its selected gains source.
+    pub gpu: Option<crate::types::TelemetryDevice>,
+    /// Labelled schema-v3 diagnostics emitted alongside legacy status flags.
+    /// The controller wiring fills this from T*/EC/device-loop diagnostics.
+    pub telemetry_flags: Vec<crate::types::TelemetryFlag>,
 }
 
 /// Hand-written (not derived) so `fan_target_rpm` and the floors start at
@@ -393,6 +403,10 @@ impl Default for ControlStatus {
             snapped_rpm: 0.0,
             strategy: None,
             budget_w: 0.0,
+            tstar_state: None,
+            cpu: None,
+            gpu: None,
+            telemetry_flags: Vec::new(),
         }
     }
 }
@@ -2996,12 +3010,15 @@ fn apply_effects<R: Runner>(
     ui_tx: &Sender<Event>,
     telemetry: &Mutex<Option<Telemetry>>,
 ) -> bool {
+    type AutoAllocation = (f64, f64, f64, f64, Option<&'static str>);
+
     let mut quit = false;
     let mut status_changed = false;
     let mut cause: Option<&'static str> = None;
-    // (demand_cpu, demand_gpu, alloc_cpu_w, alloc_gpu_w) from an Auto-mode
-    // allocator step in this batch; the WHY behind an "auto:allocate" record.
-    let mut auto_alloc: Option<(f64, f64, f64, f64)> = None;
+    // (demand_cpu, demand_gpu, alloc_cpu_w, alloc_gpu_w, freeze) from an
+    // Auto-mode allocator step in this batch; the WHY behind an
+    // "auto:allocate" record.
+    let mut auto_alloc: Option<AutoAllocation> = None;
     // Status-flag transitions in this batch (watchdog or otherwise): each
     // becomes a standalone Record::Flag line (in addition to the Decision
     // carrying the full list).
@@ -3023,9 +3040,10 @@ fn apply_effects<R: Runner>(
                 demand_gpu,
                 cpu_w,
                 gpu_w,
+                freeze,
                 ..
             } => {
-                auto_alloc = Some((*demand_cpu, *demand_gpu, *cpu_w, *gpu_w));
+                auto_alloc = Some((*demand_cpu, *demand_gpu, *cpu_w, *gpu_w, *freeze));
                 cause.get_or_insert("auto:allocate");
             }
             Effect::Flagged { flag, active } => flagged.push((flag, *active)),
@@ -3039,27 +3057,35 @@ fn apply_effects<R: Runner>(
         let _ = ui_tx.send(Event::Status(status.clone()));
     }
     // One "main" Decision per batch (whatever claimed the cause first).
-    let decision = |cause: &'static str, alloc: Option<(f64, f64, f64, f64)>| Record::Decision {
-        t_mono,
-        mode: status.mode.as_str().to_string(),
-        cpu_limit_w: status.cpu_limit_w,
-        gpu_max_mhz: status.gpu_max_mhz,
-        fan_target_rpm: status.fan_target_rpm,
-        cause: cause.to_string(),
-        flags: status
-            .flags
-            .iter()
-            .map(|f| f.as_str().to_string())
-            .collect(),
-        demand_cpu: alloc.map(|a| a.0),
-        demand_gpu: alloc.map(|a| a.1),
-        alloc_cpu_w: alloc.map(|a| a.2),
-        alloc_gpu_w: alloc.map(|a| a.3),
-        // The allocator's gpu_w IS the PI target (set_target_w).
-        pi_target_w: alloc.map(|a| a.3),
-        t_star: status.t_star_c,
-        budget_w: status.budget_w,
-        freeze: None,
+    let decision = |cause: &'static str, alloc: Option<AutoAllocation>| {
+        let mut flags = status.telemetry_flags.clone();
+        flags.extend(
+            status
+                .flags
+                .iter()
+                .map(|flag| TelemetryFlag::legacy(flag.as_str())),
+        );
+        Record::Decision {
+            t_mono,
+            mode: status.mode.as_str().to_string(),
+            cpu_limit_w: status.cpu_limit_w,
+            gpu_max_mhz: status.gpu_max_mhz,
+            fan_target_rpm: status.fan_target_rpm,
+            cause: cause.to_string(),
+            flags,
+            demand_cpu: alloc.map(|a| a.0),
+            demand_gpu: alloc.map(|a| a.1),
+            alloc_cpu_w: alloc.map(|a| a.2),
+            alloc_gpu_w: alloc.map(|a| a.3),
+            // The allocator's gpu_w IS the PI target (set_target_w).
+            pi_target_w: alloc.map(|a| a.3),
+            t_star: status.t_star_c,
+            tstar_state: status.tstar_state,
+            cpu: status.cpu.clone(),
+            gpu: status.gpu.clone(),
+            budget_w: status.budget_w,
+            freeze: alloc.and_then(|a| a.4.map(str::to_string)),
+        }
     };
     if cause.is_some() || !flagged.is_empty() {
         if let Some(t) = telemetry::lock(telemetry).as_mut() {
@@ -3158,6 +3184,19 @@ mod tests {
             snapped_rpm: 3200.0,
             strategy: Some("balanced".to_string()),
             budget_w: 45.0,
+            tstar_state: Some(crate::types::TelemetryTStarState::Held),
+            cpu: Some(crate::types::TelemetryDevice {
+                group_c: Some(61.0),
+                err_c: Some(1.5),
+                thermal: 32.0,
+                shadow: 30.0,
+                cap: 30.0,
+                selected: crate::types::TelemetrySelected::Shadow,
+                hold: crate::types::TelemetryHold::Shadow,
+                gains_source: crate::types::GainsSource::Config,
+            }),
+            gpu: None,
+            telemetry_flags: vec![crate::types::TelemetryFlag::SteepCurve { active: true }],
             ..ControlStatus::default()
         };
         assert_eq!(cs.loop_mode, LoopMode::TempLoop);
@@ -3168,6 +3207,13 @@ mod tests {
         assert_eq!(cs.snapped_rpm, 3200.0);
         assert_eq!(cs.strategy.as_deref(), Some("balanced"));
         assert_eq!(cs.budget_w, 45.0);
+        assert_eq!(cs.tstar_state, Some(crate::types::TelemetryTStarState::Held));
+        assert_eq!(cs.cpu.as_ref().and_then(|cpu| cpu.group_c), Some(61.0));
+        assert_eq!(cs.gpu, None);
+        assert_eq!(
+            cs.telemetry_flags,
+            vec![crate::types::TelemetryFlag::SteepCurve { active: true }]
+        );
     }
 
     #[test]
@@ -3183,6 +3229,10 @@ mod tests {
         assert_eq!(cs.snapped_rpm, 0.0);
         assert_eq!(cs.strategy, None);
         assert_eq!(cs.budget_w, 0.0);
+        assert_eq!(cs.tstar_state, None);
+        assert_eq!(cs.cpu, None);
+        assert_eq!(cs.gpu, None);
+        assert!(cs.telemetry_flags.is_empty());
     }
 
     // --- Task 4: Effect::AutoAllocated's new field set ---
@@ -3708,6 +3758,69 @@ mod tests {
         assert_eq!(flags[1]["flag"], "limit_not_sticking");
         assert_eq!(flags[1]["active"], false);
         assert_eq!(flags[1]["t_mono"], 4.0);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn production_decision_emits_status_v3_fields_and_auto_freeze() {
+        let runner = FakeRunner::new();
+        let dir = std::env::temp_dir().join(format!(
+            "bazerame-controller-test-{}-v3-decision",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let mut ctl = controller_no_profile(&runner);
+        ctl.status.tstar_state = Some(crate::types::TelemetryTStarState::Held);
+        ctl.status.cpu = Some(crate::types::TelemetryDevice {
+            group_c: Some(68.0),
+            err_c: Some(2.0),
+            thermal: 31.0,
+            shadow: 30.0,
+            cap: 30.0,
+            selected: crate::types::TelemetrySelected::Shadow,
+            hold: crate::types::TelemetryHold::Shadow,
+            gains_source: crate::types::GainsSource::Fitted,
+        });
+        ctl.status.telemetry_flags = vec![crate::types::TelemetryFlag::SteepCurve {
+            active: true,
+        }];
+        let (ui_tx, _ui_rx) = crossbeam_channel::unbounded();
+        let telemetry = Arc::new(Mutex::new(Some(Telemetry::open(&dir).unwrap())));
+
+        apply_effects(
+            &[Effect::AutoAllocated {
+                demand_cpu: 20.0,
+                demand_gpu: 30.0,
+                cpu_w: 18.0,
+                gpu_w: 28.0,
+                mode: LoopMode::TempLoop,
+                error: 2.0,
+                budget_w: 46.0,
+                freeze: Some("actuator_mismatch"),
+            }],
+            &ctl,
+            5.0,
+            &ui_tx,
+            &telemetry,
+        );
+        let path = {
+            let mut guard = telemetry::lock(&telemetry);
+            let t = guard.as_mut().unwrap();
+            t.flush();
+            t.path().to_path_buf()
+        };
+        let decision: serde_json::Value = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .find(|line: &serde_json::Value| line["kind"] == "decision")
+            .expect("AutoAllocated must emit one production decision");
+        assert_eq!(decision["freeze"], "actuator_mismatch");
+        assert_eq!(decision["tstar_state"], "held");
+        assert_eq!(decision["cpu"]["group_c"], 68.0);
+        assert_eq!(decision["cpu"]["gains_source"], "fitted");
+        assert_eq!(decision["flags"][0]["name"], "steep_curve");
 
         fs::remove_dir_all(&dir).unwrap();
     }

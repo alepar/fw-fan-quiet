@@ -547,6 +547,8 @@ mod wiring_sweep {
                 sample: _,     // the flattened Sample itself (telemetry.rs #[serde(flatten)])
                 ec_max,        // sample.ec.max_c
                 ec_argmax,     // sample.ec.argmax.as_str()
+                cpu_group_c,   // sample.ec.cpu_group_c
+                gpu_group_c,   // sample.ec.gpu_group_c
                 ec_ma,         // caller-supplied (the controller's live EcAverage; Sample never carries it)
                 nvme_c,        // sample.nvme_temp_c
                 fanctrl_speed, // sample.fanctrl.speed_pct
@@ -556,6 +558,8 @@ mod wiring_sweep {
                 assert_eq!(ec_ma, Some(42.0));
                 assert_eq!(ec_max, None); // Sample::default() carries no ec reading
                 assert_eq!(ec_argmax, None);
+                assert_eq!(cpu_group_c, None);
+                assert_eq!(gpu_group_c, None);
                 assert_eq!(nvme_c, None);
                 assert_eq!(fanctrl_speed, None);
                 assert_eq!(fanctrl_active, None);
@@ -573,13 +577,16 @@ mod wiring_sweep {
             gpu_max_mhz: Some(2000),
             fan_target_rpm: 2600.0,
             cause: "auto:allocate".to_string(),
-            flags: vec!["steep_curve".to_string()],
+            flags: vec![crate::types::TelemetryFlag::legacy("steep_curve")],
             demand_cpu: Some(10.0),
             demand_gpu: Some(5.0),
             alloc_cpu_w: Some(9.0),
             alloc_gpu_w: Some(4.0),
             pi_target_w: Some(4.0),
             t_star: Some(60.0),
+            tstar_state: None, // DeviceLoop wiring has not landed yet.
+            cpu: None,
+            gpu: None,
             budget_w: 30.0,
             freeze: Some("Calibrating".to_string()),
         };
@@ -598,6 +605,9 @@ mod wiring_sweep {
                 alloc_gpu_w,   // Effect::AutoAllocated.gpu_w
                 pi_target_w,   // Effect::AutoAllocated.gpu_w (also the GPU PI's own target)
                 t_star,        // status.t_star_c
+                tstar_state,   // absent until DeviceLoop wiring
+                cpu,           // absent until DeviceLoop wiring
+                gpu,           // absent until DeviceLoop wiring
                 budget_w,      // status.budget_w (always carried, never Option)
                 freeze,        // Effect::AutoAllocated.freeze
             } => {
@@ -611,6 +621,7 @@ mod wiring_sweep {
                 let _ = (
                     t_mono, mode, cpu_limit_w, gpu_max_mhz, fan_target_rpm, cause, flags,
                     demand_cpu, demand_gpu, alloc_cpu_w, alloc_gpu_w, pi_target_w, t_star,
+                    tstar_state, cpu, gpu,
                     budget_w, freeze,
                 );
             }

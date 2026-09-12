@@ -788,8 +788,10 @@ budget, split, LUT, Mode A/Mode B.
       forcing phase; do not fit the tested trace to itself and do not exempt the forcing period
       or any neighboring period. Synthetic grader bars add an independent relay at the same
       period and at a nearby period to the known forcing response and require both to be found.
-  11. Stuck-high sensor: one GPU-group label pinned at 105 °C from the first sample and,
-      separately, from t = 5 min: the GPU cap goes to its floor (the safe direction, §2.1),
+  11. Stuck-high sensor: for the startup-after-seed leg, one valid Auto-entry sample first
+      establishes the actual applied seed, then the GPU-group label is pinned at 105 °C on the
+      immediately adjacent next 1 s sample with no intervening PI tick or actuator write;
+      separately pin it from t = 5 min. The GPU cap goes to its floor (the safe direction, §2.1),
       `DeviceUnreachable` (real) is raised within `BOUND_HOLD_S` after reaching
       the floor; bound travel to the floor from the actual seeded output by
       D/(Kc/Ti*e_min) plus the PI/write latency while error remains ≤−e_min.

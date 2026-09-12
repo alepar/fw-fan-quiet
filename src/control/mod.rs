@@ -17,6 +17,7 @@ pub mod mode;
 mod sim_tests;
 #[cfg(test)]
 pub mod spike_antiwindup;
+pub mod tstar;
 pub mod watchdog;
 
 // Mode/StatusFlag are reached via `controller::` where needed (view/tests).

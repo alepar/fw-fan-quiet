@@ -3,9 +3,9 @@
     "strategy": "quiet16",
     "default": true,
     "speed": 31,
-    "temperature": 75.0,
-    "movingAverageTemperature": 75.0,
-    "effectiveTemperature": 75.0,
+    "temperature": 83.0,
+    "movingAverageTemperature": 83.0,
+    "effectiveTemperature": 83.0,
     "active": true,
     "configuration": {
         "path": "/etc/fw-fanctrl/config.json",

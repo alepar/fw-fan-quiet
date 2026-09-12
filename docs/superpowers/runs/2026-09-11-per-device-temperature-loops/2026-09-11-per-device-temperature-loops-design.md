@@ -736,13 +736,18 @@ budget, split, LUT, Mode A/Mode B.
      raising `DeviceUnreachable` only for the GPU.
   8. Configuration smoke: each `TStarSource` state (incl. `Uncontrollable`, via an
      ambient-dominated argmax leg) and each `Hold` / `Selected` value is reached at least once
-     across the sims (the checklist is behavioural, not self-pushed vectors). Cover semantic
-     variant keys exhaustively for `TStarFlag`, `Hold`, `Selected` and schema-v3 `TelemetryFlag`:
+     across the sims (the checklist is behavioural, not self-pushed vectors). Observe all
+     `TStarState` values, including `Released`, from actual `TStarSource` outputs; observe
+     `TStarFlag` diagnostics there as well. The controller intentionally publishes
+     `tstar_state = None` outside Auto and therefore never emits telemetry state `Released`.
+     Observe every `Hold`, `Selected` and schema-v3 `TelemetryFlag` key/polarity exclusively from
+     actual controller telemetry. Cover semantic variant keys exhaustively:
      label strings are payloads, finite device/bound combinations are separate where behavior
      differs, and `Legacy` is one semantic key with a representative payload. Exercise active and
      clearing polarity for dynamic structured flags where the emission boundary supports both;
      legacy controller `StatusFlag` is covered by its own exhaustive tests. Expected-key mappings
-     use no-wildcard exhaustive matches, while observed keys come only from real outputs.
+     use no-wildcard exhaustive matches, while observed keys come only from the named source or
+     controller boundary.
   9. Hot-guard episodes: (a) GPU — a 5-min die-temperature excursion above 88 °C: the ratchet
      reaches the floor, recovery of `max` starts only below 84 °C, no re-trip within the
      episode's tail, post-episode fan overshoot ≤ 150 RPM (the prior design's bar) and the

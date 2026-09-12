@@ -134,22 +134,26 @@ mod tests {
     }
 
     #[test]
-    fn cros_ec_dgpu_on_has_no_positive_gpu_reading() {
-        // §Facts, 2026-09-08: with the dGPU powered (NVML 18.9 W, P0), the
-        // cros_ec gpu_amb/gpu_vr/gpu_vram sensors still read -150 and
-        // gpu_temp@40 still returns ENODATA — they never report on this
-        // machine. A positive gpu_* reading here would mean the fixture
-        // silently reverted to the round-2 "they come alive" assumption
-        // this task replaces.
-        let dir = path("hwmon/cros_ec_dgpu_on");
-        for (label, input) in read_cros_ec_labelled(&dir) {
-            if !label.starts_with("gpu_") {
-                continue;
-            }
-            if let Some(v) = input {
-                assert!(v <= 0, "{label} reported a positive value: {v}");
-            }
+    fn loaded_ec_fixtures_have_gpu_argmax_near_83_while_idle_stays_ambient() {
+        for tree in ["cros_ec_load", "cros_ec_dgpu_on"] {
+            let entries = read_cros_ec_labelled(&path(&format!("hwmon/{tree}")));
+            let (label, value) = entries
+                .iter()
+                .filter_map(|(label, input)| input.map(|value| (label, value)))
+                .max_by_key(|(_, value)| *value)
+                .expect("loaded EC fixture should have a readable value");
+            assert_eq!(label, "gpu_amb_f75303@4d", "wrong argmax for {tree}");
+            assert_eq!(value, 83_000, "wrong loaded GPU maximum for {tree}");
         }
+
+        let idle = read_cros_ec_labelled(&path("hwmon/cros_ec_idle"));
+        let (label, value) = idle
+            .iter()
+            .filter_map(|(label, input)| input.map(|value| (label, value)))
+            .max_by_key(|(_, value)| *value)
+            .expect("idle EC fixture should have a readable value");
+        assert_eq!(label, "ambient_f75303@4d");
+        assert_eq!(value, 47_850);
     }
 
     /// Max over the positive `tempN_input` readings in a cros_ec fixture
@@ -165,13 +169,13 @@ mod tests {
     }
 
     #[test]
-    fn cros_ec_load_max_rounds_to_the_paired_print_all_temperature() {
+    fn cros_ec_load_raw_max_rounds_to_the_paired_print_all_temperature() {
         let dir = path("hwmon/cros_ec_load");
         let max_c = cros_ec_positive_max_millideg(&dir) as f64 / 1000.0;
         let rounded = max_c.round();
         assert_eq!(
-            rounded, 75.0,
-            "cros_ec_load max {max_c} does not round to 75"
+            rounded, 83.0,
+            "cros_ec_load max {max_c} does not round to 83"
         );
 
         let load_json = fs::read_to_string(path("fanctrl/print_all_load.json")).unwrap();

@@ -528,15 +528,38 @@ impl EcReplica {
         cpu_group_c: Option<f64>,
         gpu_group_c: Option<f64>,
     ) {
-        self.reconciliation.clear();
-        self.cpu.clear();
-        self.gpu.clear();
-        self.reconciliation_output_ready = false;
+        self.reset_histories(socket_ma, cpu_group_c, gpu_group_c);
         self.ever_scored = false;
         self.ec_mismatch = false;
         self.mismatch_streak = 0;
         self.match_streak = 0;
         self.ma_fail_streak = 0;
+    }
+
+    /// Re-seeds only the three histories after an already-scored
+    /// reconciliation recovery. Unlike [`Self::reset`], this preserves the
+    /// established `ever_scored` state and the cleared mismatch verdict, so
+    /// Curve does not fall back to an artificial unreconciled interval after
+    /// either a three-match clear or an MA-only repair.
+    pub fn reseed_histories(
+        &mut self,
+        socket_ma: Option<f64>,
+        cpu_group_c: Option<f64>,
+        gpu_group_c: Option<f64>,
+    ) {
+        self.reset_histories(socket_ma, cpu_group_c, gpu_group_c);
+    }
+
+    fn reset_histories(
+        &mut self,
+        socket_ma: Option<f64>,
+        cpu_group_c: Option<f64>,
+        gpu_group_c: Option<f64>,
+    ) {
+        self.reconciliation.clear();
+        self.cpu.clear();
+        self.gpu.clear();
+        self.reconciliation_output_ready = false;
 
         self.reconciliation_output = socket_ma.filter(|value| value.is_finite() && *value > 0.0);
         if let Some(value) = self.reconciliation_output {
@@ -548,14 +571,15 @@ impl EcReplica {
     }
 
     /// The reset used after `EC MISMATCH` clears. It has group inputs so
-    /// stale device heat cannot survive reconciliation recovery.
+    /// stale device heat cannot survive reconciliation recovery, while the
+    /// already-cleared reconciliation verdict remains trusted.
     pub fn reset_after_mismatch_clear(
         &mut self,
         socket_ma: Option<f64>,
         cpu_group_c: Option<f64>,
         gpu_group_c: Option<f64>,
     ) {
-        self.reset(socket_ma, cpu_group_c, gpu_group_c);
+        self.reseed_histories(socket_ma, cpu_group_c, gpu_group_c);
     }
 
     /// Appends raw reconciliation and each present group. A missing group
@@ -1387,5 +1411,56 @@ mod tests {
             assert!(!outcome.ec_mismatch);
             assert_eq!(outcome.reseed_ma, (strike == 3).then_some(83.0));
         }
+    }
+
+    #[test]
+    fn mismatch_clear_history_reseed_keeps_the_cleared_reconciliation_trusted() {
+        let mut replica = EcReplica::new(3);
+        replica.reset(Some(80.0), Some(50.0), Some(70.0));
+
+        for _ in 0..3 {
+            replica.score_reconciliation(ReconciliationObservation::Scored {
+                max_matches: false,
+                ma_matches: Some(true),
+                socket_ma: 80.0,
+            });
+        }
+        assert!(replica.ec_mismatch());
+        for _ in 0..3 {
+            replica.score_reconciliation(ReconciliationObservation::Scored {
+                max_matches: true,
+                ma_matches: Some(true),
+                socket_ma: 81.0,
+            });
+        }
+        assert!(replica.is_reconciled());
+
+        replica.reset_after_mismatch_clear(Some(81.0), Some(50.0), Some(70.0));
+        assert!(replica.ever_scored());
+        assert!(!replica.ec_mismatch());
+        assert!(replica.is_reconciled());
+        assert_eq!(replica.reconciliation_ma(), Some(81.0));
+        assert_eq!(replica.cpu_group_ma(), Some(50.0));
+        assert_eq!(replica.gpu_group_ma(), Some(70.0));
+    }
+
+    #[test]
+    fn ma_only_history_reseed_keeps_established_reconciliation_trusted() {
+        let mut replica = EcReplica::new(3);
+        replica.reset(Some(80.0), Some(50.0), Some(70.0));
+        for _ in 0..3 {
+            replica.score_reconciliation(ReconciliationObservation::Scored {
+                max_matches: true,
+                ma_matches: Some(false),
+                socket_ma: 83.0,
+            });
+        }
+        assert!(replica.is_reconciled());
+
+        replica.reseed_histories(Some(83.0), Some(50.0), Some(70.0));
+        assert!(replica.ever_scored());
+        assert!(!replica.ec_mismatch());
+        assert!(replica.is_reconciled());
+        assert_eq!(replica.reconciliation_ma(), Some(83.0));
     }
 }

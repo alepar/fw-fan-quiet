@@ -41,10 +41,12 @@
 //! [`MIN_RPM_RESPONSE`] depending on which signal they're fitting.
 
 use crate::control::budget::LoopGains;
+use crate::control::device_loop::Gains;
 
 /// Minimum identifiable EC response, °C (design doc §3.3).
 pub const MIN_EC_RESPONSE_C: f64 = 3.0;
 /// Minimum identifiable fan response, RPM (design doc §3.3).
+#[allow(dead_code)] // legacy scalar fit compatibility until task .12
 pub const MIN_RPM_RESPONSE: f64 = 150.0;
 /// Minimum accepted time constant, s (design doc §3.3) — below this the fit
 /// is too fast to trust (and, degenerate, could drive `lambda` here would
@@ -220,6 +222,7 @@ fn search_tau_theta(data: &[(f64, f64)]) -> Option<(f64, f64)> {
 /// defensively — a caller can construct a [`Fopdt`] by hand, not only via
 /// [`fit_fopdt`]), or the resulting `Kc` falls outside `[0.25, 4]x` the
 /// matching field on `defaults`.
+#[allow(dead_code)] // legacy scalar fit compatibility until task .12
 pub fn derive_gains(ec: &Fopdt, rpm: &Fopdt, defaults: &LoopGains) -> Option<LoopGains> {
     let (kc_c, ti_c) = derive_one(ec, defaults.kc_w_per_c)?;
     let (kc_rpm, ti_rpm) = derive_one(rpm, defaults.kc_w_per_rpm)?;
@@ -229,6 +232,14 @@ pub fn derive_gains(ec: &Fopdt, rpm: &Fopdt, defaults: &LoopGains) -> Option<Loo
         kc_w_per_rpm: kc_rpm,
         ti_rpm_s: ti_rpm,
     })
+}
+
+/// Derive one device loop's native actuator-per-degree gains from its
+/// group-temperature fit. The fitted delay already includes sensor
+/// filtering, so it is used directly.
+pub fn derive_device_gains(fopdt: &Fopdt, defaults: Gains) -> Option<Gains> {
+    let (kc, ti_s) = derive_one(fopdt, defaults.kc)?;
+    Some(Gains { kc, ti_s })
 }
 
 /// One signal's `(Kc, Ti)` derivation plus its rejection rules. `Ti = tau`
@@ -252,6 +263,24 @@ fn derive_one(fopdt: &Fopdt, default_kc: f64) -> Option<(f64, f64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derive_device_gains_uses_fitted_theta_as_is_in_native_units() {
+        let fit = Fopdt {
+            k: 0.8,
+            tau: 35.0,
+            theta: 20.0,
+        };
+        let defaults = crate::control::device_loop::Gains {
+            kc: 35.0 / (0.8 * 110.0),
+            ti_s: 35.0,
+        };
+
+        let gains = derive_device_gains(&fit, defaults).expect("native fit should derive");
+
+        assert!((gains.kc - 35.0 / (0.8 * (90.0 + 20.0))).abs() < 1e-12);
+        assert_eq!(gains.ti_s, 35.0);
+    }
 
     /// Small deterministic xorshift32 PRNG — matches the existing
     /// convention (`src/fanctrl/table.rs`): "All simulation and plant tests

@@ -26,7 +26,8 @@ use crate::actuators::cmd::Runner;
 use crate::actuators::gpu::{GpuCommandEvidence, GpuLockVerifier};
 use crate::actuators::guard::RestoreGuard;
 use crate::calib::burner::Burner;
-use crate::calib::runner::{CalibContext, CalibRunner, RunnerEffect};
+use crate::calib::runner::{PerDeviceCalibRunner as CalibRunner, RunnerEffect};
+use crate::calib::step::PerDeviceCalibContext as CalibContext;
 use crate::calib::steady::tail_mean;
 use crate::config::Config;
 use crate::control::allocator::{self, AllocInput, Allocator};
@@ -156,9 +157,9 @@ pub enum Command {
     /// Enter/leave the closed-loop Auto mode. Explicit bool (not a toggle) so
     /// a queued duplicate keypress can never flip the mode back unnoticed.
     SetAuto(bool),
-    /// Begin guided calibration (honored in Monitor mode only).
+    /// Begin guided calibration from Monitor, or suspend a live Auto session.
     StartCalibration,
-    /// Abort a running calibration (release everything, back to Monitor).
+    /// Abort calibration, restore its held pair, and return to its origin mode.
     AbortCalibration,
     /// Restore hardware and exit the controller thread.
     Quit,
@@ -878,8 +879,14 @@ pub struct Controller<R: Runner> {
     config: Config,
     /// Where `config` persists to (`--config`).
     config_path: PathBuf,
-    /// Auto-mode loop state; Some exactly while `Mode::Auto`.
+    /// Auto-mode loop state; retained unchanged while an Auto-originated
+    /// calibration temporarily owns the actuators.
     auto: Option<AutoState>,
+    /// Whether the current calibration suspended an Auto session.
+    calib_started_from_auto: bool,
+    /// One sample hold after an Auto-originated calibration restores its
+    /// pair; this resynchronises sample time without ticking or writing.
+    calib_reentry_hold: bool,
     /// Thermal watchdog (Task 28): observes EVERY sample in EVERY mode
     /// (including Calibrating, where the rest of the sample machinery is
     /// suspended); a trip ACTS only when something is commanded.
@@ -896,9 +903,8 @@ pub struct Controller<R: Runner> {
     idle_trip_warned: bool,
     /// The budget integrator used while `Mode::Calibrating` (design §3.3):
     /// Some exactly during a calibration session, always stepped with
-    /// `Freeze::Calibrating` (a hard hold — `u` only ever moves via an
-    /// explicit `RunnerEffect::SetBudget` seed) so `u` is unchanged from
-    /// calibration start through exit, LUT sweep included.
+    /// `Freeze::Calibrating` so the staged compatibility budget stays
+    /// unchanged while the revision-4 runner performs direct device writes.
     calib_budget: Option<Budget>,
     /// A scratch mode arbiter run alongside a calibration session solely to
     /// score EC/fw-fanctrl reconciliation (design §3.3: `CalibContext`
@@ -918,6 +924,21 @@ pub struct Controller<R: Runner> {
     /// Short raw `ec.max_c` history feeding `calib_arbiter`'s reconciliation
     /// skip rule (mirrors `AutoState::ec_slope_window`).
     calib_ec_slope_window: std::collections::VecDeque<f64>,
+    /// Per-device group boxcars used only during calibration.
+    calib_replica: Option<EcReplica>,
+    /// Frozen socket identity for the calibration replica and persisted key.
+    calib_frozen_strategy: Option<String>,
+    calib_frozen_interval: Option<u32>,
+    /// Latest synchronously verified CPU calibration write and completion.
+    calib_cpu_verified: bool,
+    calib_cpu_completed_at_s: Option<f64>,
+    /// GPU verification stays paired to acquisition time across every
+    /// calibration command, including held and stepped locks.
+    calib_gpu_verified: bool,
+    calib_gpu_completed_at_s: Option<f64>,
+    calib_gpu_verifier: Option<GpuLockVerifier>,
+    calib_gpu_commands: std::collections::VecDeque<GpuCommandEvidence>,
+    calib_gpu_command_generation: u64,
     /// Main's shutdown flag (roast-pr-2 finding 2), installed by [`spawn`].
     /// `None` in unit tests and any construction that never shuts down.
     ///
@@ -1068,6 +1089,8 @@ impl<R: Runner> Controller<R> {
             config,
             config_path,
             auto: None,
+            calib_started_from_auto: false,
+            calib_reentry_hold: false,
             watchdog: ThermalWatchdog::new(),
             pending_flags: Vec::new(),
             idle_trip_warned: false,
@@ -1077,6 +1100,16 @@ impl<R: Runner> Controller<R> {
             calib_ec_ma: None,
             calib_ec_seeded: false,
             calib_ec_slope_window: std::collections::VecDeque::new(),
+            calib_replica: None,
+            calib_frozen_strategy: None,
+            calib_frozen_interval: None,
+            calib_cpu_verified: false,
+            calib_cpu_completed_at_s: None,
+            calib_gpu_verified: false,
+            calib_gpu_completed_at_s: None,
+            calib_gpu_verifier: None,
+            calib_gpu_commands: std::collections::VecDeque::new(),
+            calib_gpu_command_generation: 0,
             shutdown: None,
         }
     }
@@ -1333,13 +1366,18 @@ impl<R: Runner> Controller<R> {
                 "auto:off"
             }
             Command::StartCalibration => {
-                if self.status.mode != Mode::Monitor {
+                if !matches!(self.status.mode, Mode::Monitor | Mode::Auto) {
                     tracing::warn!(
-                        "StartCalibration ignored: mode is {}, not monitor",
+                        "StartCalibration ignored: mode {} cannot be suspended",
                         self.status.mode.as_str()
                     );
                 } else {
-                    let mut runner = CalibRunner::new();
+                    self.calib_started_from_auto = self.status.mode == Mode::Auto;
+                    self.calib_reentry_hold = false;
+                    let mut runner = CalibRunner::new(
+                        self.persisted_cpu_gains.clone(),
+                        self.persisted_gpu_gains.clone(),
+                    );
                     let runner_effects = runner.start();
                     self.calib = Some(runner);
                     self.status.mode = Mode::Calibrating;
@@ -1352,6 +1390,16 @@ impl<R: Runner> Controller<R> {
                     self.calib_ec_ma = None;
                     self.calib_ec_seeded = false;
                     self.calib_ec_slope_window.clear();
+                    self.calib_replica = Some(EcReplica::new(DEFAULT_MA_INTERVAL));
+                    self.calib_frozen_strategy = None;
+                    self.calib_frozen_interval = None;
+                    self.calib_cpu_verified = false;
+                    self.calib_cpu_completed_at_s = None;
+                    self.calib_gpu_verified = false;
+                    self.calib_gpu_completed_at_s = None;
+                    self.calib_gpu_verifier = None;
+                    self.calib_gpu_commands.clear();
+                    self.calib_gpu_command_generation = 0;
                     self.apply_calib_effects(runner_effects, None);
                     self.sync_calib_status();
                 }
@@ -1423,6 +1471,34 @@ impl<R: Runner> Controller<R> {
                     self.idle_trip_warned = false;
                 }
             }
+            Trip::Thermal
+                if self.status.mode == Mode::Calibrating && self.anything_commanded() =>
+            {
+                // Terminate through the calibration runner first. This
+                // restores its established held pair and makes the reason
+                // observable even if the configurable calibration guard is
+                // below or above the watchdog's fixed 95 C boundary.
+                let before = self.status.clone();
+                let runner_effects = self.calib.as_mut().map_or_else(Vec::new, |runner| {
+                    runner.abort_with_reason(
+                        "global watchdog: CPU Tctl reached 95C for 3 samples".into(),
+                    )
+                });
+                let cause = self.apply_calib_effects(runner_effects, Some(s));
+                self.sync_calib_status();
+                let mut effects = Vec::new();
+                if self.status != before {
+                    effects.push(Effect::StatusChanged {
+                        cause: cause.unwrap_or("calib:skipped"),
+                    });
+                } else if let Some(cause) = cause {
+                    effects.push(Effect::Noted { cause });
+                }
+                // The global watchdog remains the final safety authority
+                // and releases the restored pair to stock.
+                effects.extend(self.emergency_release(Trip::Thermal));
+                return effects;
+            }
             trip if self.anything_commanded() => return self.emergency_release(trip),
             trip => {
                 // Diagnostically interesting even with nothing to release —
@@ -1437,6 +1513,11 @@ impl<R: Runner> Controller<R> {
         }
         if self.status.mode == Mode::Calibrating {
             return self.on_calib_sample(s);
+        }
+        if self.status.mode == Mode::Auto && self.calib_reentry_hold {
+            self.calib_reentry_hold = false;
+            self.reseed_auto_after_calibration(s);
+            return Vec::new();
         }
         let before = self.status.clone();
         let mut effects = Vec::new();
@@ -3376,11 +3457,9 @@ impl<R: Runner> Controller<R> {
     }
 
     /// The budget integrator's `(lo, hi)` clamp bounds (design §2.4). The
-    /// single computation for both the Auto every-5s block and the
-    /// calibration runner — tolerant of `self.lut` still being `None` (a
-    /// calibration's own LUT sweep hasn't landed in `self.lut` yet the first
-    /// time this runs; `self.lut` only updates at `RunnerEffect::SaveState`,
-    /// i.e. session end), falling the GPU floor back to 0 W in that case.
+    /// single computation for both the Auto every-5s block and the staged
+    /// compatibility calibration budget. It tolerates `self.lut` being
+    /// `None`, falling the GPU floor back to 0 W in that case.
     ///
     /// Roast PR-2 finding 1: `lo` and `hi` come from independent config keys
     /// and a floor-derived `lo` can exceed the cap-derived `hi`. `lo` is
@@ -3416,10 +3495,28 @@ impl<R: Runner> Controller<R> {
     /// scoring — the auto loop feeds its own instances), `fanctrl_active`
     /// and `argmax_controllable` read directly off the sample, and
     /// `budget_bounds` as computed by [`Controller::budget_bounds`].
-    fn build_calib_context(&mut self, s: &Sample, lo: f64, hi: f64) -> CalibContext {
-        // EC boxcar: seed from the first view this session, retarget its
-        // interval on a fresh view, push every EC reading — mirrors
-        // `on_auto_sample`'s own window-push block exactly.
+    fn build_calib_context(&mut self, s: &Sample, _lo: f64, _hi: f64) -> CalibContext {
+        // Freeze the replica configuration and persistence key together on
+        // the first usable view. A later live-key change is still exposed in
+        // the context so the runner aborts; it never silently retargets an
+        // in-progress response series.
+        if self.calib_frozen_strategy.is_none()
+            && let Some(view) = s
+                .fanctrl
+                .as_ref()
+                .filter(|view| !view.strategy.is_empty() && view.ma_interval > 0)
+        {
+            self.calib_frozen_strategy = Some(view.strategy.clone());
+            self.calib_frozen_interval = Some(view.ma_interval);
+            if let Some(avg) = self.calib_ec_avg.as_mut() {
+                avg.set_interval(view.ma_interval as usize);
+            }
+            if let Some(replica) = self.calib_replica.as_mut() {
+                replica.set_interval(view.ma_interval as usize);
+            }
+        }
+        // EC boxcar: seed from the first view this session and then push
+        // every EC reading without changing the frozen interval.
         if !self.calib_ec_seeded
             && let Some(view) = &s.fanctrl
         {
@@ -3428,12 +3525,13 @@ impl<R: Runner> Controller<R> {
             }
             self.calib_ec_ma = Some(view.ma_temperature);
             self.calib_ec_seeded = true;
-        }
-        if s.fanctrl_view_changed
-            && let Some(view) = &s.fanctrl
-            && let Some(avg) = self.calib_ec_avg.as_mut()
-        {
-            avg.set_interval(view.ma_interval as usize);
+            if let Some(replica) = self.calib_replica.as_mut() {
+                replica.reset(
+                    Some(view.ma_temperature),
+                    s.ec.as_ref().and_then(|ec| ec.cpu_group_c),
+                    s.ec.as_ref().and_then(|ec| ec.gpu_group_c),
+                );
+            }
         }
         if let Some(ec) = &s.ec {
             let max_c = f64::from(ec.max_c);
@@ -3445,6 +3543,28 @@ impl<R: Runner> Controller<R> {
             }
             self.calib_ec_slope_window.push_back(max_c);
         }
+        if let Some(replica) = self.calib_replica.as_mut() {
+            replica.tick(s.ec.as_ref());
+        }
+
+        self.calib_gpu_verified = if s.gpu_mhz_valid && !s.resumed {
+            self.calib_gpu_verifier
+                .as_mut()
+                .map(|verifier| {
+                    matches!(
+                        verifier.verify_paired(
+                            s.gpu_util_pct,
+                            s.gpu_sm_mhz.round() as u32,
+                            s.t_mono,
+                            self.calib_gpu_commands.make_contiguous(),
+                        ),
+                        WriteVerdict::Verified(_)
+                    )
+                })
+                .unwrap_or(false)
+        } else {
+            false
+        };
 
         let curve_valid = s
             .fanctrl
@@ -3500,12 +3620,25 @@ impl<R: Runner> Controller<R> {
 
         CalibContext {
             cpu_cap_w: self.status.cpu_limit_w,
+            cpu_cap_verified: self.calib_cpu_verified,
+            cpu_cap_completed_at_s: self.calib_cpu_completed_at_s,
             gpu_cap_mhz: self.status.gpu_max_mhz,
-            ec_ma: self.calib_ec_ma,
+            gpu_cap_verified: self.calib_gpu_verified,
+            gpu_cap_completed_at_s: self.calib_gpu_completed_at_s,
+            use_current_caps: self.calib_started_from_auto,
+            cpu_floor_w: self.config.cpu_floor_w,
+            gpu_floor_mhz: self.config.gpu_floor_mhz,
+            cpu_max_w: self.config.cpu_max_w,
+            gpu_max_mhz: self.config.gpu_max_mhz,
+            cpu_group_c: self.calib_replica.as_ref().and_then(EcReplica::cpu_group_ma),
+            gpu_group_c: self.calib_replica.as_ref().and_then(EcReplica::gpu_group_ma),
             ec_mismatch,
             fanctrl_active,
             argmax_controllable,
-            budget_bounds: (lo, hi),
+            cpu_hot_c: self.config.cpu_hot_c,
+            gpu_hot_c: self.config.gpu_hot_c,
+            strategy: s.fanctrl.as_ref().map(|view| view.strategy.clone()),
+            ma_interval: s.fanctrl.as_ref().map(|view| view.ma_interval),
         }
     }
 
@@ -3599,27 +3732,66 @@ impl<R: Runner> Controller<R> {
                 RunnerEffect::SetCpuMaxWatts(w) if self.shutting_down() => {
                     tracing::debug!("calib: shutting down; SetCpuMaxWatts({w}) skipped");
                 }
-                RunnerEffect::SetCpuMaxWatts(w) => match self.guard.cpu.as_ref() {
-                    None => tracing::warn!("calib: no CPU actuator; SetCpuMaxWatts({w}) skipped"),
-                    Some(cpu) => match cpu.set_sustained_mw((w * 1000.0).round() as u32) {
-                        WriteVerdict::Verified(applied) => self.status.cpu_limit_w = Some(applied),
-                        verdict => {
-                            tracing::warn!("calib: SetCpuMaxWatts({w}) not verified: {verdict:?}")
+                RunnerEffect::SetCpuMaxWatts(w) => {
+                    self.calib_cpu_verified = false;
+                    match self.guard.cpu.as_ref() {
+                        None => {
+                            tracing::warn!("calib: no CPU actuator; SetCpuMaxWatts({w}) skipped")
                         }
-                    },
-                },
+                        Some(cpu) => match cpu.set_sustained_mw((w * 1000.0).round() as u32) {
+                            WriteVerdict::Verified(applied) => {
+                                self.status.cpu_limit_w = Some(applied);
+                                self.calib_cpu_verified = true;
+                                self.calib_cpu_completed_at_s =
+                                    s.map(|sample| self.command_completed_at(sample));
+                            }
+                            verdict => {
+                                tracing::warn!(
+                                    "calib: SetCpuMaxWatts({w}) not verified: {verdict:?}"
+                                )
+                            }
+                        },
+                    }
+                }
                 RunnerEffect::SetBudget(w) => self.apply_calib_set_budget(w, s),
                 // Stop fence (roast-pr-2 finding 2) on the write arm only.
                 RunnerEffect::SetGpuMaxClock(mhz) if self.shutting_down() => {
                     tracing::debug!("calib: shutting down; SetGpuMaxClock({mhz}) skipped");
                 }
-                RunnerEffect::SetGpuMaxClock(mhz) => match self.guard.gpu.as_mut() {
-                    None => tracing::warn!("calib: no GPU actuator; SetGpuMaxClock({mhz}) skipped"),
-                    Some(gpu) => match gpu.set_max_clock(mhz) {
-                        Ok(()) => self.status.gpu_max_mhz = gpu.applied(),
-                        Err(e) => tracing::warn!("calib: SetGpuMaxClock({mhz}) failed: {e}"),
-                    },
-                },
+                RunnerEffect::SetGpuMaxClock(mhz) => {
+                    self.calib_gpu_verified = false;
+                    let completed_at = s.map(|sample| self.command_completed_at(sample));
+                    match self.guard.gpu.as_mut() {
+                        None => {
+                            tracing::warn!("calib: no GPU actuator; SetGpuMaxClock({mhz}) skipped")
+                        }
+                        Some(gpu) => match gpu.set_max_clock(mhz) {
+                            Ok(()) => {
+                                self.status.gpu_max_mhz = gpu.applied();
+                                if let (Some(applied), Some(completed_at)) =
+                                    (gpu.applied(), completed_at)
+                                {
+                                    self.calib_gpu_completed_at_s = Some(completed_at);
+                                    self.calib_gpu_command_generation =
+                                        self.calib_gpu_command_generation.saturating_add(1);
+                                    self.calib_gpu_commands.push_back(GpuCommandEvidence::new(
+                                        applied,
+                                        completed_at,
+                                        self.calib_gpu_command_generation,
+                                    ));
+                                    while self.calib_gpu_commands.len() > 3 {
+                                        self.calib_gpu_commands.pop_front();
+                                    }
+                                    self.calib_gpu_verifier
+                                        .get_or_insert_with(|| GpuLockVerifier::new(applied));
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("calib: SetGpuMaxClock({mhz}) failed: {e}")
+                            }
+                        },
+                    }
+                }
                 RunnerEffect::ReleaseCpu => {
                     if let Some(cpu) = self.guard.cpu.as_ref() {
                         if let Err(e) = cpu.restore_stock() {
@@ -3658,6 +3830,10 @@ impl<R: Runner> Controller<R> {
                     tracing::info!("calib: step-test fitted {gains:?} at t_mono={fitted_at}");
                     raise(&mut cause, "calib:fitted");
                 }
+                RunnerEffect::FittedDevice { device, gains } => {
+                    tracing::info!("calib: {device:?} step-test fitted {gains:?}");
+                    raise(&mut cause, "calib:fitted");
+                }
                 RunnerEffect::Noted(reason) => {
                     tracing::info!("calib: step test skipped: {reason}");
                     raise(&mut cause, "calib:skipped");
@@ -3691,9 +3867,18 @@ impl<R: Runner> Controller<R> {
                     // state (table + warm-start preserved) through the same
                     // `save_persisted_state` the auto-exit path uses.
                     self.loop_gains = state.loop_gains;
-                    if self.lut.is_some() {
-                        // A landed fit satisfies the Auto-entry requirement.
+                    self.persisted_cpu_gains = state.cpu_gains;
+                    self.persisted_gpu_gains = state.gpu_gains;
+                    let current_key = s.and_then(|sample| sample.fanctrl.as_ref()).map(|view| {
+                        format!("{}:{}", view.strategy, view.ma_interval)
+                    });
+                    if current_key.as_ref().is_some_and(|key| {
+                        self.persisted_cpu_gains.contains_key(key)
+                            && self.persisted_gpu_gains.contains_key(key)
+                    }) {
                         self.remove_flag(StatusFlag::NotCalibrated);
+                    } else {
+                        self.add_flag(StatusFlag::NotCalibrated);
                     }
                     self.save_persisted_state();
                 }
@@ -3846,8 +4031,9 @@ impl<R: Runner> Controller<R> {
         self.status.calib = self.calib.as_ref().map(CalibRunner::progress);
     }
 
-    /// Back to Monitor: drop the runner, stop the burner (defensive — the
-    /// runner's own StopBurner normally already ran), clear the wizard.
+    /// Drop the runner, stop the burner and clear the wizard. A Monitor
+    /// origin returns to Monitor; an Auto origin resumes the exact suspended
+    /// loop/TStar objects after one no-write sample-time resynchronisation.
     fn end_calibration(&mut self) {
         if let Some(burner) = self.burner.take() {
             burner.stop();
@@ -3859,8 +4045,106 @@ impl<R: Runner> Controller<R> {
         self.calib_ec_ma = None;
         self.calib_ec_seeded = false;
         self.calib_ec_slope_window.clear();
-        self.status.mode = Mode::Monitor;
+        self.calib_replica = None;
+        self.calib_frozen_strategy = None;
+        self.calib_frozen_interval = None;
+        self.calib_cpu_verified = false;
+        self.calib_cpu_completed_at_s = None;
+        self.calib_gpu_verified = false;
+        self.calib_gpu_completed_at_s = None;
+        self.calib_gpu_verifier = None;
+        self.calib_gpu_commands.clear();
+        self.calib_gpu_command_generation = 0;
+        if self.calib_started_from_auto && self.auto.is_some() {
+            if let Some(auto) = self.auto.as_mut() {
+                if let Some(cpu) = self.status.cpu_limit_w {
+                    auto.cpu_loop.note_applied(cpu);
+                }
+                if let Some(gpu) = self.status.gpu_max_mhz {
+                    auto.gpu_loop.note_applied(f64::from(gpu));
+                }
+                auto.last_sample_t_mono = None;
+                auto.last_cpu_write_t_mono = None;
+                auto.last_gpu_write_t_mono = None;
+                auto.cpu_actuator_state = ActuatorState::Unverifiable;
+                auto.gpu_actuator_state = ActuatorState::Unverifiable;
+                auto.gpu_commands.clear();
+                auto.gpu_verifier = None;
+                auto.cpu_verdict = VerdictState::default();
+                auto.gpu_verdict = VerdictState::default();
+            }
+            self.status.mode = Mode::Auto;
+            self.calib_reentry_hold = true;
+        } else {
+            self.status.mode = Mode::Monitor;
+            self.calib_reentry_hold = false;
+        }
+        self.calib_started_from_auto = false;
         self.status.calib = None;
+    }
+
+    /// The first sample after an Auto-originated calibration is a held
+    /// resynchronisation point: rebuild every observation history from this
+    /// sample while leaving the suspended loops/TStar and applied pair
+    /// untouched. The caller returns before any actuator path runs.
+    fn reseed_auto_after_calibration(&mut self, s: &Sample) {
+        let Some(auto) = self.auto.as_mut() else { return; };
+        let view = s
+            .fanctrl
+            .as_ref()
+            .filter(|_| s.fanctrl_freshness == Freshness::Fresh);
+        if let Some(view) = view {
+            auto.replica.set_interval(view.ma_interval as usize);
+        }
+        auto.replica.reset(
+            view.map(|view| view.ma_temperature),
+            s.ec.as_ref().and_then(|ec| ec.cpu_group_c),
+            s.ec.as_ref().and_then(|ec| ec.gpu_group_c),
+        );
+        auto.view_initialised = view.is_some();
+
+        auto.ec_avg = EcAverage::new(
+            view.map_or(DEFAULT_MA_INTERVAL, |view| view.ma_interval as usize),
+        );
+        auto.ec_ma = view.map(|view| view.ma_temperature);
+        auto.ec_seeded = view.is_some();
+        if let Some(value) = auto.ec_ma {
+            auto.ec_avg.reseed(value);
+        }
+        if let Some(ec) = s.ec.as_ref() {
+            auto.ec_ma = auto.ec_avg.push(f64::from(ec.max_c));
+        }
+
+        auto.cpu_draw_window.clear();
+        if s.cpu_pkg_w.is_finite() && s.cpu_pkg_w > 0.0 {
+            auto.cpu_draw_window.push_back(s.cpu_pkg_w);
+        }
+        auto.fan_window.clear();
+        auto.fan_window.push_back(if s.fan_valid {
+            s.max_fan_rpm()
+        } else {
+            f64::NAN
+        });
+        auto.ec_slope_window.clear();
+        if let Some(raw_max) = s.ec.as_ref().and_then(|ec| ec.reconciliation_max_c) {
+            auto.ec_slope_window.push_back(f64::from(raw_max));
+        }
+        auto.steady_window.clear();
+        auto.steady_key = None;
+        auto.refinement_window.clear();
+        auto.refinement_key = None;
+        auto.last_on_ac = Some(s.on_ac);
+        auto.on_ac_suppress_until = None;
+        auto.cpu_hot_streak = u8::from(
+            s.cpu_temp_valid && s.cpu_temp_c >= self.config.cpu_hot_c,
+        );
+        auto.cpu_hot = false;
+        auto.guards = Guards::new(self.config.gpu_hot_c, self.config.nvme_hot_c);
+        auto.guards.step(
+            s.gpu_temp_valid.then_some(s.gpu_temp_c),
+            s.nvme_temp_c,
+        );
+        auto.last_sample_t_mono = Some(s.t_mono);
     }
 
     /// Reapply whatever limits are currently commanded (same values). Errors
@@ -5053,24 +5337,6 @@ mod tests {
 
     // --- Task 18/22: calibration integration ---
 
-    /// Sweep-phase sample: GPU pinned at `clock` drawing clock/30 watts.
-    fn sweep_pinned(clock: u32) -> Sample {
-        Sample {
-            gpu_util_pct: 99.0,
-            gpu_sm_mhz: f64::from(clock),
-            gpu_w: f64::from(clock) / 30.0,
-            gpu_w_valid: true,
-            gpu_mhz_valid: true,
-            fan1_rpm: 3000.0,
-            fan_valid: true,
-            // A healthy machine reports a valid, cool Tctl: without this the
-            // long calibration drives would trip the sensor-lost watchdog.
-            cpu_temp_c: 60.0,
-            cpu_temp_valid: true,
-            ..Sample::default()
-        }
-    }
-
     /// A step-test settle-phase sample. It carries no `fanctrl` view, so the
     /// controller's real `build_calib_context` computes `fanctrl_active:
     /// false` — the settle gate is therefore never met and any drive
@@ -5091,28 +5357,21 @@ mod tests {
         }
     }
 
-    /// Drive the whole LUT sweep through the controller with pinned samples.
-    fn drive_sweep(ctl: &mut Controller<&FakeRunner>) {
-        use crate::calib::lut_sweep::SWEEP_CLOCKS;
-        for (i, &clock) in SWEEP_CLOCKS.iter().enumerate() {
-            for _ in 0..60 {
-                ctl.on_sample(&sweep_pinned(clock));
-                let calib = ctl.status().calib.as_ref().expect("calibrating");
-                if calib.phase != "lut" || calib.step > i {
-                    break;
-                }
-            }
-        }
+    /// Enter the revision-4 shared settle phase and apply its held pair.
+    fn drive_shared_settle_entry(ctl: &mut Controller<&FakeRunner>) {
+        ctl.on_sample(&settle_sample());
         let calib = ctl.status().calib.as_ref().expect("calibrating");
-        assert_eq!(calib.phase, "step", "sweep must finish: {calib:?}");
+        assert_eq!(calib.phase, "settle", "must start with shared settle: {calib:?}");
     }
 
     /// Drive `settle_sample()`s through the controller until the step test
-    /// gives up (5-minute settle cap under the always-default `CalibContext`)
+    /// gives up (10-minute settle cap under the always-default `CalibContext`)
     /// and calibration finishes.
     fn drive_step_test_to_skip(ctl: &mut Controller<&FakeRunner>) {
-        for _ in 0..300 {
-            ctl.on_sample(&settle_sample());
+        for second in 1..=600 {
+            let mut sample = settle_sample();
+            sample.t_mono = f64::from(second);
+            ctl.on_sample(&sample);
             if ctl.status().calib.is_none() {
                 return;
             }
@@ -5121,7 +5380,7 @@ mod tests {
     }
 
     #[test]
-    fn start_calibration_only_from_monitor() {
+    fn start_calibration_from_monitor_or_auto_but_not_manual() {
         let runner = FakeRunner::new();
         let mut ctl = controller_no_profile(&runner);
 
@@ -5133,17 +5392,118 @@ mod tests {
         assert!(ctl.status().calib.is_none());
         assert!(ctl.calib.is_none());
 
-        // Back to Monitor: calibration starts (LUT sweep phase).
+        // Back to Monitor: calibration starts directly in shared settle.
         ctl.on_command(Command::ReleaseAll);
         let effects = ctl.on_command(Command::StartCalibration);
         assert_eq!(status_changes(&effects), 1);
         assert_eq!(ctl.status().mode, Mode::Calibrating);
         let calib = ctl.status().calib.as_ref().expect("wizard progress set");
-        assert_eq!(calib.phase, "lut");
-        assert_eq!(calib.total, 10);
-        // The sweep's first clock lock was attempted (no GPU actuator in
-        // tests: warned no-op, gpu_max_mhz stays None).
+        assert_eq!(calib.phase, "settle");
+        assert_eq!(calib.total, 3);
         assert_eq!(ctl.status().gpu_max_mhz, None);
+
+        ctl.on_command(Command::AbortCalibration);
+        ctl.on_command(Command::SetAuto(true));
+        let effects = ctl.on_command(Command::StartCalibration);
+        assert_eq!(status_changes(&effects), 1);
+        assert_eq!(ctl.status().mode, Mode::Calibrating);
+        assert!(ctl.auto.is_some(), "Auto loop state is suspended in place");
+    }
+
+    #[test]
+    fn monitor_calibration_establishes_verified_floors_and_restores_that_pair_on_abort() {
+        let runner = FakeRunner::new();
+        let config = Config { cpu_floor_w: 8.0, ..Config::default() };
+        let (mut ctl, gpu_calls) = auto_controller(
+            &runner,
+            PathBuf::from("/nonexistent/platform_profile"),
+            config,
+        );
+        ctl.on_command(Command::StartCalibration);
+
+        let mut first = busy_at(0.0);
+        first.gpu_sm_mhz = 1_000.0;
+        ctl.on_sample(&first);
+        assert_eq!(
+            (ctl.status.cpu_limit_w, ctl.status.gpu_max_mhz),
+            (Some(10.0), Some(1_000)),
+            "Monitor has no applied pair, so calibration must establish configured floors through normal actuators"
+        );
+
+        let mut verified = busy_at(1.0);
+        verified.gpu_sm_mhz = 1_000.0;
+        ctl.on_sample(&verified);
+        let (lo, hi) = ctl.budget_bounds();
+        let context = ctl.build_calib_context(&verified, lo, hi);
+        assert!(context.cpu_cap_verified);
+        assert!(context.gpu_cap_verified);
+        assert_eq!(context.cpu_cap_w, Some(10.0));
+        assert_eq!(context.gpu_cap_mhz, Some(1_000));
+        assert!(!context.use_current_caps, "Monitor origin selects configured floors");
+
+        ctl.on_command(Command::AbortCalibration);
+        assert_eq!(ctl.status.mode, Mode::Monitor);
+        assert_eq!((ctl.status.cpu_limit_w, ctl.status.gpu_max_mhz), (Some(10.0), Some(1_000)));
+        assert_eq!(
+            gpu_calls.lock().unwrap().as_slice(),
+            &[GpuCall::Set(1_000), GpuCall::Set(1_000)],
+            "abort restores the established floor lock and does not release or leave a step active"
+        );
+        let cpu_writes = ryzenadj_calls(&runner);
+        assert_eq!(cpu_writes, vec![expected_args(10_000), expected_args(10_000)]);
+    }
+
+    #[test]
+    fn calibration_gpu_verification_pairs_observation_with_completed_command() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu_calls) = auto_controller_no_profile(&runner);
+        let acquired = Instant::now();
+        ctl.completion_clock = Box::new(move || acquired + Duration::from_secs(3));
+        ctl.on_command(Command::StartCalibration);
+        let first = Sample {
+            acquired_at: Some(acquired),
+            gpu_sm_mhz: 1_000.0,
+            ..busy_at(0.0)
+        };
+        ctl.on_sample(&first);
+
+        let early = Sample {
+            acquired_at: Some(acquired + Duration::from_secs(1)),
+            gpu_sm_mhz: 1_000.0,
+            ..busy_at(1.0)
+        };
+        let (lo, hi) = ctl.budget_bounds();
+        let early_context = ctl.build_calib_context(&early, lo, hi);
+        assert!(!early_context.gpu_cap_verified, "a pre-completion observation cannot verify the lock");
+
+        let after = Sample {
+            acquired_at: Some(acquired + Duration::from_secs(4)),
+            gpu_sm_mhz: 1_000.0,
+            ..busy_at(4.0)
+        };
+        let after_context = ctl.build_calib_context(&after, lo, hi);
+        assert!(after_context.gpu_cap_verified);
+        assert_eq!(after_context.gpu_cap_completed_at_s, Some(3.0));
+        ctl.on_command(Command::AbortCalibration);
+    }
+
+    #[test]
+    fn failed_calibration_cpu_write_cannot_establish_an_applied_pair() {
+        use crate::actuators::cmd::test_support::output_with_code;
+
+        let runner = FakeRunner::new();
+        runner.push_result(Ok(output_with_code(1)));
+        let (mut ctl, _gpu_calls) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::StartCalibration);
+        let mut sample = busy_at(0.0);
+        sample.gpu_sm_mhz = 1_000.0;
+        ctl.on_sample(&sample);
+        assert_eq!(ctl.status.cpu_limit_w, None);
+        assert!(!ctl.calib_cpu_verified);
+        assert_eq!(ctl.calib_cpu_completed_at_s, None);
+        assert_eq!(ctl.status.gpu_max_mhz, Some(1_000));
+        assert_eq!(ctl.status.calib.as_ref().map(|progress| progress.phase.as_str()), Some("settle"));
+        ctl.on_command(Command::AbortCalibration);
     }
 
     #[test]
@@ -5176,7 +5536,7 @@ mod tests {
         let (dir, path) = profile_fixture("calib-actuators");
         let mut ctl = controller(&runner, path);
         ctl.on_command(Command::StartCalibration);
-        drive_sweep(&mut ctl);
+        drive_shared_settle_entry(&mut ctl);
         // The burner starts unconditionally on step-test entry, before any
         // gate is ever checked (the ordering fact design §3.3 turns on).
         assert!(
@@ -5209,13 +5569,13 @@ mod tests {
     }
 
     #[test]
-    fn repeated_sweep_needs_load_nags_are_noted_for_telemetry() {
+    fn shared_settle_does_not_emit_obsolete_lut_load_nags() {
         let runner = FakeRunner::new();
         let (dir, path) = profile_fixture("calib-nag");
         let mut ctl = controller(&runner, path);
         ctl.on_command(Command::StartCalibration);
-        // GPU idle throughout: the sweep's first clock never pins. First
-        // nag flips needs_load: a StatusChanged Decision.
+        // GPU idle no longer drives an independent LUT sweep. Settle may
+        // wait on its physical gates, but it must not emit obsolete load nags.
         let idle = Sample {
             gpu_util_pct: 5.0,
             gpu_sm_mhz: 300.0,
@@ -5228,29 +5588,12 @@ mod tests {
             cpu_temp_valid: true,
             ..Sample::default()
         };
-        for _ in 0..9 {
-            assert!(ctl.on_sample(&idle).is_empty());
+        for _ in 0..20 {
+            let effects = ctl.on_sample(&idle);
+            assert!(!effects.iter().any(|effect| matches!(effect,
+                Effect::Noted { cause: "calib:needs_load" }
+                | Effect::StatusChanged { cause: "calib:needs_load" })));
         }
-        let effects = ctl.on_sample(&idle);
-        assert_eq!(
-            effects,
-            vec![Effect::StatusChanged {
-                cause: "calib:needs_load"
-            }]
-        );
-        // Later nags change no status (needs_load already true) but must
-        // still surface as telemetry-only notes, so offline analysis sees
-        // the full nag history.
-        for _ in 0..9 {
-            assert!(ctl.on_sample(&idle).is_empty());
-        }
-        let effects = ctl.on_sample(&idle);
-        assert_eq!(
-            effects,
-            vec![Effect::Noted {
-                cause: "calib:needs_load"
-            }]
-        );
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -5261,7 +5604,7 @@ mod tests {
         let (dir, path) = profile_fixture("calib-abort");
         let mut ctl = controller(&runner, path.clone());
         ctl.on_command(Command::StartCalibration);
-        drive_sweep(&mut ctl);
+        drive_shared_settle_entry(&mut ctl);
         assert!(ctl.burner.is_some(), "burner running during the step test");
         for _ in 0..10 {
             ctl.on_sample(&settle_sample());
@@ -5271,11 +5614,11 @@ mod tests {
         assert_eq!(status_changes(&effects), 1);
         assert_eq!(ctl.status().mode, Mode::Monitor);
         assert!(ctl.status().calib.is_none());
-        assert_eq!(ctl.status().cpu_limit_w, None);
+        assert_eq!(ctl.status().cpu_limit_w, Some(Config::default().cpu_floor_w));
         assert!(ctl.calib.is_none());
         assert!(ctl.burner.is_none(), "abort must stop the burner");
         // Release toggled the profile back; smu stays untouched (session on).
-        assert_eq!(fs::read_to_string(&path).unwrap(), "balanced");
+        assert_eq!(fs::read_to_string(&path).unwrap().trim(), "balanced");
         assert_eq!(modprobe_reload_calls(&runner), 0);
 
         // Manual mode works again after the abort.
@@ -5291,7 +5634,7 @@ mod tests {
         let (dir, path) = profile_fixture("calib-quit");
         let mut ctl = controller(&runner, path.clone());
         ctl.on_command(Command::StartCalibration);
-        drive_sweep(&mut ctl);
+        drive_shared_settle_entry(&mut ctl);
         for _ in 0..10 {
             ctl.on_sample(&settle_sample()); // burner active mid-settle
         }
@@ -5316,7 +5659,7 @@ mod tests {
     }
 
     #[test]
-    fn full_calibration_keeps_lut_only_in_memory_until_the_deletion_sweep() {
+    fn calibration_skip_stamps_state_without_a_legacy_lut() {
         let runner = FakeRunner::new();
         let (dir, profile) = profile_fixture("calib-full");
         let state_path = dir.join("state.json");
@@ -5336,13 +5679,12 @@ mod tests {
         assert!(ctl.lut.is_none());
 
         ctl.on_command(Command::StartCalibration);
-        drive_sweep(&mut ctl);
+        drive_shared_settle_entry(&mut ctl);
         drive_step_test_to_skip(&mut ctl);
 
         // Finished: back to Monitor, wizard gone, burner stopped. The CPU
-        // limit itself is left pinned at the floor (design §3.3's
-        // `conclude_skip`: "restore the floor", not a release), landed
-        // through the real `SetBudget` -> split_budget -> command path.
+        // limit itself is left pinned at the floor because the per-device
+        // runner restores the held pair rather than releasing to stock.
         assert_eq!(ctl.status().mode, Mode::Monitor);
         assert!(ctl.status().calib.is_none());
         assert!(ctl.burner.is_none());
@@ -5351,10 +5693,8 @@ mod tests {
             Some(Config::default().cpu_floor_w)
         );
 
-        // The state file still records the completion stamp, but the
-        // superseded LUT is deliberately not serialized by the staged v3
-        // schema. The interim controller retains it only in memory.
-        // `loop_gains` stays None: `settle_sample()` carries no `fanctrl`
+        // The state file records the completion stamp without reviving the
+        // superseded LUT/scalar gains. `settle_sample()` carries no `fanctrl`
         // view, so `fanctrl_active` is always false and the step test's
         // settle gate never clears — it skips and keeps defaults.
         let saved = PersistedState::load(&state_path);
@@ -5365,7 +5705,7 @@ mod tests {
             .expect("calibrated_at set")
             .parse::<u64>()
             .expect("unix seconds");
-        assert!(ctl.lut.is_some());
+        assert!(ctl.lut.is_none());
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -5373,8 +5713,8 @@ mod tests {
     #[test]
     fn calibration_save_preserves_the_duty_rpm_table_and_warm_start_it_does_not_own() {
         // Regression: `RunnerEffect::SaveState`'s `PersistedState` carries
-        // only what the step-test runner itself owns (`lut`/`calibrated_at`/
-        // `loop_gains`) — its `duty_rpm_table`/`warm_start` are bare
+        // only what the step-test runner itself owns (`calibrated_at` and
+        // the two gain maps) — its `duty_rpm_table`/`warm_start` are bare
         // `..PersistedState::default()` filler, NOT the controller's actual
         // table/warm-start map. Saving that struct directly to disk would
         // silently wipe both on every calibration. The controller must fold
@@ -5413,7 +5753,7 @@ mod tests {
         );
 
         ctl.on_command(Command::StartCalibration);
-        drive_sweep(&mut ctl);
+        drive_shared_settle_entry(&mut ctl);
         drive_step_test_to_skip(&mut ctl);
         assert_eq!(ctl.status().mode, Mode::Monitor, "calibration finished");
 
@@ -5919,22 +6259,43 @@ mod tests {
     fn emergency_during_calibration_aborts_it() {
         let runner = FakeRunner::new();
         let (dir, path) = profile_fixture("watchdog-calib");
-        let mut ctl = controller(&runner, path.clone());
+        let (mut ctl, gpu_calls) = auto_controller(&runner, path.clone(), Config::default());
         ctl.on_command(Command::StartCalibration);
-        drive_sweep(&mut ctl);
+        drive_shared_settle_entry(&mut ctl);
         for _ in 0..10 {
             ctl.on_sample(&settle_sample()); // burner active mid-settle
         }
         assert!(ctl.burner.is_some(), "premise: burner running mid-settle");
 
-        ctl.on_sample(&overheat_at(1000.0));
-        ctl.on_sample(&overheat_at(1001.0));
-        let effects = ctl.on_sample(&overheat_at(1002.0));
+        let first = ctl.on_sample(&overheat_at(10.0));
+        assert_eq!(ctl.status.mode, Mode::Calibrating, "first hot sample: {first:?}");
+        let second = ctl.on_sample(&overheat_at(11.0));
+        assert_eq!(ctl.status.mode, Mode::Calibrating, "second hot sample: {second:?}");
+        let effects = ctl.on_sample(&overheat_at(12.0));
+        let causes: Vec<_> = effects.iter().filter_map(|effect| match effect {
+            Effect::StatusChanged { cause } | Effect::Noted { cause } => Some(*cause),
+            _ => None,
+        }).collect();
+        assert_eq!(
+            causes.first().copied(),
+            Some("calib:skipped"),
+            "the runner's restore-pair + Noted terminal outcome must precede watchdog release: {effects:?}"
+        );
         assert!(effects.contains(&Effect::Released), "got {effects:?}");
         assert!(has_status_change_cause(
             &effects,
             "watchdog:thermal_emergency"
         ));
+        let cpu_writes = ryzenadj_calls(&runner);
+        assert!(
+            cpu_writes.iter().all(|args| args == &expected_args(15_000)),
+            "thermal terminal must only establish/restore the clamped CPU floor, never issue a step: {cpu_writes:?}"
+        );
+        assert_eq!(
+            gpu_calls.lock().unwrap().as_slice(),
+            &[GpuCall::Set(1_000), GpuCall::Set(1_000), GpuCall::Release],
+            "held GPU floor restore must precede the watchdog's final stock release"
+        );
         assert!(ctl.burner.is_none(), "emergency must stop the burner");
         assert!(ctl.calib.is_none());
         assert!(ctl.status().calib.is_none());
@@ -5946,6 +6307,100 @@ mod tests {
         assert_eq!(modprobe_reload_calls(&runner), 0);
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn auto_calibration_freezes_device_loops_and_tstar_then_reenters_without_a_cap_step() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu_calls) = auto_controller_no_profile(&runner);
+        ctl.on_command(Command::SetCpuW(40.0));
+        ctl.on_command(Command::SetGpuMaxClock(1_800));
+        ctl.on_command(Command::SetAuto(true));
+        for t in 0..8 {
+            ctl.on_sample(&temploop_sample(f64::from(t), 75.0, 74.0, TEMP_CURVE));
+        }
+        let held_pair = (ctl.status.cpu_limit_w, ctl.status.gpu_max_mhz);
+        {
+            let auto = ctl.auto.as_mut().expect("Auto state");
+            auto.replica.reset(Some(90.0), Some(89.0), Some(88.0));
+            auto.ec_avg.reseed(90.0);
+            auto.ec_ma = Some(90.0);
+            auto.ec_seeded = true;
+            auto.cpu_draw_window = [99.0; 5].into();
+            auto.fan_window = [9_999.0; 5].into();
+            auto.ec_slope_window = [90.0; 5].into();
+            auto.steady_window = [9_999.0; 40].into();
+            auto.steady_key = Some("stale".into());
+            auto.refinement_window = [9_999.0; 40].into();
+            auto.refinement_key = Some("stale".into());
+        }
+        let before = {
+            let auto = ctl.auto.as_ref().expect("Auto state");
+            (
+                auto.cpu_loop.thermal(),
+                auto.cpu_loop.requested(),
+                auto.gpu_loop.thermal(),
+                auto.gpu_loop.requested(),
+                auto.tstar.state(),
+                ctl.status.t_star_c,
+            )
+        };
+
+        ctl.on_command(Command::StartCalibration);
+        assert_eq!(ctl.status.mode, Mode::Calibrating);
+        ctl.on_sample(&temploop_sample(8.0, 75.0, 74.0, TEMP_CURVE));
+        let during = {
+            let auto = ctl.auto.as_ref().expect("suspended Auto state");
+            (
+                auto.cpu_loop.thermal(),
+                auto.cpu_loop.requested(),
+                auto.gpu_loop.thermal(),
+                auto.gpu_loop.requested(),
+                auto.tstar.state(),
+                ctl.status.t_star_c,
+            )
+        };
+        assert_eq!(during, before, "calibration must not tick either loop or TStar");
+
+        ctl.on_command(Command::AbortCalibration);
+        assert_eq!(ctl.status.mode, Mode::Auto);
+        assert_eq!((ctl.status.cpu_limit_w, ctl.status.gpu_max_mhz), held_pair);
+        let cpu_writes = ryzenadj_calls(&runner).len();
+        let gpu_writes = gpu_sets(&_gpu_calls).len();
+        let effects = ctl.on_sample(&busy_at(9.0));
+        assert!(!effects.iter().any(|effect| matches!(effect, Effect::CpuSet(_) | Effect::GpuSet(_))), "first re-entry sample must hold the restored pair: {effects:?}");
+        assert_eq!(ryzenadj_calls(&runner).len(), cpu_writes, "held reseed must not write CPU");
+        assert_eq!(gpu_sets(&_gpu_calls).len(), gpu_writes, "held reseed must not write GPU");
+        assert_eq!((ctl.status.cpu_limit_w, ctl.status.gpu_max_mhz), held_pair);
+        {
+            let auto = ctl.auto.as_mut().expect("resumed Auto state");
+            assert_eq!(auto.replica.cpu_group_ma(), Some(75.0));
+            assert_eq!(auto.replica.gpu_group_ma(), Some(74.0));
+            assert_eq!(auto.ec_ma, Some(74.0));
+            let next_ec_mean = auto.ec_avg.push(75.0).expect("held sample seeded EC average");
+            assert!((next_ec_mean - 74.5).abs() < 1e-9, "{next_ec_mean}");
+            assert_eq!(auto.cpu_draw_window.iter().copied().collect::<Vec<_>>(), vec![25.0]);
+            assert_eq!(auto.fan_window.iter().copied().collect::<Vec<_>>(), vec![3_000.0]);
+            assert_eq!(auto.ec_slope_window.iter().copied().collect::<Vec<_>>(), vec![75.0]);
+            assert!(auto.steady_window.is_empty());
+            assert_eq!(auto.steady_key, None);
+            assert!(auto.refinement_window.is_empty());
+            assert_eq!(auto.refinement_key, None);
+            assert!(auto.ec_seeded && auto.view_initialised);
+        }
+
+        // A runner-driven terminal skip resumes the same suspended Auto
+        // state and gets the same one-sample no-write re-entry contract.
+        ctl.on_command(Command::StartCalibration);
+        ctl.on_sample(&temploop_sample(10.0, 75.0, 74.0, TEMP_CURVE));
+        let mut changed = temploop_sample(11.0, 75.0, 74.0, TEMP_CURVE);
+        changed.fanctrl.as_mut().expect("view").strategy = "performance".into();
+        let terminal = ctl.on_sample(&changed);
+        assert!(has_status_change_cause(&terminal, "calib:skipped"), "{terminal:?}");
+        assert_eq!(ctl.status.mode, Mode::Auto);
+        assert_eq!((ctl.status.cpu_limit_w, ctl.status.gpu_max_mhz), held_pair);
+        let effects = ctl.on_sample(&temploop_sample(12.0, 75.0, 74.0, TEMP_CURVE));
+        assert!(!effects.iter().any(|effect| matches!(effect, Effect::CpuSet(_) | Effect::GpuSet(_))), "first re-entry sample after runner terminal must hold: {effects:?}");
     }
 
     #[test]
@@ -6472,7 +6927,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_and_calibration_commands_rejected_in_auto() {
+    fn manual_commands_are_rejected_while_calibration_suspends_auto() {
         let runner = FakeRunner::new();
         let (mut ctl, gpu_calls) = auto_controller_no_profile(&runner);
         ctl.on_command(Command::SetAuto(true));
@@ -6485,13 +6940,15 @@ mod tests {
             assert!(effects.is_empty(), "{cmd:?} must be rejected: {effects:?}");
         }
         let effects = ctl.on_command(Command::StartCalibration);
-        assert!(effects.is_empty(), "got {effects:?}");
-        assert_eq!(ctl.status().mode, Mode::Auto);
-        assert!(ctl.status().calib.is_none());
+        assert_eq!(status_changes(&effects), 1, "got {effects:?}");
+        assert_eq!(ctl.status().mode, Mode::Calibrating);
+        assert!(ctl.status().calib.is_some());
+        assert!(ctl.auto.is_some(), "Auto state remains suspended in place");
         assert_eq!(ryzenadj_calls(&runner).len(), cpu_calls_before);
         assert_eq!(gpu_sets(&gpu_calls).len(), gpu_calls_before);
 
-        // SetFanTarget stays allowed: it retargets the fan target live.
+        ctl.on_command(Command::AbortCalibration);
+        // SetFanTarget stays allowed after Auto resumes: it retargets the fan target live.
         ctl.on_command(Command::SetFanTarget(2500.0));
         assert_eq!(ctl.status().fan_target_rpm, 2500.0);
         assert_eq!(ctl.status().mode, Mode::Auto);
@@ -7021,11 +7478,29 @@ mod tests {
     }
 
     #[test]
-    fn per_device_calibration_cpu_write_seam_updates_only_after_success() {
+    fn per_device_calibration_writes_and_restores_both_caps_through_normal_paths() {
         let runner = FakeRunner::new();
-        let mut ctl = controller_no_profile(&runner);
-        ctl.apply_calib_effects(vec![RunnerEffect::SetCpuMaxWatts(23.0)], None);
+        let (mut ctl, gpu_calls) = auto_controller_no_profile(&runner);
+        ctl.apply_calib_effects(
+            vec![
+                RunnerEffect::SetCpuMaxWatts(23.0),
+                RunnerEffect::SetGpuMaxClock(1_500),
+            ],
+            None,
+        );
         assert_eq!(ctl.status().cpu_limit_w, Some(23.0));
+        assert_eq!(ctl.status().gpu_max_mhz, Some(1_500));
+        assert!(gpu_sets(&gpu_calls).contains(&1_500));
+
+        ctl.apply_calib_effects(
+            vec![
+                RunnerEffect::SetCpuMaxWatts(ctl.config.cpu_floor_w),
+                RunnerEffect::SetGpuMaxClock(ctl.config.gpu_floor_mhz),
+            ],
+            None,
+        );
+        assert_eq!(ctl.status().cpu_limit_w, Some(ctl.config.cpu_floor_w));
+        assert_eq!(ctl.status().gpu_max_mhz, Some(ctl.config.gpu_floor_mhz));
     }
 
     #[test]
@@ -7556,11 +8031,10 @@ mod tests {
         assert_eq!(ctl.status().cpu.as_ref().expect("CPU").thermal, 40.0);
     }
     #[test]
-    fn calib_budget_w_stays_at_default_through_the_lut_sweep_before_any_setbudget() {
+    fn calib_budget_w_stays_frozen_through_per_device_calibration() {
         // The whole-session calibration freeze (`Freeze::Calibrating`) holds
-        // `u` exactly through the LUT sweep — no `SetBudget` fires until the
-        // step test's hand-off, so `status.budget_w` (only ever written by
-        // `apply_calib_set_budget`) never moves off its default.
+        // the staged compatibility budget while the per-device runner owns
+        // the direct CPU/GPU writes.
         //
         // The `budget_w == 0.0` checks below are the premise, not the proof:
         // `on_calib_sample` steps the scratch integrator with a ZERO error,
@@ -7574,27 +8048,21 @@ mod tests {
         ctl.on_command(Command::StartCalibration);
         assert_eq!(ctl.status().budget_w, 0.0, "no SetBudget has fired yet");
 
-        use crate::calib::lut_sweep::SWEEP_CLOCKS;
-        for &clock in SWEEP_CLOCKS.iter().take(3) {
-            for _ in 0..60 {
-                ctl.on_sample(&sweep_pinned(clock));
-                if ctl.status().calib.as_ref().map(|c| c.phase.as_str()) != Some("lut") {
-                    break;
-                }
-            }
+        for _ in 0..20 {
+            ctl.on_sample(&settle_sample());
         }
         assert_eq!(
             ctl.status().calib.as_ref().map(|c| c.phase.clone()),
-            Some("lut".to_string()),
-            "premise: still mid-sweep, no hand-off to the step test yet"
+            Some("settle".to_string()),
+            "premise: still waiting in shared settle"
         );
         assert_eq!(
             ctl.status().budget_w,
             0.0,
-            "u must be unchanged across the LUT sweep"
+            "u must be unchanged across per-device calibration"
         );
         // The falsifiable part: the scratch integrator was really stepped
-        // under the whole-session freeze on the most recent sweep sample.
+        // under the whole-session freeze on the most recent settle sample.
         assert_eq!(
             ctl.calib_budget
                 .as_ref()
@@ -7618,12 +8086,22 @@ mod tests {
         // must actually leave the settle sub-phase.
         let runner = FakeRunner::new();
         let (dir, profile) = profile_fixture("calib-context-real");
-        let mut ctl = controller(&runner, profile);
+        let mut ctl = Controller::new(
+            RestoreGuard::new(
+                &runner,
+                Some(cpu_actuator(&runner, profile)),
+                Some(Box::new(FakeGpu::new())),
+                None,
+            ),
+            PersistedState::default(),
+            dir.join("state.json"),
+            Config::default(),
+            PathBuf::from("/nonexistent/config.toml"),
+        );
         ctl.on_command(Command::StartCalibration);
-        drive_sweep(&mut ctl);
         assert_eq!(
             ctl.status().calib.as_ref().map(|c| c.phase.clone()),
-            Some("step".to_string())
+            Some("settle".to_string())
         );
 
         let settle = |t_mono: f64| -> Sample {
@@ -7638,7 +8116,7 @@ mod tests {
                 observed_at: Instant::now(),
                 all_observed_at: Some(Instant::now()),
             };
-            let ec = ec_reading_c(&[("apu@4c", 60.0)]);
+            let ec = ec_reading_c(&[("apu@4c", 60.0), ("gpu_vr_f75303@4d", 55.0)]);
             Sample {
                 t_mono,
                 fan_valid: true,
@@ -7650,6 +8128,9 @@ mod tests {
                 fanctrl_view_changed: true,
                 cpu_temp_c: 60.0,
                 cpu_temp_valid: true,
+                gpu_mhz_valid: true,
+                gpu_sm_mhz: 1_000.0,
+                gpu_util_pct: 95.0,
                 ..Sample::default()
             }
         };
@@ -7658,7 +8139,7 @@ mod tests {
             ctl.on_sample(&settle(i as f64));
         }
         let calib = ctl.status().calib.as_ref().expect("still calibrating");
-        assert_eq!(calib.phase, "step", "phase label stays step");
+        assert_eq!(calib.phase, "cpu_step", "settle advances to CPU step");
         assert!(
             calib.step >= 1,
             "must have LEFT the settle sub-phase within 65 flat, active, \

@@ -231,9 +231,9 @@ impl Model {
                 }
             }
             'k' => {
-                // Calibration only starts from Monitor: a manual session (or
-                // a running calibration) must not be silently clobbered.
-                if self.status.mode == Mode::Monitor {
+                // Monitor starts from the configured floor pair; Auto is
+                // suspended in place and resumes from its held pair.
+                if matches!(self.status.mode, Mode::Monitor | Mode::Auto) {
                     vec![Command::StartCalibration]
                 } else {
                     Vec::new()
@@ -581,11 +581,18 @@ mod tests {
     }
 
     #[test]
-    fn k_starts_calibration_only_in_monitor_mode() {
+    fn k_starts_calibration_from_monitor_or_auto() {
         // Default status is Monitor: k emits StartCalibration.
         let mut m = Model::new();
         assert_eq!(
             m.update(Event::Input(key('k'))),
+            vec![Command::StartCalibration]
+        );
+
+        let mut auto = Model::new();
+        auto.update(Event::Status(status_in(Mode::Auto)));
+        assert_eq!(
+            auto.update(Event::Input(key('k'))),
             vec![Command::StartCalibration]
         );
 

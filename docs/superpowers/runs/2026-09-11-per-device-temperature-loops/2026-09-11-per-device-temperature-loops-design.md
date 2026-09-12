@@ -279,19 +279,23 @@ headroom ≥ 1 W / ≥ 30 MHz, fall rate ≥ 0.05 W/s / ≥ 1 MHz/s):
 with `allocator.rs` (§3).
 
 A load jump from 38 → 100 W under a 54 W `cpu_max_w` therefore ramps to the cap in ~2 s (10 W
-per second while the group is at or below T\*); a GPU recovery of 1000 MHz takes ~3.5 s at
-300 MHz/s; a scene dip lets the shadow fall by 10 W in 30 s; a one-sample 20 W burst on an
+per second while the group is at or below T\*). A GPU shadow request slews at 300 MHz/s, but
+the measured-clock target exposes one 300 MHz headroom step per successful command; at the
+required 2 s write cadence, an applied 1000 MHz recovery therefore takes at most 8 s. A scene
+dip lets the shadow fall by 10 W in 30 s; a one-sample 20 W burst on an
 unstressed CPU moves the 5-sample draw mean by 4 W, so the shadow rises 4 W and falls back in
 12 s — it does not go to `max`. The rise time is the tunable that matters: ≳15 s is the onset
 starvation the previous §2.4 forbade.
 
 **The GPU dead zone.** Above the power-limit knee (~2143 MHz at full load)
 clock-to-heat gain is approximately zero. With draw available and shadow enabled,
-a settled power-limited device has shadow ≤ knee + headroom. A genuine hot
-handover starts thermal at that cap, leaving at most 300 MHz of zero-gain
-travel. At default Kc/Ti = 1/(0.02*360) ≈ 0.1389 MHz/(°C·s),
-300 MHz costs about 540 s at 4 °C error or 720 s at 3 °C, before the
-90 s response delay. It cannot be included in a 3λ settling budget.
+a settled power-limited device has shadow ≤ reported plateau + headroom. A genuine hot
+handover starts thermal at that cap. Its zero-gain travel is therefore measured as
+`D = max(0, handover_cap − knee)`; it is not a fixed one-headroom bound because the reported
+full-load plateau (~2520 MHz in the plant) can itself sit above the knee. At default
+Kc/Ti = 1/(0.02*360) ≈ 0.1389 MHz/(°C·s), even 300 MHz costs about 540 s at 4 °C error or
+720 s at 3 °C, before the 90 s response delay. The measured crossing interval cannot be
+included in a 3λ settling budget.
 
 That 300 MHz bound is conditional: disabled shadow, missing draw after the
 dwell, or a setpoint change while thermal is already above the shadow can leave
@@ -663,8 +667,8 @@ budget, split, LUT, Mode A/Mode B.
   GPU HOT guard keys on) and CPU Tctl so guard episodes can be driven; fault injection for dGPU
   off, a single group's labels dropping out, a stuck-high sensor, fan outage, EC invalid / stale
   view).
-  **GPU clock→draw model (no LUT):** `draw_w = load_level × P_full(clock)`, where
-  `P_full(clock)` is the September full-load sweep as a piecewise-linear table —
+  **GPU clock→draw model (no LUT):** `draw_w = load_level × P_full(requested_lock)`, where
+  `P_full(requested_lock)` is the September full-load sweep as a piecewise-linear table —
   (1197 MHz, 49.3 W), (1402, 53.5), (1612, 64.2), (1807, 75.9), (1995, 90.8), (2143, 99.4),
   extended flat to 3090 at 100 W (the card's power limit) and linearly to (1000, 45) below —
   and `load_level ∈ [0, 1]` is the scripted GPU load; the reported SM clock is
@@ -673,19 +677,38 @@ budget, split, LUT, Mode A/Mode B.
   reported clock) bounds a power-limited card's cap near the knee (§2.3, "the GPU dead zone");
   GPU heat = `draw_w × 0.4 °C/W` into the GPU node (roast d2: the heat equation, not just the
   description, uses the GPU path's resistance). CPU: `draw_w = min(cap, cpu_load_w)` with
-  heat `× 0.8 °C/W` into the CPU node, as today.
+  heat `× 0.8 °C/W` into the CPU node, as today. The robustness sweep treats K as a
+  **local incremental FOPDT gain about a declared physical pivot**, rather than changing the
+  zero-power equilibrium: for the GPU, with `P0 = P_full(2143 MHz) = 99.4 W`, the robustness-only
+  heat term is `0.4·P0 + 20·K·(draw_w-P0)`. The nominal `K=0.02` reduces exactly to the physical
+  `0.4·draw_w` equation. The harness applies this affine transform only inside the thermal node;
+  the controller and trace still receive the physical
+  `draw_w = load_level × P_full(requested_lock)` and the separately power-limited reported clock.
+  Target RPM, ambient, curve, load fractions, reported draw and clock, floors and ceilings are
+  one immutable external tuple across the GPU K/τ/θ grid. Unit bars prove equal heat at P0 for
+  every K, incremental slope `ΔT/ΔP = 20·K` above and below P0, and unchanged physical reported
+  draw. CPU robustness uses one corresponding immutable external tuple across all ±50% cells.
   1. CPU-heavy, light GPU: CPU group settles at T\*, GPU sits at its shadow cap above draw,
      fans ±150 RPM of target ≥ 90 % of a 30-min converged window.
   2. GPU-heavy, light CPU: the mirror.
   3. Both heavy: both groups at T\*, same fan bar.
   4. Load step light → heavy on the GPU from a cold start (thermal candidate at `max`): cap
-     ramps at the rising slew (1000 MHz in ≤ 5 s), no fan crest above target+250, **the GPU
+     ramps at the cadence-aware rising slew (an applied 1000 MHz in ≤ 8 s, with every request
+     no higher than reported clock + headroom), no fan crest above target+250, **the GPU
      group's temperature overshoots T* by ≤ 4 °C, the GPU HOT guard does not trip, and the
      group settles within ±1 °C within 3 λ after the first downward knee crossing plus θ_eff**.
      Separately assert and report the crossing bound in §2.3 using the measured
      minimum hot error over the plateau and D at handover; never count this
-     crossing as part of the 3 λ budget, the CPU cap unchanged during the step; and the same step repeated from a
-     warm state (the loop already regulating at T\* under the light load) — overshoot ≤ 2 °C. Repeat with gpu_shadow_enabled=false and with draw
+     crossing as part of the 3 λ budget, the CPU cap unchanged during the step; and the same powered
+     light → heavy edge repeated from a warm controller/thermal state — first converge at T\* under
+     a feasible powered preload, then hold a powered light phase for a declared
+     `0 < light_dwell < θ_eff` before the heavy edge. "Warm" qualifies the initial controller and
+     thermal state; it does not claim the low-demand phase is itself a steady feasible T\* operating
+     point. Require nonzero light draw and a measured heavy draw greater than 2× the light draw,
+     GPU-group presence throughout, ±1 °C residency with Thermal selected during the scored
+     pre-light warm window, no adjacent cap jump beyond the applicable slew, continuous Auto/Curve
+     state, and no thermal-candidate reset through the light dwell; score
+     warm overshoot from the heavy edge and require ≤ 2 °C. Repeat with gpu_shadow_enabled=false and with draw
      missing for >60 s before the step; record the full 947 MHz bound,
      require the same temperature/guard bars and post-crossing settling,
      and assert no output jump at disable/dwell/return. These are offline
@@ -726,20 +749,27 @@ budget, split, LUT, Mode A/Mode B.
   10. Robustness: sims 1–3 repeated with the CPU plant's K, τ and θ each
       perturbed by ±50 % and with the GPU's full crossed grid from §2.3
       (τ=8,15,25,50; K=0.01,0.02,0.03; θ_eff=45,90,135), plus a
-      **fluctuating-load leg** (roast d2): sim 3's load with a square-wave component (period
-      60 s and 300 s, amplitude enough to swing each group ±4 °C about T\*) and a T* down-and-back step
+      **fluctuating-load leg** (roast d2): sim 3's load with square-wave half-cycle dwell
+      durations of 60 s and 300 s (full periods 120 s and 600 s) at fixed T\*. Choose amplitude
+      so the live controller-group telemetry, after its 60 s boxcar, reaches both +4 °C and
+      −4 °C about the live T\*; raw plant temperature does not satisfy this premise. Also run a T* down-and-back step
       (fan-target change in Curve at unchanged load), plus a 60 s load dip
       beginning while each group is still above T*. For the target-return
       leg, the cap returns within 10% of its prior steady value within 3λ;
       for the hot-dip leg compare against an identical thermal-error replay
       without the draw dip: PI state must match (no draw-driven loss), and
-      any purely shadow-limited 1000 MHz recovery takes ≤5 s once err≥0.
+      any purely shadow-limited applied 1000 MHz recovery takes ≤8 s once err≥0,
+      while each request remains at most the reported clock plus headroom.
       Include the corresponding Held setpoint excursion with a 3λ_inner
       recovery window measured after T* returns to its original value.
       Apply a period-agnostic **no-relay rule** on every 30-min
       window of every leg (no sustained oscillation of the cap or the fan with a peak-to-peak
       above 100 RPM / 4 W / 150 MHz at any period from 30 s to 20 min beyond what the load's
-      own period forces) — a loop hunting slowly inside ±150 RPM does not pass.
+      own period forces) — a loop hunting slowly inside ±150 RPM does not pass. For the
+      square-wave legs, residualize against a separate forcing-only reference trace keyed by
+      forcing phase; do not fit the tested trace to itself and do not exempt the forcing period
+      or any neighboring period. Synthetic grader bars add an independent relay at the same
+      period and at a nearby period to the known forcing response and require both to be found.
   11. Stuck-high sensor: one GPU-group label pinned at 105 °C from the first sample and,
       separately, from t = 5 min: the GPU cap goes to its floor (the safe direction, §2.1),
       `DeviceUnreachable` (real) is raised within `BOUND_HOLD_S` after reaching

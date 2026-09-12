@@ -9,15 +9,25 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::actuators::gpu::clamp_gpu_clock;
-use crate::control::allocator::{CPU_MAX_W, GPU_MAX_W};
 use crate::control::controller::DEFAULT_FAN_TARGET_RPM;
+use crate::control::device_loop::Gains;
 use crate::control::guards::{GPU_HOT_C_DEFAULT, GPU_HYSTERESIS_C, NVME_HOT_C_DEFAULT};
 use crate::control::lut::ClockWattsLut;
-use crate::control::watchdog::GPU_TRIP_C;
+use crate::control::watchdog::{CPU_TRIP_C, GPU_TRIP_C};
 
-/// Lower bound for `cpu_max_w`: below the actuator's ~10 W sustained floor the
-/// grid-search and the manual-mode clamps would degenerate.
-const CPU_MAX_W_FLOOR: f64 = 10.0;
+/// CPU sustained hardware ceiling (W), rehomed before allocator deletion.
+pub const CPU_MAX_W: f64 = 54.0;
+/// Lowest usable CPU sustained operating ceiling (W), also rehomed before
+/// allocator deletion.
+pub const CPU_MAX_W_FLOOR: f64 = 10.0;
+/// The maximum lockable GPU clock (MHz).
+pub const GPU_MAX_MHZ: u32 = 3090;
+/// Temporary legacy budget compatibility; removed by the deletion sweep.
+const GPU_MAX_W: f64 = 100.0;
+// The terminal sweep removes allocator's duplicate compatibility constants.
+// Referencing them here keeps this staged branch warning-free meanwhile.
+const _: f64 = crate::control::allocator::CPU_MAX_W;
+const _: f64 = crate::control::allocator::GPU_MAX_W;
 
 /// Lower bound for `gpu_hot_c`, set at the measured park point minus the
 /// hysteresis band. Design §2.8: under a 100 W gpu-burn the die settles at
@@ -73,9 +83,29 @@ pub struct Config {
     /// it. Defaults to and is clamped to the HX 370 cTDP ceiling
     /// ([`CPU_MAX_W`]); lower it to soft-cap the CPU (quieter, less power).
     pub cpu_max_w: f64,
-    /// GPU operating max (watts): same role for the GPU. Defaults to / clamped
-    /// to the RTX 5070 module TGP ([`GPU_MAX_W`]).
+    /// Legacy scalar-budget compatibility, deliberately never read from or
+    /// written to config files. Task .12 removes the Rust field.
+    #[serde(skip, default = "default_gpu_max_w")]
     pub gpu_max_w: f64,
+    /// Maximum GPU clock lock. Bounded below by `gpu_floor_mhz`.
+    pub gpu_max_mhz: u32,
+    /// Extra CPU watts above the current draw used for the shadow cap.
+    pub shadow_headroom_cpu_w: f64,
+    /// Extra GPU MHz above the current draw used for the shadow cap.
+    pub shadow_headroom_gpu_mhz: f64,
+    /// CPU shadow-cap down-slew rate (W/s).
+    pub shadow_fall_rate_cpu: f64,
+    /// GPU shadow-cap down-slew rate (MHz/s).
+    pub shadow_fall_rate_gpu: f64,
+    /// Disable only the GPU shadow candidate for A/B testing.
+    pub gpu_shadow_enabled: bool,
+    /// CPU soft hot guard threshold (°C), independently bounded below the
+    /// hard watchdog trip.
+    pub cpu_hot_c: f64,
+    /// Optional operator overrides, taking precedence over fitted gains.
+    pub cpu_gains: Option<Gains>,
+    /// Optional operator overrides, taking precedence over fitted gains.
+    pub gpu_gains: Option<Gains>,
     /// dGPU guard enter threshold (°C, exit is this − 5). See
     /// [`crate::control::guards`] for the hysteresis and the 87 °C
     /// card-spec derivation of the default.
@@ -101,6 +131,15 @@ impl Default for Config {
             fast_limit_mw: 53_000,
             cpu_max_w: CPU_MAX_W,
             gpu_max_w: GPU_MAX_W,
+            gpu_max_mhz: GPU_MAX_MHZ,
+            shadow_headroom_cpu_w: 10.0,
+            shadow_headroom_gpu_mhz: 300.0,
+            shadow_fall_rate_cpu: 0.33,
+            shadow_fall_rate_gpu: 10.0,
+            gpu_shadow_enabled: true,
+            cpu_hot_c: 90.0,
+            cpu_gains: None,
+            gpu_gains: None,
             gpu_hot_c: GPU_HOT_C_DEFAULT,
             nvme_hot_c: NVME_HOT_C_DEFAULT,
             leds: LedConfig::default(),
@@ -170,7 +209,20 @@ impl Config {
                 return Config::default();
             }
         };
-        match toml::from_str::<Config>(&text) {
+        let mut value = match toml::from_str::<toml::Value>(&text) {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::warn!("bad config {}, using defaults: {e}", path.display());
+                return Config::default();
+            }
+        };
+        if value
+            .as_table_mut()
+            .is_some_and(|table| table.remove("gpu_max_w").is_some())
+        {
+            tracing::warn!("config migration: ignoring legacy gpu_max_w");
+        }
+        match value.try_into::<Config>() {
             Ok(config) => config.sanitized(),
             Err(e) => {
                 tracing::warn!("bad config {}, using defaults: {e}", path.display());
@@ -193,6 +245,15 @@ impl Config {
                 self.gpu_floor_mhz
             );
             self.gpu_floor_mhz = gpu;
+        }
+        let gpu_max_mhz = self.gpu_max_mhz.clamp(self.gpu_floor_mhz, GPU_MAX_MHZ);
+        if gpu_max_mhz != self.gpu_max_mhz {
+            tracing::warn!(
+                "config gpu_max_mhz {} outside [{}, {GPU_MAX_MHZ}]; clamped to {gpu_max_mhz}",
+                self.gpu_max_mhz,
+                self.gpu_floor_mhz
+            );
+            self.gpu_max_mhz = gpu_max_mhz;
         }
         // Operating maxes are the source of truth for CPU/GPU "100%", but they
         // are hard-clamped to the hardware ceilings so a config typo can never
@@ -237,6 +298,45 @@ impl Config {
                 self.cpu_max_w
             );
             self.cpu_floor_w = cpu;
+        }
+        sanitize_positive(
+            &mut self.shadow_headroom_cpu_w,
+            1.0,
+            "shadow_headroom_cpu_w",
+        );
+        sanitize_positive(
+            &mut self.shadow_headroom_gpu_mhz,
+            30.0,
+            "shadow_headroom_gpu_mhz",
+        );
+        sanitize_positive(
+            &mut self.shadow_fall_rate_cpu,
+            0.05,
+            "shadow_fall_rate_cpu",
+        );
+        sanitize_positive(
+            &mut self.shadow_fall_rate_gpu,
+            1.0,
+            "shadow_fall_rate_gpu",
+        );
+        let cpu_hot = if self.cpu_hot_c.is_finite() {
+            self.cpu_hot_c.clamp(82.0, CPU_TRIP_C - 1.0)
+        } else {
+            90.0
+        };
+        if cpu_hot != self.cpu_hot_c {
+            tracing::warn!(
+                "config cpu_hot_c {} outside [82, {}]; clamped to {cpu_hot}",
+                self.cpu_hot_c,
+                CPU_TRIP_C - 1.0
+            );
+            self.cpu_hot_c = cpu_hot;
+        }
+        for (name, gains) in [("cpu_gains", &mut self.cpu_gains), ("gpu_gains", &mut self.gpu_gains)] {
+            if gains.is_some_and(|value| !value.is_valid()) {
+                tracing::warn!("config {name} must have finite positive gains; ignoring override");
+                *gains = None;
+            }
         }
         // The two guard thresholds (§2.8). NaN is the sharp edge here: every
         // comparison in `guards::hysteresis` is false against NaN, so a
@@ -329,6 +429,18 @@ impl Config {
     }
 }
 
+fn default_gpu_max_w() -> f64 {
+    GPU_MAX_W
+}
+
+fn sanitize_positive(value: &mut f64, floor: f64, name: &str) {
+    let sanitized = if value.is_finite() { value.max(floor) } else { floor };
+    if sanitized != *value {
+        tracing::warn!("config {name} must be finite and >= {floor}; clamped to {sanitized}");
+        *value = sanitized;
+    }
+}
+
 /// Atomic file write shared by config (TOML) and state (JSON): write the
 /// full contents to `<path>.tmp`, fsync, then rename over `path` — a crash
 /// mid-write leaves the old file intact, never a truncated one. Creates the
@@ -373,7 +485,16 @@ mod tests {
             gpu_floor_mhz: 1200,
             fast_limit_mw: 60_000,
             cpu_max_w: 50.0,
-            gpu_max_w: 90.0,
+            gpu_max_w: GPU_MAX_W,
+            gpu_max_mhz: 2500,
+            shadow_headroom_cpu_w: 12.0,
+            shadow_headroom_gpu_mhz: 350.0,
+            shadow_fall_rate_cpu: 0.5,
+            shadow_fall_rate_gpu: 20.0,
+            gpu_shadow_enabled: false,
+            cpu_hot_c: 89.0,
+            cpu_gains: Some(Gains { kc: 0.2, ti_s: 35.0 }),
+            gpu_gains: Some(Gains { kc: 2.1, ti_s: 15.0 }),
             gpu_hot_c: 86.0,
             nvme_hot_c: 78.0,
             leds: LedConfig {
@@ -765,6 +886,69 @@ mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         assert_eq!(names, vec!["config.toml".to_string()]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn device_loop_config_bounds_and_cpu_guard_are_independent() {
+        let defaults = Config::default();
+        assert_eq!(defaults.shadow_headroom_cpu_w, 10.0);
+        assert_eq!(defaults.shadow_headroom_gpu_mhz, 300.0);
+        assert_eq!(defaults.shadow_fall_rate_cpu, 0.33);
+        assert_eq!(defaults.shadow_fall_rate_gpu, 10.0);
+        assert!(defaults.gpu_shadow_enabled);
+        assert_eq!(defaults.gpu_max_mhz, 3090);
+
+        let clamped = Config {
+            shadow_headroom_cpu_w: f64::NAN,
+            shadow_headroom_gpu_mhz: 0.0,
+            shadow_fall_rate_cpu: -1.0,
+            shadow_fall_rate_gpu: 0.0,
+            gpu_floor_mhz: 3000,
+            gpu_max_mhz: 1000,
+            cpu_hot_c: 82.0,
+            ..defaults
+        }
+        .sanitized();
+        assert_eq!(clamped.shadow_headroom_cpu_w, 1.0);
+        assert_eq!(clamped.shadow_headroom_gpu_mhz, 30.0);
+        assert_eq!(clamped.shadow_fall_rate_cpu, 0.05);
+        assert_eq!(clamped.shadow_fall_rate_gpu, 1.0);
+        assert_eq!(clamped.gpu_max_mhz, 3000);
+        assert_eq!(clamped.cpu_hot_c, 82.0);
+        assert_eq!(clamped.cpu_hot_c - 2.0, 80.0);
+        assert_eq!(clamped.gpu_hot_c - 2.0, 86.0);
+
+        assert_eq!(
+            Config { cpu_hot_c: 999.0, ..Config::default() }
+                .sanitized()
+                .cpu_hot_c,
+            94.0
+        );
+    }
+
+    #[test]
+    fn every_shadow_numeric_rejects_nonpositive_and_nonfinite_values() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0] {
+            let config = Config { shadow_headroom_cpu_w: value, ..Config::default() }.sanitized();
+            assert_eq!(config.shadow_headroom_cpu_w, 1.0, "CPU headroom: {value}");
+            let config = Config { shadow_headroom_gpu_mhz: value, ..Config::default() }.sanitized();
+            assert_eq!(config.shadow_headroom_gpu_mhz, 30.0, "GPU headroom: {value}");
+            let config = Config { shadow_fall_rate_cpu: value, ..Config::default() }.sanitized();
+            assert_eq!(config.shadow_fall_rate_cpu, 0.05, "CPU fall rate: {value}");
+            let config = Config { shadow_fall_rate_gpu: value, ..Config::default() }.sanitized();
+            assert_eq!(config.shadow_fall_rate_gpu, 1.0, "GPU fall rate: {value}");
+        }
+    }
+
+    #[test]
+    fn legacy_gpu_max_w_is_ignored_when_loading() {
+        let dir = fixture_dir("legacy-gpu-max-w");
+        let path = dir.join("config.toml");
+        fs::write(&path, "gpu_max_w = 1.0\ngpu_max_mhz = 2000\n").unwrap();
+        let config = Config::load(&path);
+        assert_eq!(config.gpu_max_mhz, 2000);
+        assert_eq!(config.gpu_max_w, Config::default().gpu_max_w);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

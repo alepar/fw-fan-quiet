@@ -20,29 +20,55 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::config::write_atomic;
-use crate::control::budget::{LoopGains, WarmStart};
+use crate::control::budget::LoopGains;
+use crate::control::device_loop::Gains;
 use crate::control::lut::ClockWattsLut;
 use crate::fanctrl::table::DutyRpmTable;
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct PersistedState {
-    /// GPU clock→watts LUT from the calibration sweep.
+    /// Temporary old-controller compatibility only. It is never serialized
+    /// and legacy on-disk values are discarded at the load boundary.
+    #[serde(skip, default)]
     pub lut: Option<ClockWattsLut>,
     /// When calibration finished, as a unix-seconds string.
     pub calibrated_at: Option<String>,
-    /// Fitted PI gains for both loop legs (design §2.4), from the FOPDT
-    /// step-test fit. `None` until a step test has landed; `Budget::new`
-    /// falls back to `LoopGains::default()` in that case.
+    /// Temporary old-controller compatibility only. It is never serialized.
+    #[serde(skip, default)]
     pub loop_gains: Option<LoopGains>,
+    /// Fitted per-device gains keyed by `<strategy>:<ma_interval>`.
+    pub cpu_gains: BTreeMap<String, Gains>,
+    /// Fitted per-device gains keyed by `<strategy>:<ma_interval>`.
+    pub gpu_gains: BTreeMap<String, Gains>,
     /// Duty↔RPM lookup (design §2.3), passively refined by the controller.
     /// Its own `Default`/serde default is the ten seeded points, so a
     /// legacy file predating this field loads the seed unchanged.
     pub duty_rpm_table: DutyRpmTable,
-    /// Warm-start budget seeds, keyed by `WarmStart::key` (design §2.4).
-    /// Empty on a legacy or fresh file.
-    pub warm_start: BTreeMap<String, f64>,
+    /// Paired per-device warm-start caps, keyed by `WarmStart::key`.
+    pub warm_start: BTreeMap<String, WarmStartEntry>,
+    /// Last qualified setpoint for Held-mode startup.
+    pub t_star_last_good: Option<TStarSeed>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WarmStartEntry {
+    pub cpu_cap_w: f64,
+    pub gpu_lock_mhz: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TStarSeed {
+    pub strategy: String,
+    pub fan_target_rpm: u32,
+    pub value_c: f64,
+    pub saved_at_unix_s: u64,
+}
+
+const FAN_TARGET_MIN_RPM: u32 = 1000;
+const FAN_TARGET_MAX_RPM: u32 = 7000;
+const T_STAR_MAX_C: f64 = 110.0;
+const T_STAR_MAX_AGE_S: u64 = 6 * 60 * 60;
 
 impl PersistedState {
     /// Load from `path`. Missing file → default (info log); unreadable or
@@ -62,7 +88,18 @@ impl PersistedState {
                 return PersistedState::default();
             }
         };
-        match serde_json::from_str::<PersistedState>(&text) {
+        let mut value = match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::warn!(
+                    "corrupt state {}, starting uncalibrated: {e}",
+                    path.display()
+                );
+                return PersistedState::default();
+            }
+        };
+        Self::drop_legacy_fields(&mut value);
+        match serde_json::from_value::<PersistedState>(value) {
             Ok(state) => state.validated(),
             Err(e) => {
                 tracing::warn!(
@@ -71,6 +108,37 @@ impl PersistedState {
                 );
                 PersistedState::default()
             }
+        }
+    }
+
+    /// Remove superseded on-disk representations before deserializing the
+    /// new schema. One warning per category keeps normal upgrades useful
+    /// without a warning per map entry.
+    fn drop_legacy_fields(value: &mut serde_json::Value) {
+        let Some(object) = value.as_object_mut() else { return };
+        if object.remove("lut").is_some() {
+            tracing::warn!("state migration: ignoring legacy lut");
+        }
+        if object.remove("loop_gains").is_some() {
+            tracing::warn!("state migration: ignoring legacy loop_gains");
+        }
+        if object
+            .get("t_star_last_good")
+            .is_some_and(|seed| !seed.is_object() && !seed.is_null())
+        {
+            object.remove("t_star_last_good");
+            tracing::warn!("state migration: ignoring legacy scalar t_star_last_good");
+        }
+        let mut dropped_bare_warm_start = false;
+        if let Some(warm_start) = object.get_mut("warm_start").and_then(serde_json::Value::as_object_mut) {
+            warm_start.retain(|_, entry| {
+                let paired = entry.is_object();
+                dropped_bare_warm_start |= !paired;
+                paired
+            });
+        }
+        if dropped_bare_warm_start {
+            tracing::warn!("state migration: ignoring legacy scalar warm_start entries");
         }
     }
 
@@ -103,15 +171,6 @@ impl PersistedState {
             );
             self.duty_rpm_table = DutyRpmTable::default();
         }
-        if let Some(gains) = self.loop_gains
-            && !gains.is_valid()
-        {
-            tracing::warn!(
-                "state loop_gains {gains:?} are not all finite and positive; \
-                 falling back to the default gains (uncalibrated)"
-            );
-            self.loop_gains = None;
-        }
         if let Some(lut) = &self.lut
             && !lut.is_valid()
         {
@@ -123,16 +182,69 @@ impl PersistedState {
             );
             self.lut = None;
         }
-        let dropped = WarmStart::drop_non_finite(&mut self.warm_start);
-        if !dropped.is_empty() {
-            tracing::warn!(
-                "state warm_start has {} non-finite seed(s) ({}); dropping \
-                 them, those keys start cold",
-                dropped.len(),
-                dropped.join(", ")
-            );
+        self.cpu_gains.retain(|key, gains| {
+            let valid = !key.is_empty() && gains.is_valid();
+            if !valid {
+                tracing::warn!("state cpu_gains has invalid entry for {key:?}; dropping it");
+            }
+            valid
+        });
+        self.gpu_gains.retain(|key, gains| {
+            let valid = !key.is_empty() && gains.is_valid();
+            if !valid {
+                tracing::warn!("state gpu_gains has invalid entry for {key:?}; dropping it");
+            }
+            valid
+        });
+        self.warm_start.retain(|key, entry| {
+            let valid = !key.is_empty() && entry.cpu_cap_w.is_finite() && entry.cpu_cap_w >= 0.0;
+            if !valid {
+                tracing::warn!("state warm_start has invalid paired entry for {key:?}; dropping it");
+            }
+            valid
+        });
+        let invalid_tstar_seed = self.t_star_last_good.as_ref().is_some_and(|seed| {
+            self.qualified_seed(
+                &seed.strategy,
+                seed.fan_target_rpm,
+                seed.saved_at_unix_s,
+                0.0,
+                T_STAR_MAX_C,
+            )
+            .is_none()
+        });
+        if invalid_tstar_seed {
+            tracing::warn!("state t_star_last_good is invalid; dropping it");
+            self.t_star_last_good = None;
         }
         self
+    }
+
+    /// Returns a persisted T* only if it is still applicable to this
+    /// strategy/target and timestamp. Bounds are current runtime feasibility
+    /// limits, so a valid saved value is always clamped at use time.
+    pub fn qualified_seed(
+        &self,
+        strategy: &str,
+        fan_target_rpm: u32,
+        now_unix_s: u64,
+        floor_c: f64,
+        ceiling_c: f64,
+    ) -> Option<f64> {
+        let seed = self.t_star_last_good.as_ref()?;
+        if !seed.is_valid()
+            || seed.strategy != strategy
+            || seed.fan_target_rpm != fan_target_rpm
+            || now_unix_s
+                .checked_sub(seed.saved_at_unix_s)
+                .is_none_or(|age| age > T_STAR_MAX_AGE_S)
+            || !floor_c.is_finite()
+            || !ceiling_c.is_finite()
+            || floor_c > ceiling_c
+        {
+            return None;
+        }
+        Some(seed.value_c.clamp(floor_c, ceiling_c))
     }
 
     /// Atomic save: write `<path>.tmp`, then rename over `path`. Creates the
@@ -140,6 +252,16 @@ impl PersistedState {
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         write_atomic(path, text.as_bytes())
+    }
+}
+
+impl TStarSeed {
+    fn is_valid(&self) -> bool {
+        !self.strategy.is_empty()
+            && (FAN_TARGET_MIN_RPM..=FAN_TARGET_MAX_RPM).contains(&self.fan_target_rpm)
+            && self.value_c.is_finite()
+            && self.value_c > 0.0
+            && self.value_c <= T_STAR_MAX_C
     }
 }
 
@@ -157,37 +279,15 @@ mod tests {
         dir
     }
 
-    fn lut3() -> ClockWattsLut {
-        let mut lut = ClockWattsLut::new();
-        lut.insert(1200, 30.0);
-        lut.insert(2000, 60.0);
-        lut.insert(2800, 100.0);
-        lut
-    }
-
-    fn gains() -> LoopGains {
-        LoopGains {
-            kc_w_per_c: 0.31,
-            ti_s: 42.0,
-            kc_w_per_rpm: 0.0041,
-            ti_rpm_s: 28.0,
-        }
-    }
-
     #[test]
-    fn legacy_v1_file_loads_lut_intact_table_seeded_warm_start_empty_gains_none() {
+    fn legacy_v1_file_ignores_lut_and_seeds_new_fields() {
         // tests/fixtures/state_v1.json (fw-fanctrl-loop-blm) is a real pre-
         // migration file: it carries the old `model` field and its bias/gain
         // correction scalars, none of which this schema has any more.
         let path = crate::test_support::fixtures::path("state_v1.json");
         let state = PersistedState::load(&path);
 
-        let lut = state.lut.as_ref().expect("lut persisted in the fixture");
-        assert_eq!(lut.len(), 10, "fixture's LUT has 10 swept points");
-        // Spot-check both ends of the sweep survived unknown-key tolerant
-        // deserialization intact (not just "some value").
-        assert_eq!(lut.watts_for_clock(1177), Some(39.36073333333333));
-        assert_eq!(lut.watts_for_clock(2618), Some(99.89833333333333));
+        assert_eq!(state.lut, None, "the legacy LUT is intentionally ignored");
 
         assert_eq!(
             state.duty_rpm_table,
@@ -212,27 +312,33 @@ mod tests {
         let mut table = DutyRpmTable::default();
         table.refine(30, 2600.0); // differs from the untouched seed
         let mut warm_start = BTreeMap::new();
-        warm_start.insert("quiet16|30|ac".to_string(), 45.5);
-        warm_start.insert("cool16|20|bat".to_string(), 12.0);
+        warm_start.insert(
+            "quiet16|30|ac".to_string(),
+            WarmStartEntry { cpu_cap_w: 45.5, gpu_lock_mhz: 1800 },
+        );
+        warm_start.insert(
+            "cool16|20|bat".to_string(),
+            WarmStartEntry { cpu_cap_w: 12.0, gpu_lock_mhz: 1200 },
+        );
         let state = PersistedState {
-            lut: Some(lut3()),
             calibrated_at: Some("1751500000".to_string()),
-            loop_gains: Some(gains()),
+            cpu_gains: BTreeMap::from([("quiet16:60".into(), Gains { kc: 0.2, ti_s: 35.0 })]),
+            gpu_gains: BTreeMap::from([("quiet16:60".into(), Gains { kc: 2.1, ti_s: 15.0 })]),
             duty_rpm_table: table,
             warm_start,
+            t_star_last_good: Some(TStarSeed {
+                strategy: "quiet16".into(),
+                fan_target_rpm: 3000,
+                value_c: 70.0,
+                saved_at_unix_s: 100,
+            }),
+            ..PersistedState::default()
         };
 
         state.save(&path).unwrap();
         let back = PersistedState::load(&path);
 
         assert_eq!(back, state);
-        // Behavioral equivalence for the LUT, not just field equality.
-        for w in [10.0, 45.0, 60.0, 120.0] {
-            assert_eq!(
-                back.lut.as_ref().unwrap().clock_for_watts(w),
-                state.lut.as_ref().unwrap().clock_for_watts(w)
-            );
-        }
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -261,7 +367,7 @@ mod tests {
         let path = dir.join("state.json");
         PersistedState::default().save(&path).unwrap();
         let updated = PersistedState {
-            lut: Some(lut3()),
+            cpu_gains: BTreeMap::from([("quiet16:60".into(), Gains { kc: 0.2, ti_s: 35.0 })]),
             ..PersistedState::default()
         };
         updated.save(&path).unwrap();
@@ -381,12 +487,12 @@ mod tests {
     }
 
     #[test]
-    fn valid_gains_survive_the_check_and_a_bad_table_does_not_take_them_down() {
+    fn legacy_gains_are_ignored_and_a_bad_table_falls_back_independently() {
         let json = r#"{ "loop_gains": { "kc_w_per_c": 0.31, "ti_s": 42.0,
                         "kc_w_per_rpm": 0.0041, "ti_rpm_s": 28.0 },
                         "duty_rpm_table": { "points": {} } }"#;
         let state = load_json("gains-kept", json);
-        assert_eq!(state.loop_gains, Some(gains()));
+        assert_eq!(state.loop_gains, None);
         assert_eq!(state.duty_rpm_table, DutyRpmTable::default());
     }
 
@@ -447,33 +553,129 @@ mod tests {
     }
 
     #[test]
-    fn a_valid_lut_and_warm_start_survive_verbatim() {
-        // The guards must not eat good calibration data.
+    fn legacy_lut_and_scalar_warm_start_are_ignored_independently() {
         let state = load_json(
             "lut-kept",
             r#"{ "lut": { "points": [[1200, 30.0], [2000, 60.0], [2800, 100.0]] },
                  "warm_start": { "quiet16:30:ac": 45.5, "cool16:20:batt": 12.0 },
                  "duty_rpm_table": { "points": {} } }"#,
         );
-        assert_eq!(state.lut, Some(lut3()));
-        assert_eq!(state.lut.as_ref().unwrap().clock_for_watts(45.0), Some(1600));
-        assert_eq!(state.warm_start.len(), 2);
-        assert_eq!(state.warm_start.get("quiet16:30:ac"), Some(&45.5));
-        // ...and each field is judged on its own: the empty table falls back
-        // without taking the good LUT or warm start down with it.
+        assert_eq!(state.lut, None);
+        assert!(state.warm_start.is_empty());
         assert_eq!(state.duty_rpm_table, DutyRpmTable::default());
     }
 
     #[test]
-    fn a_measured_dip_in_the_watts_column_is_not_treated_as_corruption() {
-        // The LUT's documented invariant is ascending *clocks*, not
-        // monotone watts: real sweeps dip and `clock_for_watts` handles it
-        // conservatively. The guard must not throw such a sweep away.
+    fn legacy_lut_is_ignored_regardless_of_its_shape() {
         let state = load_json(
             "dip-lut",
             r#"{ "lut": { "points": [[1200, 60.0], [2000, 50.0], [2800, 100.0]] } }"#,
         );
-        let lut = state.lut.expect("a dipping sweep is valid data");
-        assert_eq!(lut.clock_for_watts(55.0), Some(2080));
+        assert_eq!(state.lut, None);
+    }
+
+    #[test]
+    fn paired_warm_starts_and_keyed_gains_round_trip() {
+        let dir = fixture_dir("device-loop-v3");
+        let path = dir.join("state.json");
+        let state = PersistedState {
+            cpu_gains: BTreeMap::from([("quiet16:60".into(), Gains { kc: 0.2, ti_s: 35.0 })]),
+            gpu_gains: BTreeMap::from([("quiet16:60".into(), Gains { kc: 2.1, ti_s: 15.0 })]),
+            warm_start: BTreeMap::from([(
+                "quiet16:36:ac".into(),
+                WarmStartEntry { cpu_cap_w: 42.0, gpu_lock_mhz: 1800 },
+            )]),
+            t_star_last_good: Some(TStarSeed {
+                strategy: "quiet16".into(),
+                fan_target_rpm: 3000,
+                value_c: 70.0,
+                saved_at_unix_s: 100,
+            }),
+            ..PersistedState::default()
+        };
+        state.save(&path).unwrap();
+        assert_eq!(PersistedState::load(&path), state);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn qualified_tstar_seed_enforces_key_age_and_bounds() {
+        let seed = TStarSeed {
+            strategy: "quiet16".into(),
+            fan_target_rpm: 3000,
+            value_c: 98.0,
+            saved_at_unix_s: 100,
+        };
+        let state = PersistedState { t_star_last_good: Some(seed), ..PersistedState::default() };
+        assert_eq!(state.qualified_seed("quiet16", 3000, 21_700, 60.0, 80.0), Some(80.0));
+        assert_eq!(state.qualified_seed("cool16", 3000, 101, 0.0, 100.0), None);
+        assert_eq!(state.qualified_seed("quiet16", 3001, 101, 0.0, 100.0), None);
+        assert_eq!(state.qualified_seed("quiet16", 3000, 21_701, 0.0, 100.0), None);
+        assert_eq!(state.qualified_seed("quiet16", 3000, 99, 0.0, 100.0), None);
+    }
+
+    #[test]
+    fn mixed_legacy_state_keeps_new_fields_and_drops_each_legacy_shape() {
+        let state = load_json(
+            "mixed-legacy-v3",
+            r#"{
+                "lut": { "points": [[1200, 30.0]] },
+                "loop_gains": { "kc_w_per_c": 0.2, "ti_s": 30, "kc_w_per_rpm": 0.01, "ti_rpm_s": 30 },
+                "warm_start": {
+                    "old": 45.0,
+                    "new": { "cpu_cap_w": 42.0, "gpu_lock_mhz": 1800 }
+                },
+                "t_star_last_good": 70.0,
+                "cpu_gains": { "quiet16:60": { "kc": 0.2, "ti_s": 35.0 } },
+                "gpu_gains": { "quiet16:60": { "kc": 2.1, "ti_s": 15.0 } }
+            }"#,
+        );
+        assert_eq!(state.lut, None);
+        assert_eq!(state.loop_gains, None);
+        assert_eq!(state.warm_start.len(), 1);
+        assert_eq!(
+            state.warm_start["new"],
+            WarmStartEntry { cpu_cap_w: 42.0, gpu_lock_mhz: 1800 }
+        );
+        assert_eq!(state.t_star_last_good, None);
+        assert_eq!(state.cpu_gains.len(), 1);
+        assert_eq!(state.gpu_gains.len(), 1);
+    }
+
+    #[test]
+    fn invalid_qualified_seed_is_dropped_and_unrelated_save_keeps_its_timestamp() {
+        for seed in [
+            r#"{ "strategy": "", "fan_target_rpm": 3000, "value_c": 70.0, "saved_at_unix_s": 100 }"#,
+            r#"{ "strategy": "quiet16", "fan_target_rpm": 999, "value_c": 70.0, "saved_at_unix_s": 100 }"#,
+            r#"{ "strategy": "quiet16", "fan_target_rpm": 3000, "value_c": -1.0, "saved_at_unix_s": 100 }"#,
+        ] {
+            let state = load_json("bad-tstar", &format!(r#"{{ "t_star_last_good": {seed} }}"#));
+            assert_eq!(state.t_star_last_good, None);
+        }
+
+        let dir = fixture_dir("seed-timestamp-preserved");
+        let path = dir.join("state.json");
+        let state = PersistedState {
+            duty_rpm_table: DutyRpmTable::default(),
+            t_star_last_good: Some(TStarSeed {
+                strategy: "quiet16".into(),
+                fan_target_rpm: 3000,
+                value_c: 70.0,
+                saved_at_unix_s: 100,
+            }),
+            ..PersistedState::default()
+        };
+        state.save(&path).unwrap();
+        let mut unrelated = PersistedState::load(&path);
+        unrelated.duty_rpm_table.refine(30, 2600.0);
+        unrelated.save(&path).unwrap();
+        assert_eq!(
+            PersistedState::load(&path)
+                .t_star_last_good
+                .expect("seed retained")
+                .saved_at_unix_s,
+            100
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

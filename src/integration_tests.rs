@@ -435,6 +435,7 @@ mod wiring_sweep {
             nvme_hot_c,
             leds,           // main.rs: led::spawn(config.leds.clone(), ...)
             fanctrl_socket, // main.rs: UnixFanctrlClient::new(config.fanctrl_socket.clone())
+            ..
         } = Config::default();
         assert!(fan_target_rpm > 0.0);
         assert!(cpu_floor_w >= 0.0);

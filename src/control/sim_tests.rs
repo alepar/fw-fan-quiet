@@ -408,6 +408,7 @@ fn build_controller<'r>(
         loop_gains: gains,
         duty_rpm_table: Default::default(),
         warm_start: BTreeMap::new(),
+        ..PersistedState::default()
     };
     let state_path = temp_state_path(tag);
     let ctl = Controller::new(

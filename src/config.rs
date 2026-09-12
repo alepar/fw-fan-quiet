@@ -464,6 +464,48 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone)]
+    struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct CapturedLogGuard(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLogGuard {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(bytes)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.lock().unwrap().flush()
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogWriter {
+        type Writer = CapturedLogGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogGuard(Arc::clone(&self.0))
+        }
+    }
+
+    fn capture_logs(run: impl FnOnce()) -> String {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(CapturedLogWriter(Arc::clone(&buffer)))
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        run();
+        drop(guard);
+        tracing::callsite::rebuild_interest_cache();
+        String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
+    }
 
     /// Unique-per-test fixture root; caller removes it when done.
     fn fixture_dir(name: &str) -> PathBuf {
@@ -925,6 +967,32 @@ mod tests {
                 .cpu_hot_c,
             94.0
         );
+        assert_eq!(
+            Config { gpu_max_mhz: u32::MAX, ..Config::default() }
+                .sanitized()
+                .gpu_max_mhz,
+            GPU_MAX_MHZ
+        );
+        assert_eq!(
+            Config { cpu_hot_c: -1.0, ..Config::default() }
+                .sanitized()
+                .cpu_hot_c,
+            82.0
+        );
+        assert_eq!(
+            Config { cpu_hot_c: f64::NAN, ..Config::default() }
+                .sanitized()
+                .cpu_hot_c,
+            90.0
+        );
+        let invalid_gains = Config {
+            cpu_gains: Some(Gains { kc: 0.0, ti_s: 30.0 }),
+            gpu_gains: Some(Gains { kc: 2.0, ti_s: f64::NAN }),
+            ..Config::default()
+        }
+        .sanitized();
+        assert_eq!(invalid_gains.cpu_gains, None);
+        assert_eq!(invalid_gains.gpu_gains, None);
     }
 
     #[test]
@@ -946,9 +1014,16 @@ mod tests {
         let dir = fixture_dir("legacy-gpu-max-w");
         let path = dir.join("config.toml");
         fs::write(&path, "gpu_max_w = 1.0\ngpu_max_mhz = 2000\n").unwrap();
-        let config = Config::load(&path);
+        let mut loaded = None;
+        let logs = capture_logs(|| loaded = Some(Config::load(&path)));
+        let config = loaded.expect("load ran");
         assert_eq!(config.gpu_max_mhz, 2000);
         assert_eq!(config.gpu_max_w, Config::default().gpu_max_w);
+        assert_eq!(
+            logs.matches("config migration: ignoring legacy gpu_max_w").count(),
+            1,
+            "one warning per legacy config category: {logs}"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 }

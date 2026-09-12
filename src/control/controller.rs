@@ -2721,10 +2721,11 @@ impl<R: Runner> Controller<R> {
         effects
     }
 
-    /// Write the full calibration/loop state to the state file. Called from
-    /// [`exit_auto_and_persist`](Self::exit_auto_and_persist) only — never
-    /// per-update (no disk churn). Save failure is warned, not fatal: the
-    /// in-memory state still carries the session.
+    /// Write the full calibration/loop state to the state file. Called when
+    /// Auto exits through [`exit_auto_and_persist`](Self::exit_auto_and_persist)
+    /// and from the calibration completion paths, never per-update (no disk
+    /// churn). Save failure is warned, not fatal: the in-memory state still
+    /// carries the session.
     fn save_persisted_state(&self) {
         let state = PersistedState {
             lut: self.lut.clone(),

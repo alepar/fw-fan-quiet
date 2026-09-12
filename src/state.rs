@@ -70,6 +70,17 @@ const FAN_TARGET_MAX_RPM: u32 = 7000;
 const T_STAR_MAX_C: f64 = 110.0;
 const T_STAR_MAX_AGE_S: u64 = 6 * 60 * 60;
 
+/// The v3 fields are deliberately decoded from their own wire values. A
+/// `null` emitted for a non-finite float, or one malformed map entry, must
+/// not make serde discard unrelated calibration state at the struct level.
+#[derive(Default)]
+struct DecodedDeviceLoopState {
+    cpu_gains: BTreeMap<String, Gains>,
+    gpu_gains: BTreeMap<String, Gains>,
+    warm_start: BTreeMap<String, WarmStartEntry>,
+    t_star_last_good: Option<TStarSeed>,
+}
+
 impl PersistedState {
     /// Load from `path`. Missing file → default (info log); unreadable or
     /// corrupt JSON → default + warning. NEVER crashes on bad state.
@@ -99,14 +110,94 @@ impl PersistedState {
             }
         };
         Self::drop_legacy_fields(&mut value);
+        let device_loop = Self::take_device_loop_fields(&mut value);
         match serde_json::from_value::<PersistedState>(value) {
-            Ok(state) => state.validated(),
+            Ok(mut state) => {
+                state.cpu_gains = device_loop.cpu_gains;
+                state.gpu_gains = device_loop.gpu_gains;
+                state.warm_start = device_loop.warm_start;
+                state.t_star_last_good = device_loop.t_star_last_good;
+                state.validated()
+            }
             Err(e) => {
                 tracing::warn!(
                     "corrupt state {}, starting uncalibrated: {e}",
                     path.display()
                 );
                 PersistedState::default()
+            }
+        }
+    }
+
+    /// Take v3 records out of the general persisted-state wire object and
+    /// decode their entries independently. The remaining legacy-compatible
+    /// fields can then use ordinary `PersistedState` deserialization without
+    /// a malformed v3 child making the entire file look corrupt.
+    fn take_device_loop_fields(value: &mut serde_json::Value) -> DecodedDeviceLoopState {
+        let Some(object) = value.as_object_mut() else {
+            return DecodedDeviceLoopState::default();
+        };
+        DecodedDeviceLoopState {
+            cpu_gains: Self::decode_gain_map(object.remove("cpu_gains"), "cpu_gains"),
+            gpu_gains: Self::decode_gain_map(object.remove("gpu_gains"), "gpu_gains"),
+            warm_start: Self::decode_warm_start_map(object.remove("warm_start")),
+            t_star_last_good: Self::decode_tstar_seed(object.remove("t_star_last_good")),
+        }
+    }
+
+    fn decode_gain_map(
+        value: Option<serde_json::Value>,
+        field: &str,
+    ) -> BTreeMap<String, Gains> {
+        let Some(value) = value else {
+            return BTreeMap::new();
+        };
+        let Some(entries) = value.as_object() else {
+            tracing::warn!("state {field} is not a map; dropping it");
+            return BTreeMap::new();
+        };
+        entries
+            .iter()
+            .filter_map(|(key, value)| match serde_json::from_value::<Gains>(value.clone()) {
+                Ok(gains) => Some((key.clone(), gains)),
+                Err(e) => {
+                    tracing::warn!("state {field} has malformed entry for {key:?}; dropping it: {e}");
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn decode_warm_start_map(value: Option<serde_json::Value>) -> BTreeMap<String, WarmStartEntry> {
+        let Some(value) = value else {
+            return BTreeMap::new();
+        };
+        let Some(entries) = value.as_object() else {
+            tracing::warn!("state warm_start is not a map; dropping it");
+            return BTreeMap::new();
+        };
+        entries
+            .iter()
+            .filter_map(|(key, value)| match serde_json::from_value::<WarmStartEntry>(value.clone()) {
+                Ok(entry) => Some((key.clone(), entry)),
+                Err(e) => {
+                    tracing::warn!("state warm_start has malformed paired entry for {key:?}; dropping it: {e}");
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn decode_tstar_seed(value: Option<serde_json::Value>) -> Option<TStarSeed> {
+        let value = value?;
+        if value.is_null() {
+            return None;
+        }
+        match serde_json::from_value::<TStarSeed>(value) {
+            Ok(seed) => Some(seed),
+            Err(e) => {
+                tracing::warn!("state t_star_last_good is malformed; dropping it: {e}");
+                None
             }
         }
     }
@@ -270,6 +361,67 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::thread::ThreadId;
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::layer::{Context, Layer};
+    use tracing_subscriber::prelude::*;
+
+    type CapturedEvents = Vec<(ThreadId, String)>;
+    type LogBuffer = Arc<Mutex<CapturedEvents>>;
+
+    #[derive(Clone)]
+    struct CapturedLogLayer(LogBuffer);
+
+    struct MessageVisitor(String);
+
+    impl Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    impl<S: Subscriber> Layer<S> for CapturedLogLayer {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            let mut visitor = MessageVisitor(String::new());
+            event.record(&mut visitor);
+            self.0
+                .lock()
+                .unwrap()
+                .push((std::thread::current().id(), visitor.0));
+        }
+    }
+
+    static CAPTURED_LOGS: OnceLock<LogBuffer> = OnceLock::new();
+
+    fn captured_logs() -> LogBuffer {
+        CAPTURED_LOGS
+            .get_or_init(|| {
+                let logs = Arc::new(Mutex::new(Vec::new()));
+                tracing::subscriber::set_global_default(
+                    tracing_subscriber::registry().with(CapturedLogLayer(Arc::clone(&logs))),
+                )
+                .expect("state tests install the only global tracing subscriber");
+                logs
+            })
+            .clone()
+    }
+
+    fn capture_logs(run: impl FnOnce()) -> String {
+        let buffer = captured_logs();
+        let thread = std::thread::current().id();
+        let start = buffer.lock().unwrap().len();
+        run();
+        buffer.lock().unwrap()[start..]
+            .iter()
+            .filter(|(event_thread, _)| *event_thread == thread)
+            .map(|(_, message)| message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     /// Unique-per-test fixture root; caller removes it when done.
     fn fixture_dir(name: &str) -> PathBuf {
@@ -599,6 +751,95 @@ mod tests {
     }
 
     #[test]
+    fn malformed_new_records_drop_individually_and_keep_valid_siblings() {
+        let state = load_json(
+            "isolated-new-record-decode",
+            r#"{
+                "calibrated_at": "1751500000",
+                "duty_rpm_table": { "points": { "15": 1200.0, "40": 3400.0, "85": 5900.0 } },
+                "cpu_gains": {
+                    "cpu-good": { "kc": 0.2, "ti_s": 35.0 },
+                    "cpu-null": null,
+                    "cpu-non-finite-shaped": { "kc": "NaN", "ti_s": 35.0 },
+                    "cpu-invalid": { "kc": 0.0, "ti_s": 35.0 }
+                },
+                "gpu_gains": {
+                    "gpu-good": { "kc": 2.1, "ti_s": 15.0 },
+                    "gpu-null": null,
+                    "gpu-non-finite-shaped": { "kc": "NaN", "ti_s": 15.0 },
+                    "gpu-invalid": { "kc": 2.1, "ti_s": 0.0 }
+                },
+                "warm_start": {
+                    "warm-good": { "cpu_cap_w": 42.0, "gpu_lock_mhz": 1800 },
+                    "warm-null": null,
+                    "warm-non-finite-shaped": { "cpu_cap_w": "NaN", "gpu_lock_mhz": 1800 },
+                    "warm-invalid": { "cpu_cap_w": -1.0, "gpu_lock_mhz": 1800 }
+                },
+                "t_star_last_good": {
+                    "strategy": "quiet16", "fan_target_rpm": 3000,
+                    "value_c": null, "saved_at_unix_s": 100
+                }
+            }"#,
+        );
+
+        assert_eq!(state.calibrated_at.as_deref(), Some("1751500000"));
+        assert_eq!(state.duty_rpm_table.rpm_for_duty(40), 3400.0);
+        assert_eq!(
+            state.cpu_gains,
+            BTreeMap::from([("cpu-good".into(), Gains { kc: 0.2, ti_s: 35.0 })])
+        );
+        assert_eq!(
+            state.gpu_gains,
+            BTreeMap::from([("gpu-good".into(), Gains { kc: 2.1, ti_s: 15.0 })])
+        );
+        assert_eq!(
+            state.warm_start,
+            BTreeMap::from([(
+                "warm-good".into(),
+                WarmStartEntry { cpu_cap_w: 42.0, gpu_lock_mhz: 1800 }
+            )])
+        );
+        assert_eq!(state.t_star_last_good, None);
+    }
+
+    #[test]
+    fn null_or_non_finite_shaped_tstar_drops_only_the_seed() {
+        for value_c in ["null", r#""NaN""#] {
+            let state = load_json(
+                "bad-tstar-wire-value",
+                &format!(
+                    r#"{{
+                        "calibrated_at": "1751500000",
+                        "cpu_gains": {{ "cpu-good": {{ "kc": 0.2, "ti_s": 35.0 }} }},
+                        "t_star_last_good": {{
+                            "strategy": "quiet16", "fan_target_rpm": 3000,
+                            "value_c": {value_c}, "saved_at_unix_s": 100
+                        }}
+                    }}"#
+                ),
+            );
+            assert_eq!(state.calibrated_at.as_deref(), Some("1751500000"));
+            assert_eq!(state.cpu_gains.len(), 1);
+            assert_eq!(state.t_star_last_good, None, "rejected: {value_c}");
+        }
+    }
+
+    #[test]
+    fn non_finite_tstar_value_is_dropped() {
+        let state = PersistedState {
+            t_star_last_good: Some(TStarSeed {
+                strategy: "quiet16".into(),
+                fan_target_rpm: 3000,
+                value_c: f64::NAN,
+                saved_at_unix_s: 100,
+            }),
+            ..PersistedState::default()
+        }
+        .validated();
+        assert_eq!(state.t_star_last_good, None);
+    }
+
+    #[test]
     fn qualified_tstar_seed_enforces_key_age_and_bounds() {
         let seed = TStarSeed {
             strategy: "quiet16".into(),
@@ -640,6 +881,36 @@ mod tests {
         assert_eq!(state.t_star_last_good, None);
         assert_eq!(state.cpu_gains.len(), 1);
         assert_eq!(state.gpu_gains.len(), 1);
+    }
+
+    #[test]
+    fn legacy_migration_warns_once_per_category() {
+        let mut loaded = None;
+        let logs = capture_logs(|| {
+            loaded = Some(load_json(
+                "migration-warnings",
+                r#"{
+                    "lut": { "points": [] },
+                    "loop_gains": { "kc_w_per_c": 0.2 },
+                    "warm_start": { "old-a": 40.0, "old-b": 45.0 },
+                    "t_star_last_good": 70.0
+                }"#,
+            ));
+        });
+        let state = loaded.expect("load ran");
+        assert_eq!(state, PersistedState::default());
+        for warning in [
+            "state migration: ignoring legacy lut",
+            "state migration: ignoring legacy loop_gains",
+            "state migration: ignoring legacy scalar warm_start entries",
+            "state migration: ignoring legacy scalar t_star_last_good",
+        ] {
+            assert_eq!(
+                logs.matches(warning).count(),
+                1,
+                "expected exactly one {warning:?} warning: {logs}"
+            );
+        }
     }
 
     #[test]

@@ -172,6 +172,8 @@ pub struct DeviceLoop<U: DeviceUnit> {
     bounds_initialised: bool,
     group_seen: bool,
     group_missing: bool,
+    group_lost: bool,
+    group_reset_pending: bool,
     group_missing_s: f64,
     draw_missing_s: f64,
     mismatch_latched: bool,
@@ -195,6 +197,8 @@ impl<U: DeviceUnit> DeviceLoop<U> {
             bounds_initialised: false,
             group_seen: false,
             group_missing: false,
+            group_lost: false,
+            group_reset_pending: false,
             group_missing_s: 0.0,
             draw_missing_s: 0.0,
             mismatch_latched: false,
@@ -247,8 +251,8 @@ impl<U: DeviceUnit> DeviceLoop<U> {
         self.requested
     }
 
-    /// Applies a guard ceiling. Lowering clamps every cap-bearing state;
-    /// raising only opens the ceiling and leaves those states untouched.
+    /// Applies a guard ceiling. Lowering clamps the candidates and requested
+    /// cap; `last_applied` remains a record of the last successful command.
     pub fn clamp_max(&mut self, max: f64) -> bool {
         if !max.is_finite() || max >= self.max {
             if max.is_finite() {
@@ -257,27 +261,20 @@ impl<U: DeviceUnit> DeviceLoop<U> {
             return false;
         }
         self.max = max.max(self.floor);
-        let mut changed = false;
+        let request_lowered = self.requested.is_some_and(|value| value > self.max);
+        let applied_above_max = self.last_applied.is_some_and(|value| value > self.max);
         for value in [&mut self.thermal, &mut self.shadow] {
             if *value > self.max {
                 *value = self.max;
-                changed = true;
             }
         }
         if let Some(value) = self.requested.as_mut()
             && *value > self.max
         {
             *value = self.max;
-            changed = true;
         }
-        if let Some(value) = self.last_applied.as_mut()
-            && *value > self.max
-        {
-            *value = self.max;
-            changed = true;
-        }
-        self.pending_immediate |= changed;
-        changed
+        self.pending_immediate |= request_lowered || applied_above_max;
+        request_lowered
     }
 
     pub fn tick(&mut self, input: TickInput) -> DeviceDecision {
@@ -285,6 +282,7 @@ impl<U: DeviceUnit> DeviceLoop<U> {
         let (floor, max) = ordered_bounds(input.floor, input.max);
         let floor_changed = self.bounds_initialised && floor != self.floor;
         let max_lowered = self.bounds_initialised && max < self.max;
+        let mut max_request_lowered = false;
         if !self.bounds_initialised {
             self.floor = floor;
             self.max = max;
@@ -293,7 +291,7 @@ impl<U: DeviceUnit> DeviceLoop<U> {
         } else {
             self.floor = floor;
             if max_lowered {
-                self.clamp_max(max);
+                max_request_lowered = self.clamp_max(max);
             } else {
                 self.max = max;
             }
@@ -302,10 +300,24 @@ impl<U: DeviceUnit> DeviceLoop<U> {
         }
 
         let err = input.group_c.map(|group| input.t_star - group);
+        let mismatch_recovered = match input.actuator {
+            ActuatorState::Mismatch => {
+                self.mismatch_latched = true;
+                false
+            }
+            ActuatorState::Verified if self.mismatch_latched => {
+                self.mismatch_latched = false;
+                true
+            }
+            ActuatorState::Verified | ActuatorState::Unverifiable => false,
+        };
 
         if input.resumed {
             self.elapsed_s = 0.0;
             self.group_missing_s = 0.0;
+            self.group_missing = input.group_c.is_none();
+            self.group_lost = false;
+            self.group_reset_pending = false;
             self.draw_missing_s = 0.0;
             if let Some(error) = err {
                 self.resync_error(error);
@@ -328,46 +340,53 @@ impl<U: DeviceUnit> DeviceLoop<U> {
             if self.group_seen {
                 self.group_missing_s += dt;
             }
-            let group_lost = self.group_seen && self.group_missing_s >= GROUP_UNAVAILABLE_DWELL_S;
-            let cap = if group_lost {
+            if self.group_seen
+                && !self.group_lost
+                && self.group_missing_s >= GROUP_UNAVAILABLE_DWELL_S
+            {
+                self.group_lost = true;
+                self.requested = Some(self.quantize(self.max));
+                self.group_reset_pending = true;
+            }
+            if self.group_reset_pending && !self.mismatch_latched {
+                self.thermal = self.max;
+                self.shadow = self.max;
+                self.group_reset_pending = false;
+            }
+            let cap = if self.group_lost {
                 self.max
             } else {
                 self.last_applied.unwrap_or(self.max)
             };
             let cap = self.quantize(cap).clamp(self.floor, self.max);
-            self.requested = Some(cap);
             return self.decision(
                 input,
                 cap,
                 self.thermal,
                 self.max,
                 self.group_seen,
-                group_lost,
+                self.group_lost,
             );
         };
 
+        let first_group = !self.group_seen;
         let recovered_group = self.group_missing;
-        if !self.group_seen || recovered_group {
+        if first_group || recovered_group {
             self.group_seen = true;
             self.group_missing = false;
             self.group_missing_s = 0.0;
-            if recovered_group {
-                self.thermal = self.max;
-                self.shadow = self.max;
-                self.requested = Some(self.quantize(self.max));
-            }
+            self.group_lost = false;
+        }
+        if self.group_reset_pending && !self.mismatch_latched {
+            self.thermal = self.max;
+            self.shadow = self.max;
+            self.requested = Some(self.quantize(self.max));
+            self.group_reset_pending = false;
+        }
+        let resynced_error = first_group || recovered_group || mismatch_recovered;
+        if resynced_error {
             self.resync_error(error);
             self.elapsed_s = 0.0;
-        }
-
-        match input.actuator {
-            ActuatorState::Mismatch => self.mismatch_latched = true,
-            ActuatorState::Verified if self.mismatch_latched => {
-                self.mismatch_latched = false;
-                self.resync_error(error);
-                self.elapsed_s = 0.0;
-            }
-            ActuatorState::Verified | ActuatorState::Unverifiable => {}
         }
 
         if self.mismatch_latched {
@@ -392,7 +411,9 @@ impl<U: DeviceUnit> DeviceLoop<U> {
         let thermal_candidate = match input.mode {
             ThermalMode::Bypass => self.max,
             ThermalMode::Regulate => {
-                self.e_prev += finite_or_zero(input.delta_tstar);
+                if !resynced_error {
+                    self.e_prev += finite_or_zero(input.delta_tstar);
+                }
                 self.elapsed_s += dt;
                 if self.elapsed_s >= PI_PERIOD_S {
                     let elapsed = self.elapsed_s.min(7.0);
@@ -412,7 +433,8 @@ impl<U: DeviceUnit> DeviceLoop<U> {
 
         let (target, selected) =
             select_candidates(thermal_candidate, self.shadow, self.floor, self.max);
-        let cap = self.slew_and_quantize(target, selected, dt, floor_changed || max_lowered);
+        let cap =
+            self.slew_and_quantize(target, selected, dt, floor_changed || max_request_lowered);
         self.requested = Some(cap);
         self.decision(input, cap, thermal_candidate, self.shadow, true, false)
     }
@@ -461,11 +483,9 @@ impl<U: DeviceUnit> DeviceLoop<U> {
             changed |= clamped != *value;
             *value = clamped;
         }
-        if let Some(value) = self.last_applied.as_mut() {
-            let clamped = value.clamp(self.floor, self.max);
-            changed |= clamped != *value;
-            *value = clamped;
-        }
+        changed |= self
+            .last_applied
+            .is_some_and(|value| value < self.floor || value > self.max);
         changed
     }
 
@@ -711,6 +731,18 @@ mod tests {
         close(decision.cap, 100.0);
         assert!(!decision.write_allowed);
         assert!(!decision.group_lost);
+
+        let mut recovered_on_resume = DeviceLoop::<W>::new(gains);
+        recovered_on_resume.seed_candidates(80.0, 100.0, Some(60.0), 0.0);
+        for _ in 0..29 {
+            recovered_on_resume.tick(input(None, 2.0));
+        }
+        let mut resumed_present = input(Some(70.0), 7_200.0);
+        resumed_present.resumed = true;
+        close(recovered_on_resume.tick(resumed_present).cap, 60.0);
+        let live = recovered_on_resume.tick(input(Some(70.0), 1.0));
+        close(live.thermal, 80.0);
+        close(live.cap, 70.0);
     }
 
     #[test]
@@ -771,6 +803,26 @@ mod tests {
     }
 
     #[test]
+    fn lowered_max_does_not_bypass_upward_slew_when_request_is_below_the_new_ceiling() {
+        let mut loop_ = DeviceLoop::<Mhz>::new(Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        });
+        loop_.seed_candidates(2_500.0, 3_090.0, Some(1_500.0), 0.0);
+        let mut tick = input(Some(70.0), 0.0);
+        tick.floor = 1_000.0;
+        tick.max = 3_090.0;
+        close(loop_.tick(tick).cap, 1_500.0);
+
+        tick.dt_s = 1.0;
+        tick.max = 2_000.0;
+        let lowered = loop_.tick(tick);
+        close(lowered.thermal, 2_000.0);
+        close(lowered.cap, 1_605.0);
+        assert!(!lowered.write_immediately);
+    }
+
+    #[test]
     fn absent_group_skips_writes_but_lost_group_releases_to_max_and_recovers() {
         let gains = Gains {
             kc: 1.0,
@@ -805,6 +857,31 @@ mod tests {
         close(recovered.thermal, 100.0);
         close(recovered.cap, 100.0);
         assert!(!recovered.group_lost);
+    }
+
+    #[test]
+    fn short_group_dropout_preserves_candidates_and_pending_request_on_recovery() {
+        let mut loop_ = DeviceLoop::<W>::new(Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        });
+        loop_.seed_candidates(80.0, 100.0, Some(60.0), 0.0);
+        let first = loop_.tick(input(Some(70.0), 1.0));
+        close(first.cap, 70.0);
+        close(loop_.requested().unwrap(), 70.0);
+
+        for _ in 0..29 {
+            let held = loop_.tick(input(None, 2.0));
+            close(held.cap, 60.0);
+            assert!(!held.group_lost);
+        }
+        close(loop_.thermal(), 80.0);
+        close(loop_.requested().unwrap(), 70.0);
+
+        let recovered = loop_.tick(input(Some(70.0), 1.0));
+        close(recovered.thermal, 80.0);
+        close(recovered.cap, 80.0);
+        close(loop_.requested().unwrap(), 80.0);
     }
 
     #[test]
@@ -911,6 +988,32 @@ mod tests {
     }
 
     #[test]
+    fn failed_bound_writes_do_not_change_the_last_successfully_applied_cap() {
+        let gains = Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        };
+
+        let mut ceiling = DeviceLoop::<W>::new(gains);
+        ceiling.seed(80.0, 0.0);
+        ceiling.tick(input(Some(70.0), 0.0));
+        let mut lowered = input(Some(70.0), 0.0);
+        lowered.max = 60.0;
+        close(ceiling.tick(lowered).cap, 60.0);
+        let mut reopened_missing = input(None, 0.0);
+        reopened_missing.max = 100.0;
+        close(ceiling.tick(reopened_missing).cap, 80.0);
+
+        let mut floor = DeviceLoop::<W>::new(gains);
+        floor.seed(20.0, 0.0);
+        floor.tick(input(Some(70.0), 0.0));
+        let mut raised = input(Some(70.0), 0.0);
+        raised.floor = 40.0;
+        close(floor.tick(raised).cap, 40.0);
+        close(floor.tick(input(None, 0.0)).cap, 20.0);
+    }
+
+    #[test]
     fn mismatch_and_resume_preserve_both_seeded_candidates() {
         let gains = Gains {
             kc: 1.0,
@@ -930,6 +1033,65 @@ mod tests {
     }
 
     #[test]
+    fn resumed_mismatch_latches_before_the_resume_hold_and_unverifiable_stays_frozen() {
+        let mut loop_ = DeviceLoop::<W>::new(Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        });
+        loop_.seed_candidates(80.0, 70.0, Some(70.0), 0.0);
+
+        let mut tick = input(Some(60.0), 2.0);
+        tick.resumed = true;
+        tick.actuator = ActuatorState::Mismatch;
+        let resumed = loop_.tick(tick);
+        assert_eq!(resumed.hold, Hold::ActuatorMismatch);
+        close(resumed.thermal, 80.0);
+        close(resumed.shadow, 70.0);
+
+        tick.resumed = false;
+        tick.actuator = ActuatorState::Unverifiable;
+        for _ in 0..3 {
+            let frozen = loop_.tick(tick);
+            assert_eq!(frozen.hold, Hold::ActuatorMismatch);
+            close(frozen.thermal, 80.0);
+            close(frozen.shadow, 70.0);
+        }
+    }
+
+    #[test]
+    fn group_loss_recovery_does_not_mutate_candidates_while_mismatch_is_latched() {
+        let mut loop_ = DeviceLoop::<W>::new(Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        });
+        loop_.seed_candidates(80.0, 70.0, Some(70.0), 0.0);
+
+        let mut mismatch = input(Some(70.0), 1.0);
+        mismatch.actuator = ActuatorState::Mismatch;
+        loop_.tick(mismatch);
+
+        mismatch.group_c = None;
+        mismatch.dt_s = 2.0;
+        for _ in 0..30 {
+            loop_.tick(mismatch);
+        }
+        close(loop_.thermal(), 80.0);
+        close(loop_.requested().unwrap(), 100.0);
+
+        let mut recovered = input(Some(70.0), 1.0);
+        recovered.actuator = ActuatorState::Unverifiable;
+        let frozen = loop_.tick(recovered);
+        assert_eq!(frozen.hold, Hold::ActuatorMismatch);
+        close(frozen.thermal, 80.0);
+        close(frozen.shadow, 70.0);
+
+        recovered.actuator = ActuatorState::Verified;
+        let reset = loop_.tick(recovered);
+        close(reset.thermal, 100.0);
+        close(reset.shadow, 100.0);
+    }
+
+    #[test]
     fn seed_and_explicit_resync_do_not_create_a_proportional_kick() {
         let mut loop_ = DeviceLoop::<W>::new(Gains {
             kc: 1.0,
@@ -946,6 +1108,46 @@ mod tests {
             loop_.tick(input(Some(80.0), dt));
         }
         close(loop_.thermal(), 50.0);
+    }
+
+    #[test]
+    fn group_recovery_resync_absorbs_simultaneous_target_motion_without_a_false_kick() {
+        let mut loop_ = DeviceLoop::<W>::new(Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        });
+        loop_.seed(50.0, 0.0);
+        loop_.tick(input(None, 2.0));
+
+        let mut recovered = input(Some(60.0), 1.0);
+        recovered.t_star = 72.0;
+        recovered.delta_tstar = 2.0;
+        close(loop_.tick(recovered).thermal, 50.0);
+        recovered.dt_s = 2.0;
+        recovered.delta_tstar = 0.0;
+        close(loop_.tick(recovered).thermal, 50.0);
+        close(loop_.tick(recovered).thermal, 56.0);
+    }
+
+    #[test]
+    fn mismatch_recovery_resync_absorbs_simultaneous_target_motion_without_a_false_kick() {
+        let mut loop_ = DeviceLoop::<W>::new(Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        });
+        loop_.seed(50.0, 0.0);
+        let mut mismatch = input(Some(70.0), 2.0);
+        mismatch.actuator = ActuatorState::Mismatch;
+        loop_.tick(mismatch);
+
+        let mut recovered = input(Some(60.0), 1.0);
+        recovered.t_star = 72.0;
+        recovered.delta_tstar = 2.0;
+        close(loop_.tick(recovered).thermal, 50.0);
+        recovered.dt_s = 2.0;
+        recovered.delta_tstar = 0.0;
+        close(loop_.tick(recovered).thermal, 50.0);
+        close(loop_.tick(recovered).thermal, 56.0);
     }
 
     fn first_order_cpu_response() -> (f64, f64) {

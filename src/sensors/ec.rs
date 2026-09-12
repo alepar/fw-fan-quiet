@@ -309,15 +309,9 @@ impl EcReading {
     }
 }
 
-/// fw-fanctrl's boxcar moving average, replicated exactly including its
-/// off-by-one: `adapt_speed` reads `mean(buffer)` (samples so far, `n-N..
-/// n-1`) *before* appending the current tick's own sample. [`push`] mirrors
-/// that in one call — it returns the mean as of *before* `sample_c` is
-/// folded in, then appends `sample_c` (dropped, like a `<= 0` EC reading,
-/// if it isn't positive) for the *next* call to see. Do not "simplify" this
-/// to return the post-push mean; that changes the replica's output and the
-/// tests below pin the exact off-by-one sequence with literal values.
-pub struct EcAverage {
+/// Shared implementation for the scalar compatibility average and the three
+/// per-stream histories in [`EcReplica`].
+struct Boxcar {
     /// Retained non-zero samples, oldest first, capped at `interval`.
     buffer: std::collections::VecDeque<f64>,
     interval: usize,
@@ -331,9 +325,9 @@ pub struct EcAverage {
 /// what the socket reports.
 pub const MAX_INTERVAL: usize = 100;
 
-impl EcAverage {
-    /// `interval` is clamped to `[1, MAX_INTERVAL]`.
-    pub fn new(interval: usize) -> Self {
+#[allow(dead_code)] // EcReplica is wired by fw-fanctrl-loop-eb9.7.
+impl Boxcar {
+    fn new(interval: usize) -> Self {
         Self {
             buffer: std::collections::VecDeque::new(),
             interval: interval.clamp(1, MAX_INTERVAL),
@@ -341,13 +335,8 @@ impl EcAverage {
         }
     }
 
-    /// Returns the boxcar mean of samples `n-N..n-1` (`None` before any
-    /// sample has ever been retained), then folds `sample_c` into the
-    /// buffer for the next call — dropped without affecting the returned
-    /// mean if it is `<= 0`, mirroring the EC reading rule. The buffer
-    /// never holds more than the current interval; the oldest sample is
-    /// dropped to make room.
-    pub fn push(&mut self, sample_c: f64) -> Option<f64> {
+    /// Returns the pre-append mean and then retains positive samples.
+    fn push(&mut self, sample_c: f64) -> Option<f64> {
         let mean = self.mean();
         if sample_c > 0.0 {
             self.buffer.push_back(sample_c);
@@ -369,11 +358,8 @@ impl EcAverage {
         }
     }
 
-    /// Grows or shrinks the window, capped at [`MAX_INTERVAL`], **without
-    /// clearing** retained samples: shrinking drops the oldest samples down
-    /// to the new size; growing only raises the cap, so the mean is
-    /// unaffected until later `push` calls fill the wider window.
-    pub fn set_interval(&mut self, n: usize) {
+    /// Retains samples on resize, dropping oldest excess only on shrink.
+    fn set_interval(&mut self, n: usize) {
         self.interval = n.clamp(1, MAX_INTERVAL);
         while self.buffer.len() > self.interval {
             self.buffer.pop_front();
@@ -383,39 +369,347 @@ impl EcAverage {
         }
     }
 
-    /// Replaces the buffer's entire contents with a single sample and
-    /// marks the boxcar seeded. The **only** operation that clears
-    /// retained samples.
-    pub fn reseed(&mut self, value: f64) {
+    fn reseed(&mut self, value: f64) {
         self.buffer.clear();
         self.buffer.push_back(value);
         self.seeded = true;
     }
 
-    /// True once `reseed` has been called, or the boxcar has accumulated a
-    /// full window of `interval` samples on its own. False before either
-    /// has happened — a mean read at that point averages fewer than a full
-    /// window and callers should not trust it as one.
-    ///
-    /// No production call site today (integration sweep, `fw-fanctrl-loop-nsc`):
-    /// the controller achieves the same "don't trust an underfilled mean"
-    /// invariant a different way — it calls `reseed` itself on the very
-    /// first sample of every engagement that carries a fw-fanctrl view
-    /// (`Controller`'s own `ec_seeded` latch, before any `push`), so by the
-    /// time `ec_avg.push` is ever read as `ec_ma` the boxcar has already
-    /// been seeded. `is_seeded`/`sample_count` remain here as the design's
-    /// own owned API surface for `EcAverage` (§2.2/§2.6) and are exercised
-    /// directly by this module's own tests.
-    #[allow(dead_code)]
-    pub fn is_seeded(&self) -> bool {
+    fn is_seeded(&self) -> bool {
         self.seeded
     }
 
-    /// Retained sample count (`<= interval`). See [`Self::is_seeded`] for
-    /// why this has no production call site today.
-    #[allow(dead_code)]
-    pub fn sample_count(&self) -> usize {
+    fn sample_count(&self) -> usize {
         self.buffer.len()
+    }
+
+    fn clear(&mut self) {
+        self.buffer.clear();
+        self.seeded = false;
+    }
+
+    fn fill(&mut self, value: f64) {
+        self.buffer.clear();
+        self.buffer.resize(self.interval, value);
+        self.seeded = true;
+    }
+
+    fn is_full(&self) -> bool {
+        self.buffer.len() >= self.interval
+    }
+}
+
+/// fw-fanctrl's scalar moving average, retained as a compatibility seam for
+/// the emulator and legacy controller while [`EcReplica`] owns the new
+/// per-group histories. [`Self::push`] returns the mean before appending the
+/// current positive sample.
+pub struct EcAverage {
+    boxcar: Boxcar,
+}
+
+impl EcAverage {
+    pub fn new(interval: usize) -> Self {
+        Self {
+            boxcar: Boxcar::new(interval),
+        }
+    }
+
+    pub fn push(&mut self, sample_c: f64) -> Option<f64> {
+        self.boxcar.push(sample_c)
+    }
+
+    pub fn set_interval(&mut self, n: usize) {
+        self.boxcar.set_interval(n);
+    }
+
+    pub fn reseed(&mut self, value: f64) {
+        self.boxcar.reseed(value);
+    }
+
+    #[allow(dead_code)] // legacy controller / emulator compatibility surface
+    pub fn is_seeded(&self) -> bool {
+        self.boxcar.is_seeded()
+    }
+
+    #[allow(dead_code)] // legacy controller / emulator compatibility surface
+    pub fn sample_count(&self) -> usize {
+        self.boxcar.sample_count()
+    }
+}
+
+/// The controller-facing EC replica: one raw fw-fanctrl reconciliation
+/// history plus independent CPU and GPU group histories. The socket has only
+/// a global moving average, so device groups are always seeded from their own
+/// instantaneous maxima, never from `movingAverageTemperature`.
+#[allow(dead_code)] // public controller seam; wiring arrives in eb9.7
+pub struct EcReplica {
+    reconciliation: Boxcar,
+    cpu: Boxcar,
+    gpu: Boxcar,
+    reconciliation_output: Option<f64>,
+    /// Whether `reconciliation_output` itself is a socket seed or the mean
+    /// of a complete prior raw window. This is intentionally captured
+    /// before each append: the third interval-3 append returns mean(60,70),
+    /// not a full-window mean that may be scored yet.
+    reconciliation_output_ready: bool,
+    cpu_output: Option<f64>,
+    gpu_output: Option<f64>,
+    /// A fair view has been scored at least once. This is sticky between
+    /// resets and deliberately distinct from an active mismatch latch.
+    ever_scored: bool,
+    ec_mismatch: bool,
+    mismatch_streak: u8,
+    match_streak: u8,
+    ma_fail_streak: u8,
+}
+
+/// The controller's result for a fresh fw-fanctrl view after it has applied
+/// the §2.6 slope/timestamp skip rule and compared the instantaneous max and
+/// (when available) moving averages.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)] // public controller seam; wiring arrives in eb9.7
+pub enum ReconciliationObservation {
+    /// The view was absent, stale, or unfair. It advances no state.
+    Skipped,
+    /// A fair fresh view. `ma_matches: None` preserves the MA-failure streak
+    /// because no usable local MA was available to compare.
+    Scored {
+        max_matches: bool,
+        ma_matches: Option<bool>,
+        socket_ma: f64,
+    },
+}
+
+/// State after one reconciliation observation. A caller that sees
+/// `reseed_ma` resets the replica using the fresh view and current groups.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReconciliationOutcome {
+    /// True only when this observation was fair and the exposed raw mean was
+    /// ready to compare.
+    pub scored: bool,
+    /// Sticky since reset: at least one fair comparison was scored.
+    pub ever_scored: bool,
+    /// The three-strike instantaneous-max latch.
+    pub ec_mismatch: bool,
+    /// `ever_scored && !ec_mismatch`, the Curve-entry trust condition.
+    pub trusted: bool,
+    /// Requests a reset after three matching views clear a mismatch, or
+    /// after three MA-only failures. Neither case erases group history until
+    /// the caller performs the explicit reset.
+    pub reseed_ma: Option<f64>,
+}
+
+#[allow(dead_code)] // public controller seam; wiring arrives in eb9.7
+impl EcReplica {
+    pub fn new(interval: usize) -> Self {
+        Self {
+            reconciliation: Boxcar::new(interval),
+            cpu: Boxcar::new(interval),
+            gpu: Boxcar::new(interval),
+            reconciliation_output: None,
+            reconciliation_output_ready: false,
+            cpu_output: None,
+            gpu_output: None,
+            ever_scored: false,
+            ec_mismatch: false,
+            mismatch_streak: 0,
+            match_streak: 0,
+            ma_fail_streak: 0,
+        }
+    }
+
+    /// Discards all histories for Auto entry, Released re-entry, calibration
+    /// exit, resume, or an explicit mismatch-clear recovery. A usable socket
+    /// MA seeds only reconciliation; each available device group gets a full
+    /// window of its own instantaneous maximum.
+    pub fn reset(
+        &mut self,
+        socket_ma: Option<f64>,
+        cpu_group_c: Option<f64>,
+        gpu_group_c: Option<f64>,
+    ) {
+        self.reset_histories(socket_ma, cpu_group_c, gpu_group_c);
+        self.ever_scored = false;
+        self.ec_mismatch = false;
+        self.mismatch_streak = 0;
+        self.match_streak = 0;
+        self.ma_fail_streak = 0;
+    }
+
+    /// Re-seeds only the three histories after an already-scored
+    /// reconciliation recovery. Unlike [`Self::reset`], this preserves the
+    /// established `ever_scored` state and the cleared mismatch verdict only
+    /// when a usable socket MA is installed. Without that seed, a full raw
+    /// window and a fresh fair score must establish trust again.
+    pub fn reseed_histories(
+        &mut self,
+        socket_ma: Option<f64>,
+        cpu_group_c: Option<f64>,
+        gpu_group_c: Option<f64>,
+    ) {
+        if !self.reset_histories(socket_ma, cpu_group_c, gpu_group_c) {
+            self.ever_scored = false;
+        }
+    }
+
+    fn reset_histories(
+        &mut self,
+        socket_ma: Option<f64>,
+        cpu_group_c: Option<f64>,
+        gpu_group_c: Option<f64>,
+    ) -> bool {
+        self.reconciliation.clear();
+        self.cpu.clear();
+        self.gpu.clear();
+        self.reconciliation_output_ready = false;
+
+        self.reconciliation_output = socket_ma.filter(|value| value.is_finite() && *value > 0.0);
+        if let Some(value) = self.reconciliation_output {
+            self.reconciliation.reseed(value);
+            self.reconciliation_output_ready = true;
+        }
+        self.cpu_output = Self::seed_group(&mut self.cpu, cpu_group_c);
+        self.gpu_output = Self::seed_group(&mut self.gpu, gpu_group_c);
+        self.reconciliation_output_ready
+    }
+
+    /// The reset used after `EC MISMATCH` clears. It has group inputs so
+    /// stale device heat cannot survive reconciliation recovery, while the
+    /// already-cleared reconciliation verdict remains trusted.
+    pub fn reset_after_mismatch_clear(
+        &mut self,
+        socket_ma: Option<f64>,
+        cpu_group_c: Option<f64>,
+        gpu_group_c: Option<f64>,
+    ) {
+        self.reseed_histories(socket_ma, cpu_group_c, gpu_group_c);
+    }
+
+    /// Appends raw reconciliation and each present group. A missing group
+    /// clears only its own history. A returning group fills its window before
+    /// ordinary averaging and reports that first value exactly.
+    pub fn tick(&mut self, reading: Option<&EcReading>) {
+        let raw = reading
+            .and_then(|ec| ec.reconciliation_max_c)
+            .map(f64::from)
+            .unwrap_or(0.0);
+        self.reconciliation_output_ready = self.reconciliation.is_seeded();
+        self.reconciliation_output = self.reconciliation.push(raw);
+
+        self.cpu_output = Self::push_group(&mut self.cpu, reading.and_then(|ec| ec.cpu_group_c));
+        self.gpu_output = Self::push_group(&mut self.gpu, reading.and_then(|ec| ec.gpu_group_c));
+    }
+
+    /// Changes all widths without resetting any history.
+    pub fn set_interval(&mut self, interval: usize) {
+        self.reconciliation.set_interval(interval);
+        self.cpu.set_interval(interval);
+        self.gpu.set_interval(interval);
+    }
+
+    /// Raw pre-append mean used only for fw-fanctrl MA reconciliation.
+    pub fn reconciliation_ma(&self) -> Option<f64> {
+        self.reconciliation_output
+    }
+
+    pub fn cpu_group_ma(&self) -> Option<f64> {
+        self.cpu_output
+    }
+
+    pub fn gpu_group_ma(&self) -> Option<f64> {
+        self.gpu_output
+    }
+
+    /// The exposed raw mean is ready only when it came from a socket seed or
+    /// a complete window before this tick's append.
+    pub fn reconciliation_ready(&self) -> bool {
+        self.reconciliation_output.is_some() && self.reconciliation_output_ready
+    }
+
+    /// Applies §2.6's exact three-strike protocol. Skipped and not-ready
+    /// observations are inert; max mismatch/match streaks are independent;
+    /// MA-only failures request a re-seed without latching `EC MISMATCH`.
+    pub fn score_reconciliation(
+        &mut self,
+        observation: ReconciliationObservation,
+    ) -> ReconciliationOutcome {
+        let mut scored = false;
+        let mut reseed_ma = None;
+        if let ReconciliationObservation::Scored {
+            max_matches,
+            ma_matches,
+            socket_ma,
+        } = observation
+            && self.reconciliation_ready()
+        {
+            scored = true;
+            self.ever_scored = true;
+            if max_matches {
+                self.match_streak = self.match_streak.saturating_add(1);
+                self.mismatch_streak = 0;
+                if self.ec_mismatch && self.match_streak >= 3 {
+                    self.ec_mismatch = false;
+                    self.match_streak = 0;
+                    reseed_ma = Some(socket_ma);
+                }
+            } else {
+                self.mismatch_streak = self.mismatch_streak.saturating_add(1);
+                self.match_streak = 0;
+                if self.mismatch_streak >= 3 {
+                    self.ec_mismatch = true;
+                }
+            }
+            match ma_matches {
+                Some(true) => self.ma_fail_streak = 0,
+                Some(false) => {
+                    self.ma_fail_streak = self.ma_fail_streak.saturating_add(1);
+                    if self.ma_fail_streak >= 3 {
+                        self.ma_fail_streak = 0;
+                        reseed_ma = Some(socket_ma);
+                    }
+                }
+                None => {}
+            }
+        }
+        ReconciliationOutcome {
+            scored,
+            ever_scored: self.ever_scored,
+            ec_mismatch: self.ec_mismatch,
+            trusted: self.is_reconciled(),
+            reseed_ma,
+        }
+    }
+
+    /// Curve entry requires at least one fair score and no active mismatch.
+    pub fn is_reconciled(&self) -> bool {
+        self.ever_scored && !self.ec_mismatch
+    }
+
+    pub fn ever_scored(&self) -> bool {
+        self.ever_scored
+    }
+
+    pub fn ec_mismatch(&self) -> bool {
+        self.ec_mismatch
+    }
+
+    fn seed_group(boxcar: &mut Boxcar, value: Option<f64>) -> Option<f64> {
+        let value = value.filter(|value| value.is_finite() && *value > 0.0)?;
+        boxcar.fill(value);
+        Some(value)
+    }
+
+    fn push_group(boxcar: &mut Boxcar, value: Option<f64>) -> Option<f64> {
+        let Some(value) = value.filter(|value| value.is_finite() && *value > 0.0) else {
+            boxcar.clear();
+            return None;
+        };
+        if boxcar.sample_count() == 0 {
+            boxcar.fill(value);
+            Some(value)
+        } else {
+            boxcar.push(value)
+        }
     }
 }
 
@@ -651,12 +945,14 @@ mod tests {
 
         write_sensor(&dir, 9, "unrelated_aux", 90_000);
         let unexpected = EcReading::scan(&dir);
-        assert!(unexpected
-            .diagnostics
-            .contains(&EcDiagnostic::EcUnknownLabel {
-                label: EcLabel::new("unrelated_aux"),
-                kind: EcUnknownLabelKind::Unexpected,
-            }));
+        assert!(
+            unexpected
+                .diagnostics
+                .contains(&EcDiagnostic::EcUnknownLabel {
+                    label: EcLabel::new("unrelated_aux"),
+                    kind: EcUnknownLabelKind::Unexpected,
+                })
+        );
         let reading = unexpected
             .reading
             .expect("CPU and unknown values are plausible");
@@ -827,5 +1123,383 @@ mod tests {
             "reseed always seeds, regardless of interval"
         );
         assert_eq!(seeded_directly.sample_count(), 1);
+    }
+
+    // --- EcReplica: independent reconciliation / CPU / GPU histories ---
+
+    #[test]
+    fn replica_reset_seeds_each_group_from_its_own_value_for_every_reset_reason() {
+        // A regression here would accidentally seed both device loops from
+        // fw-fanctrl's one socket MA, giving the cooler CPU a false error.
+        for reset_reason in [
+            "auto entry",
+            "released re-entry",
+            "calibration exit",
+            "resume",
+            "mismatch clear",
+        ] {
+            let mut replica = EcReplica::new(3);
+            replica.reset(Some(80.0), Some(50.0), Some(70.0));
+
+            assert_eq!(replica.cpu_group_ma(), Some(50.0), "{reset_reason}");
+            assert_eq!(replica.gpu_group_ma(), Some(70.0), "{reset_reason}");
+            assert_eq!(replica.reconciliation_ma(), Some(80.0), "{reset_reason}");
+            assert!(replica.reconciliation_ready(), "{reset_reason}");
+        }
+    }
+
+    #[test]
+    fn replica_without_a_socket_seed_needs_a_full_raw_window_and_a_successful_score() {
+        // Removing the full-window gate would make a one-sample raw history
+        // look reconciled before fw-fanctrl has supplied a usable MA.
+        let mut replica = EcReplica::new(3);
+        replica.reset(None, None, None);
+        assert!(!replica.reconciliation_ready());
+        assert!(
+            !replica
+                .score_reconciliation(ReconciliationObservation::Scored {
+                    max_matches: true,
+                    ma_matches: Some(true),
+                    socket_ma: 70.0,
+                })
+                .scored
+        );
+
+        let raw_70 = EcReading::from_readings(readings(&[("cpu@4c", 70.0)]))
+            .expect("a plausible CPU reading");
+        replica.tick(Some(&raw_70));
+        replica.tick(Some(&raw_70));
+        assert!(
+            !replica.reconciliation_ready(),
+            "two samples are not a three-sample window"
+        );
+
+        replica.tick(Some(&raw_70));
+        assert!(
+            !replica.reconciliation_ready(),
+            "the third append exposes mean([70, 70]), not a full pre-append window"
+        );
+        replica.tick(Some(&raw_70));
+        assert!(replica.reconciliation_ready());
+        assert!(
+            !replica.is_reconciled(),
+            "readiness still needs a scored view"
+        );
+        assert!(
+            replica
+                .score_reconciliation(ReconciliationObservation::Scored {
+                    max_matches: true,
+                    ma_matches: Some(true),
+                    socket_ma: 70.0,
+                })
+                .trusted
+        );
+        assert!(replica.is_reconciled());
+
+        let raw_150 = EcReading::from_readings(readings(&[
+            ("cpu@4c", 50.0),
+            ("gpu_vr_f75303@4d", 70.0),
+            ("gpu_bad", 150.0),
+        ]))
+        .expect("plausible groups keep this reading valid");
+        replica.tick(Some(&raw_150));
+        assert_eq!(replica.cpu_group_ma(), Some(70.0));
+        assert_eq!(replica.gpu_group_ma(), Some(70.0));
+        assert_eq!(replica.reconciliation_ma(), Some(70.0));
+        // The next raw output includes 150, while neither group history has
+        // ever received that implausible value.
+        replica.tick(Some(&raw_70));
+        assert_eq!(replica.reconciliation_ma(), Some(290.0 / 3.0));
+        assert_eq!(replica.cpu_group_ma(), Some(190.0 / 3.0));
+        assert_eq!(replica.gpu_group_ma(), None);
+    }
+
+    #[test]
+    fn replica_group_loss_return_resize_and_non_reset_events_are_isolated() {
+        // A shared history or a reset on an ordinary view update would make
+        // the GPU's established average jump when only the CPU disappears.
+        let mut replica = EcReplica::new(3);
+        replica.reset(Some(80.0), Some(50.0), Some(70.0));
+
+        let gpu_only = EcReading::from_readings(readings(&[("gpu_vr_f75303@4d", 70.0)]))
+            .expect("a plausible GPU reading");
+        replica.tick(Some(&gpu_only));
+        assert_eq!(replica.cpu_group_ma(), None);
+        assert_eq!(replica.gpu_group_ma(), Some(70.0));
+
+        let both_55_70 =
+            EcReading::from_readings(readings(&[("cpu@4c", 55.0), ("gpu_vr_f75303@4d", 70.0)]))
+                .expect("plausible groups");
+        replica.tick(Some(&both_55_70));
+        assert_eq!(
+            replica.cpu_group_ma(),
+            Some(55.0),
+            "return seeds CPU before averaging"
+        );
+        assert_eq!(
+            replica.gpu_group_ma(),
+            Some(70.0),
+            "CPU return leaves GPU alone"
+        );
+
+        for cpu in [51.0, 52.0, 53.0] {
+            let reading =
+                EcReading::from_readings(readings(&[("cpu@4c", cpu), ("gpu_vr_f75303@4d", 70.0)]))
+                    .expect("plausible groups");
+            replica.tick(Some(&reading));
+        }
+        // The current CPU history is [51, 52, 53]. Shrinking retains the
+        // newest two, and growing retains those two rather than reseeding.
+        replica.set_interval(2);
+        let cpu_54 =
+            EcReading::from_readings(readings(&[("cpu@4c", 54.0), ("gpu_vr_f75303@4d", 70.0)]))
+                .expect("plausible groups");
+        replica.tick(Some(&cpu_54));
+        assert_eq!(replica.cpu_group_ma(), Some(52.5));
+        replica.set_interval(4);
+        let cpu_55 =
+            EcReading::from_readings(readings(&[("cpu@4c", 55.0), ("gpu_vr_f75303@4d", 70.0)]))
+                .expect("plausible groups");
+        replica.tick(Some(&cpu_55));
+        assert_eq!(replica.cpu_group_ma(), Some(53.5));
+        assert_eq!(replica.gpu_group_ma(), Some(70.0));
+    }
+
+    #[test]
+    fn replica_mismatch_clear_and_resume_reset_all_histories() {
+        // A reset that only replaces reconciliation would retain stale group
+        // heat across resume or mismatch recovery.
+        let mut replica = EcReplica::new(3);
+        replica.reset(Some(80.0), Some(50.0), Some(70.0));
+        let hot =
+            EcReading::from_readings(readings(&[("cpu@4c", 90.0), ("gpu_vr_f75303@4d", 95.0)]))
+                .expect("plausible groups");
+        replica.tick(Some(&hot));
+
+        replica.reset_after_mismatch_clear(Some(80.0), Some(50.0), Some(70.0));
+        assert_eq!(replica.cpu_group_ma(), Some(50.0));
+        assert_eq!(replica.gpu_group_ma(), Some(70.0));
+
+        replica.reset(None, Some(50.0), Some(70.0)); // resume without a fresh view
+        assert_eq!(replica.cpu_group_ma(), Some(50.0));
+        assert_eq!(replica.gpu_group_ma(), Some(70.0));
+        assert!(!replica.reconciliation_ready());
+        assert!(!replica.is_reconciled());
+    }
+
+    #[test]
+    fn reconciliation_readiness_describes_the_exposed_pre_append_mean() {
+        // A readiness check against the post-append buffer would expose 65
+        // as a full interval-3 average on tick three, even though it is the
+        // returned mean of only [60, 70].
+        let make_reading = |c| {
+            EcReading::from_readings(readings(&[("cpu@4c", c)])).expect("plausible CPU reading")
+        };
+        let mut replica = EcReplica::new(3);
+        replica.reset(None, None, None);
+
+        for (sample, expected) in [(60.0, None), (70.0, Some(60.0)), (80.0, Some(65.0))] {
+            let reading = make_reading(sample);
+            replica.tick(Some(&reading));
+            assert_eq!(replica.reconciliation_ma(), expected);
+            assert!(!replica.reconciliation_ready());
+        }
+        let reading = make_reading(90.0);
+        replica.tick(Some(&reading));
+        assert_eq!(replica.reconciliation_ma(), Some(70.0));
+        assert!(replica.reconciliation_ready());
+
+        let mut one = EcReplica::new(1);
+        one.reset(None, None, None);
+        let reading = make_reading(60.0);
+        one.tick(Some(&reading));
+        assert_eq!(one.reconciliation_ma(), None);
+        assert!(!one.reconciliation_ready());
+        one.tick(Some(&reading));
+        assert_eq!(one.reconciliation_ma(), Some(60.0));
+        assert!(one.reconciliation_ready());
+
+        replica.reset(Some(80.0), None, None);
+        assert_eq!(replica.reconciliation_ma(), Some(80.0));
+        assert!(
+            replica.reconciliation_ready(),
+            "a socket-seeded output is ready immediately"
+        );
+    }
+
+    #[test]
+    fn reconciliation_growth_keeps_an_exposed_seeded_mean_ready_and_trusted() {
+        let reading =
+            EcReading::from_readings(readings(&[("cpu@4c", 70.0)])).expect("plausible CPU reading");
+        let mut replica = EcReplica::new(3);
+        replica.reset(None, None, None);
+        for _ in 0..4 {
+            replica.tick(Some(&reading));
+        }
+        assert!(replica.reconciliation_ready());
+        let scored = replica.score_reconciliation(ReconciliationObservation::Scored {
+            max_matches: true,
+            ma_matches: Some(true),
+            socket_ma: 70.0,
+        });
+        assert!(scored.scored);
+        assert!(scored.trusted);
+
+        replica.set_interval(5);
+        assert!(replica.reconciliation_ready());
+        let after_growth = replica.score_reconciliation(ReconciliationObservation::Scored {
+            max_matches: true,
+            ma_matches: Some(true),
+            socket_ma: 70.0,
+        });
+        assert!(after_growth.scored);
+        assert!(after_growth.ever_scored);
+        assert!(after_growth.trusted);
+    }
+
+    #[test]
+    fn reconciliation_protocol_latches_clears_and_ignores_skipped_views() {
+        let mut replica = EcReplica::new(3);
+        replica.reset(Some(80.0), None, None);
+
+        let skipped = replica.score_reconciliation(ReconciliationObservation::Skipped);
+        assert!(!skipped.scored);
+        assert!(!skipped.ever_scored);
+        assert!(!skipped.ec_mismatch);
+
+        for strike in 1..=2 {
+            let outcome = replica.score_reconciliation(ReconciliationObservation::Scored {
+                max_matches: false,
+                ma_matches: Some(true),
+                socket_ma: 80.0,
+            });
+            assert!(outcome.scored);
+            assert!(!outcome.ec_mismatch, "strike {strike} cannot latch");
+        }
+        let skipped_mid_streak = replica.score_reconciliation(ReconciliationObservation::Skipped);
+        assert!(!skipped_mid_streak.scored);
+        assert!(!skipped_mid_streak.ec_mismatch);
+        let latched = replica.score_reconciliation(ReconciliationObservation::Scored {
+            max_matches: false,
+            ma_matches: Some(true),
+            socket_ma: 80.0,
+        });
+        assert!(
+            latched.ec_mismatch,
+            "a skipped view must not reset or advance strikes"
+        );
+
+        for strike in 1..=3 {
+            let outcome = replica.score_reconciliation(ReconciliationObservation::Scored {
+                max_matches: true,
+                ma_matches: Some(true),
+                socket_ma: 81.0,
+            });
+            assert_eq!(outcome.ec_mismatch, strike != 3);
+            assert_eq!(outcome.reseed_ma, (strike == 3).then_some(81.0));
+        }
+    }
+
+    #[test]
+    fn reconciliation_ma_only_failures_request_a_reseed_without_mismatch() {
+        let mut replica = EcReplica::new(3);
+        replica.reset(Some(80.0), None, None);
+
+        for strike in 1..=3 {
+            let outcome = replica.score_reconciliation(ReconciliationObservation::Scored {
+                max_matches: true,
+                ma_matches: Some(false),
+                socket_ma: 83.0,
+            });
+            assert!(!outcome.ec_mismatch);
+            assert_eq!(outcome.reseed_ma, (strike == 3).then_some(83.0));
+        }
+    }
+
+    #[test]
+    fn mismatch_clear_history_reseed_keeps_the_cleared_reconciliation_trusted() {
+        let mut replica = EcReplica::new(3);
+        replica.reset(Some(80.0), Some(50.0), Some(70.0));
+
+        for _ in 0..3 {
+            replica.score_reconciliation(ReconciliationObservation::Scored {
+                max_matches: false,
+                ma_matches: Some(true),
+                socket_ma: 80.0,
+            });
+        }
+        assert!(replica.ec_mismatch());
+        for _ in 0..3 {
+            replica.score_reconciliation(ReconciliationObservation::Scored {
+                max_matches: true,
+                ma_matches: Some(true),
+                socket_ma: 81.0,
+            });
+        }
+        assert!(replica.is_reconciled());
+
+        replica.reset_after_mismatch_clear(Some(81.0), Some(50.0), Some(70.0));
+        assert!(replica.ever_scored());
+        assert!(!replica.ec_mismatch());
+        assert!(replica.is_reconciled());
+        assert_eq!(replica.reconciliation_ma(), Some(81.0));
+        assert_eq!(replica.cpu_group_ma(), Some(50.0));
+        assert_eq!(replica.gpu_group_ma(), Some(70.0));
+    }
+
+    #[test]
+    fn ma_only_history_reseed_keeps_established_reconciliation_trusted() {
+        let mut replica = EcReplica::new(3);
+        replica.reset(Some(80.0), Some(50.0), Some(70.0));
+        for _ in 0..3 {
+            replica.score_reconciliation(ReconciliationObservation::Scored {
+                max_matches: true,
+                ma_matches: Some(false),
+                socket_ma: 83.0,
+            });
+        }
+        assert!(replica.is_reconciled());
+
+        replica.reseed_histories(Some(83.0), Some(50.0), Some(70.0));
+        assert!(replica.ever_scored());
+        assert!(!replica.ec_mismatch());
+        assert!(replica.is_reconciled());
+        assert_eq!(replica.reconciliation_ma(), Some(83.0));
+    }
+
+    #[test]
+    fn seedless_history_reseed_requires_a_new_full_window_and_score() {
+        let mut replica = EcReplica::new(3);
+        replica.reset(Some(80.0), None, None);
+        replica.score_reconciliation(ReconciliationObservation::Scored {
+            max_matches: true,
+            ma_matches: Some(true),
+            socket_ma: 80.0,
+        });
+        assert!(replica.is_reconciled());
+
+        replica.reseed_histories(None, None, None);
+        assert!(!replica.reconciliation_ready());
+        assert!(!replica.is_reconciled());
+
+        let reading =
+            EcReading::from_readings(readings(&[("cpu@4c", 70.0)])).expect("plausible CPU reading");
+        for _ in 0..3 {
+            replica.tick(Some(&reading));
+            assert!(!replica.reconciliation_ready());
+            assert!(!replica.is_reconciled());
+        }
+        replica.tick(Some(&reading));
+        assert!(replica.reconciliation_ready());
+        assert!(!replica.is_reconciled());
+
+        let outcome = replica.score_reconciliation(ReconciliationObservation::Scored {
+            max_matches: true,
+            ma_matches: Some(true),
+            socket_ma: 70.0,
+        });
+        assert!(outcome.scored);
+        assert!(outcome.trusted);
+        assert!(replica.is_reconciled());
     }
 }

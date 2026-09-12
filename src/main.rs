@@ -15,6 +15,8 @@ mod model;
 mod ring;
 mod selftest;
 mod sensors;
+#[cfg(test)]
+mod sim;
 mod state;
 mod sync_util;
 mod telemetry;

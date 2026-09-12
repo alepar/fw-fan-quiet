@@ -1751,7 +1751,20 @@ impl<R: Runner> Controller<R> {
         }
         let mean = values.iter().sum::<f64>() / values.len() as f64;
         let key = key.expect("qualifies requires Some");
-        WarmStart::record(&mut self.warm_start, key, u);
+        WarmStart::record(&mut self.warm_start, key.clone(), u);
+        if let Some(cpu_cap_w) = self.status.cpu_limit_w {
+            // The old loop has no paired GPU write when the dGPU is absent;
+            // its configured floor is the valid current cap in that case.
+            // This writes only a new paired record and never feeds it back
+            // into the scalar budget loop.
+            self.persisted_warm_start.insert(
+                key,
+                WarmStartEntry {
+                    cpu_cap_w,
+                    gpu_lock_mhz: self.status.gpu_max_mhz.unwrap_or(self.config.gpu_floor_mhz),
+                },
+            );
+        }
         self.duty_rpm_table.refine(target_duty, mean);
     }
 
@@ -6127,6 +6140,14 @@ mod tests {
             WarmStart::lookup(&ctl.warm_start, &key),
             Some(ctl.status().budget_w),
             "the steady window must record the CURRENT u under this tick's key"
+        );
+        assert_eq!(
+            ctl.persisted_warm_start.get(&key),
+            Some(&WarmStartEntry {
+                cpu_cap_w: ctl.status().cpu_limit_w.expect("steady window has a CPU cap"),
+                gpu_lock_mhz: ctl.status().gpu_max_mhz.unwrap_or(ctl.config.gpu_floor_mhz),
+            }),
+            "the interim controller must mirror a genuine steady window into the paired v3 map"
         );
         // refine: 0.8*3030.0 (seed) + 0.2*3000.0 (window mean) == 3024.0.
         assert_eq!(

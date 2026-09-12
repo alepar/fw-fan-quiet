@@ -480,6 +480,40 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn one_command_lag_descent_never_scores_a_current_lock_mismatch() {
+        let fake = FakeGpu::with_behavior(FakeGpuBehavior::OneCommandLag);
+        let handles = fake.handles();
+        let mut gpu: Box<dyn GpuClockCtl> = Box::new(fake);
+        let mut commands: Vec<u32> = (0..20).map(|step| 3090 - step * 105).collect();
+        commands.push(1000);
+        for (step, command) in commands.iter().copied().enumerate() {
+            gpu.set_max_clock(command).unwrap();
+            let mut verifier = GpuLockVerifier::new(command);
+            let verdict = verifier.verify_lock(100.0, handles.reported_sm_clock().unwrap());
+            assert!(
+                !matches!(verdict, WriteVerdict::Mismatch { .. }),
+                "step {step}: {command} MHz reported {:?}",
+                handles.reported_sm_clock()
+            );
+        }
+        assert_eq!(handles.history().len(), commands.len());
+        assert_eq!(handles.history().last().unwrap().reported_mhz, Some(1095));
+
+        let ignoring = FakeGpu::with_behavior(FakeGpuBehavior::Ignore);
+        let handles = ignoring.handles();
+        let mut gpu: Box<dyn GpuClockCtl> = Box::new(ignoring);
+        for command in [3090, 2985, 2880, 2775] {
+            gpu.set_max_clock(command).unwrap();
+        }
+        assert!(
+            handles
+                .history()
+                .iter()
+                .all(|entry| entry.reported_mhz == Some(3090))
+        );
+    }
+
     /// Step 5 (TDD): below the 90% utilisation floor, `Unverifiable` --
     /// regardless of how far over the pin the reported clock is.
     #[test]

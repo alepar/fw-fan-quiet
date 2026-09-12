@@ -146,52 +146,14 @@ fn drive_ticks<R: crate::actuators::cmd::Runner>(
 // =====================================================================
 mod main_flow {
     use super::*;
+    use crate::actuators::gpu::test_support::FakeGpu;
 
-    /// A `sweep_pinned`-shaped sample (mirrors
-    /// `control::controller::tests::sweep_pinned`, unreachable from here):
-    /// enough for the LUT sweep's own point-recording gate (a pinned GPU
-    /// clock/util/watts triple, a healthy cool CPU reading and a valid fan)
-    /// without any dependency on `ChainedPlant`, which does not model the
-    /// GPU-clock sweep protocol at all.
-    fn sweep_pinned(clock: u32) -> Sample {
-        Sample {
-            gpu_util_pct: 99.0,
-            gpu_sm_mhz: f64::from(clock),
-            gpu_w: f64::from(clock) / 30.0,
-            gpu_w_valid: true,
-            gpu_mhz_valid: true,
-            fan1_rpm: 3000.0,
-            fan_valid: true,
-            cpu_temp_c: 60.0,
-            cpu_temp_valid: true,
-            ..Sample::default()
-        }
-    }
-
-    /// Drives the whole LUT sweep phase through the controller with pinned
-    /// samples (mirrors `control::controller::tests::drive_sweep`).
-    fn drive_lut_sweep(ctl: &mut Controller<&FakeRunner>) {
-        use crate::calib::lut_sweep::SWEEP_CLOCKS;
-        for (i, &clock) in SWEEP_CLOCKS.iter().enumerate() {
-            for _ in 0..60 {
-                ctl.on_sample(&sweep_pinned(clock));
-                let calib = ctl.status().calib.as_ref().expect("still calibrating");
-                if calib.phase != "lut" || calib.step > i {
-                    break;
-                }
-            }
-        }
-        let calib = ctl.status().calib.as_ref().expect("still calibrating");
-        assert_eq!(calib.phase, "step", "LUT sweep must hand off to the step test: {calib:?}");
-    }
-
-    /// Drives the step-test phase with a REAL `ChainedPlant` (the same
+    /// Drives shared settle and both device steps with a REAL `ChainedPlant` (the same
     /// FOPDT physics `control::sim_tests`'s own off-controller calibration
     /// test fits against), closing the loop on the controller's own
-    /// commanded CPU cap exactly like Auto mode's `drive_ticks` does —
-    /// `apply_calib_set_budget` (the step test's `SetBudget` effect handler)
-    /// runs the same `split_budget` -> command path Auto uses, so
-    /// `status().cpu_limit_w` is real live actuation to feed back. Panics if
+    /// commanded CPU cap and GPU lock exactly like Auto mode's `drive_ticks`
+    /// does. The per-device runner's direct effects use the controller's
+    /// normal actuator paths, so status is real live actuation to feed back. Panics if
     /// calibration has not concluded within `max_ticks` (a hang here is a
     /// test bug, not a scenario this suite should tolerate silently).
     fn drive_step_test_to_conclusion(
@@ -219,6 +181,11 @@ mod main_flow {
                 cpu_cap_w: status.cpu_limit_w.unwrap_or(cpu_floor_w),
                 cpu_demand_frac: 1.0,
                 cpu_util_pct: 95.0,
+                gpu_lock_mhz: status.gpu_max_mhz.map(f64::from),
+                gpu_load_level: Some(1.0),
+                gpu_powered: Some(true),
+                gpu_util_pct: 95.0,
+                gpu_temp_c: Some(42.0),
                 on_ac: true,
                 ..TickScript::default()
             };
@@ -247,8 +214,8 @@ mod main_flow {
     ///
     /// - Engage Auto from a fresh `state.json` carrying only a LUT; walk
     ///   `TempLoop -> socket death -> RpmLoop -> recovery -> TempLoop`.
-    /// - Run a calibration THROUGH THE CONTROLLER (LUT sweep + a real,
-    ///   physically-simulated step test) to a landed fit.
+    /// - Run a calibration THROUGH THE CONTROLLER (shared settle plus real,
+    ///   physically simulated CPU-watt and GPU-clock steps) to landed fits.
     /// - "Restart": load the state through the public surface and confirm
     ///   the staged migration retains paired/new fields while deliberately
     ///   withholding legacy LUT/scalar-gain state from the old controller.
@@ -319,16 +286,41 @@ mod main_flow {
         // ---- Run a calibration (through the controller, real physics) ----
         ctl.on_command(Command::SetAuto(false));
         assert_eq!(ctl.status().mode, Mode::Monitor);
+        let persisted_before_calibration = PersistedState::load(&state_path);
+        let mut cpu = CpuActuator::new(&runner, profile_path.clone());
+        cpu.toggle_delay = std::time::Duration::from_millis(1);
+        let calibration_config = Config { gpu_floor_mhz: 1_200, ..Config::default() };
+        ctl = Controller::new(
+            RestoreGuard::new(
+                &runner,
+                Some(cpu),
+                Some(Box::new(FakeGpu::new())),
+                Some(SmuModule::assume_unloaded()),
+            ),
+            persisted_before_calibration,
+            state_path.clone(),
+            calibration_config,
+            PathBuf::from("/nonexistent/config.toml"),
+        );
         ctl.on_command(Command::StartCalibration);
-        drive_lut_sweep(&mut ctl);
+        assert_eq!(
+            ctl.status().calib.as_ref().map(|progress| progress.phase.as_str()),
+            Some("settle"),
+            "revision-4 calibration starts directly with the shared settle"
+        );
         let mut calib_plant =
             ChainedPlant::new("quiet16", QUIET16_POINTS.to_vec(), MA_INTERVAL, AMBIENT_C, 2)
                 .expect("valid curve");
-        drive_step_test_to_conclusion(&mut calib_plant, &mut ctl, cpu_floor_w, 700);
+        // The pair is restored and physically re-settled between the CPU
+        // and GPU responses so CPU cool-down cannot masquerade as GPU-step
+        // cross coupling. Leave enough deterministic plant time for that
+        // recovery in addition to both 360 s response windows.
+        drive_step_test_to_conclusion(&mut calib_plant, &mut ctl, cpu_floor_w, 1_600);
         assert_eq!(ctl.status().mode, Mode::Monitor, "calibration must conclude back to Monitor");
+        let persisted_after_calibration = PersistedState::load(&state_path);
         assert!(
             !ctl.status().flags.contains(&StatusFlag::NotCalibrated),
-            "a landed calibration must keep NOT CALIBRATED clear"
+            "a landed calibration must keep NOT CALIBRATED clear: {persisted_after_calibration:?}"
         );
 
         // The calibration's own effects saved state as it went (design

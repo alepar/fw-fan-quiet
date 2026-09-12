@@ -22,6 +22,7 @@ impl ClockWattsLut {
 
     /// Insert a calibration point, keeping points sorted by mhz. A point with
     /// the same mhz replaces the old one (re-running a sweep step updates it).
+    #[allow(dead_code)] // staged legacy LUT module is deleted by eb9.12
     pub fn insert(&mut self, mhz: u32, watts: f64) {
         match self.points.binary_search_by_key(&mhz, |&(m, _)| m) {
             Ok(i) => self.points[i].1 = watts,

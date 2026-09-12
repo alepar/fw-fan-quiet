@@ -7,14 +7,14 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::types::Sample;
+use crate::types::{Sample, TelemetryDevice, TelemetryFlag, TelemetryTStarState};
 
 /// Bumped whenever the line format changes; stamped into the run_start line.
-/// 2 (Task 15, design §3.5): the `sample` line gains `ec_max`/`ec_argmax`/
-/// `ec_ma`/`nvme_c`/`fanctrl_speed`/`fanctrl_active`/`strategy`; the
-/// `decision` line drops the adaptation-tier's bias/gain/model fields
-/// (the tier is gone, design §4) and gains `t_star`/`budget_w`/`freeze`.
-const SCHEMA_VERSION: u32 = 2;
+/// 3 (per-device loops): sample lines add independently nullable
+/// `cpu_group_c`/`gpu_group_c`; decision lines add typed T* state,
+/// per-device candidates/holds/gain sources, and labelled/polarity flags.
+/// Legacy allocator columns remain until the eb9.12 deletion sweep.
+const SCHEMA_VERSION: u32 = 3;
 /// Flush at least once every this many records...
 const FLUSH_EVERY_RECORDS: u32 = 10;
 /// ...and no less often than this, so a quiet log still hits disk.
@@ -46,6 +46,10 @@ pub enum Record<'a> {
         ec_max: Option<i32>,
         /// `sample.ec`'s argmax sensor label.
         ec_argmax: Option<&'a str>,
+        /// `sample.ec`'s independently averaged CPU control group, °C.
+        cpu_group_c: Option<f64>,
+        /// `sample.ec`'s independently averaged GPU control group, °C.
+        gpu_group_c: Option<f64>,
         /// The controller's live EC boxcar moving average (design §2.6).
         /// Stateful and owned by the controller, not `Sample` — the
         /// caller supplies it (see [`Record::sample`]).
@@ -83,7 +87,8 @@ pub enum Record<'a> {
         gpu_max_mhz: Option<u32>,
         fan_target_rpm: f64,
         cause: String,
-        flags: Vec<String>,
+        /// Structured v3 flags preserve label, device/bound and polarity.
+        flags: Vec<TelemetryFlag>,
         #[serde(skip_serializing_if = "Option::is_none")]
         demand_cpu: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -99,6 +104,14 @@ pub enum Record<'a> {
         /// has a live target.
         #[serde(skip_serializing_if = "Option::is_none")]
         t_star: Option<f64>,
+        /// State of the shared T* source. `None` until the DeviceLoop
+        /// controller wiring replaces the legacy arbiter.
+        tstar_state: Option<TelemetryTStarState>,
+        /// CPU DeviceLoop decision. `None` while the legacy allocator owns
+        /// emission; schema v3 deliberately represents that absence.
+        cpu: Option<TelemetryDevice>,
+        /// GPU DeviceLoop decision; see [`Self::Decision::cpu`].
+        gpu: Option<TelemetryDevice>,
         /// The single power budget the integrator is holding, watts
         /// (design §2.4); mirrors `ControlStatus.budget_w`. Unlike the
         /// `Option` fields above this is always carried (0.0 before the
@@ -125,6 +138,8 @@ impl<'a> Record<'a> {
             sample,
             ec_max: sample.ec.as_ref().map(|e| e.max_c),
             ec_argmax: sample.ec.as_ref().map(|e| e.argmax.as_str()),
+            cpu_group_c: sample.ec.as_ref().and_then(|e| e.cpu_group_c),
+            gpu_group_c: sample.ec.as_ref().and_then(|e| e.gpu_group_c),
             ec_ma,
             nvme_c: sample.nvme_temp_c,
             fanctrl_speed: sample.fanctrl.as_ref().map(|v| v.speed_pct),
@@ -360,13 +375,16 @@ mod tests {
             gpu_max_mhz: None,
             fan_target_rpm: 3000.0,
             cause: "command:set_cpu_w".into(),
-            flags: vec!["resumed".into()],
+            flags: vec![TelemetryFlag::legacy("resumed")],
             demand_cpu: None,
             demand_gpu: None,
             alloc_cpu_w: None,
             alloc_gpu_w: None,
             pi_target_w: None,
             t_star: None,
+            tstar_state: None,
+            cpu: None,
+            gpu: None,
             budget_w: 0.0,
             freeze: None,
         });
@@ -387,7 +405,7 @@ mod tests {
             start["t_wall"].as_f64().unwrap() > 1.5e9,
             "t_wall must be real unix seconds"
         );
-        assert_eq!(start["schema_version"], 2);
+        assert_eq!(start["schema_version"], 3);
 
         let first: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(first["kind"], "sample");
@@ -414,7 +432,9 @@ mod tests {
         assert_eq!(decision["gpu_max_mhz"], serde_json::Value::Null);
         assert_eq!(decision["fan_target_rpm"], 3000.0);
         assert_eq!(decision["cause"], "command:set_cpu_w");
-        assert_eq!(decision["flags"][0], "resumed");
+        assert_eq!(decision["flags"][0]["name"], "legacy");
+        assert_eq!(decision["flags"][0]["flag"], "resumed");
+        assert_eq!(decision["flags"][0]["active"], true);
         // None auto fields are skipped entirely: non-auto lines stay lean.
         for key in [
             "demand_cpu",
@@ -526,6 +546,43 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[test]
+    fn schema_v3_sample_groups_are_independently_nullable() {
+        use crate::test_support::fixtures;
+
+        let mut ec = crate::sensors::ec::EcReading::read(&fixtures::path("hwmon/cros_ec_load"))
+            .expect("fixture must yield a reading");
+        ec.cpu_group_c = Some(50.0);
+        ec.gpu_group_c = Some(70.0);
+        let both = Sample {
+            ec: Some(ec.clone()),
+            ..Sample::default()
+        };
+        let both_wire = serde_json::to_value(Record::sample(&both, None)).unwrap();
+        assert_eq!(both_wire["cpu_group_c"], 50.0);
+        assert_eq!(both_wire["gpu_group_c"], 70.0);
+
+        ec.gpu_group_c = None;
+        let missing_gpu = Sample {
+            ec: Some(ec),
+            ..Sample::default()
+        };
+        let missing_gpu_wire = serde_json::to_value(Record::sample(&missing_gpu, None)).unwrap();
+        assert_eq!(missing_gpu_wire["cpu_group_c"], 50.0);
+        assert!(missing_gpu_wire["gpu_group_c"].is_null());
+
+        let mut gpu_only_ec = missing_gpu.ec.unwrap();
+        gpu_only_ec.cpu_group_c = None;
+        gpu_only_ec.gpu_group_c = Some(70.0);
+        let missing_cpu = Sample {
+            ec: Some(gpu_only_ec),
+            ..Sample::default()
+        };
+        let missing_cpu_wire = serde_json::to_value(Record::sample(&missing_cpu, None)).unwrap();
+        assert!(missing_cpu_wire["cpu_group_c"].is_null());
+        assert_eq!(missing_cpu_wire["gpu_group_c"], 70.0);
+    }
+
     /// Task 15 acceptance criterion, verbatim: the decision line carries
     /// every new field and contains NONE of the removed adaptation-tier
     /// ones — checked by substring on the raw JSON text, not only by
@@ -550,6 +607,9 @@ mod tests {
             alloc_gpu_w: None,
             pi_target_w: None,
             t_star: Some(71.5),
+            tstar_state: None,
+            cpu: None,
+            gpu: None,
             budget_w: 68.0,
             freeze: Some("demand_limited".into()),
         });
@@ -569,6 +629,98 @@ mod tests {
         assert_eq!(line["freeze"], "demand_limited");
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn schema_v3_decision_carries_tstar_devices_and_detailed_flags() {
+        use crate::control::device_loop::{DeviceDecision, Hold, Selected};
+        use crate::types::{GainsSource, TelemetryDevice, TelemetryFlag, TelemetryTStarState};
+
+        let device = |selected, hold, source| {
+            TelemetryDevice::from((
+                DeviceDecision {
+                    t_star: 72.0,
+                    group_c: Some(70.0),
+                    err_c: Some(2.0),
+                    thermal: 2100.0,
+                    shadow: 2050.0,
+                    cap: 2050.0,
+                    selected,
+                    hold,
+                    write_allowed: true,
+                    group_lost: false,
+                    write_immediately: false,
+                },
+                source,
+            ))
+        };
+        let decision = Record::Decision {
+            t_mono: 10.0,
+            mode: "auto".into(),
+            cpu_limit_w: Some(30.0),
+            gpu_max_mhz: Some(2050),
+            fan_target_rpm: 3000.0,
+            cause: "auto:device_loops".into(),
+            flags: vec![TelemetryFlag::ArgmaxStuck {
+                label: "ambient_f75303@4d".into(),
+                active: true,
+            }],
+            demand_cpu: Some(10.0),
+            demand_gpu: Some(5.0),
+            alloc_cpu_w: Some(9.0),
+            alloc_gpu_w: Some(4.0),
+            pi_target_w: Some(4.0),
+            t_star: Some(72.0),
+            tstar_state: Some(TelemetryTStarState::Curve),
+            cpu: Some(device(Selected::Thermal, Hold::None, GainsSource::Config)),
+            gpu: Some(device(Selected::Shadow, Hold::Shadow, GainsSource::Fitted)),
+            budget_w: 30.0,
+            freeze: Some("legacy".into()),
+        };
+
+        let wire = serde_json::to_value(&decision).unwrap();
+        assert_eq!(wire["tstar_state"], "curve");
+        assert_eq!(wire["cpu"]["group_c"], 70.0);
+        assert_eq!(wire["cpu"]["selected"], "thermal");
+        assert_eq!(wire["gpu"]["hold"]["kind"], "shadow");
+        assert_eq!(wire["flags"][0]["name"], "argmax_stuck");
+        assert_eq!(wire["flags"][0]["label"], "ambient_f75303@4d");
+        assert_eq!(wire["flags"][0]["active"], true);
+        // Legacy fields remain populated until eb9.12 removes them.
+        assert_eq!(wire["budget_w"], 30.0);
+        assert_eq!(wire["pi_target_w"], 4.0);
+    }
+
+    #[test]
+    fn legacy_emission_explicitly_marks_v3_device_state_absent() {
+        let decision = Record::Decision {
+            t_mono: 1.0,
+            mode: "auto".into(),
+            cpu_limit_w: Some(20.0),
+            gpu_max_mhz: Some(2000),
+            fan_target_rpm: 3000.0,
+            cause: "auto:allocate".into(),
+            flags: vec![TelemetryFlag::legacy("steep_curve")],
+            demand_cpu: Some(10.0),
+            demand_gpu: Some(5.0),
+            alloc_cpu_w: Some(9.0),
+            alloc_gpu_w: Some(4.0),
+            pi_target_w: Some(4.0),
+            t_star: Some(60.0),
+            tstar_state: None,
+            cpu: None,
+            gpu: None,
+            budget_w: 30.0,
+            freeze: Some("legacy".into()),
+        };
+
+        let wire = serde_json::to_value(decision).unwrap();
+        for field in ["tstar_state", "cpu", "gpu"] {
+            assert!(
+                wire.get(field).is_some_and(serde_json::Value::is_null),
+                "{field} must be an explicit null in the pre-eb9.7 compatibility shape: {wire}"
+            );
+        }
     }
 
     #[test]

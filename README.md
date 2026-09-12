@@ -182,14 +182,38 @@ one line (most severe first):
 ## Telemetry
 
 Every run writes one JSONL file under the telemetry dir (falls back to the current
-directory if unwritable). Each line carries a `kind` field: one `run_start` header, then
-1 Hz `sample` lines (fan RPM, CPU/GPU sensors, the EC replica's max/argmax/moving-average,
-NVMe temperature, and the fw-fanctrl view's speed/active/strategy), `decision` lines
-(every controller status change or reassert, with a `cause` string, current limits, flags,
-and — on Auto-mode lines — the arbiter's `mode`/`t_star`/`budget_w`/`freeze`) and `flag`
-lines (watchdog flag transitions). It loads directly into pandas
-(`pd.read_json(path, lines=True)`) or DuckDB (`read_json_auto`) for offline controller
-review.
+directory if unwritable). Schema v3 has one `run_start` header, then 1 Hz `sample`,
+event-driven `decision`, and standalone `flag` lines. It loads directly into pandas
+(`pd.read_json(path, lines=True)`) or DuckDB (`read_json_auto`) for offline review.
+
+`sample` retains the raw fan, CPU/GPU, validity, resume, EC max/argmax/moving-average,
+NVMe, and fw-fanctrl speed/active/strategy fields. It also has independent nullable
+`cpu_group_c` and `gpu_group_c` values in °C: a missing dGPU group is `null` without
+discarding the CPU group.
+
+`decision` records the timestamp, top-level controller `mode`, `cpu_limit_w` (W),
+`gpu_max_mhz` (MHz), `fan_target_rpm`, and `cause`. `t_star` (°C) is paired with
+`tstar_state` (`curve`, `held`, `uncontrollable`, or `released`). The nullable `cpu` and
+`gpu` objects each carry `group_c` and `err_c` (°C). CPU `thermal`, `shadow`, and `cap` are
+watts; GPU `thermal`, `shadow`, and `cap` are MHz. `selected` is the JSON string
+`thermal`, `shadow`, `floor`, or `max`. `hold` is a serde-tagged object: for example,
+`{"kind":"shadow"}`, `{"kind":"group_unavailable"}`, or
+`{"kind":"clamp","bound":"floor"}` (the bound is `floor` or `max`). Every object also
+has `gains_source` (`config`, `fitted`, `default`). Until the controller wiring lands,
+these three v3 fields are explicit `null`s while the legacy arbiter continues to emit its
+decision values.
+
+The `flags` array uses objects with a `name` and `active` polarity. Label-bearing flags
+(`argmax_uncontrollable`, `argmax_stuck`, `ec_unknown_label`, `ec_implausible`) also carry
+`label`; `group_lost` carries `device`; `device_unreachable` carries `device` and `bound`;
+and `target_unreachable` carries `bound`. `ec_uncontrollable_unavailable` and `steep_curve`
+need no extra detail. Existing pre-v3 controller flags appear temporarily as
+`{"name":"legacy","flag":...,"active":true}`. A separate `flag` line remains the
+transition stream with its string flag name and `active` polarity.
+
+`demand_cpu`, `demand_gpu`, `alloc_cpu_w`, `alloc_gpu_w`, `pi_target_w`, `budget_w`, and
+`freeze` are deprecated compatibility columns. They remain populated while the legacy
+allocator is still live and are scheduled for removal in task `eb9.12`.
 
 ## Safety model
 

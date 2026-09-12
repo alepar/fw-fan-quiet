@@ -320,6 +320,9 @@ mod tests {
                 dt_s: 1.0,
                 resumed: false,
                 delta_tstar: 0.0,
+                shadow_headroom: 10.0,
+                shadow_fall_rate: 0.33,
+                shadow_enabled: false,
             };
             loop_.tick(tick);
 

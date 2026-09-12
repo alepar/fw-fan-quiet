@@ -538,16 +538,18 @@ impl EcReplica {
 
     /// Re-seeds only the three histories after an already-scored
     /// reconciliation recovery. Unlike [`Self::reset`], this preserves the
-    /// established `ever_scored` state and the cleared mismatch verdict, so
-    /// Curve does not fall back to an artificial unreconciled interval after
-    /// either a three-match clear or an MA-only repair.
+    /// established `ever_scored` state and the cleared mismatch verdict only
+    /// when a usable socket MA is installed. Without that seed, a full raw
+    /// window and a fresh fair score must establish trust again.
     pub fn reseed_histories(
         &mut self,
         socket_ma: Option<f64>,
         cpu_group_c: Option<f64>,
         gpu_group_c: Option<f64>,
     ) {
-        self.reset_histories(socket_ma, cpu_group_c, gpu_group_c);
+        if !self.reset_histories(socket_ma, cpu_group_c, gpu_group_c) {
+            self.ever_scored = false;
+        }
     }
 
     fn reset_histories(
@@ -555,7 +557,7 @@ impl EcReplica {
         socket_ma: Option<f64>,
         cpu_group_c: Option<f64>,
         gpu_group_c: Option<f64>,
-    ) {
+    ) -> bool {
         self.reconciliation.clear();
         self.cpu.clear();
         self.gpu.clear();
@@ -568,6 +570,7 @@ impl EcReplica {
         }
         self.cpu_output = Self::seed_group(&mut self.cpu, cpu_group_c);
         self.gpu_output = Self::seed_group(&mut self.gpu, gpu_group_c);
+        self.reconciliation_output_ready
     }
 
     /// The reset used after `EC MISMATCH` clears. It has group inputs so
@@ -1462,5 +1465,41 @@ mod tests {
         assert!(!replica.ec_mismatch());
         assert!(replica.is_reconciled());
         assert_eq!(replica.reconciliation_ma(), Some(83.0));
+    }
+
+    #[test]
+    fn seedless_history_reseed_requires_a_new_full_window_and_score() {
+        let mut replica = EcReplica::new(3);
+        replica.reset(Some(80.0), None, None);
+        replica.score_reconciliation(ReconciliationObservation::Scored {
+            max_matches: true,
+            ma_matches: Some(true),
+            socket_ma: 80.0,
+        });
+        assert!(replica.is_reconciled());
+
+        replica.reseed_histories(None, None, None);
+        assert!(!replica.reconciliation_ready());
+        assert!(!replica.is_reconciled());
+
+        let reading =
+            EcReading::from_readings(readings(&[("cpu@4c", 70.0)])).expect("plausible CPU reading");
+        for _ in 0..3 {
+            replica.tick(Some(&reading));
+            assert!(!replica.reconciliation_ready());
+            assert!(!replica.is_reconciled());
+        }
+        replica.tick(Some(&reading));
+        assert!(replica.reconciliation_ready());
+        assert!(!replica.is_reconciled());
+
+        let outcome = replica.score_reconciliation(ReconciliationObservation::Scored {
+            max_matches: true,
+            ma_matches: Some(true),
+            socket_ma: 70.0,
+        });
+        assert!(outcome.scored);
+        assert!(outcome.trusted);
+        assert!(replica.is_reconciled());
     }
 }

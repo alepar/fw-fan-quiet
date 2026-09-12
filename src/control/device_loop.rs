@@ -191,6 +191,7 @@ pub struct DeviceLoop<U: DeviceUnit> {
     hot_episode_armed: bool,
     hot_rearm_s: f64,
     control_entry_pending: bool,
+    entry_candidates_seeded: bool,
     last_mode: Option<ThermalMode>,
     unit: std::marker::PhantomData<U>,
 }
@@ -224,6 +225,7 @@ impl<U: DeviceUnit> DeviceLoop<U> {
             hot_episode_armed: true,
             hot_rearm_s: 0.0,
             control_entry_pending: true,
+            entry_candidates_seeded: false,
             last_mode: None,
             unit: std::marker::PhantomData,
         }
@@ -243,6 +245,7 @@ impl<U: DeviceUnit> DeviceLoop<U> {
         self.e_prev = error;
         self.elapsed_s = 0.0;
         self.group_seen = true;
+        self.entry_candidates_seeded = true;
     }
 
     /// Bumplessly transfers thermal ownership to `cap`.
@@ -355,6 +358,11 @@ impl<U: DeviceUnit> DeviceLoop<U> {
                 .or(self.requested)
                 .unwrap_or(self.max)
                 .clamp(self.floor, self.max);
+            if !self.entry_candidates_seeded {
+                self.thermal = cap;
+                self.shadow = cap;
+                self.entry_candidates_seeded = true;
+            }
             self.requested = Some(cap);
             let write_allowed = input.group_c.is_some() || self.group_seen;
             self.pending_immediate = write_allowed;
@@ -488,7 +496,7 @@ impl<U: DeviceUnit> DeviceLoop<U> {
             let cap = if initial_hot_entry {
                 if let Some(cap) = self.last_applied {
                     cap.clamp(self.floor, self.max)
-                } else if self.requested.is_some() {
+                } else if self.entry_candidates_seeded {
                     self.shadow.clamp(self.floor, self.max)
                 } else if input.shadow_enabled {
                     input
@@ -950,6 +958,26 @@ mod tests {
         let live = recovered_on_resume.tick(input(Some(70.0), 1.0));
         close(live.thermal, 80.0);
         close(live.cap, 70.0);
+    }
+
+    #[test]
+    fn resumed_absent_loop_keeps_its_held_cap_on_first_hot_entry() {
+        let mut loop_ = DeviceLoop::<W>::new(Gains {
+            kc: 1.0,
+            ti_s: 10.0,
+        });
+        let mut resumed = input(None, 7_200.0);
+        resumed.resumed = true;
+        resumed.shadow_enabled = true;
+        let held = loop_.tick(resumed);
+        close(held.cap, 100.0);
+
+        let mut hot = input(Some(80.0), 1.0);
+        hot.shadow_enabled = true;
+        let entered = loop_.tick(hot);
+        close(entered.thermal, 100.0);
+        close(entered.cap, 100.0);
+        close(loop_.requested().expect("entry request"), 100.0);
     }
 
     #[test]

@@ -32,6 +32,8 @@
 //!   destructures it exhaustively so an added field fails the build.
 
 use crate::control::allocator::DOWN_RATE_W;
+use crate::control::device_loop::{Mhz, W};
+use std::marker::PhantomData;
 
 /// Default `gpu_hot_c` (°C). Exit is this minus [`GPU_HYSTERESIS_C`] (86 °C).
 /// See the module docs for the measured derivation.
@@ -49,6 +51,92 @@ pub const GPU_HYSTERESIS_C: f64 = 2.0;
 /// NVMe hysteresis band: exit = enter − this. The guard is reporting-only,
 /// so a wide band only affects how long the flag shows.
 const NVME_HYSTERESIS_C: f64 = 5.0;
+
+/// dGPU maximum-clock reduction per valid GPU-hot control sample (MHz).
+#[allow(dead_code)] // Wired by the following controller integration task.
+pub const GPU_MAX_RATCHET_DOWN_RATE_MHZ: f64 = 105.0;
+/// CPU sustained-power reduction per valid CPU-hot control sample (W).
+#[allow(dead_code)] // Wired by the following controller integration task.
+pub const CPU_MAX_RATCHET_DOWN_RATE_W: f64 = 2.0;
+/// The GPU die must be this far below its enter threshold before recovery.
+#[allow(dead_code)] // Wired by the following controller integration task.
+pub const GPU_MAX_RATCHET_RECOVERY_MARGIN_C: f64 = 4.0;
+/// Tctl must be this far below its enter threshold before CPU recovery.
+#[allow(dead_code)] // Wired by the following controller integration task.
+pub const CPU_MAX_RATCHET_RECOVERY_MARGIN_C: f64 = 5.0;
+
+/// Per-device ceiling ratchet used by the CPU and GPU hot guards.  It only
+/// moves on valid control samples: an active guard lowers the ceiling, while
+/// a cool die/Tctl reading restores it at half the lowering rate.
+#[allow(dead_code)] // Wired by the following controller integration task.
+pub struct MaxRatchet<U> {
+    floor: f64,
+    ceiling: f64,
+    current: f64,
+    down_rate: f64,
+    recovery_c: f64,
+    unit: PhantomData<U>,
+}
+
+#[allow(dead_code)] // Wired by the following controller integration task.
+impl<U> MaxRatchet<U> {
+    pub fn new(floor: f64, ceiling: f64, current: f64, down_rate: f64, recovery_c: f64) -> Self {
+        let (floor, ceiling) = if floor <= ceiling {
+            (floor, ceiling)
+        } else {
+            (ceiling, floor)
+        };
+        Self {
+            floor,
+            ceiling,
+            current: current.clamp(floor, ceiling),
+            down_rate,
+            recovery_c,
+            unit: PhantomData,
+        }
+    }
+
+    /// Advances one control sample and returns the new device ceiling.
+    pub fn step(&mut self, valid_control: bool, active: bool, temperature_c: Option<f64>) -> f64 {
+        if !valid_control {
+            return self.current;
+        }
+        if active {
+            self.current = (self.current - self.down_rate).max(self.floor);
+        } else if temperature_c.is_some_and(|temperature| temperature <= self.recovery_c) {
+            self.current = (self.current + self.down_rate / 2.0).min(self.ceiling);
+        }
+        self.current
+    }
+}
+
+#[allow(dead_code)] // Wired by the following controller integration task.
+impl MaxRatchet<Mhz> {
+    /// Builds the GPU max-clock ratchet from its configured hot threshold.
+    pub fn gpu(floor: f64, ceiling: f64, current: f64, gpu_hot_c: f64) -> Self {
+        Self::new(
+            floor,
+            ceiling,
+            current,
+            GPU_MAX_RATCHET_DOWN_RATE_MHZ,
+            gpu_hot_c - GPU_MAX_RATCHET_RECOVERY_MARGIN_C,
+        )
+    }
+}
+
+#[allow(dead_code)] // Wired by the following controller integration task.
+impl MaxRatchet<W> {
+    /// Builds the CPU sustained-power ratchet from its configured hot threshold.
+    pub fn cpu(floor: f64, ceiling: f64, current: f64, cpu_hot_c: f64) -> Self {
+        Self::new(
+            floor,
+            ceiling,
+            current,
+            CPU_MAX_RATCHET_DOWN_RATE_W,
+            cpu_hot_c - CPU_MAX_RATCHET_RECOVERY_MARGIN_C,
+        )
+    }
+}
 
 /// Per-tick guard flags. Deliberately only these two `bool`s: the NVMe guard
 /// is reporting-only and the dGPU override is applied directly to the
@@ -88,7 +176,12 @@ impl Guards {
     /// inactive and any hot state clears, regardless of the last reading.
     pub fn step(&mut self, gpu_temp_c: Option<f64>, nvme_temp_c: Option<f64>) -> GuardState {
         self.gpu_hot = hysteresis(self.gpu_hot, gpu_temp_c, self.gpu_hot_c, GPU_HYSTERESIS_C);
-        self.nvme_hot = hysteresis(self.nvme_hot, nvme_temp_c, self.nvme_hot_c, NVME_HYSTERESIS_C);
+        self.nvme_hot = hysteresis(
+            self.nvme_hot,
+            nvme_temp_c,
+            self.nvme_hot_c,
+            NVME_HYSTERESIS_C,
+        );
         GuardState {
             gpu_hot: self.gpu_hot,
             nvme_hot: self.nvme_hot,
@@ -122,6 +215,129 @@ pub fn gpu_share_override(current_gpu_w: f64, gpu_floor_w: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::device_loop::{
+        ActuatorState, DeviceLoop, Gains, Hold, Mhz, ThermalMode, TickInput, W,
+    };
+
+    #[test]
+    fn gpu_max_ratchet_lowers_once_per_valid_active_sample() {
+        let mut ratchet = MaxRatchet::<Mhz>::new(1_000.0, 3_090.0, 3_090.0, 105.0, 84.0);
+
+        assert_eq!(ratchet.step(true, true, Some(88.0)), 2_985.0);
+        assert_eq!(ratchet.step(true, true, Some(88.0)), 2_880.0);
+        assert_eq!(ratchet.step(false, true, Some(88.0)), 2_880.0);
+    }
+
+    #[test]
+    fn device_ratchets_use_their_specified_units_and_recovery_gates() {
+        let mut gpu = MaxRatchet::<Mhz>::gpu(1_000.0, 3_090.0, 1_000.0, 88.0);
+        let mut cpu = MaxRatchet::<W>::cpu(8.0, 54.0, 54.0, 90.0);
+
+        assert_eq!(
+            gpu.step(true, false, Some(85.0)),
+            1_000.0,
+            "GPU exit band cannot recover"
+        );
+        assert_eq!(
+            cpu.step(true, true, Some(90.0)),
+            52.0,
+            "CPU lowers in watts, not MHz"
+        );
+        assert_eq!(
+            cpu.step(true, false, Some(86.0)),
+            52.0,
+            "CPU exit band cannot recover"
+        );
+        assert_eq!(gpu.step(true, false, Some(84.0)), 1_052.5);
+        assert_eq!(cpu.step(true, false, Some(85.0)), 53.0);
+    }
+
+    #[test]
+    fn ratchets_stop_at_floor_and_recovery_stops_at_configured_max() {
+        let mut gpu = MaxRatchet::<Mhz>::gpu(1_000.0, 3_090.0, 1_105.0, 88.0);
+        assert_eq!(gpu.step(true, true, Some(95.0)), 1_000.0);
+        assert_eq!(
+            gpu.step(true, true, Some(95.0)),
+            1_000.0,
+            "floor is idempotent"
+        );
+        assert_eq!(
+            gpu.step(false, true, Some(95.0)),
+            1_000.0,
+            "invalid samples do not ratchet"
+        );
+
+        let mut cpu = MaxRatchet::<W>::cpu(8.0, 9.5, 8.8, 90.0);
+        assert_eq!(cpu.step(true, false, Some(85.0)), 9.5);
+        assert_eq!(
+            cpu.step(true, false, Some(85.0)),
+            9.5,
+            "configured max caps recovery"
+        );
+    }
+
+    #[test]
+    fn gpu_exit_band_flapping_cannot_restore_or_cycle_its_max() {
+        let mut guard = Guards::new(88.0, 80.0);
+        let mut ratchet = MaxRatchet::<Mhz>::gpu(1_000.0, 3_090.0, 1_000.0, 88.0);
+
+        assert!(guard.step(Some(88.0), None).gpu_hot);
+        assert_eq!(ratchet.step(true, true, Some(88.0)), 1_000.0);
+        for temperature in [87.9, 86.5, 86.0, 86.5, 87.9, 88.0] {
+            let active = guard.step(Some(temperature), None).gpu_hot;
+            assert_eq!(
+                ratchet.step(true, active, Some(temperature)),
+                1_000.0,
+                "{temperature}C in the enter/exit band must not re-open the ceiling"
+            );
+        }
+    }
+
+    #[test]
+    fn hot_die_ratchet_clamps_a_cool_averaged_group_during_bypass_and_mismatch() {
+        for (mode, actuator, expected_hold) in [
+            (ThermalMode::Bypass, ActuatorState::Verified, Hold::Bypass),
+            (
+                ThermalMode::Regulate,
+                ActuatorState::Mismatch,
+                Hold::ActuatorMismatch,
+            ),
+        ] {
+            let mut loop_ = DeviceLoop::<W>::new(Gains {
+                kc: 1.0,
+                ti_s: 10.0,
+            });
+            loop_.seed(100.0, 0.0);
+            loop_.transfer_shadow(100.0);
+            let mut tick = TickInput {
+                t_star: 70.0,
+                group_c: Some(60.0),
+                draw: Some(50.0),
+                floor: 10.0,
+                max: 100.0,
+                mode,
+                actuator,
+                dt_s: 1.0,
+                resumed: false,
+                delta_tstar: 0.0,
+            };
+            loop_.tick(tick);
+
+            let mut ratchet = MaxRatchet::<W>::cpu(10.0, 100.0, 100.0, 90.0);
+            tick.max = ratchet.step(true, true, Some(90.0));
+            let guarded = loop_.tick(tick);
+            assert_eq!(guarded.cap, 98.0);
+            assert_eq!(guarded.thermal, 98.0);
+            assert_eq!(loop_.thermal(), 98.0);
+            assert_eq!(guarded.hold, expected_hold);
+            assert!(guarded.write_immediately);
+
+            tick.max = ratchet.step(true, false, Some(85.0));
+            let recovered = loop_.tick(tick);
+            assert_eq!(loop_.thermal(), 98.0, "recovery raises only the ceiling");
+            assert!(!recovered.write_immediately);
+        }
+    }
 
     #[test]
     fn gpu_hysteresis_enters_at_threshold_and_exits_two_below() {

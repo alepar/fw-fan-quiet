@@ -615,6 +615,9 @@ pub struct ThermalPlant {
     /// Pending watts inputs not yet past the dead time, oldest first.
     cpu_delay: VecDeque<(f64, f64)>,
     gpu_delay: VecDeque<(f64, f64)>,
+    /// Exact carried scalar delay for cap/fraction scripts.  It remains
+    /// separate from the elapsed-time per-device queues by design.
+    legacy_delay: VecDeque<f64>,
     controllable_c: f64,
     gpu_group_c: f64,
     ambient_c: f64,
@@ -665,6 +668,7 @@ impl ThermalPlant {
             ambient_base_c,
             cpu_delay: VecDeque::new(),
             gpu_delay: VecDeque::new(),
+            legacy_delay: VecDeque::new(),
             controllable_c: ambient_base_c,
             gpu_group_c: ambient_base_c,
             ambient_c: ambient_base_c - 2.0,
@@ -712,16 +716,31 @@ impl ThermalPlant {
     /// channels into the scratch hwmon tree, and reads a fresh
     /// [`EcReading`] back.
     pub fn tick(&mut self, watts: f64) -> EcReading {
-        self.tick_nodes(
+        self.tick_legacy_scalar(
             watts,
-            0.0,
-            TICK_S,
             ThermalFaults {
                 gpu_group_present: self.gpu_ec_c.is_some(),
                 ..ThermalFaults::default()
             },
         )
         .expect("legacy thermal tick always has a CPU EC channel")
+    }
+
+    /// The carried scalar plant uses an integer-tick delay and explicit Euler
+    /// update.  Old cap/fraction acceptance traces are phase-sensitive, so
+    /// routing them through the analytic per-device model changes outcomes.
+    fn tick_legacy_scalar(&mut self, watts: f64, faults: ThermalFaults) -> Option<EcReading> {
+        self.legacy_delay.push_back(watts);
+        let delayed = if self.legacy_delay.len() > (THERMAL_THETA_S / TICK_S) as usize {
+            self.legacy_delay
+                .pop_front()
+                .expect("the just-appended scalar delay is nonempty")
+        } else {
+            0.0
+        };
+        let target = self.ambient_base_c + THERMAL_K_C_PER_W * delayed;
+        self.controllable_c += (target - self.controllable_c) * (TICK_S / THERMAL_TAU_S);
+        self.emit_reading(faults)
     }
 
     /// Advances independent CPU/GPU group nodes.  The GPU target deliberately
@@ -776,6 +795,10 @@ impl ThermalPlant {
         update(&mut self.controllable_c, cpu_target, self.cpu_params.tau_s);
         update(&mut self.gpu_group_c, gpu_target, self.gpu_params.tau_s);
 
+        self.emit_reading(faults)
+    }
+
+    fn emit_reading(&mut self, faults: ThermalFaults) -> Option<EcReading> {
         let write_milli = |name: &str, c: f64| {
             std::fs::write(
                 self.dir.join(name),
@@ -1439,6 +1462,15 @@ impl ChainedPlant {
         let gpu_present = (script.gpu_temp_c.is_some() || self.thermal.gpu_ec_c.is_some())
             && script.gpu_group_present;
         let clock_model = script.gpu_lock_mhz.is_some() && script.gpu_load_level.is_some();
+        let per_device_fault = !script.cpu_group_present
+            || !script.gpu_group_present
+            || script.cpu_stuck_c.is_some()
+            || script.gpu_stuck_c.is_some()
+            || script.ambient_c.is_some()
+            || script.charger_c.is_some()
+            || script.raw_only_c.is_some()
+            || script.unknown_c.is_some()
+            || script.ec_invalid;
         let (gpu_w, gpu_sm_mhz) = if gpu_present {
             if let (Some(lock_mhz), Some(load_level)) = (script.gpu_lock_mhz, script.gpu_load_level)
             {
@@ -1467,17 +1499,20 @@ impl ChainedPlant {
             unknown_c: script.unknown_c,
             ec_invalid: script.ec_invalid,
         };
-        // Existing cap/fraction scripts model the carried scalar plant. The
-        // revision-4 two-node path is selected explicitly by clock+load, so
-        // older controller acceptance cases retain their physical fixture.
-        let (cpu_heat_w, gpu_heat_w) = if clock_model {
-            (cpu_pkg_w, gpu_w)
+        // Existing cap/fraction scripts retain the carried scalar dynamics.
+        // Clock/load and new fault scripts enter the elapsed-time two-node
+        // model, so the two physical contracts cannot perturb each other.
+        let ec_reading = if clock_model || per_device_fault {
+            self.thermal.tick_nodes(cpu_pkg_w, gpu_w, elapsed_s, faults)
         } else {
-            (cpu_pkg_w + gpu_w, 0.0)
+            self.thermal.tick_legacy_scalar(
+                cpu_pkg_w + gpu_w,
+                ThermalFaults {
+                    gpu_group_present: self.thermal.gpu_ec_c.is_some(),
+                    ..faults
+                },
+            )
         };
-        let ec_reading = self
-            .thermal
-            .tick_nodes(cpu_heat_w, gpu_heat_w, elapsed_s, faults);
         let current_c = ec_reading
             .as_ref()
             .map_or(0.0, |reading| f64::from(reading.max_c));

@@ -1,6 +1,6 @@
 # Per-device temperature loops
 
-Date: 2026-09-11 · Status: draft (revision 2, after design roast iteration 1) · Supersedes §2.4 and §2.5 of
+Date: 2026-09-11 · Status: draft (revision 4, after design roast iteration 3) · Supersedes §2.4 and §2.5 of
 [2026-09-07-fw-fanctrl-loop-design.md](../../specs/2026-09-07-fw-fanctrl-loop-design.md) (its
 §2.2, §2.6, §2.8, §2.9 and §3.4 carry over) · Seed:
 [2026-09-11-per-device-temperature-loops-seed.md](../../specs/2026-09-11-per-device-temperature-loops-seed.md)
@@ -24,9 +24,9 @@ a load jump becomes a ramp of seconds rather than a fan overshoot.
 3. The GPU loop drives the **max-clock lock directly**. The clock→watts LUT, its sweep and the
    watts inner loop go.
 4. **Shadow cap + override control:** every device carries `draw + headroom` as a second cap
-   candidate; the applied cap is the min of the thermal and shadow candidates, with hot-only tracking
-   (§2.3 step 4) so the thermal candidate hands over without windup when the device crosses
-   T\* and is otherwise free to saturate. A GPU clock lock is a frequency
+   candidate; the applied cap is the min of the thermal and shadow candidates. A one-time
+   handover on entry to a hot episode (§2.3 step 4) starts thermal regulation at the last
+   applied cap; draw never continuously overwrites the PI state. A GPU clock lock is a frequency
    ceiling, so a card locked at 2 GHz running 80 % duty does the same work at a lower V/F point
    than one boosting to 3 GHz at 56 % — the GPU shadow cap binds continuously and is expected to pay for
    itself in watt-hours — **an unmeasured claim** (roast d1): it is inert while the card is
@@ -100,28 +100,63 @@ lives in `control/device_loop.rs` and the T\* logic in `control/tstar.rs`.
 
 `EcReading` gains `cpu_group_c: Option<f64>` and `gpu_group_c: Option<f64>`: the max over the
 **plausible** readings of each group's labels, `None` when the group has no plausible reading
-(dGPU unpowered → GPU group `None`). Plausibility (roast d1/d2): a reading is dropped
-when it is ≤ 0 or > `EC_PLAUSIBLE_MAX_C = 110` — an **absolute, stateless gate** applied to
-every label before `argmax`, `all` and the group maxima alike (the EC's −150 unset sentinel and
-a wild value never reach any consumer); a dropped reading raises the informational
-`EcImplausible` flag naming the label. There is **no jump rule**: a label that is plausible but
-stuck (say 105 °C from daemon start) is indistinguishable from a hot sensor without a plant
-model, and the group max fails in the **safe direction** — that device is cooled toward its
-floor — where §2.4's `DeviceUnreachable` (at floor and over T\* for `BOUND_HOLD_S`) names it
-within a minute. That is the accepted disposition of the stuck-sensor case (sim 11 asserts it).
-Group membership is a fixed label list in `ec.rs` (the table
-above); `is_controllable()` becomes `group().is_some()`. `argmax` and `all` stay for the T\*
-source's feasibility check (§2.4) and telemetry.
+(dGPU unpowered → GPU group `None`). A control reading must be finite and satisfy
+`0 < value <= EC_PLAUSIBLE_MAX_C = 110`; otherwise it is omitted from `max_c`, `argmax`,
+`all`, the group maxima and T* feasibility inputs, with `EcImplausible` naming the label.
+These are control-facing fields. A separate `reconciliation_max_c: Option<i32>` uses every
+finite positive reading, rounded and maximised exactly as the carried replica does, **including
+values above 110 °C**. Only this stream feeds the argmax reconciliation boxcar (§2.2), matching
+fw-fanctrl's positive-only filter. It never feeds a device error, T* feasibility or argmax
+controllability. Thus a 150 °C fault cannot manufacture an `EC MISMATCH` solely because our
+control gate rejected it; genuine timing/history mismatches still score normally. `ec_valid`
+continues to require at least one plausible control reading, so a raw-only stream cannot keep
+an otherwise-invalid EC in Auto.
 
-**owns:** the group label sets and `cpu_group_c`/`gpu_group_c`. **consumes:** nothing new.
+There is **no jump rule**. A plausible stuck device-group reading (e.g. 105 °C from startup)
+stays in that group's max; cooling toward the device floor is the accepted safe direction and
+`DeviceUnreachable` reports it after `BOUND_HOLD_S`. This argument applies to device groups;
+a stuck uncontrollable label has the separate visible backstop in §2.4.
+
+Membership uses the exact table above first, then the carried prefix fallback (`cpu` / `apu`
+→ CPU, `gpu_` → GPU). Every unexpected label or missing expected label raises informational
+`EcUnknownLabel` naming it, at discovery and on subsequent label-set changes; log only when
+that diagnostic set changes. A present label with a sentinel or ENODATA is not a missing label.
+Fallback labels remain in their device group's max. Only the two exact ambient/charger labels
+are known uncontrollable sensors; an unmatched label with no device prefix is **Unknown**,
+not ambient/charger. It remains visible in the plausible `all`/`argmax` and raw reconciliation
+streams but cannot enter `Uncontrollable`. An Unknown argmax forces `Held`, inhibits `Curve`
+entry and raises `EcUnknownLabel`; if no device group is available, the per-device unavailable
+rules apply. `is_controllable()` means CPU or GPU membership, while `is_uncontrollable()`
+explicitly means one of the known ambient/charger labels; Unknown is neither.
+
+**owns:** group classification, label diagnostics, plausible control fields and the separate
+positive-only reconciliation maximum. **consumes:** nothing new.
 
 ### 2.2 `EcReplica` — per-group boxcar (change to §2.2)
 
-The §2.2 replica becomes three boxcars over the same `ma_interval`: the argmax replica it is
-today (reconciliation still compares it to fw-fanctrl's `movingAverageTemperature`), plus one
-per group. All three are seeded, reseeded and invalidated together exactly as §2.2 states
-(auto entry, `view_changed`, resume, `EC MISMATCH`). A group that reads `None` clears its own
-boxcar and reports `None`; the loop for that device then holds its cap (§2.3 steps 1 and 8).
+The replica has three boxcars over the same `ma_interval`, capped at 100 samples and retaining
+the carried mean-before-append off-by-one. The reconciliation boxcar consumes
+`reconciliation_max_c` and is compared with fw-fanctrl's `movingAverageTemperature`; CPU and
+GPU boxcars consume only their own plausible instantaneous group maxima.
+
+On Auto engagement, re-engagement from Released, calibration exit, resume, and an explicit
+reseed after `EC MISMATCH` clears, discard the old histories. Seed the reconciliation boxcar
+from a fresh `view.ma_temperature` as in the carried §2.2; without a usable view it starts
+unseeded and accumulates its own raw maximum stream, with reconciliation remaining
+unreconciled until a usable full window and successful scored comparison. Seed **each group
+independently with N copies of its own current instantaneous group max**, making that group's
+first reported average exactly its own value. Never use the socket's single argmax average as
+a group seed. A missing group instead clears its own boxcar and reports `None`; the first
+plausible sample on its return seeds that group in the same way before ordinary averaging.
+The corresponding device cap follows §2.3's unavailable/recovery rules.
+
+`view_changed` is **not a reseed or invalidation event**. A changed interval calls
+`set_interval` on all three boxcars, retaining existing samples and trimming only excess
+oldest samples when N shrinks; when it grows, average the retained history while new samples
+fill it. An ordinary poll, strategy change or points edit preserves all histories and seed
+state. Reconciliation failure disables Curve through §2.4 but does not itself erase valid
+group histories; the explicit mismatch-clear reseed above is the reset event. Resume also
+clears the fan/steady windows and elapsed-time baselines as the controller contract requires.
 
 ### 2.3 `control/device_loop.rs` — `DeviceLoop` (new)
 
@@ -135,66 +170,84 @@ reports `max` and its PI does not run — used by `Uncontrollable`, §2.4), and
 `actuator: ActuatorState { Verified | Mismatch | Unverifiable }` from the previous write's
 read-back. Output: the cap to apply and a `DeviceDecision` record for telemetry.
 
-**Two candidates, one selector, tracking only while hot (roast d2 — replaces rev2's parking
-rule and band).** The thermal PI is slow by design (a 200–360 s closed-loop constant); the
-shadow ramps in seconds. The rev1 rule (track the unselected candidate to the cap every tick)
-pinned a cool device's cap at the PI's rate; the rev2 rule (park the thermal candidate outside a
-band) put a hysteresis-free relay in the forward path and froze the cap inside the band. Rev3
-keeps the thermal candidate **always live and never overwritten while the device is cool**, so
-it sits wherever its own PI has integrated to — at `max` if the device has never been hot — and
-pulls it down to the applied cap **only while the device is above T\***, which is the one moment
-a lower thermal candidate is wanted:
+**Two candidates with a one-time thermal handover (revision 4).** The thermal PI
+owns regulation; the shadow shapes cool-device load changes. The previous continuous
+`thermal := min(thermal, shadow)` rule is removed: a draw dip is not evidence that a
+lower thermal limit is needed. Both shadow directions stop while regulating above T*.
+The handover is an edge, not a condition repeated while hot.
 
-1. `err = t_star − group_c`. If `group_c` is `None` → hold the last applied cap (or `max`
-   when none was ever applied), `hold: GroupUnavailable`; see the dwell rule in step 8. A
-   `None` draw does **not** stop thermal regulation (the thermal candidate consumes no draw):
-   the shadow holds its last value (no rise, no fall), `hold: DrawUnavailable` is reported, and
-   after `DRAW_UNAVAILABLE_DWELL_S = 60` s the shadow is set to `max` (thermal-only control)
-   until draw returns. Entry seeding of the shadow (§2.5) is deferred while draw is `None`.
-2. **Thermal candidate.** Velocity-form PI on `err` with `Gains { kc, ti_s }`,
-   `PI_PERIOD_S = 5` (the integrator runs every 5th sample; the selector runs every sample),
-   output clamped to `[floor, max]` with **directional conditional integration** at the clamps
-   (the `sat_dir` rule from `gpu_pid.rs`: an error pushing further into an active clamp does not
-   integrate; one pulling out of it does). There is no band, no parking and no "integrate only
-   when selected" gate: while the device is cool the PI integrates upward at its own pace and
-   saturates at `max`; that is the intended "let the PI saturate" behaviour — the shadow, not
-   the thermal candidate, is what caps a cool device. Under `ThermalMode::Bypass` the candidate
-   reports `max` and the PI state is untouched.
-3. **Shadow candidate.** `shadow_target = draw + headroom` — always; there is no pinned test
-   (a pinned device's draw tracks its cap, so the target ratchets up one headroom per sample
-   by itself; a device that is not pinned has a target that sits above its draw). `shadow`
-   moves toward `shadow_target`:
-   - **rising only while `err ≥ 0`** (the group is at or below T\*), at most `rise_slew` per
-     second — CPU `headroom` per second (10 W/s), GPU `GPU_RISE_SLEW = 300 MHz/s`; while
-     `err < 0` the shadow does not rise (the thermal candidate has taken over, step 4);
-   - falling at `shadow_fall_rate` toward the target whenever the target is below it;
-   - clamped `[floor, max]`.
-4. **Selector.** `cap = min(thermal, shadow)`; on a tie `Selected = Shadow`.
-   `selected ∈ {Thermal, Shadow, Floor, Max}` names which bound produced it. **Tracking is
-   one-sided and hot-only:** on every tick with `err < 0`, `thermal := min(thermal, cap)` (the
-   PI's integrator state `u` is set with it). A device that crosses T\* while the shadow binds
-   therefore hands over on that tick — the thermal candidate is at the cap and its next PI
-   increment (both terms negative) takes it below the shadow — with no windup to unwind and no
-   step. While `err ≥ 0` the thermal candidate is **never tracked**: the shadow ramps freely
-   under it and a load jump on a cool device is limited by the rise slew alone. The shadow is
-   never tracked (its value is a function of draw and time only).
-   Consequences worth stating: after a hot episode the thermal candidate is low and rises at
-   the PI's rate while the device is cool — that is regulation, not a lock-up (the device was
-   hot at that cap under that load); a device that has never been hot has `thermal = max` and
-   is shaped by the shadow alone; no state is discarded on any transition, so there is no
-   relay — the cap moves either at the rise slew (shadow, upward, cool) or at the PI's rate.
-5. **Quantise and slew.** 0.5 W grid on the CPU; on the GPU `GPU_RISE_SLEW = 300 MHz/s` when the
-   shadow is selected and rising, `105 MHz/s` otherwise (floors and the hot-guard ratchets win
-   over the slew, as today).
+Timing input includes `dt_s`, `resumed`, and `delta_tstar` (new minus previous T*). Use
+`dt_control = clamp(dt_s, 0, 2)` seconds (non-finite or negative means zero);
+accumulate it to a 5 s PI period, run at most once per sample using the accumulated
+interval (bounded to 7 s), then clear the accumulator. Shadow slews use `dt_control`.
+A resumed sample holds the pre-suspend cap, clears the PI time accumulator and draw
+window, reseeds boxcars (§2.2), and resyncs each error; it performs no PI or shadow step.
+Elapsed wall time does not count toward hot, missing-data, bound or verification
+streaks across resume; restart those dwells. Guards and emergency release still win.
+
+1. `err = t_star − group_c`. A missing group holds the last applied cap (or `max`
+   if none), with `GroupUnavailable`; step 8 defines its dwell. Missing draw does
+   not stop the thermal PI. It freezes the shadow with `DrawUnavailable`; after
+   60 s of valid control time it requests shadow = max, using the normal output
+   rise slew, so control becomes thermal-only without an upward step. On draw
+   return seed the shadow at the current applied cap, then resume its slews.
+2. **Thermal PI.** Velocity-form PI at the elapsed 5 s cadence:
+   `u_next = u + Kc*(err-e_prev) + Kc*elapsed_s/Ti*err`.
+   Clamp to `[floor,max]`; suppress only an integral term pushing farther into
+   an active bound. Update `e_prev` even when integration is suppressed.
+   In Regulate the PI runs irrespective of which candidate binds. In Bypass it
+   is frozen and reports max. `resync_error` sets the previous error to the
+   current error without changing output or applying a proportional kick.
+3. **Shadow.** Target = clamp(draw + headroom, floor, max). In Regulate it
+   rises at CPU headroom/s or GPU 300 MHz/s and falls at the configured fall
+   rate **only when err ≥ 0**; with err < 0 both directions hold. In Bypass
+   both directions run regardless of err (the frozen T* is not a gate).
+   Missing draw holds it as step 1 specifies. The shadow is never continuously
+   tracked to thermal output. Mode transitions seed it explicitly below.
+4. **Handover and selector.** Before any candidate motion, detect a measured hot crossing:
+   `prev_group <= prev_tstar && group > prev_tstar && group > tstar`,
+   with a rearmed hot-episode latch and previous decision selected Shadow.
+   On this one tick seed `u = thermal = clamp(last_applied, floor, max)`,
+   resync error, and skip the PI increment. Set a `hot_episode` latch.
+   No further handover is allowed until err has been nonnegative for 5 s of
+   control time. Initial entry with a hot group uses the entry shadow as
+   last_applied for this one handover. On a T* change shift `e_prev += delta_tstar` before the PI update:
+   this cancels only the setpoint's proportional kick and preserves the
+   measured-temperature contribution. Preserve the hot latch and its
+   debounce across Held updates. The measured-crossing predicate prevents a target-only error sign change
+   from manufacturing a handover. Ordinary PI integration
+   still regulates toward the new target. Record previous group and T*
+   on every valid tick, including non-PI ticks.
+   Select `cap_requested = min(thermal, shadow)`. Bound precedence:
+   if requested == floor, Selected=Floor; else if requested == max,
+   Selected=Max; otherwise thermal ≤ shadow selects Thermal, else Shadow.
+   Clamp comparisons use the unquantised clamped candidates, not telemetry
+   rounding. This makes both clamp identities reachable, including ties.
+   A hot draw dip leaves shadow unchanged and cannot overwrite thermal;
+   ordinary PI movement from the measured temperature remains possible.
+
+   **Mode transfers.** On Bypass entry seed shadow to last_applied, suppress
+   candidate motion for that tick, and freeze thermal. On exit seed thermal
+   to last_applied, resync error, clear the PI accumulator, suppress motion
+   for the transition tick and initialize the hot latch from the new error.
+   This removes both entry and exit steps; later Bypass load changes use
+   the normal shadow slew. The output slew applies even with shadow disabled.
+
+5. **Quantise and slew.** 0.5 W grid on the CPU. All upward applied-cap motion is bounded by CPU
+   headroom/s or GPU 300 MHz/s when Shadow binds, GPU 105 MHz/s otherwise;
+   GPU downward motion is bounded by 105 MHz/s. Accumulate this slew from
+   the previous slew-limited request even on samples with no actuator write;
+   the write path sends the latest request when due. Use dt_control, including
+   configuration toggles and missing-draw dwell expiry. Floor changes and
+   hot-guard downward ratchets bypass slew. Bounds win after quantisation.
 6. **Actuator mismatch hold (carried §2.9).** While `actuator == Mismatch` both candidates are
-   frozen (no integration, no shadow move, no tracking) and `hold: ActuatorMismatch`; the first
+   frozen (no integration, no shadow move, no handover) and `hold: ActuatorMismatch`; the first
    `Verified` read-back unfreezes and resyncs the error. `Unverifiable` (GPU util under the
    verifier floor) is not a hold. **Guards have precedence over the freeze:** the applied cap
    is always `min(cap, max)`, so a hot-guard ratchet of `max` (§2.5 step 3) lowers even a frozen
    cap, and that change writes immediately under the cadence rule below.
 7. **Hold states** reported: `None`, `Shadow` (shadow selected), `Clamp(Bound::Floor |
-   Bound::Max)` (thermal selected at a clamp; the bound identity is carried so the T\* source
-   can read it), `ActuatorMismatch`, `GroupUnavailable`, `DrawUnavailable`, `Bypass`.
+   Bound::Max)` (requested cap at that bound, including a tie; the bound identity is carried), `ActuatorMismatch`, `GroupUnavailable`, `DrawUnavailable`, `Bypass`.
 8. **GroupUnavailable dwell.** A group that was available in this Auto session and then reads
    `None` for `GROUP_UNAVAILABLE_DWELL_S = 60` while the EC as a whole is valid has that device
    **released to `max`** (`cpu_max_w` / `gpu_max_mhz` — not the stock limits; a normal cap
@@ -208,8 +261,9 @@ a lower thermal candidate is wanted:
 (ryzenadj write + read-back, NVML set + verify, each bounded by `RUN_TIMEOUT`) is synchronous
 on the controller thread. A write is issued only when the quantised cap changes **and** at least
 `WRITE_MIN_INTERVAL_S = 2` s have passed since that device's last write, except that a floor
-move, a guard ratchet, a Released transition and a resume reassert write immediately. The PI and
-shadow maths are `t_mono`-driven, so a backlog lags the hardware, not the arithmetic.
+move, a guard ratchet, a Released transition and a resume reassert write immediately. The elapsed-time contract above bounds PI and shadow arithmetic during a backlog.
+A pending cap is not evidence of a successful write: last_applied means the last
+successfully commanded cap; write cadence may delay a requested change.
 
 Defaults (all `Config` keys, sanitised like every other numeric key, **with positive floors**:
 headroom ≥ 1 W / ≥ 30 MHz, fall rate ≥ 0.05 W/s / ≥ 1 MHz/s):
@@ -218,7 +272,7 @@ headroom ≥ 1 W / ≥ 30 MHz, fall rate ≥ 0.05 W/s / ≥ 1 MHz/s):
 |---|---|---|---|
 | `shadow_headroom` | 10 W | 300 MHz | step above draw; also the rising slew per second (CPU 10 W/s, GPU `GPU_RISE_SLEW`) |
 | `shadow_fall_rate` | 0.33 W/s | 10 MHz/s | one headroom per 30 s |
-| `gpu_shadow_enabled` | — | true | off = GPU shadow candidate held at `max`, i.e. thermal-only control of the GPU (the A/B for Decision 4: the first hot response then starts from `max`, at the PI's rate) |
+| `gpu_shadow_enabled` | — | true | off = shadow requests `max`; output rise remains slew-limited; thermal-only control has the full max-to-knee dead zone (tested below) |
 
 `shadow_band_c` and the `pin_margin` row of rev2 are gone (no band, no pinned test); the
 `CPU_PINNED_MARGIN_W` / `GPU_PINNED_MARGIN_MHZ` / `GPU_PINNED_UTIL_PCT` constants are deleted
@@ -231,17 +285,29 @@ unstressed CPU moves the 5-sample draw mean by 4 W, so the shadow rises 4 W and 
 12 s — it does not go to `max`. The rise time is the tunable that matters: ≳15 s is the onset
 starvation the previous §2.4 forbade.
 
-**The GPU dead zone.** Above the card's power-limit knee (~2143 MHz) the lock has no effect on
-power, so the clock→heat gain is ~0 there. Because the shadow tracks the *reported* clock
-(which sits at the knee when the card is power-limited), a power-limited card's cap sits at
-most one headroom above the knee, and the hot-only tracking puts the thermal candidate at that
-cap on the crossing — so the PI has at most `headroom` (300 MHz) of zero-gain travel before the
-lock bites, not the ~950 MHz to `gpu_max_mhz`. At the default gains that travel takes
-`300 / (Kc·T/Ti·|err|)` ≈ 300 / (0.7·|err|) ticks — about 12 min at 3 °C over T\* from the
-integral term alone, less the proportional term's contribution as the group keeps rising. This
-is the cost of a slow λ-tuned loop on a 90 s dead-time plant, and it is bounded by the GPU HOT
-guard (88 °C) on the safety side; §4 sim 4's overshoot bar is set from it, and eb9.8's fitted
-gains are what shorten it on the real card.
+**The GPU dead zone.** Above the power-limit knee (~2143 MHz at full load)
+clock-to-heat gain is approximately zero. With draw available and shadow enabled,
+a settled power-limited device has shadow ≤ knee + headroom. A genuine hot
+handover starts thermal at that cap, leaving at most 300 MHz of zero-gain
+travel. At default Kc/Ti = 1/(0.02*360) ≈ 0.1389 MHz/(°C·s),
+300 MHz costs about 540 s at 4 °C error or 720 s at 3 °C, before the
+90 s response delay. It cannot be included in a 3λ settling budget.
+
+That 300 MHz bound is conditional: disabled shadow, missing draw after the
+dwell, or a setpoint change while thermal is already above the shadow can leave
+up to max−knee ≈ 947 MHz (about 2273 s at 3 °C) of travel. These are explicit
+thermal-only sim legs, not covered by the normal headroom claim.
+For a plateau interval with |err| ≥ e_min > 0 and non-increasing err, the
+integral-only upper bound is D/(Kc/Ti*e_min), with D the thermal output's
+distance to the knee at that interval's start; the proportional term helps.
+The sim records the first downward knee crossing after a hot response
+(the lock begins reducing full-load power), asserts this bound plus one PI
+period, and measures settling from that crossing plus θ_eff. If the hot
+response starts below the knee, D=0 and its start is the crossing time.
+An earlier upward crossing during load onset does not start the settling
+clock. It does not divide by
+zero or assert a finite crossing time when the group never exceeds T*.
+The GPU HOT guard remains the independent protection during this travel.
 
 **Gains.** `Gains { kc, ti_s }` per device, fitted (§2.6) or defaulted. Defaults: IMC with
 λ = max(90, 3·θ_eff), Kc = τ/(K·(λ+θ_eff)), Ti = τ, with θ_eff = EC lag + `ma_interval`/2
@@ -249,9 +315,18 @@ for the CPU group and + 40 s more for the GPU group (the `gpu_vr` tail) — **co
 live `ma_interval`** at Auto entry and on an interval change (roast d2 nit), not frozen at the
 60 s numbers below. Units: CPU W/°C, GPU MHz/°C. Numeric defaults at `ma_interval` = 60 s:
 **CPU** τ = 35 s, K = 0.8 °C/W, θ_eff = 50 s, λ = 150 → Kc = 0.22 W/°C, Ti = 35 s; **GPU**
-τ = 35 s, K ≈ 0.02 °C/MHz (0.05 W/MHz from the September sweep × **0.4 °C/W**, the GPU path's
+τ = 15 s (provisional), K ≈ 0.02 °C/MHz (0.05 W/MHz from the September sweep × **0.4 °C/W**, the GPU path's
 own thermal resistance from the gpu-burn fact — idle die 42 °C → 82 °C at 100 W — not the CPU's
-0.8), θ_eff = 90 s, λ = 270 → Kc = 35/(0.02 × 360) ≈ 4.9 MHz/°C, Ti = 35 s. **Precedence
+0.8), θ_eff = 90 s, λ = 270 → Kc = 15/(0.02 × 360) ≈ 2.1 MHz/°C, Ti = 15 s.
+The offline replay of both September 9 gpu-burn CSVs gives raw GPU-group
+rise fits τ=11.26/13.89 s; individual VR/VRAM poles are about 35–43 s.
+Fans changed during those captures and the argmax switched sensors, so 15 s
+is an evidence-informed provisional default, not a measured physical pole.
+[GPU time-constant evidence](tools/gpu-tau-evidence.md) records source hashes,
+fit method, horizon sensitivity and reproducible commands. The offline
+acceptance crosses GPU τ={8,15,25,50} s with K={0.01,0.02,0.03} °C/MHz
+and θ_eff={45,90,135} s; nominal controller gains stay fixed during those
+perturbations. Fitted per-device gains supersede this assumption. **Precedence
 (roast d2):** a `Config` override (`cpu_gains` / `gpu_gains`) wins over a fitted entry for the
 current `(strategy, ma_interval)` key, which wins over the defaults; the controller resolves
 this at Auto entry and on a strategy/interval change and reports the source (`gains_source ∈
@@ -264,9 +339,16 @@ shadow-cap defaults, the write-cadence rule. **consumes:** `t_star` (§2.4),
 
 ### 2.4 `control/tstar.rs` — `TStarSource` (new, replaces `mode.rs`)
 
-States and transitions. **Auto entry starts in `Held`** (roast d2): T\* = `t_star_last_good`
-when persisted, else the current max over the controllable groups (so err = 0 on both loops and
-nothing moves); the entry hysteresis and the argmax debounce then run from there. `Held` means
+States and transitions. **Auto entry starts in `Held`**: use `t_star_last_good` only when its
+`(strategy, fan_target_rpm)` key matches the current resolved strategy and sanitised requested
+fan target, its timestamp is not in the future, and its age is at most
+`TSTAR_SEED_MAX_AGE_S = 21600` (6 h). Otherwise seed from the max over the currently available
+controllable-group averages, never from a previous strategy or target. Clamp the seed to the
+current `[T*_floor, T*_ceiling]`; when neither group is available use `T*_ceiling` and let both
+device-unavailable rules apply. A shared max gives zero error only to the hottest group; the
+cooler group's error is non-negative before any required feasibility clamp. Resync each loop's
+previous error to its actual seeded error to suppress a proportional kick; cap seeding follows
+§2.5. The entry hysteresis and argmax debounce then run from there. `Held` means
 "T\* is not curve-derived right now" — because there is no curve, or because Curve's entry
 conditions have not yet held for the hysteresis window — and the RPM PI runs in it regardless
 (over the 15 s window it moves T\* by well under 0.1 °C at the gains below).
@@ -278,20 +360,46 @@ conditions have not yet held for the hysteresis window — and the RPM PI runs i
   `ENTRY_HYSTERESIS_S` (15 s at the sample cadence). `T* = min(tread temperature, T*_ceiling)`
   with `T*_ceiling = min(cpu_hot_c − 2, gpu_hot_c − 2)`. Re-derived only when the **curve
   points or the snapped `target_duty` change** (the `points_changed` cache mode.rs keeps today —
-  not on every `view_changed`, which fires ~1 sample in 30 in the field), with `resync_error`
-  on both loops (no proportional kick).
+  not on every `view_changed`, which fires ~1 sample in 30 in the field),
+  shifting e_prev by ΔT* on both loops (no setpoint proportional kick,
+  but measured-temperature changes still contribute). Pass `delta_tstar`
+  for actual T* changes including Held PI updates. On an explicit upward
+  fan-target/curve change in Curve, restore thermal to max without changing
+  shadow or last_applied; the output rise slew governs recovery. Held's
+  incremental updates do not perform this restoration.
 - **Uncontrollable.** Entered from `Curve` or `Held` when the debounced argmax is an
   uncontrollable sensor (ambient, charger — plausible readings only, §2.1): the fan is being set
   by heat neither loop can touch (11–16 % of loaded field samples). T\* is frozen, both loops
   are ticked with `ThermalMode::Bypass` (§2.3: the thermal candidates report `max`, the shadows
   own the caps, so devices run at their draw plus headroom), and the `ArgmaxUncontrollable`
   flag is raised. Exit to `Held` (then `Curve` via the normal entry) when a controllable sensor
-  takes the argmax (debounced). No cap step on either transition: the shadows already hold the
-  applied caps on entry, and on exit each thermal candidate resumes from its own state with the
-  hot-only tracking pulling it to the cap on the first hot tick.
+  takes the argmax (debounced). No cap step on either transition: §2.3's explicit mode-transfer seeds and
+  one-tick motion suppression apply, including when thermal < shadow on entry.
+  Bypass shadows ignore the frozen T* and follow load normally.
+- **Stuck uncontrollable backstop.** While a known ambient/charger label continuously holds the
+  debounced argmax, keep a rolling `ARGMAX_STUCK_DWELL_S = 300` s window of fresh 1 Hz
+  observations. Once a complete window exists and its max-minus-min span is at most
+  `ARGMAX_STUCK_SPAN_C = 0.25`, raise
+  `ArgmaxStuck(label)` and quarantine that label from T* argmax selection and feasibility.
+  This is a suspect-reading diagnostic, not proof of a failed sensor; stable real ambient
+  heat can also trigger it, and the flag makes the conservative choice visible. Keep the
+  reading in telemetry and the raw reconciliation stream. Leave `Uncontrollable` for `Held`
+  through its normal cap-continuity transition, seed T* from the controllable-group max using
+  the entry fallback/clamp above, and resync device errors. While any label is quarantined,
+  keep `Held` with both loops in Regulate; inhibit both Curve and Uncontrollable entry so the
+  same reading (or the other ambient/charger label) cannot immediately restore Bypass.
+  Recover a quarantined label only after 30 consecutive fresh samples differ by more than
+  0.5 °C from its value at quarantine; missing/implausible samples reset that recovery streak
+  without clearing quarantine. Then resume normal entry debounce/hysteresis. Missing samples,
+  resume and exit from argmax dominance reset a pending 300 s detection window; quarantine
+  itself survives those events for the Auto session. Group temperatures and die/Tctl guards
+  remain live throughout.
 - **Held.** Entered from `Curve` when the view goes stale, the curve is invalid, or
-  reconciliation fails (§2.6's `EC MISMATCH`), and at Auto entry. `T*` starts at the last good
-  curve-derived value (persisted; the current controllable max when none) and is driven by the
+  reconciliation fails (§2.6's `EC MISMATCH`), at Auto entry, or when a plausible argmax is
+  Unknown or quarantined. Mid-session Curve loss retains the current in-memory T*; ordinary
+  Uncontrollable exit retains its frozen T*, and the stuck backstop uses its explicit seed
+  above. Only Auto/re-engagement reads the qualified persisted seed; a key change mid-session
+  never reloads foreign persisted state. In Held, T* is driven by the
   **RPM PI**: `err_rpm = fan_target − fan_smoothed` (`fan_smoothed` = the existing
   `FAN_SMOOTH_N = 5` tail mean of `max(fan1, fan2)`, raw fallback on outage), a slow
   velocity-form PI in °C per RPM at `PI_PERIOD_S = 5`. **Tuning (roast d1):** the inner loops'
@@ -304,15 +412,19 @@ conditions have not yet held for the hysteresis window — and the RPM PI runs i
   (the EC-autofan case has a near-zero slope in 67–73 °C and 140–420 RPM/°C below 64 °C). The
   effective closed-loop constant is therefore `λ_eff = λ_held / schedule` — up to ~96 min with
   the floor engaged — and §4 sim 6's bar is written against `λ_eff`, not λ_held (roast d2).
-  Output clamped to `[T*_floor, T*_ceiling]` where `T*_floor = min(max(plausible uncontrollable
-  sensors) + 5 °C, T*_ceiling)` (§2.7's feasibility bound; the `min` keeps the interval
-  well-formed — when the raw floor exceeds the ceiling the ceiling wins and
-  `TargetUnreachable(high)` is raised), with directional conditional integration at both
-  clamps. **Anti-windup — directional (roast d2):** the RPM PI's integrator is held **in the
+  Output clamped to `[T*_floor, T*_ceiling]`. For the nonempty set of plausible, known,
+  non-quarantined uncontrollable readings, the raw floor is `max(readings) + 5 °C` and
+  `T*_floor = min(raw_floor, T*_ceiling)`; a raw floor above the ceiling raises
+  `TargetUnreachable(high)`. If that set is empty, define `T*_floor = T*_ceiling` and raise
+  `EcUncontrollableUnavailable`: feasibility is unknown, so the interval conservatively
+  collapses to the existing hot-guard ceiling instead of inventing an ambient reading.
+  The same helper supplies entry-seed clamps and feasibility diagnostics on every tick.
+  Restore the normal floor immediately when a usable uncontrollable reading returns.
+  Directional conditional integration applies at both clamps, including the collapsed case. **Anti-windup — directional (roast d2):** the RPM PI's integrator is held **in the
   upward direction** when no device can raise its cap in response — every device's
-  previous-tick hold is in `{Clamp(Max), Shadow, Bypass, ActuatorMismatch, GroupUnavailable,
-  DrawUnavailable}` (a shadow-bound device will not draw more because T\* rose; a frozen or
-  unavailable one cannot move) — and **in the downward direction** when no device can lower its
+  previous-tick hold is in `{Clamp(Max), Shadow, Bypass, ActuatorMismatch, GroupUnavailable}` (a shadow-bound device will not draw more because T\* rose; a frozen or
+  unavailable group cannot move). `DrawUnavailable` is in neither directional
+  blocking set: thermal regulation remains live, including after its dwell — and **in the downward direction** when no device can lower its
   cap — every device's hold is in `{Clamp(Floor), Bypass, ActuatorMismatch, GroupUnavailable}`.
   A `Shadow` hold blocks only the upward direction: lowering T\* pulls the thermal candidate
   below the shadow and does act. `Clamp(Floor)` blocks only the downward direction: raising T\*
@@ -331,8 +443,13 @@ conditions have not yet held for the hysteresis window — and the RPM PI runs i
   target) or at `Clamp(Floor)` with its group over T\* (the real one — the target is too cold
   for this load, or a sensor in its group is stuck high, §2.1).
 
-`t_star_last_good` is written on Held exit, on Auto exit, and at most every 60 s while dirty —
-never per PI tick.
+`t_star_last_good` records the current valid controlled T* together with its current resolved
+strategy, requested fan target and wall-clock save timestamp. It is written on Held exit, on
+Auto exit, and at most every 60 s while dirty — never per PI tick. Do not refresh the saved
+value or its age in Released, Uncontrollable, while both groups are unavailable, while a sensor
+quarantine/unknown-label/empty-feasibility condition is active, or without a resolved strategy.
+A mid-session strategy/target change rekeys future writes without reseeding the running loops;
+the old record cannot be used under the new key.
 
 **owns:** `TStarSource`, its states (incl. `Uncontrollable`), the RPM PI and its slope schedule,
 the `ThermalMode` each loop is ticked with, `T*` persistence cadence. **consumes:** `FanctrlView`,
@@ -357,19 +474,31 @@ replica, the steady window and the warm start. `on_auto_sample`:
    the fixed 53 W fast limit produces single-sample Tctl jumps of 10 °C+; `watchdog.rs`'s
    `TRIP_STREAK = 3` exists for the same reason). Both use the same `MaxRatchet` helper. The
    ratchet lowers `max` and the applied cap is always `min(cap, max)` — including a cap frozen
-   by `ActuatorMismatch` (§2.3 step 6) — so a guard always has an effect on what is written. Note the recovery of the applied
-   cap after an episode is governed by the thermal PI (the device is at or above T\* when the
-   guard clears), not by the ratchet — the ratchet only restores the ceiling;
+   by `ActuatorMismatch` (§2.3 step 6) — so a guard always has an effect on what is written. Each downward guard ratchet clamps thermal and its PI state to the new
+   max, regardless of EC-group error, even during Bypass or Mismatch. This
+   is guard evidence, never tracking to a draw-derived shadow. On recovery
+   the ceiling alone rises; the PI state is not raised with it. Recovery
+   gates use cpu_hot_c−5 and gpu_hot_c−4, respectively; test the branch
+   where the die trips while the averaged group remains below T*;
 4. `cpu.tick(...)`, `gpu.tick(...)` → two caps (with `ThermalMode` from the
    T\* source: `Bypass` in `Uncontrollable`, `Regulate` otherwise);
 5. write through the existing actuator paths under the §2.3 write-cadence rule:
    `cpu.set_sustained_mw` with read-back (§2.9), `gpu.set_max_clock` with `verify_lock`; the
    read-back verdict is fed back into the next tick as `ActuatorState` (§2.3 step 6); the
    stickiness watchdog, the Mismatch re-write, the shutdown fences and the reassert paths are
-   unchanged. **`verify_lock` is re-scoped (roast d1):** because the lock now moves every sample
-   under the shadow or a ratchet, the verifier checks `reported ≤ commanded + slack` with a
-   strike streak that survives lock changes instead of a per-value state machine that resets on
-   every change;
+   unchanged. **Verification is paired to sample time.** Record every successful GPU
+   command with its monotonic completion time and generation. Before issuing
+   this tick's write, score the clock sample against the latest completed
+   command preceding that sample's acquisition timestamp. A sample with no
+   matching command is Unverifiable. Allow the largest of that command and
+   its immediate predecessor plus VERIFY_CLOCK_SLACK_MHZ (30) for the first
+   one-second sampling interval after a downward change; afterward compare
+   only the paired command plus slack. Do not reset strike streaks on a
+   lock change; a compliant one-command-lag card must never strike during
+   105 MHz/s descent. A persistently ignoring card still strikes after the
+   bounded allowance. Resume clears pairing history and starts with an
+   Unverifiable sample until the reassert has completed. CPU read-back
+   remains paired with its synchronous write;
 6. warm start: when both groups have sat within 1 °C of T\* and the fan within the steady
    window's tolerance for `STEADY_WINDOW_N` samples, record `(cpu_cap, gpu_lock)` under
    `WarmStart::key(strategy, duty, on_ac)` and refine the duty↔RPM table as today.
@@ -384,11 +513,11 @@ either device has no fitted gains).
 `draw + headroom` and its thermal candidate at **`max`** (roast d2 — not at draw: a cool device
 must not be capped at its running draw, which was the 2026-09-11 field complaint). The first
 applied cap is therefore the shadow, `draw + headroom`, one headroom above the running state;
-a device already above T\* at entry is tracked on that first tick (`thermal := min(max, cap)`)
-and the PI takes it down from there. With a warm-start entry the thermal candidate seeds at the
-recorded value instead of `max` and the shadow still starts from draw; the selector picks the
-min, so a stale warm start can only under-cap by the amount the shadow allows to ramp back in
-seconds.
+a device already above T* at entry performs the single entry handover
+described in §2.3. A warm-start record is advisory: seed thermal at
+max(recorded, clamp(draw + headroom, floor, max)) when draw exists,
+otherwise defer its use. Thus a stale low record cannot impose a
+minutes-long PI recovery or violate the entry headroom requirement.
 
 Manual mode (`c`/`g` keys), Monitor, calibration, `p` release, quit and the emergency release
 are unchanged in behaviour; they now address the two loops instead of the budget.
@@ -399,7 +528,7 @@ are unchanged in behaviour; they now address the two loops instead of the budget
 
 1. **Settle** (shared): both devices held at their current applied caps — "the settled cap" below — for the
    calibration's duration: the controller does not tick either `DeviceLoop` (no PI, no shadow,
-   no tracking; the T\* source is frozen with them) and writes nothing but the step and the
+   no handover; the T\* source is frozen with them) and writes nothing but the step and the
    restore; this is a controller-level freeze, not a `TStarSource` state (§2.4); the argmax controllable; both
    groups flat within 0.5 °C over 60 s; fans flat within **150 RPM** over 20 s (was 100 — field
    noise at ~2400 RPM spans 100–200); cap **600 s** (was 300). On timeout the skip reason
@@ -429,7 +558,8 @@ A step on a device whose group cannot respond (dGPU unpowered, a light load that
 produces a sub-threshold response and is rejected by the existing magnitude rule; the runner
 reports it and moves on. `calibrated_at` stamps the run; `NOT CALIBRATED` now means "no fitted
 gains for at least one device" and is informational — **Auto no longer requires calibration**
-(defaults are safe by construction of the IMC bound).
+(defaults are provisional and must pass the offline robustness gates;
+the independent guards remain active before fitted gains are available).
 
 ### 2.7 Guards, watchdog, verification (§2.8, §2.9, unchanged)
 
@@ -444,14 +574,21 @@ restore with read-back and retry, the controller stop fence and bounded joins �
 
 `PersistedState`: `lut` **removed**; `loop_gains` → `cpu_gains` / `gpu_gains:
 BTreeMap<String, Gains>` keyed by `"<strategy>:<ma_interval>"` (§2.6); `warm_start: BTreeMap<String, WarmStartEntry { cpu_cap_w, gpu_lock_mhz }>`;
-`t_star_last_good: Option<f64>` (new, for `Held`). `validated()` extends to the new fields
-(finite, positive, in range). **Migration:** an old file loads with `lut` ignored (one log
+`t_star_last_good: Option<TStarSeed { strategy: String, fan_target_rpm: u32,
+value_c: f64, saved_at_unix_s: u64 }>` (for Held). `validated()` requires finite positive
+in-range temperatures, a nonempty strategy and a sanitised-range fan target. At use time,
+reject key mismatch, future timestamps and ages above 6 h (§2.4), then clamp the value to
+current bounds. A legacy bare `t_star_last_good` number is dropped with one migration log
+line; absent fields remain valid. The qualified record round-trips with its original timestamp,
+so loading/saving unrelated fields does not renew its freshness. **Migration:** an old file loads with `lut` ignored (one log
 line), `loop_gains` ignored (it was Mode A/B gains for one plant — not reusable), and any
 `warm_start` value that is a bare number dropped (one log line). No `.bak` is written (carried
 nit; out of scope). `Config` gains the shadow-cap keys (`shadow_headroom_*`, `shadow_fall_rate_*`, with the
 positive sanitiser floors of §2.3; no band key), `gpu_shadow_enabled`, `cpu_hot_c` (default 90,
-sanitised to `[gpu_hot_c − 2 + 3, CPU_TRIP_C − 1]` i.e. strictly below `CPU_TRIP_C` 95 with the
-exit margin and never so low that `T*_ceiling` drops under 80 °C), and per-device gain overrides
+sanitised independently to `[82, CPU_TRIP_C − 1]` = `[82, 94]`: strictly below the CPU trip
+and preserving `cpu_hot_c − 2 >= 80 °C`. GPU bounds remain independently sanitised by their
+existing rule, so either device can determine `T*_ceiling = min(cpu_hot_c − 2, gpu_hot_c − 2)`.
+The CPU exit/recovery thresholds remain `cpu_hot_c − 3` / `cpu_hot_c − 5`), and per-device gain overrides
 (`cpu_gains` / `gpu_gains`, which take precedence over fitted gains — §2.3 Gains). `CPU_MAX_W` / `CPU_MAX_W_FLOOR` move from
 `allocator.rs` into `config.rs` **before** the deletion sweep (roast d1) so `cpu_max_w` keeps its
 bound. The GPU
@@ -485,27 +622,43 @@ budget, split, LUT, Mode A/Mode B.
 
 ## 4. Testing
 
-- **Unit.** `DeviceLoop` as a pure function: thermal PI reaches setpoint on a first-order plant
-  within 1 % with ≤ 5 % overshoot at defaults; selector picks the min (tie → Shadow); **tracking is hot-only
-  and one-sided**: with the shadow binding and the group below T\* for 300 s the thermal
-  candidate is untouched (at `max` from a cold start); on the first tick with the group above
-  T\* it equals the cap, and on the next PI tick it is below the shadow (hand-over); a load
-  jump on a cool device is limited by the rise slew alone (the cap rises `headroom` per second
-  regardless of the thermal candidate's state); shadow rises only while the group is at or
-  below T\*, holds while above, falls at `fall_rate`, never below floor; `Bypass` reports `max`
-  and leaves the PI state unchanged; `DrawUnavailable` keeps thermal regulation and holds the
-  shadow, then thermal-only after the dwell; a group lost mid-session releases to `max` after
-  the dwell while a group absent from the first tick does not; hold states as enumerated; the GPU `sat_dir` unwind test
-  carried over. `TStarSource`: each transition (entry in `Held`, `Held`→`Curve` after the hysteresis,
-  `Held`/`Curve`→`Uncontrollable` and back), hysteresis at 1 Hz, the RPM PI's clamp, the
-  well-formed `[T*_floor, T*_ceiling]` interval when the raw floor exceeds the ceiling, the
-  **directional** hold rules (both-Shadow blocks up and not down; both-Clamp(Floor) blocks down
-  and not up; one GroupUnavailable + one Clamp(Max) blocks up), feasibility bounds, persistence
-  of the last good T\*. `EcReading` groups: max over the
-  labels, `None` on an unpowered dGPU, the fixture `cros_ec_dgpu_on` re-captured so a `gpu_*`
-  sensor is the argmax under load.
+- **Unit.** DeviceLoop: first-order plant response within 1% with ≤5%
+  overshoot at defaults; directional unwind at each clamp; handover happens
+  once on a measured hot crossing with previous Shadow selection, not on
+  subsequent hot ticks, draw dips, or T* changes. Both shadow directions
+  hold while hot in Regulate and run in Bypass even above frozen T*.
+  A 60 s hot draw dip does not alter thermal except by its own PI;
+  repeat crossings cannot rearm before 5 s nonnegative error.
+  Test Floor/Max tie precedence and interior Thermal ties. Bypass entry
+  from thermal < shadow and exit after shadow motion have zero transition
+  step. Explicit upward Curve target change recovers through output slew;
+  Held PI updates preserve thermal state and shift only the setpoint part
+  of e_prev; measured-temperature P response survives coincident 5 s ticks.
+  DrawUnavailable keeps thermal regulation live, becomes thermal-only after
+  60 s without an output jump, and reappears without a step. GroupUnavailable
+  absent/lost legs and guard precedence over Mismatch remain as specified.
+  A resumed sample at t=100→7300, err=+20 changes no cap or PI output;
+  subsequent ticks use bounded dt and the 5 s PI accumulator, not 5 samples.
+  TStarSource tests every transition, hysteresis, directional Held
+  anti-windup (DrawUnavailable + Shadow must not block upward integration),
+  feasibility bounds, gain-source precedence and last-good persistence.
+  Sensor and boxcar tests cover each group, per-group seeding, interval
+  changes without reseeding, None and mismatch recovery. No automated test
+  acquires physical hardware.
+  Qualified last-good seeds: fresh/matching accepted; wrong strategy/target,
+  expired, future-dated and legacy scalar rejected; unrelated saves never
+  refresh age. Test empty/quarantined feasibility, sentinel-pair recovery,
+  cpu_hot_c=82 yielding ceiling80 and default GPU ceiling86. Test rolling
+  stuck detection, recovery, Held inhibition and Unknown argmax routing.
+  Exact/prefix sensor groups, missing-label diagnostics, and unknown
+  non-device labels are separate cases. Seed CPU50/GPU70/socket MA80
+  at every reset: output CPU50/GPU70. Poll and strategy edits preserve
+  history; shrink/grow retains the specified samples; 150 enters only raw
+  reconciliation. Use synthetic hwmon fixtures; physical capture stays parked.
 - **Simulation** (`ChainedPlant` grows a second thermal node: CPU heat → CPU group with
-  τ≈35 s at 0.8 °C/W, GPU clock → GPU group with the `gpu_vr` tail at **0.4 °C/W** (§2.3),
+  τ≈35 s at 0.8 °C/W, GPU clock → GPU group with nominal τ=15 s and the
+  `gpu_vr` tail represented by θ_eff and the τ=8–50 s robustness range,
+  at **0.4 °C/W** (§2.3),
   cross-coupling 0.1 °C/°C each way; a scriptable GPU die temperature (the NVML reading the
   GPU HOT guard keys on) and CPU Tctl so guard episodes can be driven; fault injection for dGPU
   off, a single group's labels dropping out, a stuck-high sensor, fan outage, EC invalid / stale
@@ -527,10 +680,16 @@ budget, split, LUT, Mode A/Mode B.
   3. Both heavy: both groups at T\*, same fan bar.
   4. Load step light → heavy on the GPU from a cold start (thermal candidate at `max`): cap
      ramps at the rising slew (1000 MHz in ≤ 5 s), no fan crest above target+250, **the GPU
-     group's temperature overshoots T\* by ≤ 4 °C, the GPU HOT guard does not trip, and the
-     group settles within ±1 °C of T\* within 3 λ** (the dead-zone crossing of §2.3 is part of
-     the budget), the CPU cap unchanged during the step; and the same step repeated from a
-     warm state (the loop already regulating at T\* under the light load) — overshoot ≤ 2 °C.
+     group's temperature overshoots T* by ≤ 4 °C, the GPU HOT guard does not trip, and the
+     group settles within ±1 °C within 3 λ after the first downward knee crossing plus θ_eff**.
+     Separately assert and report the crossing bound in §2.3 using the measured
+     minimum hot error over the plateau and D at handover; never count this
+     crossing as part of the 3 λ budget, the CPU cap unchanged during the step; and the same step repeated from a
+     warm state (the loop already regulating at T\* under the light load) — overshoot ≤ 2 °C. Repeat with gpu_shadow_enabled=false and with draw
+     missing for >60 s before the step; record the full 947 MHz bound,
+     require the same temperature/guard bars and post-crossing settling,
+     and assert no output jump at disable/dwell/return. These are offline
+     acceptance requirements, not measured passes.
   5. Auto entry under a steady heavy load: neither device's draw changes by more than 1.5 W /
      30 MHz in the first 10 s and neither cap starts below `draw + headroom`; fans do not fall.
   6. Curve loss mid-session from a converged state on the EC-autofan curve (near-zero slope in
@@ -539,7 +698,11 @@ budget, split, LUT, Mode A/Mode B.
      return within ±150 RPM within 3 λ_eff (λ_eff = λ_held / 0.25 = 96 min, simulated offline at
      plant speed) with a period-agnostic hunting check over the run; the same leg on the
      quiet16 curve (schedule 1×) returns within 3 λ_held = 72 min; curve return → `Curve` with
-     no step in either cap.
+     no step in either cap. Restart variants use a matching fresh seed, a different strategy,
+     a changed requested fan target, an expired (>6 h) timestamp and a future timestamp with
+     no curve available: only the matching fresh record is accepted, every other variant
+     starts from the current controllable-group max/clamp, and the per-group first averages
+     equal their own instantaneous maxima rather than the socket argmax MA.
   7. Unreachable device: a GPU that cannot reach T\* never changes the CPU cap.
   8. Configuration smoke: each `TStarSource` state (incl. `Uncontrollable`, via an
      ambient-dominated argmax leg) and each `Hold` / `Selected` value is reached at least once
@@ -547,23 +710,58 @@ budget, split, LUT, Mode A/Mode B.
   9. Hot-guard episodes: (a) GPU — a 5-min die-temperature excursion above 88 °C: the ratchet
      reaches the floor, recovery of `max` starts only below 84 °C, no re-trip within the
      episode's tail, post-episode fan overshoot ≤ 150 RPM (the prior design's bar) and the
-     applied cap back within 10 % of its pre-episode value within 3 λ of the guard clearing
-     (the cap recovers at the PI's rate from the ratcheted value — the thermal candidate was
-     tracked down with it while the group was hot); (b) CPU — the mirror on Tctl with
-     `cpu_hot_c` 90: a 3-sample streak trips, a 1-sample spike does not, time at `cpu_floor_w`
-     ≤ the excursion's length + 60 s.
-  10. Robustness: sims 1–3 repeated with the plant's K, τ and θ each perturbed by ±50 %, plus a
+     applied cap back within 10 % of its pre-episode value within 3 λ after
+     recovery eligibility: the die remains below its recovery threshold,
+     load and T* return to the prior feasible operating condition, and max
+     has reopened to the pre-episode cap. Report guard-clear, recovery-gate
+     and ceiling-reopened times separately
+     (thermal was clamped by the guard independently of group error).
+     Run both group-already-hot and group-still-cool branches; use a compliant
+     one-command-lag verifier in both and assert zero mismatch strikes or
+     mismatch-driven releases. A separate ignoring-card leg must still trip; (b) CPU — the mirror on Tctl with
+     `cpu_hot_c` 90: a 3-sample streak trips, a 1-sample spike does not, recovery uses the same eligibility and 3λ bar as the GPU. With a
+     sustained positive error e_min, separately bound the first full 0.5 W
+     rise by 0.5/(Kc/Ti*e_min) plus one PI period and write interval; do not
+     promise a 60 s floor exit for an arbitrarily small positive error.
+  10. Robustness: sims 1–3 repeated with the CPU plant's K, τ and θ each
+      perturbed by ±50 % and with the GPU's full crossed grid from §2.3
+      (τ=8,15,25,50; K=0.01,0.02,0.03; θ_eff=45,90,135), plus a
       **fluctuating-load leg** (roast d2): sim 3's load with a square-wave component (period
-      60 s and 300 s, amplitude enough to swing each group ±4 °C about T\*) and a T\* step
-      (fan-target change in `Curve`) — and a period-agnostic **no-relay rule** on every 30-min
+      60 s and 300 s, amplitude enough to swing each group ±4 °C about T\*) and a T* down-and-back step
+      (fan-target change in Curve at unchanged load), plus a 60 s load dip
+      beginning while each group is still above T*. For the target-return
+      leg, the cap returns within 10% of its prior steady value within 3λ;
+      for the hot-dip leg compare against an identical thermal-error replay
+      without the draw dip: PI state must match (no draw-driven loss), and
+      any purely shadow-limited 1000 MHz recovery takes ≤5 s once err≥0.
+      Include the corresponding Held setpoint excursion with a 3λ_inner
+      recovery window measured after T* returns to its original value.
+      Apply a period-agnostic **no-relay rule** on every 30-min
       window of every leg (no sustained oscillation of the cap or the fan with a peak-to-peak
       above 100 RPM / 4 W / 150 MHz at any period from 30 s to 20 min beyond what the load's
       own period forces) — a loop hunting slowly inside ±150 RPM does not pass.
   11. Stuck-high sensor: one GPU-group label pinned at 105 °C from the first sample and,
       separately, from t = 5 min: the GPU cap goes to its floor (the safe direction, §2.1),
-      `DeviceUnreachable` (real) is raised within `BOUND_HOLD_S` + 60 s, the CPU cap and the
-      EC's other consumers are unaffected, and a 150 °C label (implausible) is dropped with
-      `EcImplausible` and no cap effect.
+      `DeviceUnreachable` (real) is raised within `BOUND_HOLD_S` after reaching
+      the floor; bound travel to the floor from the actual seeded output by
+      D/(Kc/Ti*e_min) plus the PI/write latency while error remains ≤−e_min.
+      The other device-group input is unaffected. Unstick the GPU label to
+      the live plant reading, restore the prior feasible load and target,
+      and require cap/temperature recovery within 3λ after the group boxcar
+      has flushed the bad readings. Repeat with a 150 °C label: `EcImplausible`
+      names it, plausible control maxima/argmax omit it, while the emulator and replica both
+      retain it in the positive-only raw reconciliation stream. Over at least four scored
+      steady views, no `EC MISMATCH` is caused by the gate and the valid control argmax does
+      not force Held or Bypass. Assert no direct device-error/cap change from the excluded
+      value; any physical fan response commanded by fw-fanctrl remains visible and is not
+      falsely claimed absent. Add ambient and charger variants pinned at 105 °C from startup
+      and from t=5 min: within the debounce plus 300 s unchanged dwell, `ArgmaxStuck(label)`
+      appears, Held/Regulate replaces Bypass, the suspect reading is excluded from feasibility,
+      and further unchanged samples cannot re-enter Uncontrollable. Unstick it by >0.5 °C for
+      30 consecutive samples and verify quarantine clears, normal entry timers resume, and
+      independent guards remain effective. A separate pair of −150 ambient/charger sentinels
+      with valid CPU/GPU readings keeps EC valid, raises `EcUncontrollableUnavailable`, and
+      produces a finite collapsed Held interval until a plausible label returns.
 - **Hardware (the user's, parked):** the 30-min gaming check; the VR/VRAM label spike.
 
 ## 5. Follow-ons (not in this tree)

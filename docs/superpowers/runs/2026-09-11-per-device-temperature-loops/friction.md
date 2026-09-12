@@ -1,0 +1,1 @@
+- [2026-09-11 roast-design/extension-4] Saved continuation assumed Claude Workflow and Claude cache paths; current Codex session has subagents but no Workflow — used the documented manual pipeline, rendered local prompts, mapped role tiers to available OpenAI models, and will persist coverage and stage outputs.

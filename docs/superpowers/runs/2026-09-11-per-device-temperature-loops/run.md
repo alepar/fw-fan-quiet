@@ -24,9 +24,11 @@ coverage-round-2:
 - tree changes: edges eb9.9<-eb9.16, eb9.13<-eb9.16, eb9.4<-eb9.6, eb9.15<-eb9.6, eb9.7<-eb9.16, eb9.12<-eb9.15; descriptions amended on eb9.3, eb9.4, eb9.7, eb9.9, eb9.10, eb9.12, eb9.14, eb9.16
 - integration sweep: eb9.17 (blocks on eb9.1..eb9.16)
 - ledger: per-device-temperature-loops-coverage-ledger.md (c2-01..c2-13)
-roastDesignRound: 3
+roastDesignRound: 4
 roast-design:
 - 2026-09-11-per-device-temperature-loops-roast-design-1.md (Blocking, 32 confirmed: 3 Blocking / 27 Should-fix / 2 Nit; 8 scouts, 153 raw -> 86 deduped, 61 panels, judge completion 100%, not degraded) — all 32 confirmed applied as spec revision 2 + bead amendments (ledger: Design roast 1 dispositions d1-01..d1-32); escalation mitigated and parked
 - 2026-09-11-per-device-temperature-loops-roast-design-2.md (Blocking, 27 confirmed: 8 Blocking / 18 Should-fix / 1 Nit; delta 16 new (4 B) · 0 carried · 22 resolved · 10 regressed (6 B); 9 scouts, 77 raw -> 41 deduped, 38 panels, judge completion 100%, not degraded) — all 27 applied as spec revision 3 (parking/band replaced by hot-only tracking; jump rule deleted; directional Held anti-windup; entry in Held; ThermalMode) + every bead body rewritten wholesale (ledger: Design roast 2 dispositions d2-01..d2-27)
-- 2026-09-11-per-device-temperature-loops-roast-design-3.md (Blocking, 19 confirmed: 4 Blocking / 15 Should-fix; delta 14 new (2 B) · 0 carried · 22 resolved · 5 regressed (2 B); 9 scouts, 42 raw -> 29 deduped, 25 panels, judge completion 100%, not degraded) — NOT applied: cap round still Blocking; the user asked to pause before the capped-Blocking extension round
-roastDesignCapped: round 3 still Blocking (tracking lock-up third incarnation; per-group boxcar seed + view_changed reseed; sim 4 bar vs the dead zone; verify_lock pairing) — paused by the user 2026-09-11 before the extension round; next step needs the user's decision (extension round after a mechanism rethink, or a different mechanism for the shadow/thermal hand-over)
+- 2026-09-11-per-device-temperature-loops-roast-design-3.md (Blocking, 19 confirmed: 4 Blocking / 15 Should-fix; delta 14 new (2 B) · 0 carried · 22 resolved · 5 regressed (2 B); 9 scouts, 42 raw -> 29 deduped, 25 panels, judge completion 100%, not degraded) — all 19 applied as spec revision 4 and wholesale bead descriptions (ledger d3-01..d3-19); authorized extension follows
+roastDesignExtension: round 4 (capped-Blocking extension) launched 2026-09-11
+
+- Extension authorization (2026-09-11): user adopted next-session-prompt.md; fix all round-3 confirmations, run exactly one post-cap extension, record verdict and stop before super-code regardless of verdict. Codex manual super-roast fallback uses fresh OpenAI GPT scouts and differentiated judges; no Workflow tool is available.

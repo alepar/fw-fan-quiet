@@ -114,3 +114,27 @@ Root cause of the Blocking cluster: rev2's parking rule + band. Rev3 replaces bo
 - d2-25 · Should-fix · CPU hot guard undebounced / no sim · applied · CPU_HOT_STREAK = 3; sim 9(b) → eb9.7, eb9.14, eb9.15.
 - d2-26 · Should-fix · Mismatch freeze vs guard ratchet · applied · applied cap = min(cap, max) always; guards precede the freeze; immediate write → eb9.3, eb9.7.
 - d2-27 · Nit · θ_eff frozen at 60 s · applied · default_gains(ma_interval) computed live → eb9.3, eb9.7.
+
+## Design roast 3 dispositions (d3-01..d3-19; 2026-09-11; spec revision 4)
+
+The authorized two-candidate alternative is retained with an edge-only measured thermal handover. The continuous draw-driven state overwrite is removed. All bead descriptions are rewritten wholesale. Offline arithmetic/trace evidence is documented; future implementation acceptance simulations are requirements, not claimed passes.
+
+- d3-01 · Blocking · §2.3 hot draw dip tracking · applied · one-time measured handover; no continuous draw overwrite; both shadow directions hold while hot; recovery replay → eb9.3, eb9.4, eb9.11, eb9.14.
+- d3-02 · Blocking · §2.2 group seed and view changes · applied · own instantaneous group seeds; view changes preserve history and set interval only → eb9.1, eb9.2, eb9.7.
+- d3-03 · Blocking · §4 sim 4 dead-zone arithmetic · applied · separate downward-knee crossing bound from post-crossing delay and 3λ settling → eb9.3, eb9.10, eb9.11.
+- d3-04 · Blocking · §2.5 verify_lock timing · applied · pair sample with successfully completed command; bounded predecessor allowance; compliant and ignoring-card vectors → eb9.7, eb9.14.
+- d3-05 · Should-fix · §2.3 dt and resume · applied · explicit bounded elapsed time, PI accumulator, resume hold/reset and dwell semantics → eb9.2, eb9.3, eb9.7.
+- d3-06 · Should-fix · §2.5 guard versus averaged group · applied · guard clamps PI independent of group error; both branches tested; recovery bars start at eligibility → eb9.3, eb9.7, eb9.14, eb9.15.
+- d3-07 · Should-fix · §2.3/2.4 target-driven hot spell · applied · measured-only handover, ΔT* error-history shift, explicit Curve upward reset and recovery assertions → eb9.3, eb9.5, eb9.7, eb9.11, eb9.16.
+- d3-08 · Should-fix · §2.8 last-good seed · applied · strategy/target/timestamp qualification, six-hour age, migration and restart cases → eb9.5, eb9.6, eb9.7, eb9.14, eb9.17.
+- d3-09 · Should-fix · §2.4 Bypass transitions · applied · seed shadow on entry and thermal on exit from commanded cap; suppress transition motion → eb9.3, eb9.4, eb9.5, eb9.7, eb9.14.
+- d3-10 · Should-fix · §2.1 plausibility/reconciliation · applied · positive-only raw reconciliation stream separate from plausible control data; no filter-induced mismatch sim → eb9.1, eb9.2, eb9.10, eb9.14.
+- d3-11 · Should-fix · §2.4 DrawUnavailable anti-windup · applied · remove from both directional blocking sets; live thermal-only must-not-hold vector → eb9.3, eb9.16.
+- d3-12 · Should-fix · §2.3 Bypass shadow gate · applied · Bypass ignores frozen T* for both shadow directions; hot-group load-rise case → eb9.3, eb9.4, eb9.14.
+- d3-13 · Should-fix · §2.3 thermal-only plateau · applied · explicit full max-to-knee bound and disabled/missing-draw sim legs; slew on transitions → eb9.3, eb9.4, eb9.11, eb9.14.
+- d3-14 · Should-fix · §2.3 bound tie identity · applied · Floor then Max precedence; interior Thermal ties; reachable clamp diagnostics and smoke → eb9.3, eb9.4, eb9.9, eb9.13, eb9.14, eb9.16.
+- d3-15 · Should-fix · §2.3 GPU τ assumption · applied · offline group-fit evidence; provisional τ15/Ti15/Kc2.1 and crossed τ8–50 uncertainty grid → eb9.3, eb9.10, eb9.11.
+- d3-16 · Should-fix · §2.4 stuck uncontrollable argmax · applied · rolling unchanged dwell, visible quarantine, Held/Regulate backstop and recovery → eb9.1, eb9.5, eb9.9, eb9.10, eb9.13, eb9.14, eb9.16.
+- d3-17 · Should-fix · §2.1 unknown labels · applied · exact plus prefix fallback; unknown/missing label diagnostics; unrelated Unknown routes Held → eb9.1, eb9.5, eb9.9, eb9.13, eb9.14.
+- d3-18 · Should-fix · §2.4 empty uncontrollable set · applied · finite collapsed interval plus explicit diagnostic and recovery tests → eb9.5, eb9.9, eb9.13, eb9.14, eb9.16.
+- d3-19 · Should-fix · §2.8 CPU hot sanitizer · applied · independent [82,94] range and relative exit/recovery thresholds → eb9.6, eb9.7, eb9.14, eb9.15, eb9.16.

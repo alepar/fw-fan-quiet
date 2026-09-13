@@ -291,6 +291,8 @@ pub struct ControlStatus {
     pub gpu_floor_mhz: u32,
     /// CPU operating max (watts), shared with the actuator and UI scale.
     pub cpu_max_w: f64,
+    /// Configured GPU operating ceiling, distinct from its current cap.
+    pub gpu_ceiling_mhz: u32,
     /// Currently active flags.
     pub flags: Vec<StatusFlag>,
     /// Calibration wizard progress; Some exactly while Calibrating.
@@ -339,6 +341,7 @@ impl Default for ControlStatus {
             cpu_floor_w: config.cpu_floor_w,
             gpu_floor_mhz: config.gpu_floor_mhz,
             cpu_max_w: config.cpu_max_w,
+            gpu_ceiling_mhz: config.gpu_max_mhz,
             flags: Vec::new(),
             calib: None,
             calib_outcome: None,
@@ -821,6 +824,7 @@ impl<R: Runner> Controller<R> {
             cpu_floor_w: config.cpu_floor_w,
             gpu_floor_mhz: config.gpu_floor_mhz,
             cpu_max_w: config.cpu_max_w,
+            gpu_ceiling_mhz: config.gpu_max_mhz,
             ..ControlStatus::default()
         };
         Self {
@@ -1078,6 +1082,8 @@ impl<R: Runner> Controller<R> {
                     self.config = sanitized;
                     self.status.cpu_floor_w = self.config.cpu_floor_w;
                     self.status.gpu_floor_mhz = self.config.gpu_floor_mhz;
+                    self.status.cpu_max_w = self.config.cpu_max_w;
+                    self.status.gpu_ceiling_mhz = self.config.gpu_max_mhz;
                     // Both device loops read these floors on their next
                     // step. Persist on CHANGE only (a held
                     // key repeats the clamped value at the bounds — never
@@ -7000,7 +7006,11 @@ mod tests {
             Config { cpu_max_w: 30.0, gpu_max_mhz: 1500, ..Config::default() });
         ctl.on_command(Command::SetAuto(true));
         ctl.on_sample(&busy_at(0.0));
+        assert_eq!(ctl.status.cpu_max_w, 30.0);
+        assert_eq!(ctl.status.gpu_ceiling_mhz, 1500);
         ctl.on_command(Command::SetFloors { cpu_w: 40.0, gpu_mhz: 2000 });
+        assert_eq!(ctl.status.cpu_max_w, ctl.config.cpu_max_w);
+        assert_eq!(ctl.status.gpu_ceiling_mhz, ctl.config.gpu_max_mhz);
         ctl.on_sample(&busy_at(1.0));
         assert!(ctl.status.cpu.as_ref().unwrap().cap >= ctl.config.cpu_floor_w);
         assert!(ctl.status.gpu.as_ref().unwrap().cap >= f64::from(ctl.config.gpu_floor_mhz));

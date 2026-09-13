@@ -90,12 +90,12 @@ pub fn view(model: &Model, frame: &mut Frame) {
 /// warnings for the latest sample. Flags carry their own (loud) styling.
 fn header_line(model: &Model) -> Line<'static> {
     let cpu = match model.status.cpu_limit_w {
-        Some(w) => format!("{w:.1}W"),
-        None => "—".into(),
+        Some(w) => format!("{w:.1}/{:.0}W", model.status.cpu_max_w),
+        None => format!("—/{:.0}W", model.status.cpu_max_w),
     };
     let gpu = match model.status.gpu_max_mhz {
-        Some(mhz) => format!("{:.1}GHz", f64::from(mhz) / 1000.0),
-        None => "—".into(),
+        Some(mhz) => format!("{:.1}/{:.1}GHz", f64::from(mhz) / 1000.0, f64::from(model.status.gpu_ceiling_mhz) / 1000.0),
+        None => format!("—/{:.1}GHz", f64::from(model.status.gpu_ceiling_mhz) / 1000.0),
     };
     // Auto is the mode the whole app exists for: style it loud so a glance
     // tells whether the closed loop is driving.
@@ -680,6 +680,23 @@ mod tests {
     }
 
     #[test]
+    fn header_cap_denominators_use_configured_maxima() {
+        let mut m = Model::new();
+        m.status.cpu_max_w = 50.0;
+        m.status.gpu_ceiling_mhz = 3000;
+        m.status.cpu_limit_w = Some(44.0);
+        m.status.gpu_max_mhz = Some(2800);
+        let header = row_text(&draw(&m), 0);
+        assert!(header.contains("44.0/50W"));
+        assert!(header.contains("2.8/3.0GHz"));
+        m.status.cpu_limit_w = None;
+        m.status.gpu_max_mhz = None;
+        let header = row_text(&draw(&m), 0);
+        assert!(header.contains("—/50W"));
+        assert!(header.contains("—/3.0GHz"));
+    }
+
+    #[test]
     fn header_fan_current_target_and_color_follow_valid_maximum() {
         for (rpm, valid, text, color) in [
             (3123.0, true, "3123", Color::Green),
@@ -834,9 +851,9 @@ mod tests {
         let terminal = draw(&m);
         let header = row_text(&terminal, 0);
         assert!(header.contains("manual"), "header was: {header:?}");
-        assert!(header.contains("CPU — - 20.0W"), "header was: {header:?}");
+        assert!(header.contains("CPU — - 20.0/54W"), "header was: {header:?}");
         assert!(
-            header.contains("GPU — - 1.5GHz"),
+            header.contains("GPU — - 1.5/3.1GHz"),
             "header was: {header:?}"
         );
         assert!(header.contains("LIMIT-SLIP!"), "header was: {header:?}");
@@ -1044,9 +1061,9 @@ mod tests {
         assert_eq!(cell.fg, Color::Green);
         assert!(cell.modifier.contains(Modifier::BOLD));
         // Allocation shows through the existing limit fields.
-        assert!(header.contains("CPU — - 17.0W"), "header was: {header:?}");
+        assert!(header.contains("CPU — - 17.0/54W"), "header was: {header:?}");
         assert!(
-            header.contains("GPU — - 1.7GHz"),
+            header.contains("GPU — - 1.7/3.1GHz"),
             "header was: {header:?}"
         );
     }
@@ -1313,7 +1330,7 @@ mod tests {
             let mut model = Model::new(); model.update(Event::Status(status));
             let terminal = draw_size(&model, 200, 40);
             let header = row_text(&terminal, 0);
-            for expected in ["T* 71.0°C", tstar_state_name(state), "CPU ↑+18.6°C - 31.0W unfitted", "GPU ↓-1.5°C - 2.1GHz"] {
+            for expected in ["T* 71.0°C", tstar_state_name(state), "CPU ↑+18.6°C - 31.0/54W unfitted", "GPU ↓-1.5°C - 2.1/3.1GHz"] {
                 assert!(header.contains(expected), "missing {expected}: {header}");
             }
             for (label, color) in [("↑+18.6°C", Color::Cyan), ("↓-1.5°C", Color::Yellow)] {
@@ -1333,7 +1350,7 @@ mod tests {
             let mut model = Model::new(); model.update(Event::Status(status));
             let terminal = draw_size(&model, 200, 40);
             let header = row_text(&terminal, 0);
-            assert!(header.contains(&format!("CPU ↓-1.5°C - 31.0W{text}")));
+            assert!(header.contains(&format!("CPU ↓-1.5°C - 31.0/54W{text}")));
             assert!(!header.contains(" fitted"));
             if source != GainsSource::Fitted {
                 let x = find_col(&header, "unfitted").unwrap() as u16;

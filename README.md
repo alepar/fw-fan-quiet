@@ -6,7 +6,7 @@ In Auto mode, you choose how fast you want the fans to spin. The app uses fw-fan
 
 ## Current machine and tuning
 
-This project is fine-tuned for our **Framework Laptop 16 (2025)** with an **AMD Ryzen AI 9 HX 370** (integrated Radeon 890M) and the **NVIDIA GeForce RTX 5070 Laptop GPU** graphics module, running Bazzite. The sensor grouping, actuator ranges, and calibration below come from this specific hardware and cooling setup; they are not a universal Framework 16 profile.
+Below are example settings tuned for a **Framework Laptop 16 (2025)** with an **AMD Ryzen AI 9 HX 370** (integrated Radeon 890M) and the **NVIDIA GeForce RTX 5070 Laptop GPU** graphics module, running Bazzite. Use them as a starting point, not a universal profile. Built-in recalibration (`k`) can fit the controller gains to other Framework laptop models and cooling setups; sensor mappings and hardware limits still need to match the machine.
 
 Current settings, recorded on September 12, 2026:
 

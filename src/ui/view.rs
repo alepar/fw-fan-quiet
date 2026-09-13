@@ -167,7 +167,19 @@ fn header_line(model: &Model) -> Line<'static> {
             spans.push(Span::styled(" unfitted", Style::default().fg(Color::Red)));
         }
     }
-    spans.push(Span::raw(format!(" | fan {:.0}rpm", model.fan_target_rpm)));
+    let current_rpm = model.latest.as_ref().filter(|s| s.fan_valid)
+        .map(|s| s.max_fan_rpm()).filter(|rpm| rpm.is_finite());
+    let fan_color = match current_rpm {
+        Some(rpm) if rpm < model.fan_target_rpm => Color::Green,
+        Some(_) => Color::Yellow,
+        None => Color::DarkGray,
+    };
+    spans.push(Span::raw(" | fan "));
+    spans.push(Span::styled(
+        current_rpm.map(|rpm| format!("{rpm:.0}")).unwrap_or_else(|| "—".into()),
+        Style::default().fg(fan_color),
+    ));
+    spans.push(Span::raw(format!("/{:.0} rpm", model.fan_target_rpm)));
     let ambient = model.latest.as_ref().filter(|s| s.ec_valid)
         .and_then(|s| s.ec.as_ref())
         .and_then(|ec| ec.all.iter().find(|(label, _)| label.as_str() == "ambient_f75303@4d"))
@@ -647,6 +659,31 @@ mod tests {
             m.update(Event::Sample(valid_sample(f64::from(i))));
         }
         draw(&m);
+    }
+
+    #[test]
+    fn header_fan_current_target_and_color_follow_valid_maximum() {
+        for (rpm, valid, text, color) in [
+            (3123.0, true, "3123", Color::Green),
+            (3750.0, true, "3750", Color::Yellow),
+            (4000.0, true, "4000", Color::Yellow),
+            (4000.0, false, "—", Color::DarkGray),
+        ] {
+            let mut m = Model::new();
+            m.fan_target_rpm = 3750.0;
+            let mut sample = valid_sample(1000.0);
+            sample.fan2_rpm = rpm;
+            sample.fan_valid = valid;
+            m.update(Event::Sample(sample));
+            let terminal = draw(&m);
+            let header = row_text(&terminal, 0);
+            let expected = format!("fan {text}/3750 rpm");
+            let x = find_col(&header, &expected).expect(&header) as u16 + 4;
+            assert_eq!(terminal.backend().buffer().cell((x, 0)).unwrap().fg, color);
+            let target_x = x + text.chars().count() as u16 + 1;
+            assert_eq!(terminal.backend().buffer().cell((target_x, 0)).unwrap().fg, Color::White);
+        }
+        assert!(row_text(&draw(&Model::new()), 0).contains("fan —/3000 rpm"));
     }
 
     #[test]

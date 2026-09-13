@@ -4,11 +4,11 @@
 
 In Auto mode, you choose how fast you want the fans to spin. The app uses fw-fanctrl’s fan curve to work out the temperature to aim for, then adjusts the CPU and GPU separately: if either gets too hot, it lowers that device’s limit; if it has room to warm up, it lets the device do more work. It makes these changes gradually and accounts for how much work each device is actually doing. If one device’s readings disappear, it can still manage the other.
 
-## Current machine and tuning
+## Example settings
 
 Below are example settings tuned for a **Framework Laptop 16 (2025)** with an **AMD Ryzen AI 9 HX 370** (integrated Radeon 890M) and the **NVIDIA GeForce RTX 5070 Laptop GPU** graphics module, running Bazzite. Use them as a starting point, not a universal profile. Built-in recalibration (`k`) can fit the controller gains to other Framework laptop models and cooling setups; sensor mappings and hardware limits still need to match the machine.
 
-Current settings, recorded on September 12, 2026:
+The example uses these settings:
 
 | Setting | Value |
 |---|---|
@@ -20,7 +20,7 @@ Current settings, recorded on September 12, 2026:
 | CPU short-burst PPT limit | **53 W** |
 | GPU clock-cap range | **1,000–3,090 MHz** |
 
-The current fan target resolves to approximately **79°C T*** with our learned duty/RPM table. T* is derived at runtime, not a fixed temperature setting.
+With this setup, a 3,500 RPM fan target corresponds to a temperature target (**T***) of about **79°C**. The app calculates T* from the active fan curve and the measured relationship between fan duty and RPM. It is not a fixed temperature setting.
 
 The `quiet16` entry in fw-fanctrl's `/etc/fw-fanctrl/config.json` → `strategies` is:
 
@@ -63,7 +63,7 @@ The `quiet16` entry in fw-fanctrl's `/etc/fw-fanctrl/config.json` → `strategie
 }
 ```
 
-Our app settings in `/etc/fw-fan-quiet/config.toml` include:
+Example app settings in `/etc/fw-fan-quiet/config.toml` include:
 
 ```toml
 fan_target_rpm = 3500.0
@@ -76,14 +76,14 @@ gpu_hot_c = 88.0
 nvme_hot_c = 80.0
 ```
 
-Latest saved calibration for **`quiet16:30`**:
+Example calibration for **`quiet16:30`** (the `quiet16` strategy with a 30-second moving average):
 
 | Device | Kc | Ti |
 |---|---:|---:|
 | CPU | 0.279475988 W/°C | 29.809252495 s |
 | GPU | 46.435961060 MHz/°C | 48.413195881 s |
 
-These are fitted values in `/var/lib/fw-fan-quiet/state.json`, not compiled defaults or TOML overrides. Calibration keeps gains separate for each strategy and averaging interval; the older 60-second fits remain separate. Press `k` to fit the active setup, keeping GPU load above 90% with a workload such as `gpu_burn`.
+Kc controls how strongly the app responds to a temperature error. Ti sets how quickly it corrects an error that persists. Calibration measures these values and saves them in `/var/lib/fw-fan-quiet/state.json`. Each fan strategy and averaging interval has its own saved gains. Press `k` to calibrate your setup.
 
 ## Requirements
 
@@ -95,7 +95,7 @@ These are fitted values in `/var/lib/fw-fan-quiet/state.json`, not compiled defa
 
 No particular Linux distribution is required by the code. The setup above has been tested on Bazzite with the listed Framework 16 hardware. Other configurations need matching sensor mappings and hardware limits; recalibration fits the thermal response but does not discover those mappings or limits automatically.
 
-The app includes a `ryzen_smu` compatibility workaround: if the loaded module exposes no PM table, it attempts to unload it so `ryzenadj` can use its alternate backend, then reloads it on exit. This condition was observed on the example machine; the check is independent of the distribution name. A failed unload is reported, and CPU actuation may remain unavailable.
+The app includes a `ryzen_smu` compatibility workaround: if the loaded module exposes no PM table, it attempts to unload it so `ryzenadj` can use its alternate backend, then reloads it on exit. A failed unload is reported, and CPU actuation may remain unavailable.
 
 ## Setup and usage with fw-fanctrl
 
@@ -120,16 +120,16 @@ Run **fw-fanctrl alongside this app**. fw-fanctrl reads the EC temperatures and 
    ```
 
 5. Press **`k` to calibrate** your machine. Keep GPU utilization above 90% throughout calibration; `gpu_burn` is the suggested workload. Follow the on-screen CPU-load prompts, and wait for the explicit success or partial-success result. The saved gains apply only to that strategy and moving-average interval.
-6. Press **`Esc`** to dismiss the result, then **`a`** to engage Auto. Start the workload you want to quiet. The header shows the mode, fan target, T*, per-device temperature errors, caps, and gain source. Use **`t` / `T`** to lower or raise the fan target by 250 RPM. Allow time for the machine to warm up and settle; reaching the target depends on the workload and cooling conditions.
+6. Press **`Esc`** to dismiss the result, then **`a`** to engage Auto. Start the workload you want to quiet. The header shows the mode, current and target fan speed, T*, device temperature errors, and caps. Use **`t` / `T`** to lower or raise the fan target by 250 RPM. Allow time for the machine to warm up and settle; reaching the target depends on the workload and cooling conditions.
 7. Press **`p`** to release the caps and return to Monitor, or **`q`** to quit and restore stock limits. fw-fanctrl continues running and managing the fans.
 
-The app can monitor and run Auto with default gains before calibration, but the current profile above uses measured fits. Recalibrate after changing the fw-fanctrl strategy or averaging interval. Select the curve before starting calibration; calibration freezes its context for the run.
+Auto can use built-in gains before calibration. Calibrate to fit its response to your machine. Recalibrate after changing the fan strategy or averaging interval, and keep both unchanged during calibration.
 
 Optional paths are selected with `--config`, `--state-file`, `--telemetry-dir`, and `--log-dir`. `sudo ./target/release/fw-fan-quiet selftest` exercises the sensor and actuator paths before a controlled session.
 
 ## Configuration
 
-The TOML file accepts partial configuration. Unknown legacy keys are ignored during migration.
+You can specify only the settings you want to change. Missing keys use defaults; unknown keys are ignored.
 
 | Key | Default | Meaning |
 |---|---:|---|
@@ -139,11 +139,11 @@ The TOML file accepts partial configuration. Unknown legacy keys are ignored dur
 | `fast_limit_mw` | `53000` | CPU short-burst PPT limit |
 | `cpu_max_w` | `54` | CPU sustained ceiling |
 | `gpu_max_mhz` | `3090` | GPU clock ceiling |
-| `shadow_headroom_cpu_w` | `10` | CPU shadow headroom over measured draw |
-| `shadow_headroom_gpu_mhz` | `300` | GPU shadow headroom over measured clock |
-| `shadow_fall_rate_cpu` | `0.33` | CPU shadow downward slew in W/s |
-| `shadow_fall_rate_gpu` | `10` | GPU shadow downward slew in MHz/s |
-| `gpu_shadow_enabled` | `true` | Enables the GPU measured-shadow candidate |
+| `shadow_headroom_cpu_w` | `10` | CPU power allowance above measured use |
+| `shadow_headroom_gpu_mhz` | `300` | GPU clock allowance above measured use |
+| `shadow_fall_rate_cpu` | `0.33` | Rate at which the CPU workload-based cap falls, in W/s |
+| `shadow_fall_rate_gpu` | `10` | Rate at which the GPU workload-based cap falls, in MHz/s |
+| `gpu_shadow_enabled` | `true` | Limits unused GPU clock headroom |
 | `cpu_hot_c` | `90` | CPU hot-guard entry temperature |
 | `cpu_gains` | unset | Optional CPU `{ kc, ti_s }` override |
 | `gpu_gains` | unset | Optional GPU `{ kc, ti_s }` override |
@@ -171,68 +171,93 @@ The `[leds]` table supports `enabled`, `cpu_port`, `gpu_port`, `brightness`, `fl
 
 ## Calibration
 
-Calibration starts with a shared steady hold, then performs a native CPU-watt step and a native GPU-clock step. Keep GPU load above 90% throughout; `gpu_burn` is suggested for generating that load. Each response is fitted independently and stored under the fw-fanctrl strategy and moving-average interval that produced it. A rejected device fit keeps the existing keyed gain or uses the default. Calibration uses the normal verified actuator paths, stops cleanly on abort, and never commands the fans. Movement of the other device’s temperature no longer rejects a fit: shared cooling is part of the measured response.
+Calibration measures how temperature responds to a change in each device’s limit. It waits for temperatures and fans to settle, changes the CPU power cap, and then tests a change in the GPU clock cap. These measurements set the strength and timing of each controller’s response.
 
-After calibration, the result remains visible until Esc or another calibration. Use Up/Down to scroll long explanations and Home to return to the top. It reports success, partial success, or failure, with each device’s old/new Kc and Ti or its rejection reason and retained gains. Save failures are explicit; configured gain overrides still take precedence and are identified in the result.
+Keep GPU utilization above 90% throughout the run. `gpu_burn` is a suggested load generator. Follow the CPU-load prompts on screen. Keep the fan curve and averaging interval unchanged so the measurements describe one consistent setup.
 
-The GPU runtime default now uses the 2026-09-12 recorded fit: Kc ≈ 22.2218 MHz/°C and Ti ≈ 32.5641 s at a 60-second moving average. Other intervals adjust the delay contribution; CPU defaults are unchanged. Calibration still accepts Kc only within 0.25×–4× the corresponding default. CPU cap maintenance is shared by normal operation and calibration: every 10 seconds it reads back the slow/fast limits, rewrites a confirmed mismatch, and verifies the repair. Matching caps and unreadable checks do not trigger blind CPU writes. Calibration also checks before completing a response; a reset discards that response, restores the baseline pair, settles again, and retries the affected device up to twice. Loss of readable verification during a response fails explicitly. Guards and release/shutdown ownership still take precedence. The new default passes the recorded-model response check, but produced 11.12°C overshoot on the previous provisional GPU model (K=0.02, τ=15 s, delay=90 s). The existing broad simulation matrix uses an explicit older gain and does not validate this new default; real-machine runs have since supplied the interval-specific fitted gains documented above; the default-model simulation is not a substitute for validating a new hardware setup.
+The result reports success, partial success, or failure. It shows which gains changed, which were retained, and why any measurement was rejected. Each device is evaluated separately, so a successful CPU calibration can be saved even if the GPU measurement fails. Rejected measurements retain the saved gains for that setup, or use built-in gains if none are saved. Calibration accepts Kc between 0.25× and 4× its corresponding built-in value.
 
-The state file stores the duty/RPM relation, keyed CPU and GPU gains, paired warm starts, and a qualified last-good T*. Old state keys are detected and ignored with migration warnings.
+If a CPU cap resets during a measurement, the app repairs it, discards the affected measurement, and retries after settling. It allows up to two retries per device. It reports an error if it cannot verify the cap or save the results. Explicit gain overrides in the configuration take priority over saved calibration.
 
-## Auto control
+Press `Esc` to abort a run or dismiss its result. Use Up/Down to scroll a long result and Home to return to its top.
+
+## How Auto works
+
+The fan curve relates temperature to fan duty. The app also learns how fan duty relates to RPM. Together, these give it a temperature target for your requested fan speed. The header calls this target **T***.
+
+Each device has two limits:
+
+- A **temperature-based limit** decreases when the device is too hot and increases when it is below target. A proportional-integral (PI) controller responds both to temperature changes and to errors that persist.
+- A **workload-based limit** follows measured CPU power or GPU clock use, with spare capacity for short bursts. The code calls this the *shadow* limit.
+
+The app selects the lower limit, within the configured minimum and maximum. Changes are rate-limited to avoid abrupt shifts. CPU and GPU limits are adjusted separately because the devices respond differently to heat and load.
+
+A cap above actual demand has little cooling effect. When a device becomes hot, the app can skip this unused headroom using the highest draw measured over five seconds, plus 2 W for CPU or 100 MHz for GPU. The allowance is smaller if you configured less headroom. If Auto starts while a device is already hot, it waits for those readings before making one such adjustment. This avoids spending minutes lowering an ineffective cap. It does not repeatedly follow short drops in workload.
+
+When the fan curve is temporarily unavailable, or a board sensor is hottest, **Held** mode uses the last usable target and fan-speed feedback. Board temperature can respond to CPU and GPU heat, so both device controllers remain active. Missing device-temperature data holds that device’s control; the other device can continue operating.
+
+The fan target is a goal, not a guarantee. Workload, cooling conditions, and the configured minimum caps can prevent the app from reaching it. If both devices are at their minimum caps and settled fans remain too fast, the app reports that the target cannot be reached.
+
+`NOT CALIBRATED` means there are no saved gains for the active strategy and averaging interval. Auto can still use its built-in gains.
+
+## Reading the display
+
+The header shows temperature errors and current/configured-maximum caps, for example:
 
 ```text
-fan target -> snapped duty -> fw-fanctrl curve -> shared T*
-                                      |-> CPU group PI -> CPU watts cap
-                                      `-> GPU group PI -> GPU MHz ceiling
+CPU ↓-3.7°C - 44.0/54W | GPU ↑+0.6°C - 2.8/3.1GHz | fan 3123/3750 rpm
 ```
 
-A valid curve supplies T*. When the curve is temporarily unavailable, the source holds and slowly adjusts the last trustworthy target. When a known board sensor (ambient or charger) is hottest, Held mode continues regulating CPU/GPU power using fan RPM feedback; the sensor label does not establish that its heat is independent of CPU/GPU power. Missing device-group data holds only that device; a missing GPU does not perturb CPU decisions.
+Temperature error is T* minus the device’s measured temperature:
 
-Measured draw or clock supplies a shadow candidate that follows available work. The thermal candidate takes over when a device is above the current T*, including when T* itself falls. Hot guards ratchet each device's allowed maximum toward its configured floor and reopen only after measured recovery. Actuator mismatches hold the affected device for reassertion; three confirmed failures release stock limits. Suspend/resume clears stale timing and evidence before caps are reasserted.
+- **Cyan ↑**: below target, with room to warm up.
+- **Orange ↓**: above target, so cooling is needed.
+- **Green ≈**: at target to the displayed precision of 0.1°C.
 
-`NOT CALIBRATED` is informational and means fitted gains are absent for the active strategy/interval. Safe defaults still allow Auto to operate.
+The arrows show the desired direction, not the observed temperature trend. A red `unfitted` label means the device uses built-in gains or a configuration override rather than saved calibration.
 
-## Safety
+Fan RPM is the faster of the two fans. It is green below the requested speed and orange at or above it. Ambient temperature is green below T* and orange at or above it. NVMe temperature uses the drive’s reported maximum temperature (`temp1_max`); if that is unavailable, it uses `nvme_hot_c`. This display color is separate from the `NVME HOT` warning, which always uses the configured threshold. Missing readings are gray.
 
-- fw-fanctrl owns fan commands and its EC curve remains the thermal safety net.
-- The fw-fanctrl client can issue only the read commands `print speed` and `print all`.
-- Thermal-emergency and CPU-sensor-loss watchdogs release all limits and require acknowledgement before actuation resumes.
-- CPU and GPU writes use paired read-back evidence. Repeated confirmed mismatches restore stock behavior; unreadable evidence is reported separately.
-- GPU heat changes the GPU ceiling. NVMe heat is reported because measurements showed fan-target changes were not an effective NVMe control action.
-- Startup, normal exit, signals, panics, and controller-thread failure all restore stock CPU and GPU behavior.
+Graphs show a rolling five-minute history. Gray lines record the targets at each point in time. A bright **`<`** on each right border marks the current target, so it remains visible when a measurement covers the target line. Released or unavailable targets have no marker.
 
-## Telemetry
+The shared top-right legend and target markers use cyan for fans, yellow for CPU, and green for GPU. The shared temperature target is white. Narrow terminals prioritize warnings and clip the right side of the status text.
 
-While calibration is running, a `kind: "calibration"` record is emitted for every processed calibration sample, even when the UI status is unchanged. Schema v4 introduced this record; v5 adds CPU cap read-back evidence. Existing sample/decision shapes remain unchanged.
+## Limits and recovery
 
-- `phase` is the phase evaluated on this sample; `next_phase` records any transition (`settle`, `cpu_step`, `gpu_recovery`, `gpu_step`, `done`). Ordinary settle/response timeout samples retain their final gate snapshot before the runner is removed. Command aborts and global watchdog exits remain decision/flag events.
-- `run_elapsed_s`, `phase_elapsed_s`, and `timeout_s` give timing. `gates` contains the seven actual settle checks with `satisfied`, `observed`, `last_observed_at_s`, and continuous satisfied/failed `duration_s`.
-- `windows` exposes actual sample counts, `coverage_s`, `required_s`, measured peak-to-peak `span`, `limit`, and `unit`. CPU and GPU limits are 1°C and 2°C over 60 seconds; fans remain 150 RPM over 20 seconds. The window retains one sample at or before its time boundary so sampling jitter cannot prevent full coverage; that boundary sample counts toward the span. A small span is insufficient if window coverage is too short. Empty windows have null span. Gates/windows are null during response phases so old settle results cannot masquerade as current measurements.
-- `context.cpu_cap_checked_at_s` timestamps the latest CPU cap read-back. `cpu_cap_readback` preserves the result before any repair; `cpu_cap_reset_reason` marks the tick that detected a reset, even if repair succeeded. The command completion timestamp remains separate.
-- `context` records the exact controller inputs to calibration, including CPU/GPU cap verification and command completion times, group moving averages, EC mismatch, controllable argmax, and fanctrl activity. `baseline_cpu_w`, `baseline_gpu_mhz`, and `phase_commanded_at_s` expose the held-pair comparison.
-- `gpu_util_pct`, `view_fresh`, `view_changed`, `reconciliation_ma_c`, and `socket_ma_c` provide verification and EC-reconciliation context. Missing values are null. Completion times use the same monotonic seconds as `t_mono`.
+fw-fanctrl controls the fans throughout operation. This app reads its configuration and status using `print all` and `print speed`; it does not send fan-control commands.
 
+CPU and GPU hot guards reduce the affected device’s allowed maximum until it cools. Emergency-temperature and CPU-sensor-loss watchdogs release the limits and require acknowledgement before control resumes. NVMe heat is reported; it does not change CPU or GPU limits.
 
-Schema v5 JSONL contains `run_start`, 1 Hz `sample`, event-driven `decision`, and flag-transition records. Samples include raw CPU/GPU/fan data, fw-fanctrl data, reconciliation values, and independent `cpu_group_c`/`gpu_group_c` readings. Decisions include T* state, per-device group/error, thermal and shadow candidates, selected candidate, hold reason, gains source, applied CPU watts/GPU MHz, and structured diagnostic flags.
+The app checks that requested caps take effect. Every 10 seconds, it reads back the CPU power limits and repairs a confirmed reset. It verifies the result after a repair. Unreadable checks are reported and do not trigger blind repair writes. Repeated confirmed failures release control and restore stock limits.
+
+After suspend, the app clears stale timing and measurements before reapplying caps. Release, shutdown, signal, panic, and controller-failure handling attempt to restore stock CPU and GPU behavior. Errors are recorded in the log.
+
+## Telemetry and troubleshooting
+
+Each run writes JSONL telemetry with a schema version and timestamps. The records explain what the app measured and why it changed a cap:
+
+- **Samples** contain CPU/GPU temperatures, power and clock readings, fan RPM, and fw-fanctrl status.
+- **Decisions** contain T*, device temperature errors, both candidate limits, the selected caps, and reasons for holding control.
+- **Calibration records** contain the active phase, elapsed time, settling checks, and cap-verification results. They are written for each processed calibration sample.
+- **Flag changes** record warnings and state transitions.
+
+For a slow or stalled calibration, inspect both the temperature variation and the observation-window coverage. Settling requires CPU variation within 1°C and GPU variation within 2°C over 60 seconds, plus fan variation within 150 RPM over 20 seconds. A quiet but incomplete window is not yet settled.
+
+For slow cooling, compare the selected cap with actual use. A falling cap will not reduce heat while it remains above what the workload needs. Decision records also show whether temperature control, workload headroom, a guard, or missing data is limiting progress.
 
 ## Files
 
-- `/etc/fw-fan-quiet/config.toml` — operator configuration
-- `/var/lib/fw-fan-quiet/state.json` — calibrated gains and qualified entry state
-- `/var/lib/fw-fan-quiet/telemetry/` — JSONL runs
-- `/var/lib/fw-fan-quiet/log/` — tracing logs
+| Path | Contents |
+|---|---|
+| `/etc/fw-fan-quiet/config.toml` | User settings |
+| `/var/lib/fw-fan-quiet/state.json` | Saved calibration and learned control settings |
+| `/var/lib/fw-fan-quiet/telemetry/` | JSONL run records |
+| `/var/lib/fw-fan-quiet/log/` | Diagnostic logs |
 
-`cargo test` runs the offline suite. Hardware tests are ignored and must be invoked manually. The current design is [Per-device temperature loops, revision 4](docs/superpowers/runs/2026-09-11-per-device-temperature-loops/2026-09-11-per-device-temperature-loops-design.md).
+Use `--config`, `--state-file`, `--telemetry-dir`, and `--log-dir` to choose other paths.
 
-The TUI groups each device’s temperature error with its current/configured-maximum cap (W / GHz) in the top line, alongside target temperature/state, current/target fan RPM, ambient, and NVMe temperature. Current fan RPM is the faster of the two fans, green below target and amber at or above it; an unavailable reading is a gray dash. Fitted gains have no label; defaults and config overrides show red `unfitted`. Error is target minus group temperature: cyan ↑ means below target, amber ↓ means above target, and green ≈ means zero at the displayed 0.1°C precision. Arrows indicate the desired direction, not an observed trend or a guarantee that the workload will reach the target. Ambient is green below T* and amber at or above it. NVMe is green below the drive’s `temp1_max` hwmon threshold (read at startup), and amber at or above it; unavailable or invalid thresholds fall back to configured `nvme_hot_c` (80°C by default). This display threshold does not change the existing `NVME HOT` warning threshold. Missing temperatures or unknown comparison targets are gray. Warnings precede control details; narrow terminals clip the right side of this single line.
+## Development
 
-Board temperature no longer imposes an ambient-plus-5°C lower bound on T*. The upper thermal ceiling remains enforced. A hot episode now transfers thermal control from the applied cap whenever the device is above the current target with shadow selected, including target-only crossings; five cool seconds re-arm it. A settled fan-target limitation is reported after both devices remain at their minimum caps for a full minute with CPU/GPU spans ≤1/2°C, fan span ≤150 RPM, and fan speed >150 RPM above target. The top status line also shows board ambient and NVMe temperatures.
+Run `cargo test` for the offline test suite. Hardware tests are ignored by default and require an explicit run. `cargo clippy --all-targets -- -D warnings` checks the code.
 
-Hot handoff can now skip unused headroom: with five seconds of valid recent draw, it seeds the thermal limit at the smaller of the applied cap and recent peak draw + 2 W (CPU) / 100 MHz (GPU), or the configured shadow margin if smaller. It trims once per hot episode, respects hardware floors and GPU slew from the actually applied cap, and does not follow brief draw dips. If Auto starts already hot before draw history is available, one deferred trim runs after five uninterrupted seconds of valid readings while still hot. It uses the recent peak plus the same allowance, never raises a lower thermal candidate, and is cancelled by cooling to target or disabling shadow control. Normal shadow headroom is unchanged. Auto and calibration follow fw-fanctrl’s live averaging interval. Saved fits remain keyed by strategy and interval; if the active key has no fit, interval-adjusted defaults apply until calibration succeeds.
-
-Chart target overlays are historical series sampled alongside measurements: fan RPM target, temperature T*, CPU watts cap, and GPU clock cap. Status updates change future points without rewriting earlier history; absent or released temperature/cap targets leave gaps. The histories cover the same rolling five-minute window and begin when the app starts.
-
-Each graph marks its current target with a bright `<` on the right border: fan RPM, CPU watt cap, T*, or GPU clock cap. Markers match their device traces: cyan for fans, yellow for the CPU cap, green for the GPU cap, and white for the shared temperature target. The marker stays visible over overlapping traces; the gray target time series preserves previous targets. Released or unavailable targets have no marker.
-
-A shared `fan cpu gpu` legend sits at the top-right, colored cyan/yellow/green. Graph panels have no internal legends. Very narrow terminals prioritize the status line.
+For implementation details, see the [controller design](docs/superpowers/runs/2026-09-11-per-device-temperature-loops/2026-09-11-per-device-temperature-loops-design.md).

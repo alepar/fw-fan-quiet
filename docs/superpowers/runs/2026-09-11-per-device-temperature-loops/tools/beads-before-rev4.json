@@ -1,0 +1,507 @@
+[
+  {
+    "dependencies": [],
+    "description": "Root epic for the 2026-09-11 super-auto run (branch super-auto/per-device-temperature-loops, base epic-fw-fanctrl-loop-6ma-integration). Spec: docs/superpowers/runs/2026-09-11-per-device-temperature-loops/2026-09-11-per-device-temperature-loops-design.md. Goal: the fan target is met by regulating each device's own EC temperature group toward one shared setpoint T*; no scalar budget, no CPU/GPU split; bumpless Auto entry; shadow caps with override control; T* source replacing the Mode A/B arbiter; GPU clock driven directly (LUT deleted); per-device step test. Run completion = this epic closed. Hardware acceptance (30-min gaming check) and the VR/VRAM label spike are the user's and are parked in run.md, not beads.",
+    "id": "fw-fanctrl-loop-eb9",
+    "issue_type": "epic",
+    "parent": null,
+    "priority": 1,
+    "status": "open",
+    "title": "Per-device temperature loops (replace the budget split)"
+  },
+  {
+    "dependencies": [
+      {
+        "dependency_type": "parent-child",
+        "id": "fw-fanctrl-loop-eb9"
+      }
+    ],
+    "description": "Spec \u00a72.1 (rev3). Add the fixed CPU group {cpu@4c, apu_f75303@4d} and GPU group {gpu_vr, gpu_vram, gpu_amb, gpu_temp@40} label sets to sensors/ec.rs; EcReading gains cpu_group_c/gpu_group_c = max over the group's PLAUSIBLE readings, None when none (dGPU unpowered -> gpu_group_c None); is_controllable() becomes group().is_some(). Plausibility is an ABSOLUTE, STATELESS gate applied to every label before argmax, all and the group maxima: a reading <= 0 or > EC_PLAUSIBLE_MAX_C = 110 is dropped and raises the informational EcImplausible flag naming the label. There is NO jump rule and no per-label history (roast d2: a jump rule is ambiguous about its reference and either re-admits a stuck sensor or latches a good one out); a plausible-but-stuck sensor fails safe (that device cools toward its floor) and is surfaced by DeviceUnreachable (eb9.16). Update the hwmon fixtures so cros_ec_dgpu_on presents a gpu_* sensor as the argmax at ~83 C under load (synthetic values allowed; a hardware re-capture is not automatable) and cros_ec_idle keeps ambient as argmax.\nAcceptance: unit tests for both groups incl. dGPU-unpowered -> gpu_group_c None; a 150 C label is dropped from its group max AND from argmax/all with EcImplausible naming it; a 105 C label is NOT dropped (it is the group max, by design); the -150 sentinel is dropped everywhere; existing ec tests green.\nowns: the group label sets, EcReading.cpu_group_c / gpu_group_c, the plausibility gate and the EcImplausible flag.\nconsumes: nothing new.\nFiles: src/sensors/ec.rs, tests/fixtures/hwmon/*",
+    "id": "fw-fanctrl-loop-eb9.1",
+    "issue_type": "task",
+    "parent": "fw-fanctrl-loop-eb9",
+    "priority": 1,
+    "status": "open",
+    "title": "EC sensor groups: cpu_group_c / gpu_group_c on EcReading"
+  },
+  {
+    "dependencies": [
+      {
+        "dependency_type": "parent-child",
+        "id": "fw-fanctrl-loop-eb9"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.1"
+      }
+    ],
+    "description": "Spec \u00a72.2. EcAverage/replica keeps its argmax boxcar (reconciliation unchanged) and adds one boxcar per group over the same ma_interval; all three seed/reseed/invalidate together on auto entry, view_changed, resume and EC MISMATCH exactly as \u00a72.2 of the prior design; a group reading None clears its own boxcar and reports None. Public API: cpu_group_ma()/gpu_group_ma() -> Option<f64>. Acceptance: unit tests for seeding, interval change, None handling; the existing assert_ec_ma_tracks_emulator test still green.\nowns: the per-group boxcar API on EcAverage.\nconsumes: EcReading.cpu_group_c / gpu_group_c.\nblocked-by fw-fanctrl-loop-eb9.1: consumes EcReading.cpu_group_c/gpu_group_c\nFiles: src/sensors/ec.rs",
+    "id": "fw-fanctrl-loop-eb9.2",
+    "issue_type": "task",
+    "parent": "fw-fanctrl-loop-eb9",
+    "priority": 1,
+    "status": "open",
+    "title": "Per-group EC boxcars in EcAverage (replica)"
+  },
+  {
+    "dependencies": [
+      {
+        "dependency_type": "parent-child",
+        "id": "fw-fanctrl-loop-eb9"
+      }
+    ],
+    "description": "Spec \u00a72.3 (rev3) steps 1, 2, 4, 5, 6, 7, 8 and the tick contract \u2014 the UNBLOCKING ARTIFACT for every consumer. New control/device_loop.rs: DeviceLoop generic over unit (W | MHz); Gains{kc, ti_s} with the spec's CPU/GPU defaults and a default_gains(ma_interval_s) constructor (\u03b8_eff from the live interval); ThermalMode{Regulate, Bypass}; ActuatorState{Verified, Mismatch, Unverifiable}; Hold{None, Shadow, Clamp(Bound{Floor, Max}), ActuatorMismatch, GroupUnavailable, DrawUnavailable, Bypass}; Selected{Thermal, Shadow, Floor, Max}; DeviceDecision; tick(input) -> (cap, DeviceDecision) with input {t_star, group_c: Option, draw: Option, floor, max, mode, actuator}. Thermal candidate: velocity-form PI at PI_PERIOD_S = 5 on err = t_star - group_c, output clamp [floor, max], directional conditional integration at the clamps (the sat_dir rule moved from gpu_pid.rs); NO band, NO parking, NO 'integrate only when selected' gate \u2014 while the device is cool the PI integrates upward at its own rate and saturates at max. Selector cap = min(thermal, shadow), tie -> Shadow. TRACKING IS HOT-ONLY AND ONE-SIDED: on every tick with err < 0, thermal := min(thermal, cap) (integrator state set with it); on ticks with err >= 0 the thermal candidate is never modified by tracking; the shadow is never tracked. Bypass: the thermal candidate reports max and its PI state is untouched. draw None: thermal regulation continues, the shadow holds (no rise/fall), hold DrawUnavailable; after DRAW_UNAVAILABLE_DWELL_S = 60 the shadow is set to max until draw returns. group None: hold the last applied cap (max when none was ever applied) with GroupUnavailable; a group that WAS available this session and stays None for GROUP_UNAVAILABLE_DWELL_S = 60 releases that device to max (cap = max, a normal write) with the GroupLost flag until it reads again (then thermal resumes from max, shadow reseeds); a group None from the first tick is absent, not lost: reports max, no dwell, no flag, caller skips the write. ActuatorMismatch: both candidates frozen (no integration, no shadow move, no tracking) until the first Verified; the applied cap is always min(cap, max) so a lowered max (guard ratchet) takes effect even while frozen. Quantise 0.5 W / slew 105 MHz/s (GPU_RISE_SLEW 300 MHz/s when the shadow is selected and rising; floors and ratchets win) moved from allocator/gpu_pid. The shadow candidate in THIS bead is a stub (shadow = max; Selected never Shadow) \u2014 eb9.4 fills it in; the seed/resync API: seed(thermal_at: Option<unit>, shadow_at: Option<unit>) (None = max / deferred) and resync_error() (resets e_prev only; no proportional kick; shadow untouched). Pure, no I/O. The 'first-order plant' in the acceptance is a local test stub in the test module.\nAcceptance: step response on a first-order plant within 1 % with <= 5 % overshoot at defaults for both units; clamp hold and directional unwind tests (carry the gpu_pid unwind test over); with the group below T* for 300 ticks and an externally lower cap (stub shadow) the thermal candidate is UNTOUCHED (stays at max); on the first tick with err < 0 thermal == cap and on the next PI tick thermal < cap (hand-over, no windup); Clamp carries its bound; Bypass reports max and preserves PI state across a Bypass/Regulate round trip; draw None keeps regulating and after the dwell the (stub) shadow is max; group None from the first tick reports max with GroupUnavailable and no GroupLost; a group lost after being available releases to max with GroupLost after 60 ticks and regulation resumes on return; Mismatch freezes and a lowered max still lowers the applied cap; after seed(Some(x), _) the first tick applies min(x, shadow) without a kick; after resync_error() the next tick's proportional term is zero; default_gains(20 s) yields a larger Kc than default_gains(60 s).\nowns: DeviceLoop, Gains (+ default_gains(ma_interval)), ThermalMode, ActuatorState, Hold, Selected, DeviceDecision, the tick contract, the hot-only tracking rule, the dwells, the seed/resync API.\nconsumes: nothing.\nFiles: src/control/device_loop.rs, src/control/mod.rs",
+    "id": "fw-fanctrl-loop-eb9.3",
+    "issue_type": "task",
+    "parent": "fw-fanctrl-loop-eb9",
+    "priority": 1,
+    "status": "open",
+    "title": "DeviceLoop core: types, thermal PI, clamps, hold, tick contract"
+  },
+  {
+    "dependencies": [
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.6"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.3"
+      },
+      {
+        "dependency_type": "parent-child",
+        "id": "fw-fanctrl-loop-eb9"
+      }
+    ],
+    "description": "Spec \u00a72.3 (rev3) step 3 and the shadow half of steps 4\u20135, in device_loop.rs (fills the stub eb9.3 leaves): shadow_target = draw + headroom ALWAYS (no pinned test, no band); the shadow rises toward the target ONLY while err >= 0 (group at or below T*), at most rise_slew per second (CPU: headroom per second = 10 W/s; GPU: GPU_RISE_SLEW = 300 MHz/s); while err < 0 it does not rise; it falls toward the target at shadow_fall_rate whenever the target is below it; clamped [floor, max]; never tracked. Selected::Shadow / Hold::Shadow become reachable; tie -> Shadow. gpu_shadow_enabled = false holds the GPU shadow at max (thermal-only GPU control). Config-driven parameters shadow_headroom / shadow_fall_rate per device with the spec defaults (CPU 10 W, 0.33 W/s; GPU 300 MHz, 10 MHz/s) \u2014 the key declarations, defaults and sanitisers are eb9.6's. The GPU draw is the reported SM clock (gpu_sm_mhz), so a power-limited card's shadow sits one headroom above the knee \u2014 the spec's 'GPU dead zone' paragraph.\nAcceptance: a 38 -> 100 W load jump under cpu_max_w 54 with the group below T* ramps the cap 10 W per second to 54 W with the thermal candidate at max throughout; a 1000 MHz GPU ramp completes in <= 5 s; a group above T* stops the shadow rising (it holds) and the thermal candidate takes over on the next PI tick; a scene dip drops the shadow by one headroom in 30 s; never below floor; a 5-sample draw mean is what the target follows (a one-sample 20 W burst raises the shadow ~4 W, not to max \u2014 the mean is formed by the caller, this bead asserts the target = draw + headroom contract); after seed(_, Some(s)) with the shadow binding the first tick applies min(thermal, s) with Selected::Shadow and no step relative to draw + headroom; resync_error() leaves the shadow and its fall state untouched; gpu_shadow_enabled = false yields cap = thermal on every tick.\nowns: the shadow candidate, the rise/fall rules, the selector's Shadow leg, the shadow candidate's USE of the shadow Config keys.\nconsumes: DeviceLoop tick contract, Gains, Hold, Selected (eb9.3); the shadow Config keys (eb9.6).\nblocked-by fw-fanctrl-loop-eb9.3: consumes the DeviceLoop tick contract and Selected/Hold types\nblocked-by fw-fanctrl-loop-eb9.6: consumes the shadow Config keys (declarations, defaults, sanitisers)\nFiles: src/control/device_loop.rs",
+    "id": "fw-fanctrl-loop-eb9.4",
+    "issue_type": "task",
+    "parent": "fw-fanctrl-loop-eb9",
+    "priority": 1,
+    "status": "open",
+    "title": "Shadow cap candidate, min selector and tracking (override control)"
+  },
+  {
+    "dependencies": [
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.6"
+      },
+      {
+        "dependency_type": "parent-child",
+        "id": "fw-fanctrl-loop-eb9"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.3"
+      }
+    ],
+    "description": "Spec \u00a72.4 (rev3) first half. New control/tstar.rs replacing the mode.rs arbiter. States: Held (the ENTRY state at Auto entry: T* = t_star_last_good when persisted else the current max over the controllable groups; also entered from Curve on stale view / invalid curve / EC MISMATCH), Curve (entered from Held when view fresh + curve resolves a tread for duty(fan_target) + replica reconciled + the DEBOUNCED argmax is a controllable sensor (ARGMAX_DEBOUNCE_TICKS, moved from mode.rs), all held for ENTRY_HYSTERESIS_S 15 s at 1 Hz; T* = min(tread, T*_ceiling) with T*_ceiling = min(cpu_hot_c - 2, gpu_hot_c - 2); re-derived + resync_error on both loops ONLY when the curve points or the snapped target_duty change (the mode.rs points_changed cache), not on every view_changed), Uncontrollable (entered from Curve or Held when the debounced argmax is a plausible uncontrollable sensor: T* frozen, both loops ticked with ThermalMode::Bypass, ArgmaxUncontrollable flag; exit to Held when a controllable sensor takes the debounced argmax; no cap step either way), Released (fan/EC invalid, watchdog trip \u2014 calibration is NOT a state here; the controller freezes the loops and this source with them). The Held DRIVER (RPM PI, feasibility/steepness flags, DeviceUnreachable) is eb9.16's; this bead provides the Held slot and freezes T* when no driver is attached. \u00a72.6 reconciliation moved here; t_star_last_good exposed at the API boundary and written on Held exit / Auto exit / at most every 60 s while dirty \u2014 never per tick (the controller bead persists it). Output per tick: t_star, state, the ThermalMode each loop must be ticked with, flags.\nAcceptance: unit tests per transition at 1 Hz (entry in Held; Held -> Curve only after 15 s of all four conditions; Held/Curve -> Uncontrollable on an ambient-dominated debounced argmax and back to Held when a controllable sensor takes over; Curve -> Held on each of stale/invalid/mismatch); no proportional kick on re-derivation; view_changed with unchanged points does NOT resync; Held freezes T* at the last good value with no driver attached; the ThermalMode output is Bypass exactly in Uncontrollable; mode.rs's still-relevant state-machine tests ported.\nowns: TStarSource, its states and transitions, the Curve derivation, the argmax debounce, the ThermalMode output, the T* persistence field's meaning at the API boundary and its write cadence, the Held slot the driver bead fills.\nconsumes: Hold and ThermalMode (device_loop, eb9.3), FanctrlView + curve + DutyRpmTable (existing), EcAverage reconciliation verdict, EcReading.all/argmax (plausible readings only, eb9.1), the DeviceLoop seed/resync API (eb9.3) for the no-kick re-derivation, PersistedState.t_star_last_good (eb9.6) via the controller's load/persist wiring (eb9.7).\nblocked-by fw-fanctrl-loop-eb9.3: consumes the Hold type\nblocked-by fw-fanctrl-loop-eb9.6: consumes PersistedState.t_star_last_good (field shape)\nFiles: src/control/tstar.rs, src/control/mode.rs (logic moves out), src/control/mod.rs",
+    "id": "fw-fanctrl-loop-eb9.5",
+    "issue_type": "task",
+    "parent": "fw-fanctrl-loop-eb9",
+    "priority": 1,
+    "status": "open",
+    "title": "TStarSource states: Curve / Held / Released, curve derivation, reconciliation, T* at the API boundary"
+  },
+  {
+    "dependencies": [
+      {
+        "dependency_type": "parent-child",
+        "id": "fw-fanctrl-loop-eb9"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.3"
+      }
+    ],
+    "description": "Spec \u00a72.8 (rev3) and the Config half of \u00a72.3. Config: shadow_headroom_{cpu_w,gpu_mhz} (floors >= 1 W / >= 30 MHz), shadow_fall_rate_{cpu,gpu} (floors >= 0.05 W/s / >= 1 MHz/s), gpu_shadow_enabled (bool, default true), cpu_hot_c (default 90, sanitised to [gpu_hot_c - 2 + 3, CPU_TRIP_C - 1]), cpu_gains / gpu_gains overrides (Option<Gains>; take precedence over fitted gains \u2014 the resolution is eb9.7's), gpu_max_mhz (default 3090, sanitised to [gpu_floor_mhz, 3090]); remove gpu_max_w (old file loads with one warning); NO shadow_band_c key. CPU_MAX_W / CPU_MAX_W_FLOOR rehomed from allocator.rs into config.rs BEFORE the deletion sweep. PersistedState: remove lut; loop_gains removed; cpu_gains / gpu_gains: BTreeMap<String, Gains> keyed by \"<strategy>:<ma_interval>\" (the fitted map \u2014 NOT Option<Gains>; roast d2); warm_start values -> WarmStartEntry{cpu_cap_w, gpu_lock_mhz} under WarmStart::key(strategy, duty, on_ac) (bare-number values dropped with a log line); t_star_last_good: Option<f64>; validated() covers the new fields.\nAcceptance: old-file migration tests (lut ignored, loop_gains ignored, bare warm-start dropped, gpu_max_w warned); sanitiser tests per new key including each floor and the cpu_hot_c range; save/load round trip of the keyed gains map and the warm-start map; cpu_max_w keeps its CPU_MAX_W bound after the rehome.\nowns: the new Config keys and their sanitisers, CPU_MAX_W / CPU_MAX_W_FLOOR in config.rs, PersistedState's new shape (keyed gains maps, WarmStartEntry, t_star_last_good).\nconsumes: Gains (device_loop, eb9.3).\nblocked-by fw-fanctrl-loop-eb9.3: consumes the Gains type\nFiles: src/config.rs, src/state.rs",
+    "id": "fw-fanctrl-loop-eb9.6",
+    "issue_type": "task",
+    "parent": "fw-fanctrl-loop-eb9",
+    "priority": 1,
+    "status": "open",
+    "title": "Config keys and PersistedState migration for two loops"
+  },
+  {
+    "dependencies": [
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.16"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.4"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.9"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.3"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.2"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.15"
+      },
+      {
+        "dependency_type": "parent-child",
+        "id": "fw-fanctrl-loop-eb9"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.5"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.6"
+      }
+    ],
+    "description": "Spec \u00a72.5 (rev3). AutoState holds tstar, cpu: DeviceLoop<W>, gpu: DeviceLoop<Mhz>, the replica, the steady window, the warm start, and the per-device draw window (SEED_WINDOW_N = 5 tail mean of cpu_pkg_w; gpu_sm_mhz as-is). on_auto_sample: replica tick -> groups; tstar.tick -> T*, ThermalMode, flags; guards: the MaxRatchet helper (eb9.15) on each loop's max \u2014 GPU HOT on the die, the CPU hot guard on Tctl debounced over CPU_HOT_STREAK = 3 consecutive samples; cpu.tick / gpu.tick with {t_star, group, draw (None on the first RAPL sample / post-resume reset), floor, max, mode, actuator} -> caps; write through the existing actuator paths under the \u00a72.3 write-cadence rule (write only when the quantised cap changes AND >= WRITE_MIN_INTERVAL_S = 2 s since that device's last write; floor moves, guard ratchets, Released and resume reasserts write immediately); feed each write's read-back verdict into the next tick's ActuatorState; verify_lock re-scoped to 'reported <= commanded + slack' with a strike streak that survives lock changes (src/actuators/gpu.rs); stickiness watchdog, Mismatch re-write, shutdown fences, stock restore per device, emergency release and resume reassert unchanged in behaviour, re-pointed at the two loops. Bumpless entry: each thermal candidate seeds at MAX (or the warm-start value when one matches), each shadow at draw + headroom (deferred while draw is None; thermal-only until then). Gains resolution at Auto entry and on a strategy / ma_interval change: Config override > fitted map entry for the current key > default_gains(ma_interval); the source is reported per device (gains_source) on the decision line (eb9.9) and the TUI (eb9.13). Warm start records (cpu_cap, gpu_lock) when both groups are within 1 C of T* AND the fan is within the steady window's tolerance for STEADY_WINDOW_N (not recorded while the fan is outside tolerance); the steady window's duty<->RPM table refinement unchanged. Calibration: the controller does not tick the loops or the T* source for the run's duration and holds the applied caps ('the settled cap'); on exit it reseeds both loops at the caps in force (no step). Remove the NOT CALIBRATED gate on SetAuto(true) (flag stays informational, raised when either device has no fitted gains). Remove Budget/allocator/mode plumbing from controller.rs (the files are deleted by the sweep bead). A GPU whose group reads None from the first tick (dGPU unpowered) seeds at max and has NO NVML lock written until its group appears; a GroupLost release IS written. Manual/Monitor/calibration/release/quit/emergency-release BEHAVIOUR unchanged, WIRING changed: each path addresses the two loops.\nAcceptance: controller tests for entry seeding (no draw change > 1.5 W / 30 MHz on the first tick; the first applied cap is draw + headroom, never draw; the thermal candidate starts at max); a Mismatch read-back freezes the loop until Verified and a guard ratchet still lowers the written cap; a write does not fire within 2 s of the previous one unless floor/guard/Released/reassert; a 3-sample Tctl streak above cpu_hot_c ratchets the CPU max and a 1-sample spike does not; the GPU HOT ratchet wired to the GPU max with recovery only below gpu_hot_c - 4; warm-start record/seed (and NOT recorded while the fan is outside tolerance); resume reassert; the existing guard/watchdog/fence tests re-pointed at the two loops and green (verify_lock Mismatch re-write on both actuators, the lock verifier trips on a card ignoring the lock while the lock moves every sample, stickiness watchdog trip -> Released, shutdown fence and stock restore per device, emergency release); caps held constant across a simulated calibration run and no cap step on unfreeze/reseed (R17); t_star_last_good loaded at Auto entry and written back per the \u00a72.4 cadence; per-device draw values (5-sample mean for the CPU) reaching each tick, None on the first sample; gains resolution precedence with gains_source reported; table refinement invoked from the steady window; Uncontrollable ticks both loops in Bypass; wiring_sweep exhaustive matches updated (incl. the emergency path).\nowns: AutoState composition, the TStarSource tick input plumbing (fan_target, raw fan readings behind FAN_SMOOTH_N, EcReading.all, each loop's PREVIOUS-tick Hold \u2014 tstar.tick runs before the device ticks, one-sample lag by construction), the ThermalMode plumbing from the T* source into each tick, the decision-line emission call site (v3 fields incl. gains_source), the per-device draw inputs and the CPU draw mean, the gains resolution and its precedence, the steady-window refinement, t_star_last_good load/persist, the calibration freeze/unfreeze, the Auto-entry gate (no calibration required), the wiring of both hot-guard ratchets and the CPU_HOT_STREAK debounce, the write path with its cadence rule, verify_lock's re-scope, warm-start pair semantics.\nconsumes: DeviceLoop tick contract / seed / resync / ThermalMode / ActuatorState (eb9.3), the shadow candidate (eb9.4), TStarSource (eb9.5) and its Held driver flags (eb9.16), Config keys and PersistedState (eb9.6), MaxRatchet (eb9.15), the v3 telemetry schema (eb9.9), per-group boxcars (eb9.2).\nblocked-by fw-fanctrl-loop-eb9.3: consumes the DeviceLoop tick contract\nblocked-by fw-fanctrl-loop-eb9.5: consumes TStarSource\nblocked-by fw-fanctrl-loop-eb9.2: consumes the per-group boxcar API\nblocked-by fw-fanctrl-loop-eb9.6: consumes the new Config keys and PersistedState shape\nblocked-by fw-fanctrl-loop-eb9.4: consumes the shadow candidate and its seeding (bumpless entry seeds shadows at draw + headroom)\nblocked-by fw-fanctrl-loop-eb9.9: consumes the v3 decision schema (the emission call site fills it)\nblocked-by fw-fanctrl-loop-eb9.15: consumes the MaxRatchet helper\nblocked-by fw-fanctrl-loop-eb9.16: consumes the Held driver's tick inputs and the lagged-Hold convention\nFiles: src/control/controller.rs, src/actuators/gpu.rs (verify_lock re-scope), src/integration_tests.rs",
+    "id": "fw-fanctrl-loop-eb9.7",
+    "issue_type": "task",
+    "parent": "fw-fanctrl-loop-eb9",
+    "priority": 1,
+    "status": "open",
+    "title": "Controller wiring: AutoState = TStarSource + two DeviceLoops"
+  },
+  {
+    "dependencies": [
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.3"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.7"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.6"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.2"
+      },
+      {
+        "dependency_type": "parent-child",
+        "id": "fw-fanctrl-loop-eb9"
+      }
+    ],
+    "description": "Spec \u00a72.6 (rev3). lut_sweep.rs deleted (by the sweep bead); step.rs becomes a per-device step test run twice by the runner. Settle (shared): both devices held at their applied caps by the controller (eb9.7 owns the freeze; this bead owns the step logic and the writes it issues through the same actuator paths), the argmax controllable, both groups flat within 0.5 C over 60 s, fans flat within 150 RPM over 20 s, settle cap 600 s with a skip reason naming the failed condition and its duration. Over-temperature aborts at any calibration sample: EC max >= EC_MAX_ABORT_C = 95, GPU HOT (die >= gpu_hot_c) or CPU hot (Tctl >= cpu_hot_c, 3-sample streak) aborts the step \u2014 actuators restored to their pre-step caps, run ends with a Noted reason; guards have precedence over the step writer. CPU step: +STEP_W = 15 W from the settled cap (clamped to cpu_max_w), GPU lock held; FIT_WINDOW_S = 360; fit_fopdt + derive_gains in W/C with the fitted theta used as-is; cross-term rejection if the GPU group moved more than max(1 C, 0.2 x dT_primary). GPU step: +STEP_MHZ = 500 (clamped to gpu_max_mhz), CPU cap held; fit in MHz/C; same rejection on the CPU group. Save cpu_gains / gpu_gains into the persisted map keyed by \"<strategy>:<ma_interval>\"; a rejected fit leaves that device on its resolved gains (config override or defaults) and says so; a sub-threshold response (dGPU unpowered, light load) is rejected by the existing magnitude rule. calibrated_at stamps the run; NOT CALIBRATED is informational.\nAcceptance: fixture-driven runner tests for each abort trigger (caps restored, reason Noted); each rejection path; a coupled response below 0.2 x dT_primary is NOT rejected; the fitted gains land under the current key and a strategy change resolves to defaults until re-fitted; the settle timeout names the failing condition.\nowns: the per-device step test, its settle/abort/rejection rules, the keyed save of fitted gains.\nconsumes: Gains + DeviceLoop bounds (eb9.3), the keyed PersistedState map (eb9.6), the controller's calibration freeze and actuator paths (eb9.7).\nblocked-by fw-fanctrl-loop-eb9.3: consumes the Gains type\nblocked-by fw-fanctrl-loop-eb9.6: consumes PersistedState.cpu_gains/gpu_gains\nblocked-by fw-fanctrl-loop-eb9.2: consumes the per-group boxcar API\nblocked-by fw-fanctrl-loop-eb9.7: consumes the controller's calibration freeze/unfreeze of both loops (caps held for the run's duration)\nFiles: src/calib/step.rs, src/calib/runner.rs, src/calib/mod.rs",
+    "id": "fw-fanctrl-loop-eb9.8",
+    "issue_type": "task",
+    "parent": "fw-fanctrl-loop-eb9",
+    "priority": 1,
+    "status": "open",
+    "title": "Per-device step test (CPU watts step, GPU clock step), settle gate, gains save"
+  },
+  {
+    "dependencies": [
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.4"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.1"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.3"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.16"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.5"
+      },
+      {
+        "dependency_type": "parent-child",
+        "id": "fw-fanctrl-loop-eb9"
+      }
+    ],
+    "description": "Spec \u00a72.9 (rev3). decision line schema v3: t_star, tstar_state, per device {group_c, err_c, thermal, shadow, cap, selected, hold, gains_source}, cpu_limit_w, gpu_max_mhz, flags (incl. ArgmaxUncontrollable, EcImplausible, GroupLost, DeviceUnreachable, TargetUnreachable, SteepCurve); the Budget*/pi_target_w/alloc_*/demand_*/freeze fields are NOT removed here (this bead lands before the controller is rewired and must keep the crate compiling): they are marked deprecated and removed by the deletion sweep (eb9.12) once the emission call site (eb9.7) stops filling them. sample line adds cpu_group_c/gpu_group_c.\nAcceptance: the crate compiles and every_telemetry_field_is_populated is green with the v3 fields added and the deprecated fields still populated by the old call site; a decision-line round-trip test with every Selected/Hold value (incl. Bypass, Clamp(Floor), Clamp(Max), ActuatorMismatch, DrawUnavailable) and every gains_source value populated from a real DeviceDecision.\nowns: the v3 decision schema, the sample-line group fields, and the README/docs telemetry-schema section updated field-by-field to v3.\nconsumes: DeviceDecision / Hold / Selected (eb9.3, eb9.4), TStarSource state (eb9.5), the Held driver flag set (eb9.16), EcReading groups (eb9.1).\nblocked-by fw-fanctrl-loop-eb9.3: consumes DeviceDecision\nblocked-by fw-fanctrl-loop-eb9.5: consumes the TStarSource state enum\nblocked-by fw-fanctrl-loop-eb9.4: consumes Selected::Shadow / Hold::Shadow semantics (structurally dead before the shadow bead)\nblocked-by fw-fanctrl-loop-eb9.1: consumes EcReading.cpu_group_c/gpu_group_c (the sample-line group fields)\nblocked-by fw-fanctrl-loop-eb9.16: consumes the feasibility/SteepCurve/DeviceUnreachable flag set (serialised into the v3 flags field)\nFiles: src/telemetry.rs, src/types.rs, README.md (telemetry section)",
+    "id": "fw-fanctrl-loop-eb9.9",
+    "issue_type": "task",
+    "parent": "fw-fanctrl-loop-eb9",
+    "priority": 1,
+    "status": "open",
+    "title": "Telemetry v3 decision line and sample groups"
+  },
+  {
+    "dependencies": [
+      {
+        "dependency_type": "parent-child",
+        "id": "fw-fanctrl-loop-eb9"
+      }
+    ],
+    "description": "Spec \u00a74 (rev3) plant. ChainedPlant grows a second thermal node: CPU heat -> CPU group with tau ~35 s at 0.8 C/W; GPU clock -> GPU group with the gpu_vr tail at 0.4 C/W (the GPU path's own thermal resistance \u2014 the heat equation, not just the description); cross-coupling 0.1 C/C each way. GPU clock->draw model (no LUT): draw_w = load_level x P_full(clock) with P_full the September full-load sweep as a piecewise-linear table ((1197, 49.3), (1402, 53.5), (1612, 64.2), (1807, 75.9), (1995, 90.8), (2143, 99.4), flat to 3090 at 100 W, linear to (1000, 45) below); the REPORTED SM clock = min(lock, clock_at_power_limit(load_level)) so a loaded card sits BELOW the lock above the ~2143 MHz knee (the shadow then sits one headroom above the knee \u2014 the spec's dead zone). CPU: draw_w = min(cap, cpu_load_w), plus a scripted burst component (single-sample package-power spikes above the sustained cap, as the fixed fast limit allows). Scriptable GPU die temperature and CPU Tctl (for the two hot guards). Fault injection: dGPU off (GPU group None from the start), a single group's labels dropping out mid-run (CPU or GPU group -> None with the rest of the EC valid), a stuck-high sensor (one label pinned at 105 C, from the start or from a given t), an implausible label (150 C), fan outage, EC invalid / stale view, draw unavailable (RAPL/NVML None) for a given window, a load with a square-wave component (period and amplitude scripted) for sim 10's fluctuating-load leg, and a curve switch between the quiet16 and EC-autofan tables.\nAcceptance: the plateau is visible in an open-loop lock sweep (reported clock flat above the knee at full load); the GPU node reaches ~82 C at 100 W steady from a 42 C idle (the gpu-burn fact); each fault is observable at the sample boundary; the square-wave load swings the group by the scripted amplitude in open loop.\nowns: the two-node plant, the GPU clock->draw model, the fault-injection and load-shape API the sim beads script against.\nconsumes: EcReading groups (eb9.1) for the emulated EC output shape.\nFiles: src/sim/plant.rs, src/sim/mod.rs",
+    "id": "fw-fanctrl-loop-eb9.10",
+    "issue_type": "task",
+    "parent": "fw-fanctrl-loop-eb9",
+    "priority": 1,
+    "status": "open",
+    "title": "ChainedPlant: second thermal node per device with cross-coupling, clock->heat GPU model"
+  },
+  {
+    "dependencies": [
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.4"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.10"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.7"
+      },
+      {
+        "dependency_type": "parent-child",
+        "id": "fw-fanctrl-loop-eb9"
+      }
+    ],
+    "description": "Spec \u00a74 (rev3) sims 1\u20134 and 10 plus shared harness helpers. Sims 1\u20133 (CPU-heavy / GPU-heavy / both heavy): each stressed group settles at T*, an unstressed device sits at its shadow cap above draw, fans within +-150 RPM of target >= 90 % of a 30-min converged window. Sim 4 (GPU load step light -> heavy) from a COLD start (thermal candidate at max): the cap ramps at the rising slew (1000 MHz in <= 5 s), no fan crest above target+250, the GPU group overshoots T* by <= 4 C, the GPU HOT guard does not trip, the group settles within +-1 C of T* within 3 lambda, the CPU cap unchanged during the step; the same step from a WARM state (already regulating at T* under the light load): overshoot <= 2 C. Sim 10 (robustness): sims 1\u20133 repeated with the plant's K, tau and theta each perturbed by +-50 %; a fluctuating-load leg (sim 3's load with a square-wave component at 60 s and 300 s periods, amplitude swinging each group +-4 C about T*) and a T* step (fan-target change in Curve); a period-agnostic no-relay rule on every 30-min window of every leg (no sustained oscillation of the cap or the fan above 100 RPM / 4 W / 150 MHz peak-to-peak at any period from 30 s to 20 min beyond what the load's own period forces) \u2014 a loop hunting slowly inside +-150 RPM fails.\nAcceptance: each bar above is a named assertion; sim 4's cold-start trace shows the thermal candidate at max until the crossing and equal to the cap on the crossing tick (the hot-only tracking); the no-relay rule is a shared helper (spectral or peak-to-peak-per-period) reused by sim 6 (eb9.14).\nowns: sims 1\u20134 and 10, the no-relay / hunting helper, the converged-window helper.\nconsumes: the plant and fault API (eb9.10), the two loops (eb9.3, eb9.4), the T* source (eb9.5), the controller wiring (eb9.7).\nblocked-by fw-fanctrl-loop-eb9.7: consumes the wired on_auto_sample\nblocked-by fw-fanctrl-loop-eb9.10: consumes the two-node plant\nblocked-by fw-fanctrl-loop-eb9.4: consumes the shadow cap behaviour\nFiles: src/sim/scenarios.rs, src/sim/helpers.rs",
+    "id": "fw-fanctrl-loop-eb9.11",
+    "issue_type": "task",
+    "parent": "fw-fanctrl-loop-eb9",
+    "priority": 1,
+    "status": "open",
+    "title": "Closed-loop acceptance sims 1\u20134 and the two-loop sim helpers"
+  },
+  {
+    "dependencies": [
+      {
+        "dependency_type": "parent-child",
+        "id": "fw-fanctrl-loop-eb9"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.14"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.9"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.11"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.15"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.13"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.7"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.8"
+      }
+    ],
+    "description": "Spec \u00a73 (rev3) deletion sweep, path AND basename, source and non-source (manifests, fixtures, docs). Delete: src/control/budget.rs (incl. the Freeze enum \u2014 its ActuatorMismatch semantics live in DeviceLoop), src/control/allocator.rs (incl. CPU_PINNED_MARGIN_W / GPU_PINNED_MARGIN_MHZ / GPU_PINNED_UTIL_PCT and the pinned tests \u2014 rev3 has none; CPU_MAX_W / CPU_MAX_W_FLOOR were rehomed by eb9.6), src/control/spike_antiwindup.rs, src/control/mode.rs (the debounce/hysteresis/points_changed logic moved into tstar.rs by eb9.5), src/control/lut.rs, src/calib/lut_sweep.rs, the watts inner loop in src/control/gpu_pid.rs (the slew and sat_dir moved into DeviceLoop), DEMAND_MARGIN_W_*, the deprecated Budget*/pi_target_w/alloc_*/demand_*/freeze telemetry fields (eb9.9 kept them additive), Config::gpu_max_w, gpu_share_override (replaced by MaxRatchet, eb9.15), PersistedState::lut and loop_gains, the gpu_watts_lut fixtures and the ClockWattsLut sims, the design doc's \u00a72.4/\u00a72.5 (marked superseded with a pointer), and every README/docs mention of budget, split, LUT, Mode A/Mode B, shadow_band, pinned.\nAcceptance: grep for each path and basename returns zero hits in source, tests, fixtures, docs, Cargo manifests; cargo test + cargo clippy --all-targets -- -D warnings green; every_telemetry_field_is_populated green with the deprecated fields gone.\nowns: the deletions.\nconsumes: everything the other leaves land (this bead runs after them).\nblocked-by fw-fanctrl-loop-eb9.7: consumes the controller no longer referencing budget/allocator/mode\nblocked-by fw-fanctrl-loop-eb9.8: consumes the runner no longer referencing lut_sweep\nblocked-by fw-fanctrl-loop-eb9.9: consumes the telemetry line no longer carrying Budget fields\nblocked-by fw-fanctrl-loop-eb9.13: consumes the TUI no longer rendering the budget/allocation panel\nblocked-by fw-fanctrl-loop-eb9.11: consumes sim_tests.rs no longer referencing ClockWattsLut, and the acceptance sims 1\u20134 green at the sweep gate\nblocked-by fw-fanctrl-loop-eb9.14: consumes the acceptance sims 5\u20138 green at the sweep gate (all leaves precede the terminal sweep)\nblocked-by fw-fanctrl-loop-eb9.15: consumes the MaxRatchet replacement for gpu_share_override\nFiles: src/control/*, src/calib/*, src/telemetry.rs, tests/fixtures/*, README.md, docs/*",
+    "id": "fw-fanctrl-loop-eb9.12",
+    "issue_type": "task",
+    "parent": "fw-fanctrl-loop-eb9",
+    "priority": 1,
+    "status": "open",
+    "title": "Delete the budget/allocator/arbiter/LUT machinery and sweep docs"
+  },
+  {
+    "dependencies": [
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.9"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.5"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.4"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.16"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.3"
+      },
+      {
+        "dependency_type": "parent-child",
+        "id": "fw-fanctrl-loop-eb9"
+      }
+    ],
+    "description": "Spec \u00a72.9 (rev3) TUI. Show T* and its source state (Held / Curve / Uncontrollable / Released), both group temperatures with their error, both caps with the binding candidate (T/S/F/M), the hold state per device (incl. Bypass, Mismatch, GroupLost), the per-device gains source (config / fitted / default), the per-device unreachable flags, ArgmaxUncontrollable and EcImplausible. Keys unchanged (c/g manual, a auto, p release, k calibrate, q quit). Remove the budget/split/LUT panels.\nAcceptance: a render test per state with a fixture DeviceDecision; the exhaustive match over Hold / Selected / TStarState compiles (a new variant is a compile error here).\nowns: the TUI's view of the v3 decision.\nconsumes: the v3 decision schema (eb9.9), the Held driver flags (eb9.16).\nblocked-by fw-fanctrl-loop-eb9.3: consumes DeviceDecision\nblocked-by fw-fanctrl-loop-eb9.5: consumes the TStarSource state enum\nblocked-by fw-fanctrl-loop-eb9.4: consumes Selected::Shadow / Hold::Shadow semantics\nblocked-by fw-fanctrl-loop-eb9.9: consumes the v3 ControlStatus fields\nblocked-by fw-fanctrl-loop-eb9.16: consumes the feasibility/SteepCurve/DeviceUnreachable flag set (rendered per device)\nFiles: src/tui.rs",
+    "id": "fw-fanctrl-loop-eb9.13",
+    "issue_type": "task",
+    "parent": "fw-fanctrl-loop-eb9",
+    "priority": 1,
+    "status": "open",
+    "title": "TUI for two loops: T* + state, group temps, caps with binding candidate, hold, unreachable"
+  },
+  {
+    "dependencies": [
+      {
+        "dependency_type": "parent-child",
+        "id": "fw-fanctrl-loop-eb9"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.16"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.11"
+      }
+    ],
+    "description": "Spec \u00a74 (rev3) sims 5\u20139 and 11 plus the configuration smoke. Sim 5 (Auto entry under a steady heavy load): neither device's draw changes by more than 1.5 W / 30 MHz in the first 10 s, neither cap starts below draw + headroom, fans do not fall. Sim 6 (curve loss mid-session from a converged state): on the EC-autofan curve (near-zero slope in 67\u201373 C so the 0.25x slope floor is engaged \u2014 this IS the EC-autofan leg the d1 escalation asked for): Held entered, T* moves from the last good value, fans return within +-150 RPM within 3 lambda_eff (lambda_eff = 1440 s / 0.25 = 96 min, simulated at plant speed offline) with the hunting helper over the run; the same leg on the quiet16 curve (schedule 1x) returns within 3 x 1440 s; curve return -> Curve with no step in either cap. Sim 7 (unreachable device): a GPU that cannot reach T* never changes the CPU cap; DeviceUnreachable raised. Sim 8 (configuration smoke): every TStarSource state (Held at entry, Curve, Uncontrollable via an ambient-dominated argmax leg, Released) and every Hold / Selected value (None, Shadow, Clamp(Floor), Clamp(Max), ActuatorMismatch, GroupUnavailable absent-from-start, GroupLost after the dwell, DrawUnavailable with and without the dwell, Bypass) is reached at least once across the sims \u2014 behavioural, not self-pushed vectors \u2014 including a dGPU-off leg where the absent group raises no GroupLost and a mid-run dropout leg where it does and the device is released to max. Sim 9 (hot-guard episodes): (a) GPU \u2014 a 5-min die excursion above 88 C: ratchet reaches the floor, recovery of max starts only below 84 C, no re-trip in the tail, post-episode fan overshoot <= 150 RPM, applied cap back within 10 % of its pre-episode value within 3 lambda of the guard clearing; (b) CPU \u2014 the mirror on Tctl with cpu_hot_c 90: a 3-sample streak trips, a 1-sample spike does not, time at cpu_floor_w <= excursion length + 60 s. Sim 11 (stuck-high sensor): one GPU-group label at 105 C from the first sample and, separately, from t = 5 min: the GPU cap goes to its floor (safe direction), DeviceUnreachable (real) within BOUND_HOLD_S + 60 s, the CPU cap and the fan's other consumers unaffected; a 150 C label is dropped with EcImplausible and no cap effect.\nAcceptance: each bar is a named assertion; sim 6's two legs are separate tests with their own lambda_eff bars; the smoke checklist is derived from the Hold/Selected/TStarState enums so a new variant fails the smoke until reached.\nowns: sims 5\u20139 and 11, the smoke checklist.\nconsumes: the plant and fault API (eb9.10), the hunting helper (eb9.11), the loops (eb9.3, eb9.4), the T* source and Held driver (eb9.5, eb9.16), the hot-guard ratchets (eb9.15), the controller wiring (eb9.7).\nblocked-by fw-fanctrl-loop-eb9.11: consumes the two-loop sim helpers\nblocked-by fw-fanctrl-loop-eb9.16: consumes the Held driver (RPM PI) for the curve-loss sim and the feasibility/unreachable flags for the smoke\nFiles: src/sim/scenarios.rs",
+    "id": "fw-fanctrl-loop-eb9.14",
+    "issue_type": "task",
+    "parent": "fw-fanctrl-loop-eb9",
+    "priority": 1,
+    "status": "open",
+    "title": "Closed-loop acceptance sims 5\u20138: bumpless entry, curve loss, unreachable device, configuration smoke"
+  },
+  {
+    "dependencies": [
+      {
+        "dependency_type": "parent-child",
+        "id": "fw-fanctrl-loop-eb9"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.3"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.6"
+      }
+    ],
+    "description": "Spec \u00a72.5 (rev3) step 3. A pure MaxRatchet helper in control/guards.rs used for BOTH hot guards: while the guard is active the loop's max steps down by DOWN_RATE per sample to no lower than floor (GPU: DOWN_RATE_MHZ = 105 to gpu_floor_mhz; CPU: DOWN_RATE_W = 2 to cpu_floor_w); recovery of max is TEMPERATURE-GATED and asymmetric: it climbs back only while the gate temperature holds (GPU: die <= gpu_hot_c - 4; CPU: Tctl <= 85), at half the down rate, to the configured max \u2014 so the enter/exit band (88/86, 90/87) cannot become a limit cycle. The CPU guard's 3-sample streak debounce is the controller's (eb9.7); this helper takes an already-debounced active flag plus the gate temperature. Idempotent per tick. Replaces gpu_share_override (watts), which the sweep removes.\nAcceptance: unit tests for the down ramp, the floor stop, recovery only while the gate holds (not above it), half-rate recovery, a guard that flaps at the exit threshold producing no rising/falling limit cycle, the CPU variant in watts.\nowns: MaxRatchet and its constants for both guards.\nconsumes: the existing GPU HOT guard state (guards.rs), gpu_floor_mhz / gpu_max_mhz / cpu_floor_w / cpu_max_w / cpu_hot_c (config, eb9.6), the DeviceLoop max-bound semantics (eb9.3).\nblocked-by fw-fanctrl-loop-eb9.3: consumes the GPU DeviceLoop's max bound semantics\nblocked-by fw-fanctrl-loop-eb9.6: consumes gpu_max_mhz / gpu_floor_mhz bounds and the cpu_hot_c key\nFiles: src/control/guards.rs",
+    "id": "fw-fanctrl-loop-eb9.15",
+    "issue_type": "task",
+    "parent": "fw-fanctrl-loop-eb9",
+    "priority": 1,
+    "status": "open",
+    "title": "Hot-guard MaxRatchet helper for both loops' max (GPU HOT and the new CPU hot guard; temperature-gated recovery)"
+  },
+  {
+    "dependencies": [
+      {
+        "dependency_type": "parent-child",
+        "id": "fw-fanctrl-loop-eb9"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.5"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.3"
+      }
+    ],
+    "description": "Spec \u00a72.4 (rev3) second half \u2014 the Held DRIVER in control/tstar.rs. A slow velocity-form RPM PI on T*: err_rpm = fan_target - fan_smoothed (FAN_SMOOTH_N = 5 tail mean of max(fan1, fan2), raw fallback on outage), PI_PERIOD_S = 5, lambda_held = 1440 s -> Kc ~= 2.9e-4 C/RPM at the reference slope, Ti = 35 s, output step bounded to 0.5 C per PI tick; SLOPE SCHEDULE: Kc scaled by slope_ref / max(slope_at(T*), slope_ref) clamped to [0.25, 1], 0.25x when no curve resolves a slope (lambda_eff = lambda_held / schedule; sim 6 is written against it). Output clamped to [T*_floor, T*_ceiling] with T*_ceiling = min(cpu_hot_c - 2, gpu_hot_c - 2) and T*_floor = min(max(plausible uncontrollable sensors) + 5, T*_ceiling) \u2014 the min keeps the interval well-formed (never a lo > hi clamp); when the raw floor exceeds the ceiling TargetUnreachable(high) is raised. Directional conditional integration at both clamps. DIRECTIONAL ANTI-WINDUP (roast d2): the integrator is held in the UPWARD direction when every device's previous-tick Hold is in {Clamp(Max), Shadow, Bypass, ActuatorMismatch, GroupUnavailable, DrawUnavailable} (raising T* could raise no cap) and in the DOWNWARD direction when every device's Hold is in {Clamp(Floor), Bypass, ActuatorMismatch, GroupUnavailable} (lowering T* could lower no cap); Shadow blocks up only, Clamp(Floor) blocks down only; the two sets are the complement of None split by direction and the enum match is exhaustive so a new Hold variant must be assigned explicitly. Reads the PREVIOUS tick's Hold values (one-sample lag by construction, asserted). \u00a72.7 feasibility: TargetUnreachable(low) when the tread duty is below the curve's minimum, (high) when T* would exceed the ceiling or the floor does; SteepCurve informational (the schedule's only consumer). Per-device DeviceUnreachable: at Clamp(Max) with the group under T* for BOUND_HOLD_S = 60 -> informational; at Clamp(Floor) with the group over T* for BOUND_HOLD_S -> real (target too cold, or a stuck-high sensor per \u00a72.1).\nAcceptance: unit tests \u2014 the RPM PI's clamp and step bound; the well-formed interval when the raw floor exceeds the ceiling (no panic, ceiling wins, TargetUnreachable(high)); the directional hold: both-Shadow blocks upward integration and NOT downward; both-Clamp(Floor) blocks downward and NOT upward; one GroupUnavailable + one Clamp(Max) blocks upward; both None blocks nothing; a Bypass pair blocks both; the slope schedule scales Kc incl. the 0.25x floor with no curve; the RPM PI does not wind at its own clamps; each feasibility flag; each DeviceUnreachable case with the 60 s dwell; the one-sample Hold lag asserted explicitly.\nowns: the RPM PI, its slope schedule and directional anti-windup, the feasibility/steepness flags, DeviceUnreachable, and the export of those flag values on the TStarSource decision for the v3 schema and the TUI.\nconsumes: TStarSource states and the Held slot (eb9.5), both loops' Hold WITH the Clamp bound identity (eb9.3), the curve slope at T* (eb9.5), EcReading.all (plausible readings, eb9.1), fan readings.\nblocked-by fw-fanctrl-loop-eb9.5: consumes the TStarSource state machine and its Held slot\nblocked-by fw-fanctrl-loop-eb9.3: consumes the Hold type\nFiles: src/control/tstar.rs",
+    "id": "fw-fanctrl-loop-eb9.16",
+    "issue_type": "task",
+    "parent": "fw-fanctrl-loop-eb9",
+    "priority": 1,
+    "status": "open",
+    "title": "TStarSource Held driver: RPM PI on T*, feasibility/steepness flags, per-device DeviceUnreachable"
+  },
+  {
+    "dependencies": [
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.5"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.9"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.1"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.10"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.4"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.16"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.11"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.6"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.14"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.3"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.12"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.7"
+      },
+      {
+        "dependency_type": "parent-child",
+        "id": "fw-fanctrl-loop-eb9"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.2"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.13"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.15"
+      },
+      {
+        "dependency_type": "blocks",
+        "id": "fw-fanctrl-loop-eb9.8"
+      }
+    ],
+    "description": "Root integration sweep (coverage loop terminal join). On the merged tree: (1) walk the goal's main flows end to end on the fakes/plant \u2014 engage Auto from a fresh state.json under a steady two-device load (bumpless), hold at T* in Curve, lose the curve -> Held -> regain, GPU HOT trip and recovery, calibration run (freeze, both steps, gains saved) and a simulated daemon restart reloading cpu_gains/gpu_gains/warm-start pair/t_star_last_good; (2) sweep for unwired values: every Config key read somewhere, every StatusFlag raised and rendered, every v3 telemetry field populated from live data, every DeviceDecision/TStar field reaching the TUI, no reference to any deleted module/symbol outside historical docs; (3) add the integration tests no per-bead test covers (sampler -> controller -> telemetry with real types; a full on_command/on_sample session on the fakes); fix small gaps inline, file blockers for large ones. Acceptance: the flows above pass; the unwired-sweep checklist recorded in the spec's Post-Implementation Notes with zero open items or a filed blocker per item; cargo test + clippy -D warnings green.\nblocked-by fw-fanctrl-loop-eb9.1: consumes all leaves (integration sweep)\nblocked-by fw-fanctrl-loop-eb9.2: consumes all leaves (integration sweep)\nblocked-by fw-fanctrl-loop-eb9.3: consumes all leaves (integration sweep)\nblocked-by fw-fanctrl-loop-eb9.4: consumes all leaves (integration sweep)\nblocked-by fw-fanctrl-loop-eb9.5: consumes all leaves (integration sweep)\nblocked-by fw-fanctrl-loop-eb9.6: consumes all leaves (integration sweep)\nblocked-by fw-fanctrl-loop-eb9.7: consumes all leaves (integration sweep)\nblocked-by fw-fanctrl-loop-eb9.8: consumes all leaves (integration sweep)\nblocked-by fw-fanctrl-loop-eb9.9: consumes all leaves (integration sweep)\nblocked-by fw-fanctrl-loop-eb9.10: consumes all leaves (integration sweep)\nblocked-by fw-fanctrl-loop-eb9.11: consumes all leaves (integration sweep)\nblocked-by fw-fanctrl-loop-eb9.12: consumes all leaves (integration sweep)\nblocked-by fw-fanctrl-loop-eb9.13: consumes all leaves (integration sweep)\nblocked-by fw-fanctrl-loop-eb9.14: consumes all leaves (integration sweep)\nblocked-by fw-fanctrl-loop-eb9.15: consumes all leaves (integration sweep)\nblocked-by fw-fanctrl-loop-eb9.16: consumes all leaves (integration sweep)\nFiles: src/** (small inline fixes), src/integration_tests.rs, docs/superpowers/runs/2026-09-11-per-device-temperature-loops/*.md (notes)",
+    "id": "fw-fanctrl-loop-eb9.17",
+    "issue_type": "task",
+    "parent": "fw-fanctrl-loop-eb9",
+    "priority": 1,
+    "status": "open",
+    "title": "Integration sweep: per-device temperature loops end to end"
+  }
+]

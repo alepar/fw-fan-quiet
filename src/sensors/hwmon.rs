@@ -78,12 +78,44 @@ impl Hwmon {
         Some(self.read_chip_value("amdgpu", "power1_average")? / 1e6)
     }
 
+    /// NVMe composite temperature in degrees C from the `nvme` chip
+    /// (`temp1_input`, millidegrees, labelled `Composite`). None if no NVMe
+    /// chip is present (the drive is absent, or the driver doesn't expose
+    /// hwmon) or the file is unreadable/unparseable.
+    pub fn nvme_composite_c(&self) -> Option<f64> {
+        Some(self.read_chip_value("nvme", "temp1_input")? / 1000.0)
+    }
+
     fn read_chip_value(&self, chip: &str, file: &str) -> Option<f64> {
         let Some(dir) = self.chips.get(chip) else {
             tracing::debug!("hwmon: chip {chip} not present");
             return None;
         };
         read_f64(&dir.join(file))
+    }
+}
+
+/// Reads AC-adapter presence from `<power_supply_root>/ACAD/online`
+/// (production: `/sys/class/power_supply`). Not a hwmon chip, so this is a
+/// free function rather than a `Hwmon` method -- `power_supply_root` is a
+/// different sysfs subtree than the `hwmon` root `Hwmon::discover` scans.
+/// `1` -> `Some(true)`, `0` -> `Some(false)`; `None` if the file is
+/// missing, unreadable, or holds anything else.
+pub fn on_ac(power_supply_root: &Path) -> Option<bool> {
+    let path = power_supply_root.join("ACAD").join("online");
+    match fs::read_to_string(&path) {
+        Ok(s) => match s.trim() {
+            "1" => Some(true),
+            "0" => Some(false),
+            other => {
+                tracing::debug!("on_ac {}: unexpected value {other:?}", path.display());
+                None
+            }
+        },
+        Err(e) => {
+            tracing::debug!("on_ac {}: {e}", path.display());
+            None
+        }
     }
 }
 
@@ -224,6 +256,50 @@ mod tests {
 
         let hwmon = Hwmon::discover(&root);
         assert_eq!(hwmon.fan_rpms(), Some((1467.0, 1452.0)));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn nvme_composite_c_reads_the_checked_in_fixture() {
+        let root = crate::test_support::fixtures::path("hwmon");
+        let hwmon = Hwmon::discover(&root);
+        let temp = hwmon
+            .nvme_composite_c()
+            .expect("nvme composite should read from the fixture");
+        assert!((temp - 59.85).abs() < 1e-9, "expected 59.85 C, got {temp}");
+    }
+
+    #[test]
+    fn nvme_composite_c_none_when_chip_absent() {
+        let root = fixture_dir("no-nvme");
+        add_chip(&root, "hwmon0", "k10temp", &[("temp1_input", "40000")]);
+
+        let hwmon = Hwmon::discover(&root);
+        assert_eq!(hwmon.nvme_composite_c(), None);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn on_ac_reads_the_checked_in_fixture() {
+        let root = crate::test_support::fixtures::path("power_supply");
+        assert_eq!(on_ac(&root), Some(true));
+    }
+
+    #[test]
+    fn on_ac_none_when_root_is_missing() {
+        assert_eq!(on_ac(Path::new("/nonexistent/power-supply-root")), None);
+    }
+
+    #[test]
+    fn on_ac_none_on_an_unexpected_value() {
+        let root = fixture_dir("on-ac-garbage");
+        let acad = root.join("ACAD");
+        fs::create_dir_all(&acad).unwrap();
+        fs::write(acad.join("online"), "banana\n").unwrap();
+
+        assert_eq!(on_ac(&root), None);
 
         fs::remove_dir_all(&root).unwrap();
     }

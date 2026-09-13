@@ -9,6 +9,8 @@
 use nvml_wrapper::Nvml;
 use nvml_wrapper::enums::device::GpuLockedClocksSetting;
 
+use super::WriteVerdict;
+
 /// Hardware clock floor on this RTX 5070 Laptop (min supported graphics
 /// clock); used as the lock's min so idle clocks stay free to drop.
 const MIN_LOCK_MHZ: u32 = 210;
@@ -23,6 +25,158 @@ const DEVICE_INDEX: u32 = 0;
 /// ~7.5 MHz bins on its own; we don't need to.
 pub fn clamp_gpu_clock(mhz: u32) -> u32 {
     mhz.clamp(MIN_MAX_CLOCK_MHZ, MAX_MAX_CLOCK_MHZ)
+}
+
+/// Utilisation floor (design §2.9): below this, load isn't heavy enough to
+/// trust the SM-clock read-back either way.
+const VERIFY_UTIL_FLOOR_PCT: f64 = 90.0;
+/// clock-verification pin-rule slack (design §2.9, reused from the calibration
+/// sweep): the pinned clock may run this many MHz above the locked ceiling
+/// before it counts as a violation.
+const VERIFY_CLOCK_SLACK_MHZ: u32 = 30;
+/// Consecutive violating samples before a `Mismatch` is scored (design
+/// §2.9's "over 3 samples" — matches the clock-verification's own pin rule; a lone
+/// over-clock sample is normal boost-clock noise at the pin edge).
+const VERIFY_STRIKES: u32 = 3;
+
+/// A GPU lock command that completed successfully.  The controller records
+/// these from the monotonic sample clock; verification deliberately selects
+/// only commands that were complete before a sample was acquired.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GpuCommandEvidence {
+    pub locked_mhz: u32,
+    pub completed_at_s: f64,
+    pub generation: u64,
+}
+
+impl GpuCommandEvidence {
+    pub const fn new(locked_mhz: u32, completed_at_s: f64, generation: u64) -> Self {
+        Self {
+            locked_mhz,
+            completed_at_s,
+            generation,
+        }
+    }
+}
+
+/// GPU lock read-back verification (design §2.9): there is no NVML read of
+/// the applied lock itself, so verification is indirect -- while the GPU is
+/// under load (`gpu_util` above the floor), the measured SM clock must stay
+/// at or below `locked + slack`. One state machine per locked value; the
+/// controller call site that constructs and drives this is Task 19's
+/// (`fw-fanctrl-loop-j6s`) -- this type is a standalone, fully unit-tested
+/// building block until then.
+#[derive(Debug, Clone, Copy)]
+pub struct GpuLockVerifier {
+    #[allow(dead_code)] // retained for the direct single-lock compatibility API
+    locked_mhz: u32,
+    violation_streak: u32,
+}
+
+impl GpuLockVerifier {
+    /// New verifier for a lock just commanded at `locked_mhz`.
+    pub fn new(locked_mhz: u32) -> Self {
+        Self {
+            locked_mhz,
+            violation_streak: 0,
+        }
+    }
+
+    /// Score one sample against the clock-verification pin rule. Below the
+    /// utilisation floor: `Unverifiable` (not a failure — there isn't
+    /// enough load to trust the reading), and the streak resets (a lull
+    /// tells us nothing about whether the NEXT loaded sample would still
+    /// violate). At/above the floor: `Verified` when the clock stays within
+    /// `locked + slack`; a single overshoot only counts a strike
+    /// (`Unverifiable` while the streak is building) — only
+    /// `VERIFY_STRIKES` CONSECUTIVE overshoots score a `Mismatch`, naming
+    /// the pinned clock.
+    #[allow(dead_code)] // exercised by the direct verifier unit contract
+    pub fn verify_lock(&mut self, gpu_util: f64, gpu_sm_mhz: u32) -> WriteVerdict {
+        if gpu_util <= VERIFY_UTIL_FLOOR_PCT {
+            self.violation_streak = 0;
+            return WriteVerdict::Unverifiable;
+        }
+        let ceiling = self.locked_mhz + VERIFY_CLOCK_SLACK_MHZ;
+        if gpu_sm_mhz <= ceiling {
+            self.violation_streak = 0;
+            return WriteVerdict::Verified(f64::from(gpu_sm_mhz));
+        }
+        self.violation_streak += 1;
+        if self.violation_streak >= VERIFY_STRIKES {
+            WriteVerdict::Mismatch {
+                field: "gpu_sm_mhz",
+                commanded: f64::from(ceiling),
+                read: f64::from(gpu_sm_mhz),
+            }
+        } else {
+            WriteVerdict::Unverifiable
+        }
+    }
+
+    /// Scores a clock sample against the command that was actually in force
+    /// when it was acquired.  A just-issued command is not evidence for an
+    /// earlier sample.  During the first second after a downward command, a
+    /// one-command-lag card may still report the immediate predecessor, so
+    /// the larger of those two locks is allowed exactly for that interval.
+    /// The caller retains the history and appends only successful commands.
+    pub fn verify_paired(
+        &mut self,
+        gpu_util: f64,
+        gpu_sm_mhz: u32,
+        sample_acquired_at_s: f64,
+        commands: &[GpuCommandEvidence],
+    ) -> WriteVerdict {
+        let Some((index, paired)) = commands
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, command)| command.completed_at_s <= sample_acquired_at_s)
+        else {
+            return WriteVerdict::Unverifiable;
+        };
+
+        let predecessor = index.checked_sub(1).and_then(|i| commands.get(i));
+        let within_downward_lag_window = predecessor.is_some_and(|previous| {
+            paired.locked_mhz < previous.locked_mhz
+                && sample_acquired_at_s - paired.completed_at_s <= 1.0
+        });
+        let allowed_lock = if within_downward_lag_window {
+            paired
+                .locked_mhz
+                .max(predecessor.expect("checked above").locked_mhz)
+        } else {
+            paired.locked_mhz
+        };
+        self.verify_against_lock(gpu_util, gpu_sm_mhz, allowed_lock)
+    }
+
+    fn verify_against_lock(
+        &mut self,
+        gpu_util: f64,
+        gpu_sm_mhz: u32,
+        locked_mhz: u32,
+    ) -> WriteVerdict {
+        if gpu_util <= VERIFY_UTIL_FLOOR_PCT {
+            self.violation_streak = 0;
+            return WriteVerdict::Unverifiable;
+        }
+        let ceiling = locked_mhz + VERIFY_CLOCK_SLACK_MHZ;
+        if gpu_sm_mhz <= ceiling {
+            self.violation_streak = 0;
+            return WriteVerdict::Verified(f64::from(gpu_sm_mhz));
+        }
+        self.violation_streak += 1;
+        if self.violation_streak >= VERIFY_STRIKES {
+            WriteVerdict::Mismatch {
+                field: "gpu_sm_mhz",
+                commanded: f64::from(ceiling),
+                read: f64::from(gpu_sm_mhz),
+            }
+        } else {
+            WriteVerdict::Unverifiable
+        }
+    }
 }
 
 /// Actuation seam for the GPU clock lock (Task 25): the real [`GpuActuator`]
@@ -134,6 +288,50 @@ pub mod test_support {
         Release,
     }
 
+    /// How the fake card reports an accepted clock command.  The modes model
+    /// the two verifier acceptance legs without weakening production policy.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum FakeGpuBehavior {
+        #[default]
+        Immediate,
+        OneCommandLag,
+        Ignore,
+    }
+
+    /// Observable command completion record.  Tests set the logical times so
+    /// histories are deterministic and never depend on wall-clock hardware.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct GpuHistory {
+        pub call: GpuCall,
+        pub acquired_at_s: f64,
+        pub completed_at_s: f64,
+        pub reported_mhz: Option<u32>,
+    }
+
+    /// Cloneable observer retained by tests after a fake moves into a boxed
+    /// controller seam.  It intentionally exposes only observations, never
+    /// a way to alter the fake's actuator behavior.
+    #[derive(Clone)]
+    pub struct FakeGpuHandles {
+        calls: Arc<Mutex<Vec<GpuCall>>>,
+        history: Arc<Mutex<Vec<GpuHistory>>>,
+        reported_mhz: Arc<Mutex<Option<u32>>>,
+    }
+
+    impl FakeGpuHandles {
+        pub fn calls(&self) -> Vec<GpuCall> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        pub fn history(&self) -> Vec<GpuHistory> {
+            self.history.lock().unwrap().clone()
+        }
+
+        pub fn reported_sm_clock(&self) -> Option<u32> {
+            *self.reported_mhz.lock().unwrap()
+        }
+    }
+
     /// Recording stand-in for `GpuActuator`. The call log and the failure
     /// injector are behind `Arc`s so tests keep handles after the fake moves
     /// into the controller's `RestoreGuard`.
@@ -143,11 +341,55 @@ pub mod test_support {
         calls: Arc<Mutex<Vec<GpuCall>>>,
         fail_sets: Arc<Mutex<usize>>,
         resumed_count: Arc<Mutex<usize>>,
+        /// Raised on every successful `set_max_clock`, when armed: lets a
+        /// test model a flag flipping WHILE the (real-world untimed) NVML
+        /// call is in flight — e.g. main's `shutdown` racing a sample.
+        raise_on_set: Option<Arc<std::sync::atomic::AtomicBool>>,
+        behavior: FakeGpuBehavior,
+        reported_mhz: Arc<Mutex<Option<u32>>>,
+        prior_requested_mhz: Option<u32>,
+        command_times: (f64, f64),
+        history: Arc<Mutex<Vec<GpuHistory>>>,
     }
 
     impl FakeGpu {
         pub fn new() -> Self {
             Self::default()
+        }
+
+        pub fn with_behavior(behavior: FakeGpuBehavior) -> Self {
+            Self {
+                behavior,
+                ..Self::default()
+            }
+        }
+
+        /// Timestamp the next command's acquisition and completion in the
+        /// deterministic simulated clock used by acceptance scenarios.
+        pub fn set_command_times(&mut self, acquired_at_s: f64, completed_at_s: f64) {
+            self.command_times = (acquired_at_s, completed_at_s);
+        }
+
+        pub fn handles(&self) -> FakeGpuHandles {
+            FakeGpuHandles {
+                calls: Arc::clone(&self.calls),
+                history: Arc::clone(&self.history),
+                reported_mhz: Arc::clone(&self.reported_mhz),
+            }
+        }
+
+        pub fn reported_sm_clock(&self) -> Option<u32> {
+            *self.reported_mhz.lock().unwrap()
+        }
+
+        pub fn history(&self) -> Vec<GpuHistory> {
+            self.history.lock().unwrap().clone()
+        }
+
+        /// Arm the mid-call flag raise (see `raise_on_set`).
+        #[allow(dead_code)]
+        pub fn raise_on_set(&mut self, flag: Arc<std::sync::atomic::AtomicBool>) {
+            self.raise_on_set = Some(flag);
         }
 
         /// Shared handle to the call log (clone it before boxing the fake).
@@ -158,12 +400,14 @@ pub mod test_support {
         /// Shared failure injector: set `*handle.lock() = n` to make the
         /// next `n` `set_max_clock` calls fail (like the real actuator, a
         /// failed call leaves `applied` untouched and is not recorded).
+        #[allow(dead_code)]
         pub fn failures(&self) -> Arc<Mutex<usize>> {
             Arc::clone(&self.fail_sets)
         }
 
         /// Shared counter of `resumed()` hook invocations (Task 29): tests
         /// assert the controller pokes the hook exactly once per resume.
+        #[allow(dead_code)]
         pub fn resumed_count(&self) -> Arc<Mutex<usize>> {
             Arc::clone(&self.resumed_count)
         }
@@ -181,12 +425,38 @@ pub mod test_support {
             let clamped = clamp_gpu_clock(mhz);
             self.applied = Some(clamped);
             self.calls.lock().unwrap().push(GpuCall::Set(clamped));
+            let reported_mhz = match self.behavior {
+                FakeGpuBehavior::Immediate => Some(clamped),
+                FakeGpuBehavior::OneCommandLag => self.prior_requested_mhz.or(Some(clamped)),
+                // A card that ignores changes keeps its first accepted clock
+                // visible to the verifier across every later descent.
+                FakeGpuBehavior::Ignore => self.reported_sm_clock().or(Some(clamped)),
+            };
+            *self.reported_mhz.lock().unwrap() = reported_mhz;
+            self.prior_requested_mhz = Some(clamped);
+            self.history.lock().unwrap().push(GpuHistory {
+                call: GpuCall::Set(clamped),
+                acquired_at_s: self.command_times.0,
+                completed_at_s: self.command_times.1,
+                reported_mhz,
+            });
+            if let Some(flag) = &self.raise_on_set {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             Ok(())
         }
 
         fn release(&mut self) -> color_eyre::Result<()> {
             self.applied = None;
             self.calls.lock().unwrap().push(GpuCall::Release);
+            *self.reported_mhz.lock().unwrap() = None;
+            self.prior_requested_mhz = None;
+            self.history.lock().unwrap().push(GpuHistory {
+                call: GpuCall::Release,
+                acquired_at_s: self.command_times.0,
+                completed_at_s: self.command_times.1,
+                reported_mhz: None,
+            });
             Ok(())
         }
 
@@ -202,6 +472,7 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::{FakeGpu, FakeGpuBehavior};
     use super::*;
 
     #[test]
@@ -221,6 +492,240 @@ mod tests {
         assert_eq!(clamp_gpu_clock(1500), 1500);
         assert_eq!(clamp_gpu_clock(1000), 1000);
         assert_eq!(clamp_gpu_clock(3090), 3090);
+    }
+
+    #[test]
+    fn paired_verifier_uses_only_commands_completed_before_the_sample() {
+        let mut verifier = GpuLockVerifier::new(3_090);
+        let commands = [
+            GpuCommandEvidence::new(3_090, 10.2, 1),
+            GpuCommandEvidence::new(2_985, 11.2, 2),
+        ];
+
+        assert_eq!(
+            verifier.verify_paired(95.0, 3_090, 10.1, &commands),
+            WriteVerdict::Unverifiable,
+            "a command completing after acquisition cannot be paired backwards"
+        );
+        assert_eq!(
+            verifier.verify_paired(95.0, 3_090, 10.3, &commands),
+            WriteVerdict::Verified(3_090.0)
+        );
+    }
+
+    #[test]
+    fn paired_verifier_allows_one_command_lag_only_for_one_second_after_descent() {
+        let mut verifier = GpuLockVerifier::new(3_090);
+        let commands = [
+            GpuCommandEvidence::new(3_090, 10.0, 1),
+            GpuCommandEvidence::new(2_985, 11.0, 2),
+        ];
+
+        assert_eq!(
+            verifier.verify_paired(95.0, 3_090, 11.5, &commands),
+            WriteVerdict::Verified(3_090.0),
+        );
+        assert_eq!(
+            verifier.verify_paired(95.0, 3_090, 12.1, &commands),
+            WriteVerdict::Unverifiable,
+            "outside the bounded grace window the paired descent command scores a strike"
+        );
+    }
+
+    #[test]
+    fn fake_gpu_records_timestamped_one_command_lag_and_ignore_histories() {
+        let mut lag = FakeGpu::with_behavior(FakeGpuBehavior::OneCommandLag);
+        lag.set_command_times(10.0, 10.2);
+        lag.set_max_clock(3090).unwrap();
+        lag.set_command_times(11.0, 11.2);
+        lag.set_max_clock(2985).unwrap();
+        lag.set_command_times(12.0, 12.2);
+        lag.set_max_clock(2880).unwrap();
+        assert_eq!(lag.reported_sm_clock(), Some(2985));
+        let history = lag.history();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[1].acquired_at_s, 11.0);
+        assert_eq!(history[1].completed_at_s, 11.2);
+        assert_eq!(history[1].reported_mhz, Some(3090));
+        assert_eq!(history[2].reported_mhz, Some(2985));
+
+        let mut ignoring = FakeGpu::with_behavior(FakeGpuBehavior::Ignore);
+        ignoring.set_max_clock(3090).unwrap();
+        ignoring.set_max_clock(2985).unwrap();
+        ignoring.set_max_clock(2880).unwrap();
+        assert_eq!(ignoring.reported_sm_clock(), Some(3090));
+        let mut verifier = GpuLockVerifier::new(2880);
+        for _ in 0..3 {
+            verifier.verify_lock(100.0, ignoring.reported_sm_clock().unwrap());
+        }
+        assert!(matches!(
+            verifier.verify_lock(100.0, ignoring.reported_sm_clock().unwrap()),
+            WriteVerdict::Mismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn boxed_fake_keeps_shared_lag_and_ignore_histories_for_verifier_pairs() {
+        let fake = FakeGpu::with_behavior(FakeGpuBehavior::OneCommandLag);
+        let handles = fake.handles();
+        let mut gpu: Box<dyn GpuClockCtl> = Box::new(fake);
+        gpu.set_max_clock(3090).unwrap();
+        gpu.set_max_clock(2985).unwrap();
+        assert_eq!(handles.reported_sm_clock(), Some(3090));
+        let mut prior_pair = GpuLockVerifier::new(3090);
+        assert_eq!(
+            prior_pair.verify_lock(100.0, handles.reported_sm_clock().unwrap()),
+            WriteVerdict::Verified(3090.0)
+        );
+        gpu.release().unwrap();
+        gpu.set_max_clock(2880).unwrap();
+        assert_eq!(
+            handles.reported_sm_clock(),
+            Some(2880),
+            "release clears the lag predecessor"
+        );
+        assert_eq!(handles.calls().len(), 4);
+        assert_eq!(handles.history().len(), 4);
+
+        let ignoring = FakeGpu::with_behavior(FakeGpuBehavior::Ignore);
+        let handles = ignoring.handles();
+        let mut gpu: Box<dyn GpuClockCtl> = Box::new(ignoring);
+        gpu.set_max_clock(3090).unwrap();
+        gpu.set_max_clock(2880).unwrap();
+        let mut verifier = GpuLockVerifier::new(2880);
+        assert_eq!(
+            verifier.verify_lock(100.0, handles.reported_sm_clock().unwrap()),
+            WriteVerdict::Unverifiable
+        );
+        assert_eq!(
+            verifier.verify_lock(100.0, handles.reported_sm_clock().unwrap()),
+            WriteVerdict::Unverifiable
+        );
+        assert!(matches!(
+            verifier.verify_lock(100.0, handles.reported_sm_clock().unwrap()),
+            WriteVerdict::Mismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn one_command_lag_descent_never_scores_a_current_lock_mismatch() {
+        let fake = FakeGpu::with_behavior(FakeGpuBehavior::OneCommandLag);
+        let handles = fake.handles();
+        let mut gpu: Box<dyn GpuClockCtl> = Box::new(fake);
+        let mut commands: Vec<u32> = (0..20).map(|step| 3090 - step * 105).collect();
+        commands.push(1000);
+        for (step, command) in commands.iter().copied().enumerate() {
+            gpu.set_max_clock(command).unwrap();
+            let mut verifier = GpuLockVerifier::new(command);
+            let verdict = verifier.verify_lock(100.0, handles.reported_sm_clock().unwrap());
+            assert!(
+                !matches!(verdict, WriteVerdict::Mismatch { .. }),
+                "step {step}: {command} MHz reported {:?}",
+                handles.reported_sm_clock()
+            );
+        }
+        assert_eq!(handles.history().len(), commands.len());
+        assert_eq!(handles.history().last().unwrap().reported_mhz, Some(1095));
+
+        let ignoring = FakeGpu::with_behavior(FakeGpuBehavior::Ignore);
+        let handles = ignoring.handles();
+        let mut gpu: Box<dyn GpuClockCtl> = Box::new(ignoring);
+        for command in [3090, 2985, 2880, 2775] {
+            gpu.set_max_clock(command).unwrap();
+        }
+        assert!(
+            handles
+                .history()
+                .iter()
+                .all(|entry| entry.reported_mhz == Some(3090))
+        );
+    }
+
+    /// Step 5 (TDD): below the 90% utilisation floor, `Unverifiable` --
+    /// regardless of how far over the pin the reported clock is.
+    #[test]
+    fn below_util_floor_is_unverifiable_even_when_clock_is_wildly_over() {
+        let mut v = GpuLockVerifier::new(2000);
+        assert_eq!(v.verify_lock(89.9, 5000), WriteVerdict::Unverifiable);
+        assert_eq!(v.verify_lock(0.0, 5000), WriteVerdict::Unverifiable);
+        assert_eq!(v.verify_lock(90.0, 5000), WriteVerdict::Unverifiable);
+    }
+
+    /// Above the floor and within `locked + 30`: `Verified`.
+    #[test]
+    fn above_util_floor_within_slack_is_verified() {
+        let mut v = GpuLockVerifier::new(2000);
+        assert_eq!(v.verify_lock(95.0, 2000), WriteVerdict::Verified(2000.0));
+        assert_eq!(v.verify_lock(95.0, 2030), WriteVerdict::Verified(2030.0));
+    }
+
+    /// Mismatch requires 3 CONSECUTIVE over-pin samples, not 1 or 2 -- a
+    /// wrong implementation that scored on the first (or second) violation
+    /// would fail these two assertions before the loop ever reaches 3.
+    #[test]
+    fn mismatch_only_fires_on_the_third_consecutive_overshoot() {
+        let mut v = GpuLockVerifier::new(2000); // ceiling 2030
+        assert_eq!(
+            v.verify_lock(95.0, 2031),
+            WriteVerdict::Unverifiable,
+            "1st consecutive overshoot must not yet be Mismatch"
+        );
+        assert_eq!(
+            v.verify_lock(95.0, 2031),
+            WriteVerdict::Unverifiable,
+            "2nd consecutive overshoot must not yet be Mismatch"
+        );
+        assert_eq!(
+            v.verify_lock(95.0, 2031),
+            WriteVerdict::Mismatch {
+                field: "gpu_sm_mhz",
+                commanded: 2030.0,
+                read: 2031.0,
+            },
+            "3rd consecutive overshoot must score Mismatch"
+        );
+    }
+
+    /// A compliant sample between overshoots resets the streak: 2 + 2 never
+    /// reaches 3.
+    #[test]
+    fn a_compliant_sample_resets_the_overshoot_streak() {
+        let mut v = GpuLockVerifier::new(2000);
+        assert_eq!(v.verify_lock(95.0, 2031), WriteVerdict::Unverifiable);
+        assert_eq!(v.verify_lock(95.0, 2031), WriteVerdict::Unverifiable);
+        assert_eq!(v.verify_lock(95.0, 2000), WriteVerdict::Verified(2000.0));
+        // Streak reset: this is only the first overshoot again.
+        assert_eq!(v.verify_lock(95.0, 2031), WriteVerdict::Unverifiable);
+    }
+
+    /// A below-floor sample between overshoots also resets the streak (an
+    /// unloaded lull tells us nothing about whether the NEXT loaded sample
+    /// would still violate).
+    #[test]
+    fn a_below_floor_sample_resets_the_overshoot_streak() {
+        let mut v = GpuLockVerifier::new(2000);
+        assert_eq!(v.verify_lock(95.0, 2031), WriteVerdict::Unverifiable);
+        assert_eq!(v.verify_lock(95.0, 2031), WriteVerdict::Unverifiable);
+        assert_eq!(v.verify_lock(10.0, 2031), WriteVerdict::Unverifiable); // resets
+        assert_eq!(
+            v.verify_lock(95.0, 2031),
+            WriteVerdict::Unverifiable,
+            "1st since the reset"
+        );
+        assert_eq!(
+            v.verify_lock(95.0, 2031),
+            WriteVerdict::Unverifiable,
+            "2nd since the reset"
+        );
+        assert_eq!(
+            v.verify_lock(95.0, 2031),
+            WriteVerdict::Mismatch {
+                field: "gpu_sm_mhz",
+                commanded: 2030.0,
+                read: 2031.0,
+            },
+            "3rd since the reset"
+        );
     }
 
     /// Manual smoke check against the real GPU: exercises NVML init and the

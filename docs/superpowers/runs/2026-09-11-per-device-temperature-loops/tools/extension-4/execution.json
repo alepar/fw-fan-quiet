@@ -1,0 +1,47 @@
+{
+  "mode": "design",
+  "iteration": 4,
+  "reportIteration": "post-cap extension",
+  "artifactCommit": "86b808a3c4aa9bc30c55e335843c03d22520b861",
+  "mechanism": "manual subagent fan-out; Workflow tool unavailable",
+  "models": {
+    "triage": {
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "medium"
+    },
+    "scout": {
+      "model": "gpt-6-astra",
+      "reasoning_effort": "high"
+    },
+    "dedupe": {
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "high"
+    },
+    "judge": {
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "high"
+    },
+    "reporter": {
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "high"
+    }
+  },
+  "independence": "same-family (OpenAI GPT) — nine fresh scouts; no judge panel (zero candidates)",
+  "remainderCap": 50,
+  "panelCap": null,
+  "maxConcurrentAgentsIncludingController": 4,
+  "priorReport": "2026-09-11-per-device-temperature-loops-roast-design-3.md",
+  "earlierRejectedDispositions": [
+    "roast-design-1.md",
+    "roast-design-2.md"
+  ],
+  "stopAfterReport": true,
+  "actualStages": {
+    "triage": 1,
+    "scouts": 9,
+    "dedupe": 1,
+    "judges": 0,
+    "reporter": 1
+  },
+  "zeroFindingQualifier": "Reporter Step4 requires low coverage on a non-trivial artifact despite all scouts completing"
+}

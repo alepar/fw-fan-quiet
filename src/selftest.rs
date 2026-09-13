@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::actuators::WriteVerdict;
 use crate::actuators::cmd::RealRunner;
 use crate::actuators::cpu::{CpuActuator, PLATFORM_PROFILE_PATH};
 use crate::actuators::gpu::{BoxedGpu, GpuActuator};
@@ -193,9 +194,13 @@ fn cpu_limit_step(
 ) -> Result<String, String> {
     let cpu = guard.cpu.as_ref().ok_or("no CPU actuator")?;
     let rapl = rapl.ok_or("RAPL reader unavailable")?;
-    let mw = cpu
-        .set_sustained_mw(CPU_LIMIT_MW)
-        .map_err(|e| format!("ryzenadj: {e}"))?;
+    // fw-fanctrl-loop-j6s: selftest only cares whether the limit landed, so
+    // any non-Verified verdict (Mismatch/Unreadable) is reported as today's
+    // plain failure rather than routed through the hold/flag machinery.
+    let commanded_w = match cpu.set_sustained_mw(CPU_LIMIT_MW) {
+        WriteVerdict::Verified(w) => w,
+        other => return Err(format!("ryzenadj: not verified: {other:?}")),
+    };
 
     let burner = Burner::start(BURN_THREADS);
     std::thread::sleep(Duration::from_secs(LIMIT_SETTLE_SECS));
@@ -207,7 +212,7 @@ fn cpu_limit_step(
     let watts = watts.ok_or("RAPL read failed during burn")?;
     let detail = format!(
         "measured {watts:.1} W avg over {MEASURE_SECS} s under {BURN_THREADS}-thread burn \
-         (commanded {mw} mW, threshold {CPU_WATTS_THRESHOLD} W)"
+         (commanded+verified {commanded_w} W, threshold {CPU_WATTS_THRESHOLD} W)"
     );
     if watts <= CPU_WATTS_THRESHOLD {
         Ok(detail)

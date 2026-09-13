@@ -1,3 +1,18 @@
+> **2026-09-09 note:** the learned power→RPM thermal model this document designs around
+
+> **Historical / superseded (2026-09-11).** Retained as research evidence. The implemented controller is specified by [Per-device temperature loops, revision 4](../superpowers/runs/2026-09-11-per-device-temperature-loops/2026-09-11-per-device-temperature-loops-design.md).
+> (Section 2's affine-plus-cross-term / softplus model, Section 2's RLS/EWMA online
+> adaptation, and the Section 5 calibration matrix that fit it) has been replaced. The
+> shipped design instead closes the loop through fw-fanctrl's own temperature→RPM curve
+> with a single PI integrator, has no learned thermal model, and calibrates with a GPU
+> clock→watts sweep plus a step test rather than a full (CPU W × GPU W) matrix. See
+> [`docs/research/05-fw-fanctrl-loop.md`](05-fw-fanctrl-loop.md) for the verified research
+> behind that design and
+> [`docs/superpowers/specs/2026-09-07-fw-fanctrl-loop-design.md`](../superpowers/specs/2026-09-07-fw-fanctrl-loop-design.md)
+> for the design itself. This document remains useful as prior-art/background research
+> (actuator behavior, time constants, demand estimation) but its Section 2 model form and
+> Section 5 calibration matrix no longer describe the shipped system.
+
 # Designing a Noise-Targeted Power-Shaping Thermal Controller for the Framework 16 (Ryzen AI HX 370 + RTX 5070 Mobile, Linux)
 
 ## TL;DR

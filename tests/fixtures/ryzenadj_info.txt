@@ -1,0 +1,33 @@
+no compatible ryzen_smu kernel module found, fallback to /dev/mem
+CPU Family: Strix Point
+SMU BIOS Interface Version: 22
+Version: v0.18.0 
+PM Table Version: 5d000b
+|        Name         |   Value   |     Parameter      |
+|---------------------|-----------|--------------------|
+| STAPM LIMIT         |    40.000 | stapm-limit        |
+| STAPM VALUE         |    37.619 |                    |
+| PPT LIMIT FAST      |    65.000 | fast-limit         |
+| PPT VALUE FAST      |    35.777 |                    |
+| PPT LIMIT SLOW      |    48.000 | slow-limit         |
+| PPT VALUE SLOW      |    37.282 |                    |
+| StapmTimeConst      |       nan | stapm-time         |
+| SlowPPTTimeConst    |       nan | slow-time          |
+| PPT LIMIT APU       |       nan | apu-slow-limit     |
+| PPT VALUE APU       |       nan |                    |
+| TDC LIMIT VDD       |       nan | vrm-current        |
+| TDC VALUE VDD       |       nan |                    |
+| TDC LIMIT SOC       |       nan | vrmsoc-current     |
+| TDC VALUE SOC       |       nan |                    |
+| EDC LIMIT VDD       |       nan | vrmmax-current     |
+| EDC VALUE VDD       |       nan |                    |
+| EDC LIMIT SOC       |       nan | vrmsocmax-current  |
+| EDC VALUE SOC       |       nan |                    |
+| THM LIMIT CORE      |       nan | tctl-temp          |
+| THM VALUE CORE      |       nan |                    |
+| STT LIMIT APU       |       nan | apu-skin-temp      |
+| STT VALUE APU       |       nan |                    |
+| STT LIMIT dGPU      |       nan | dgpu-skin-temp     |
+| STT VALUE dGPU      |       nan |                    |
+| CCLK Boost SETPOINT |       nan | power-saving /     |
+| CCLK BUSY VALUE     |       nan | max-performance    |

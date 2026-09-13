@@ -69,7 +69,7 @@ impl Panel {
 pub fn spawn(
     config: LedConfig,
     cpu_max_w: f64,
-    gpu_max_w: f64,
+    gpu_scale_w: f64,
     rx: Receiver<Event>,
 ) -> Option<std::thread::JoinHandle<()>> {
     if !config.enabled {
@@ -96,7 +96,7 @@ pub fn spawn(
     let gpu = Panel {
         matrix: gpu,
         history: History::new(),
-        full_scale_w: gpu_max_w,
+        full_scale_w: gpu_scale_w,
         orient: Orient {
             flip_time: config.flip_time,
             flip_watts: config.gpu_flip_watts,

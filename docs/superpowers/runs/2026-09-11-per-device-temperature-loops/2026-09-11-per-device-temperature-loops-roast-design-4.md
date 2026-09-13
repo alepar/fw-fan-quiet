@@ -1,0 +1,37 @@
+---
+super-roast verdict: clean (0 nits) [low coverage]
+mode: design        iteration: post-cap extension
+profile (assumed): Single-operator personal tooling with hardware side-effects: a Rust daemon on one Framework 16 laptop that writes CPU power limits via ryzenadj (sudo) and dGPU clock locks via NVML, and reads the EC through cros_ec/ectool. No network surface, no other users, no external data. Blast radius is the operator's own machine: a wrong cap or a stuck emergency release degrades performance or acoustics and, at worst, lets the hardware's own thermal protection (card slowdown 89 C / shutdown 92 C; EC trip points) take over. Rollback is a git revert and a daemon restart. Treat thermal-safety inversions, silent loss of control, control-loop instability (windup, chatter, starvation) and anything that defeats the hardware backstops as the material class; resilience/observability polish is low-value here.
+inputs: /var/home/alepar/AleCode/bazerame-fans/.claude/worktrees/fw-fanctrl-loop/.worktrees/super-auto-per-device-temperature-loops/docs/superpowers/runs/2026-09-11-per-device-temperature-loops/2026-09-11-per-device-temperature-loops-design.md + /var/home/alepar/AleCode/bazerame-fans/.claude/worktrees/fw-fanctrl-loop/.worktrees/super-auto-per-device-temperature-loops/docs/superpowers/runs/2026-09-11-per-device-temperature-loops/task-tree-settled.md (epic fw-fanctrl-loop-eb9, 18 beads)
+delta vs prior: 0 new confirmed (0 Blocking) · 0 carried (0 Blocking) · 19 resolved · 0 regressed (0 Blocking)
+coverage: triage ok · 9 scouts ran (0 dead) · dedupe ok · 0 raw → 0 deduped → 0 panel + 0 spot (0 promoted) · judge completion n/a (no seats; engine reports 0% for the empty population) · remainder-capped: 0
+independence: same-family (OpenAI GPT) — nine fresh scouts; no judge panel (zero candidates)
+
+Coverage qualification: `[low coverage]` is required because this non-trivial artifact produced zero raw findings. All nine scouts and dedupe completed successfully, and no agent stage failed. With no candidates there were no judge seats to dispatch, so the engine's numeric 0 judge-completion value describes an empty population rather than a dead panel.
+
+Prior-report reconciliation (iteration 3, 19 confirmed): none of the 19 findings re-surfaced in the current packets, and `per-device-temperature-loops-coverage-ledger.md` records revision-4 design dispositions for d3-01 through d3-19. They are therefore counted as resolved design findings. Those dispositions record amendments to the design and settled task tree at frozen artifact 86b808a; they do not prove that future implementation acceptance simulations or hardware behavior pass. No finding was carried or regressed.
+
+## Confirmed findings
+
+- none
+
+## Not verified (beyond panel cap)
+
+- none
+
+## Beyond remainder cap (count only)
+
+- none
+
+## Rejected (with reason)
+
+- No finding was newly rejected or re-surfaced. The Rejected dispositions in `2026-09-11-per-device-temperature-loops-roast-design-1.md`, `2026-09-11-per-device-temperature-loops-roast-design-2.md`, and `2026-09-11-per-device-temperature-loops-roast-design-3.md` remain settled.
+
+## Unverified nits (spot-checked)
+
+- none
+
+## Escalations (need human)
+
+- none
+---

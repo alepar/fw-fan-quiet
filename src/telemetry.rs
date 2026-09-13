@@ -1,5 +1,5 @@
 //! Append-only JSONL telemetry log for offline controller-quality review:
-//! every 1 Hz [`Sample`] (and, from Task 14, every controller decision)
+//! every 1 Hz [`Sample`] and every controller decision
 //! becomes one JSON line loadable into pandas/DuckDB.
 
 use std::fs::File;
@@ -7,10 +7,15 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::types::Sample;
+use crate::types::{Sample, TelemetryDevice, TelemetryFlag, TelemetryTStarState};
 
 /// Bumped whenever the line format changes; stamped into the run_start line.
-const SCHEMA_VERSION: u32 = 1;
+/// 3 (per-device loops): sample lines add independently nullable
+/// `cpu_group_c`/`gpu_group_c`; decision lines add typed T* state,
+/// per-device candidates/holds/gain sources, and labelled/polarity flags.
+// 4 adds per-sample calibration diagnostics; existing record shapes are unchanged.
+// 5 adds fresh CPU cap read-back timestamps and reset evidence to calibration context.
+const SCHEMA_VERSION: u32 = 5;
 /// Flush at least once every this many records...
 const FLUSH_EVERY_RECORDS: u32 = 10;
 /// ...and no less often than this, so a quiet log still hits disk.
@@ -27,11 +32,53 @@ const MAX_NAME_ATTEMPTS: u32 = 10;
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Record<'a> {
-    Sample(&'a Sample),
-    /// One status-flag transition (thermal_emergency, sensor_lost,
-    /// limit_not_sticking, resumed, not_calibrated, target_unreachable,
-    /// model_distrust): emitted by the controller shell alongside the
-    /// Decision record, so offline analysis gets a greppable per-flag
+    /// One evaluated calibration tick, including the tick ending the run.
+    Calibration {
+        t_mono: f64,
+        #[serde(flatten)]
+        diagnostics: &'a crate::calib::step::CalibrationDiagnostics,
+        gpu_util_pct: f64,
+        view_fresh: bool,
+        view_changed: bool,
+        reconciliation_ma_c: Option<f64>,
+        socket_ma_c: Option<f64>,
+    },
+    /// One 1 Hz sensor snapshot. `sample`'s own fields flatten straight
+    /// onto this line (its `ec`/`fanctrl`/`fanctrl_freshness` fields stay
+    /// `#[serde(skip)]`ped on `Sample` itself — `Instant` isn't
+    /// serializable and the raw structs aren't the wire shape design §3.5
+    /// wants); the seven fields below re-surface exactly the columns §3.5
+    /// asks for, flattened out of `sample.ec`/`sample.fanctrl`/
+    /// `sample.nvme_temp_c`. Build with [`Record::sample`] rather than the
+    /// struct literal directly.
+    Sample {
+        #[serde(flatten)]
+        sample: &'a Sample,
+        /// `sample.ec`'s replica max reading (design §2.2), °C.
+        ec_max: Option<i32>,
+        /// `sample.ec`'s argmax sensor label.
+        ec_argmax: Option<&'a str>,
+        /// `sample.ec`'s independently averaged CPU control group, °C.
+        cpu_group_c: Option<f64>,
+        /// `sample.ec`'s independently averaged GPU control group, °C.
+        gpu_group_c: Option<f64>,
+        /// The controller's live EC boxcar moving average (design §2.6).
+        /// Stateful and owned by the controller, not `Sample` — the
+        /// caller supplies it (see [`Record::sample`]).
+        ec_ma: Option<f64>,
+        /// `sample.nvme_temp_c`, under the design §3.5 column name.
+        nvme_c: Option<f64>,
+        /// `sample.fanctrl`'s reported fan duty, percent.
+        fanctrl_speed: Option<u8>,
+        /// `sample.fanctrl`'s `active` flag (design §2.5: `false` means
+        /// the EC's own curve, not fw-fanctrl, is driving the fans).
+        fanctrl_active: Option<bool>,
+        /// `sample.fanctrl`'s resolved strategy name.
+        strategy: Option<&'a str>,
+    },
+    /// One status-flag transition (any [`crate::control::controller::StatusFlag`],
+    /// by its `as_str()` name): emitted by the controller shell alongside
+    /// the Decision record, so offline analysis gets a greppable per-flag
     /// stream (Decision lines carry the full flag list, not the transition).
     Flag {
         t_mono: f64,
@@ -41,10 +88,7 @@ pub enum Record<'a> {
     /// One controller decision: emitted by the controller thread whenever a
     /// status change or reassert happens, with a short `cause` string
     /// ("command:set_cpu_w", "reassert", "stickiness", "resume", "release",
-    /// "auto:allocate", "auto:gpu_clock", ...). The `demand_*`/`alloc_*`/
-    /// `pi_target_w` fields carry the WHY of an Auto-mode allocator step
-    /// (cause "auto:allocate"); they are None — and skipped on the wire to
-    /// keep lines lean — for every other decision.
+    /// "auto:device_loops", ...).
     Decision {
         t_mono: f64,
         mode: String,
@@ -52,42 +96,42 @@ pub enum Record<'a> {
         gpu_max_mhz: Option<u32>,
         fan_target_rpm: f64,
         cause: String,
-        flags: Vec<String>,
+        /// Structured v3 flags preserve label, device/bound and polarity.
+        flags: Vec<TelemetryFlag>,
+        /// Shared source target temperature, °C;
+        /// mirrors `ControlStatus.t_star_c` while the source has a target.
         #[serde(skip_serializing_if = "Option::is_none")]
-        demand_cpu: Option<f64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        demand_gpu: Option<f64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        alloc_cpu_w: Option<f64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        alloc_gpu_w: Option<f64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pi_target_w: Option<f64>,
-        /// Current Kalman bias (RPM; the field keeps the historical "trim"
-        /// name so offline tooling reads old and new sessions alike);
-        /// carried on every Auto-mode decision (cause "auto:kf" marks the
-        /// updates), None otherwise.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        trim_rpm: Option<f64>,
-        /// Current Kalman gain (multiplier on the model's GPU-slope term),
-        /// carried on every Auto-mode decision alongside `trim_rpm` so the
-        /// two learned states are reviewable as one trajectory offline.
-        /// None (skipped) outside Auto.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        gain: Option<f64>,
-        /// Thermal-model parameters, carried ONLY on the periodic Auto-mode
-        /// "auto:model_snapshot" decisions (every 60 s): per-line params
-        /// would be too heavy, one snapshot a minute keeps the online-RLS
-        /// trajectory reviewable offline. None (skipped) everywhere else.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        model_a: Option<f64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        model_b: Option<f64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        model_e: Option<f64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        model_c: Option<f64>,
+        t_star: Option<f64>,
+        /// State of the shared T* source; `None` outside Auto.
+        tstar_state: Option<TelemetryTStarState>,
+        /// CPU DeviceLoop decision; `None` outside Auto.
+        cpu: Option<TelemetryDevice>,
+        /// GPU DeviceLoop decision; see [`Self::Decision::cpu`].
+        gpu: Option<TelemetryDevice>,
     },
+}
+
+impl<'a> Record<'a> {
+    /// Builds a `sample` telemetry line from a sensor snapshot plus the
+    /// controller's live EC boxcar average (design §3.5's `ec_ma` column).
+    /// `ec_ma` is threaded in by the caller rather than read off `sample`
+    /// because `EcAverage` is stateful and owned by the controller (design
+    /// §2.6, `sensors::ec` module docs) — a single `Sample` never carries
+    /// it. Every other new column derives straight from `sample` itself.
+    pub fn sample(sample: &'a Sample, ec_ma: Option<f64>) -> Self {
+        Record::Sample {
+            sample,
+            ec_max: sample.ec.as_ref().map(|e| e.max_c),
+            ec_argmax: sample.ec.as_ref().map(|e| e.argmax.as_str()),
+            cpu_group_c: sample.ec.as_ref().and_then(|e| e.cpu_group_c),
+            gpu_group_c: sample.ec.as_ref().and_then(|e| e.gpu_group_c),
+            ec_ma,
+            nvme_c: sample.nvme_temp_c,
+            fanctrl_speed: sample.fanctrl.as_ref().map(|v| v.speed_pct),
+            fanctrl_active: sample.fanctrl.as_ref().map(|v| v.active),
+            strategy: sample.fanctrl.as_ref().map(|v| v.strategy.as_str()),
+        }
+    }
 }
 
 /// First line of every file: anchors the monotonic axis to wall clock and
@@ -245,12 +289,13 @@ impl Telemetry {
 /// the controller thread (decisions): if the other thread panicked while
 /// holding the lock, keep logging instead of cascading the panic. Callers
 /// keep lock scopes one-call tiny.
+///
+/// Delegates to [`crate::sync_util::lock`], the single copy of this rule --
+/// the sensor path adopted it in roast PR-1 finding 3.
 pub fn lock(
     shared: &std::sync::Mutex<Option<Telemetry>>,
 ) -> std::sync::MutexGuard<'_, Option<Telemetry>> {
-    shared
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    crate::sync_util::lock(shared)
 }
 
 /// Opens under `preferred_dir`, falling back to `fallback_dir` if that fails
@@ -301,8 +346,8 @@ mod tests {
     fn roundtrip_records() {
         let dir = fixture_dir("roundtrip");
         let mut t = Telemetry::open(&dir).unwrap();
-        t.log(&Record::Sample(&sample_at(1.0)));
-        t.log(&Record::Sample(&sample_at(2.0)));
+        t.log(&Record::sample(&sample_at(1.0), None));
+        t.log(&Record::sample(&sample_at(2.0), None));
         t.log(&Record::Flag {
             t_mono: 3.0,
             flag: "resumed".into(),
@@ -315,18 +360,11 @@ mod tests {
             gpu_max_mhz: None,
             fan_target_rpm: 3000.0,
             cause: "command:set_cpu_w".into(),
-            flags: vec!["resumed".into()],
-            demand_cpu: None,
-            demand_gpu: None,
-            alloc_cpu_w: None,
-            alloc_gpu_w: None,
-            pi_target_w: None,
-            trim_rpm: None,
-            gain: None,
-            model_a: None,
-            model_b: None,
-            model_e: None,
-            model_c: None,
+            flags: vec![TelemetryFlag::legacy("resumed")],
+            t_star: None,
+            tstar_state: None,
+            cpu: None,
+            gpu: None,
         });
         t.flush();
 
@@ -345,7 +383,7 @@ mod tests {
             start["t_wall"].as_f64().unwrap() > 1.5e9,
             "t_wall must be real unix seconds"
         );
-        assert_eq!(start["schema_version"], 1);
+        assert_eq!(start["schema_version"], 5);
 
         let first: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(first["kind"], "sample");
@@ -372,7 +410,9 @@ mod tests {
         assert_eq!(decision["gpu_max_mhz"], serde_json::Value::Null);
         assert_eq!(decision["fan_target_rpm"], 3000.0);
         assert_eq!(decision["cause"], "command:set_cpu_w");
-        assert_eq!(decision["flags"][0], "resumed");
+        assert_eq!(decision["flags"][0]["name"], "legacy");
+        assert_eq!(decision["flags"][0]["flag"], "resumed");
+        assert_eq!(decision["flags"][0]["active"], true);
         // None auto fields are skipped entirely: non-auto lines stay lean.
         for key in [
             "demand_cpu",
@@ -380,24 +420,281 @@ mod tests {
             "alloc_cpu_w",
             "alloc_gpu_w",
             "pi_target_w",
-            "trim_rpm",
-            "gain",
-            "model_a",
-            "model_b",
-            "model_e",
-            "model_c",
+            "t_star",
+            "freeze",
         ] {
             assert!(
                 decision.get(key).is_none(),
                 "{key} must be skipped when None: {decision}"
             );
         }
+        assert!(decision.get("budget_w").is_none());
         assert!(
             decision["t_wall"].as_f64().unwrap() > 1.5e9,
             "decision lines carry a top-level wall-clock stamp"
         );
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Design §3.5: the `sample` line's sensor-group columns, each
+    /// derived from a populated `Sample` (`ec`, `nvme_temp_c`, `fanctrl`)
+    /// plus the caller-supplied `ec_ma`. A value the record could actually
+    /// fail to carry (a real EC reading, a real `FanctrlView`) — not a
+    /// `Sample::default()`, which would let every field trivially pass at
+    /// `null`.
+    #[test]
+    fn sample_line_carries_the_new_sensor_columns() {
+        use crate::fanctrl::client::FanctrlView;
+        use crate::test_support::fixtures;
+        use std::time::Instant;
+
+        let dir = fixture_dir("sample-new-columns");
+        let ec = crate::sensors::ec::EcReading::read(&fixtures::path("hwmon/cros_ec_load"))
+            .expect("fixture must yield a reading");
+        let expected_max = ec.max_c;
+        let expected_argmax = ec.argmax.as_str().to_string();
+        let sample = Sample {
+            ec: Some(ec),
+            nvme_temp_c: Some(63.5),
+            fanctrl: Some(FanctrlView {
+                strategy: "quiet16".into(),
+                active: true,
+                speed_pct: 42,
+                temperature: 75.0,
+                ma_temperature: 74.2,
+                ma_interval: 60,
+                curve: vec![(0.0, 15), (95.0, 100)],
+                observed_at: Instant::now(),
+                all_observed_at: Some(Instant::now()),
+            }),
+            ..Sample::default()
+        };
+
+        let mut t = Telemetry::open(&dir).unwrap();
+        t.log(&Record::sample(&sample, Some(70.8)));
+        t.flush();
+
+        let contents = fs::read_to_string(t.path()).unwrap();
+        let line: serde_json::Value = serde_json::from_str(contents.lines().nth(1).unwrap())
+            .expect("line 1 is the sample record");
+        assert_eq!(line["ec_max"], expected_max);
+        assert_eq!(line["ec_argmax"], expected_argmax);
+        assert_eq!(line["ec_ma"], 70.8);
+        assert_eq!(line["nvme_c"], 63.5);
+        assert_eq!(line["fanctrl_speed"], 42);
+        assert_eq!(line["fanctrl_active"], true);
+        assert_eq!(line["strategy"], "quiet16");
+        // The raw sub-structs stay off the wire; only the flattened
+        // columns above surface them.
+        assert!(line.get("ec").is_none());
+        assert!(line.get("fanctrl").is_none());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A `Sample::default()` has no EC/fanctrl/NVMe reading at all: every
+    /// new column must come back `null`, not panic or fabricate a value.
+    #[test]
+    fn sample_line_new_columns_are_null_without_a_reading() {
+        let dir = fixture_dir("sample-new-columns-absent");
+        let mut t = Telemetry::open(&dir).unwrap();
+        t.log(&Record::sample(&sample_at(1.0), None));
+        t.flush();
+
+        let contents = fs::read_to_string(t.path()).unwrap();
+        let line: serde_json::Value = serde_json::from_str(contents.lines().nth(1).unwrap())
+            .expect("line 1 is the sample record");
+        for key in [
+            "ec_max",
+            "ec_argmax",
+            "ec_ma",
+            "nvme_c",
+            "fanctrl_speed",
+            "fanctrl_active",
+            "strategy",
+        ] {
+            assert!(
+                line[key].is_null(),
+                "{key} must be null without a reading: {line}"
+            );
+        }
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn schema_v3_sample_groups_are_independently_nullable() {
+        use crate::test_support::fixtures;
+
+        let mut ec = crate::sensors::ec::EcReading::read(&fixtures::path("hwmon/cros_ec_load"))
+            .expect("fixture must yield a reading");
+        ec.cpu_group_c = Some(50.0);
+        ec.gpu_group_c = Some(70.0);
+        let both = Sample {
+            ec: Some(ec.clone()),
+            ..Sample::default()
+        };
+        let both_wire = serde_json::to_value(Record::sample(&both, None)).unwrap();
+        assert_eq!(both_wire["cpu_group_c"], 50.0);
+        assert_eq!(both_wire["gpu_group_c"], 70.0);
+
+        ec.gpu_group_c = None;
+        let missing_gpu = Sample {
+            ec: Some(ec),
+            ..Sample::default()
+        };
+        let missing_gpu_wire = serde_json::to_value(Record::sample(&missing_gpu, None)).unwrap();
+        assert_eq!(missing_gpu_wire["cpu_group_c"], 50.0);
+        assert!(missing_gpu_wire["gpu_group_c"].is_null());
+
+        let mut gpu_only_ec = missing_gpu.ec.unwrap();
+        gpu_only_ec.cpu_group_c = None;
+        gpu_only_ec.gpu_group_c = Some(70.0);
+        let missing_cpu = Sample {
+            ec: Some(gpu_only_ec),
+            ..Sample::default()
+        };
+        let missing_cpu_wire = serde_json::to_value(Record::sample(&missing_cpu, None)).unwrap();
+        assert!(missing_cpu_wire["cpu_group_c"].is_null());
+        assert_eq!(missing_cpu_wire["gpu_group_c"], 70.0);
+    }
+
+    /// The decision line carries every revision-4 field and none of the
+    /// retired controller fields. Check raw JSON text, not only the
+    /// struct shape (a struct that no longer HAS a removed field always
+    /// "lacks" it trivially; this catches a field merely renamed back in,
+    /// or a stray value smuggled into `cause`/a flag string).
+    #[test]
+    fn decision_line_drops_retired_fields_and_carries_revision_four_fields() {
+        let dir = fixture_dir("decision-new-fields");
+        let mut t = Telemetry::open(&dir).unwrap();
+        t.log(&Record::Decision {
+            t_mono: 10.0,
+            mode: "auto".into(),
+            cpu_limit_w: Some(30.0),
+            gpu_max_mhz: Some(1950),
+            fan_target_rpm: 3000.0,
+            cause: "auto:device_loops".into(),
+            flags: vec![],
+            t_star: Some(71.5),
+            tstar_state: Some(TelemetryTStarState::Held),
+            cpu: Some(TelemetryDevice {
+                group_c: Some(70.0),
+                err_c: Some(1.5),
+                thermal: 30.0,
+                shadow: 31.0,
+                cap: 30.0,
+                selected: crate::types::TelemetrySelected::Thermal,
+                hold: crate::types::TelemetryHold::None,
+                gains_source: crate::types::GainsSource::Config,
+            }),
+            gpu: Some(TelemetryDevice {
+                group_c: Some(70.5),
+                err_c: Some(1.0),
+                thermal: 1950.0,
+                shadow: 2000.0,
+                cap: 1950.0,
+                selected: crate::types::TelemetrySelected::Thermal,
+                hold: crate::types::TelemetryHold::None,
+                gains_source: crate::types::GainsSource::Config,
+            }),
+        });
+        t.flush();
+
+        let contents = fs::read_to_string(t.path()).unwrap();
+        let raw = contents.lines().nth(1).unwrap();
+        assert!(!raw.contains("\"gain\""), "raw line: {raw}");
+        assert!(!raw.contains("model_a"), "raw line: {raw}");
+        assert!(!raw.contains("model_b"), "raw line: {raw}");
+        assert!(!raw.contains("model_e"), "raw line: {raw}");
+        assert!(!raw.contains("model_c"), "raw line: {raw}");
+
+        let line: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(line["t_star"], 71.5);
+        for retired in ["budget_w", "freeze", "pi_target_w", "alloc_cpu_w", "alloc_gpu_w", "demand_cpu", "demand_gpu"] {
+            assert!(line.get(retired).is_none(), "retired {retired}: {line}");
+        }
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn schema_v3_decision_carries_tstar_devices_and_detailed_flags() {
+        use crate::control::device_loop::{DeviceDecision, Hold, Selected};
+        use crate::types::{GainsSource, TelemetryDevice, TelemetryFlag, TelemetryTStarState};
+
+        let device = |selected, hold, source| {
+            TelemetryDevice::from((
+                DeviceDecision {
+                    t_star: 72.0,
+                    group_c: Some(70.0),
+                    err_c: Some(2.0),
+                    thermal: 2100.0,
+                    shadow: 2050.0,
+                    cap: 2050.0,
+                    selected,
+                    hold,
+                    write_allowed: true,
+                    group_lost: false,
+                    write_immediately: false,
+                },
+                source,
+            ))
+        };
+        let decision = Record::Decision {
+            t_mono: 10.0,
+            mode: "auto".into(),
+            cpu_limit_w: Some(30.0),
+            gpu_max_mhz: Some(2050),
+            fan_target_rpm: 3000.0,
+            cause: "auto:device_loops".into(),
+            flags: vec![TelemetryFlag::ArgmaxStuck {
+                label: "ambient_f75303@4d".into(),
+                active: true,
+            }],
+            t_star: Some(72.0),
+            tstar_state: Some(TelemetryTStarState::Curve),
+            cpu: Some(device(Selected::Thermal, Hold::None, GainsSource::Config)),
+            gpu: Some(device(Selected::Shadow, Hold::Shadow, GainsSource::Fitted)),
+        };
+
+        let wire = serde_json::to_value(&decision).unwrap();
+        assert_eq!(wire["tstar_state"], "curve");
+        assert_eq!(wire["cpu"]["group_c"], 70.0);
+        assert_eq!(wire["cpu"]["selected"], "thermal");
+        assert_eq!(wire["gpu"]["hold"]["kind"], "shadow");
+        assert_eq!(wire["flags"][0]["name"], "argmax_stuck");
+        assert_eq!(wire["flags"][0]["label"], "ambient_f75303@4d");
+        assert_eq!(wire["flags"][0]["active"], true);
+        for retired in ["budget_w", "freeze", "pi_target_w", "alloc_cpu_w", "alloc_gpu_w", "demand_cpu", "demand_gpu"] {
+            assert!(wire.get(retired).is_none(), "retired {retired}: {wire}");
+        }
+    }
+
+    #[test]
+    fn monitor_emission_explicitly_marks_v3_device_state_absent() {
+        let decision = Record::Decision {
+            t_mono: 1.0,
+            mode: "monitor".into(),
+            cpu_limit_w: None,
+            gpu_max_mhz: None,
+            fan_target_rpm: 3000.0,
+            cause: "command:release_all".into(),
+            flags: Vec::new(),
+            t_star: None,
+            tstar_state: None,
+            cpu: None,
+            gpu: None,
+        };
+
+        let wire = serde_json::to_value(decision).unwrap();
+        for field in ["tstar_state", "cpu", "gpu"] {
+            assert!(
+                wire.get(field).is_some_and(serde_json::Value::is_null),
+                "{field} must be an explicit null outside Auto: {wire}"
+            );
+        }
     }
 
     #[test]
@@ -462,12 +759,12 @@ mod tests {
     fn log_survives_unlinked_file() {
         let dir = fixture_dir("file-gone");
         let mut t = Telemetry::open(&dir).unwrap();
-        t.log(&Record::Sample(&sample_at(0.0)));
+        t.log(&Record::sample(&sample_at(0.0), None));
         fs::remove_dir_all(&dir).unwrap();
 
         // 20 records force flushes past the deleted file; must not panic.
         for i in 1..=20 {
-            t.log(&Record::Sample(&sample_at(f64::from(i))));
+            t.log(&Record::sample(&sample_at(f64::from(i)), None));
         }
         t.flush();
     }
@@ -483,7 +780,7 @@ mod tests {
 
         let mut t = Telemetry::from_parts(file, path);
         for i in 0..20 {
-            t.log(&Record::Sample(&sample_at(f64::from(i))));
+            t.log(&Record::sample(&sample_at(f64::from(i)), None));
         }
         assert!(
             t.warned,
@@ -499,7 +796,7 @@ mod tests {
         let dir = fixture_dir("flush-policy");
         let mut t = Telemetry::open(&dir).unwrap();
         for i in 0..10 {
-            t.log(&Record::Sample(&sample_at(f64::from(i))));
+            t.log(&Record::sample(&sample_at(f64::from(i)), None));
         }
         // No explicit flush: the 10-record policy must have flushed already
         // (run_start header + 10 records).

@@ -6,27 +6,35 @@ mod calib;
 mod config;
 mod control;
 mod event;
+mod fanctrl;
+#[cfg(test)]
+mod integration_tests;
 mod led;
 mod logging;
 mod model;
 mod ring;
 mod selftest;
 mod sensors;
+#[cfg(test)]
+mod sim;
 mod state;
+mod sync_util;
 mod telemetry;
+#[cfg(test)]
+mod test_support;
 mod types;
 mod ui;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 
-use actuators::cmd::RealRunner;
+use actuators::cmd::{self, RealRunner};
 use actuators::cpu::{CpuActuator, PLATFORM_PROFILE_PATH};
 use actuators::gpu::{BoxedGpu, GpuActuator};
 use actuators::guard::{FinalRestore, RestoreGuard};
@@ -34,7 +42,10 @@ use actuators::smu_module::SmuModule;
 use control::Command;
 use control::controller::{self, Controller};
 use event::Event;
+use fanctrl::client::{FanctrlSource, UnixFanctrlClient};
 use model::Model;
+use sensors::hwmon::Hwmon;
+use sensors::poller::{self, FanctrlPoller, SharedFanctrl, SharedNvme, spawn_nvme_poller};
 use sensors::sampler::Sampler;
 use telemetry::{Record, Telemetry};
 use ui::view::view;
@@ -104,7 +115,7 @@ fn main() -> Result<()> {
     // one; the controller consumes the fan target, floors and fast limit
     // (and saves the fan target back on change).
     let config = config::Config::load(&args.config);
-    // Persisted calibration (model + LUT) seeds the controller; a fresh
+    // Persisted calibration (controller state) seeds the controller; a fresh
     // calibration run overwrites the file through the same path.
     let persisted = state::PersistedState::load(&args.state_file);
 
@@ -184,14 +195,40 @@ fn main() -> Result<()> {
     let led = led::spawn(
         config.leds.clone(),
         config.cpu_max_w,
-        config.gpu_max_w,
+        config::GPU_POWER_SCALE_W,
         led_sample_rx,
     );
+    // fw-fanctrl socket poller + NVMe poller (design doc §3.4 / Task 14):
+    // each gets its own thread and owns its own source outright, publishing
+    // into a small `Arc<Mutex<_>>` the sampler tick only ever reads -- see
+    // `sensors::poller`'s module doc for why neither lives on the sampler
+    // tick itself, and why the socket client is not what is shared.
+    // Construction only, here: the cadence/merge logic is
+    // `sensors::poller`'s and `Sampler`'s.
+    let fanctrl_snapshot: SharedFanctrl = poller::shared_fanctrl();
+    let fanctrl_client = Box::new(UnixFanctrlClient::new(config.fanctrl_socket.clone()))
+        as Box<dyn FanctrlSource + Send>;
+    let fanctrl_poller = FanctrlPoller::new(
+        fanctrl_client,
+        Arc::clone(&fanctrl_snapshot),
+        Instant::now(),
+    );
+    let fanctrl_poller_thread = fanctrl_poller.spawn(Arc::clone(&shutdown));
+
+    let nvme_hwmon = Hwmon::discover(Path::new("/sys/class/hwmon"));
+    let nvme_cache: SharedNvme = Arc::new(Mutex::new(None));
+    let nvme_poller_thread = spawn_nvme_poller(
+        move || nvme_hwmon.nvme_composite_c(),
+        Arc::clone(&nvme_cache),
+        Arc::clone(&shutdown),
+    );
+
     let mut sampler_txs = vec![ui_tx.clone(), ctl_sample_tx];
     if led.is_some() {
         sampler_txs.push(led_sample_tx);
     }
-    let sampler = Sampler::new_system().spawn(sampler_txs, Arc::clone(&shutdown));
+    let sampler =
+        Sampler::new_system(fanctrl_snapshot, nvme_cache).spawn(sampler_txs, Arc::clone(&shutdown));
     let ctl = controller::spawn(
         Controller::new(guard, persisted, args.state_file, config, args.config),
         ctl_sample_rx,
@@ -199,6 +236,7 @@ fn main() -> Result<()> {
         ui_tx.clone(),
         Arc::clone(&telemetry),
         Arc::clone(&restored),
+        Arc::clone(&shutdown),
     );
 
     // try_init() returns Err instead of panicking when there is no usable
@@ -225,6 +263,7 @@ fn main() -> Result<()> {
     // fails and it eprintln!s the error, which PANICS (dead stderr) - during
     // unwind that is a double panic -> SIGABRT before any hardware restore
     // can run (observed on-machine as SIGABRT via coredumpctl).
+    let controller_joined;
     let init_result = ratatui::try_init();
     let result = match init_result {
         Ok(terminal) => {
@@ -239,7 +278,7 @@ fn main() -> Result<()> {
             let result = run(&mut terminal, &ui_rx, &cmd_tx, &telemetry, &term_flag);
             // Hardware restore BEFORE any terminal I/O (see ORDER above).
             shutdown.store(true, Ordering::Relaxed);
-            quit_and_join_controller(cmd_tx, ctl);
+            controller_joined = quit_and_join_controller(cmd_tx, ctl);
             // try_restore, NOT restore(): restore() reports failure via
             // eprintln!, which itself panics when stderr is a dead tty (e.g.
             // the terminal hung up). Verified on-machine via pty-hangup repro.
@@ -253,7 +292,7 @@ fn main() -> Result<()> {
         }
         Err(e) => {
             shutdown.store(true, Ordering::Relaxed);
-            quit_and_join_controller(cmd_tx, ctl);
+            controller_joined = quit_and_join_controller(cmd_tx, ctl);
             Err(color_eyre::eyre::eyre!(e).wrap_err("cannot initialize terminal UI"))
         }
     };
@@ -261,16 +300,41 @@ fn main() -> Result<()> {
     if let Some(t) = telemetry::lock(&telemetry).as_mut() {
         t.flush();
     }
-    if sampler.join().is_err() {
-        tracing::error!("sampler thread panicked");
-    }
+    // The sampler and poller threads: `shutdown` is already set above, so
+    // all are already exiting (or exited) by the time we get here; this is
+    // just reaping them. UNLESS the controller join timed out (roast-pr-3):
+    // the wedge that bound exists for is an untimed driver call, and the
+    // sampler makes the same NVML calls — an unbounded join here would then
+    // block main forever BEFORE `_final_restore` drops, making the bounded
+    // controller join's documented fallback unreachable. On that path the
+    // reaps are bounded too; the threads own nothing needing cleanup once
+    // shutdown began, and process exit reclaims them.
+    let reap = |name: &str, handle: std::thread::JoinHandle<()>| {
+        let outcome = if controller_joined {
+            match handle.join() {
+                Ok(()) => JoinOutcome::Joined,
+                Err(_) => JoinOutcome::Panicked,
+            }
+        } else {
+            join_with_timeout(handle, DETACHED_REAP_TIMEOUT)
+        };
+        match outcome {
+            JoinOutcome::Joined => {}
+            JoinOutcome::Panicked => tracing::error!("{name} thread panicked"),
+            JoinOutcome::TimedOut => tracing::error!(
+                "{name} thread did not exit within {DETACHED_REAP_TIMEOUT:?} after a \
+                 timed-out controller join; detaching it so hardware restore can run"
+            ),
+        }
+    };
+    reap("sampler", sampler);
+    reap("fanctrl poller", fanctrl_poller_thread);
+    reap("nvme poller", nvme_poller_thread);
     // After the sampler: it held the only live led_sample sender, so its exit
     // disconnects the LED channel, letting that thread blank the panels and
     // return. A no-op when the feature was inert (`led` is None).
     if let Some(led) = led {
-        if led.join().is_err() {
-            tracing::error!("led thread panicked");
-        }
+        reap("led", led);
     }
     // The input thread stays blocked in crossterm::event::read(). A
     // poll(100ms)+shutdown-flag loop would let it exit cleanly, but detaching
@@ -279,17 +343,97 @@ fn main() -> Result<()> {
     result
 }
 
+/// Margin on top of the bounded worst case in [`CONTROLLER_JOIN_TIMEOUT`]:
+/// covers the ~400 ms fan-profile toggle, the untimed-but-fast `nvml`
+/// release, and scheduling slop.
+const CONTROLLER_JOIN_MARGIN: Duration = Duration::from_secs(5);
+
+/// How long shutdown waits for the controller to finish restoring hardware
+/// before giving up on it and continuing (terminal restore in particular).
+///
+/// DERIVED from `actuators::cmd::RUN_TIMEOUT` so the two cannot drift
+/// (roast-pr-2 finding 3). The bounded worst case for "one in-flight sample
+/// plus the restore that follows" is five external commands, each capped at
+/// `RUN_TIMEOUT`: a `set_sustained_mw` (write + `verify_write` = 2), its
+/// design-§2.9 Mismatch re-write (another 2 — itself now skipped once
+/// shutdown began, so this is the pessimistic bound), and `modprobe
+/// ryzen_smu` in the restore (1). At the previous flat 20 s the join could
+/// expire with every external command honouring its own deadline, which is
+/// exactly the abandoned-thread window finding 2 closes; the constant's doc
+/// claimed it "only bites when the controller thread is wedged somewhere
+/// with no timeout of its own", and now that is true.
+const CONTROLLER_JOIN_TIMEOUT: Duration =
+    Duration::from_secs(5 * cmd::RUN_TIMEOUT.as_secs() + CONTROLLER_JOIN_MARGIN.as_secs());
+
+/// How long each sampler/poller reap waits AFTER a timed-out controller
+/// join. One sample period plus the NVMe poll's own bound is plenty for a
+/// healthy thread; a wedged one is detached (roast-pr-3).
+const DETACHED_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Outcome of [`join_with_timeout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinOutcome {
+    Joined,
+    Panicked,
+    TimedOut,
+}
+
+/// `JoinHandle::join` with a deadline. `join` itself cannot be interrupted,
+/// so the handle is moved into a helper thread that reports back over a
+/// channel; on timeout the helper is simply left running (it owns nothing
+/// but the handle and exits when the thread it is waiting on does).
+fn join_with_timeout(handle: std::thread::JoinHandle<()>, timeout: Duration) -> JoinOutcome {
+    let (done_tx, done_rx) = unbounded();
+    // A spawn failure here must not itself be fatal: fall back to reporting
+    // a timeout, which is the same "carry on with shutdown" behaviour.
+    if std::thread::Builder::new()
+        .name("join-waiter".to_string())
+        .spawn(move || {
+            let _ = done_tx.send(handle.join().is_ok());
+        })
+        .is_err()
+    {
+        return JoinOutcome::TimedOut;
+    }
+    match done_rx.recv_timeout(timeout) {
+        Ok(true) => JoinOutcome::Joined,
+        Ok(false) => JoinOutcome::Panicked,
+        Err(_) => JoinOutcome::TimedOut,
+    }
+}
+
 /// Restore hardware first: tell the controller to Quit and JOIN it, so stock
 /// state is guaranteed back before any later teardown step (terminal I/O in
 /// particular) gets a chance to block. A send failure means the controller
 /// already exited (it restores on channel disconnect too); the join still
 /// reaps it either way.
-fn quit_and_join_controller(cmd_tx: Sender<Command>, ctl: std::thread::JoinHandle<()>) {
+///
+/// The join is BOUNDED ([`CONTROLLER_JOIN_TIMEOUT`]): hardware restore comes
+/// first, but it may not come *forever*, or a wedged controller thread would
+/// leave the terminal in raw mode with no cursor for as long as the process
+/// lives. On expiry we log and continue; `FinalRestore`'s `Drop` and the
+/// controller's own disconnect path are still there to restore the hardware.
+///
+/// Returns whether the controller actually finished (joined or panicked);
+/// `false` means it is still running somewhere and every later join must be
+/// bounded too, or `FinalRestore` is never reached.
+fn quit_and_join_controller(cmd_tx: Sender<Command>, ctl: std::thread::JoinHandle<()>) -> bool {
     if cmd_tx.send(Command::Quit).is_err() {
         tracing::warn!("controller already gone at shutdown");
     }
-    if ctl.join().is_err() {
-        tracing::error!("controller thread panicked");
+    match join_with_timeout(ctl, CONTROLLER_JOIN_TIMEOUT) {
+        JoinOutcome::Joined => true,
+        JoinOutcome::Panicked => {
+            tracing::error!("controller thread panicked");
+            true
+        }
+        JoinOutcome::TimedOut => {
+            tracing::error!(
+                "controller thread did not finish restoring within {CONTROLLER_JOIN_TIMEOUT:?}; \
+                 continuing shutdown so the terminal is restored"
+            );
+            false
+        }
     }
 }
 
@@ -312,7 +456,10 @@ fn run(
             model.running = false;
             continue;
         }
-        terminal.draw(|f| view(&model, f))?;
+        terminal.draw(|f| {
+            model.set_calib_result_scroll_max(ui::view::calib_result_scroll_max(&model, f.area()));
+            view(&model, f);
+        })?;
         match rx.recv_timeout(RECV_TIMEOUT) {
             Ok(first) => {
                 // Coalesce bursts: fold everything already queued into the
@@ -321,7 +468,11 @@ fn run(
                 'events: while let Some(ev) = next {
                     if let Event::Sample(s) = &ev {
                         if let Some(t) = telemetry::lock(telemetry).as_mut() {
-                            t.log(&Record::Sample(s));
+                            // `ec_ma` (design §3.5) is the controller's own
+                            // live EC boxcar average, not part of `Sample`
+                            // (Task 15) -- the model's echoed status is the
+                            // freshest copy this loop has of it.
+                            t.log(&Record::sample(s, model.status.ec_ma_c));
                         }
                     }
                     for c in model.update(ev) {
@@ -411,5 +562,69 @@ mod tests {
             Args::try_parse_from(["bazerame-fans", "--log-dir", "/tmp/x", "selftest"]).unwrap();
         assert!(matches!(args.command, Some(Commands::Selftest)));
         assert_eq!(args.log_dir, PathBuf::from("/tmp/x"));
+    }
+
+    // --- roast-pr-2 finding 3: the join bound must exceed the BOUNDED case -
+
+    /// The pin: `CONTROLLER_JOIN_TIMEOUT`'s doc promises it "only bites when
+    /// the controller thread is wedged somewhere with no timeout of its
+    /// own". The worst case in which every external command honours its own
+    /// deadline is five `RUN_TIMEOUT`s (a `set_sustained_mw` write +
+    /// `verify_write`, its Mismatch re-write + `verify_write`, and the
+    /// restore's `modprobe ryzen_smu`). At the previous flat 20 s the join
+    /// expired on a merely slow SMU mailbox, orphaning the controller
+    /// thread. Derivation, not duplication: this fails if either constant
+    /// drifts.
+    #[test]
+    fn controller_join_timeout_exceeds_the_bounded_worst_case() {
+        assert!(
+            CONTROLLER_JOIN_TIMEOUT > 5 * cmd::RUN_TIMEOUT,
+            "join bound {CONTROLLER_JOIN_TIMEOUT:?} does not exceed 5 x RUN_TIMEOUT ({:?})",
+            5 * cmd::RUN_TIMEOUT
+        );
+    }
+
+    // --- finding 4: shutdown may never hang on the controller join --------
+
+    #[test]
+    fn join_with_timeout_reports_a_clean_join() {
+        let h = std::thread::spawn(|| {});
+        assert_eq!(
+            join_with_timeout(h, Duration::from_secs(5)),
+            JoinOutcome::Joined
+        );
+    }
+
+    #[test]
+    fn join_with_timeout_reports_a_panicking_thread() {
+        let h = std::thread::spawn(|| panic!("controller blew up"));
+        assert_eq!(
+            join_with_timeout(h, Duration::from_secs(5)),
+            JoinOutcome::Panicked
+        );
+    }
+
+    /// The pin: a controller thread wedged in an untimed hardware call must
+    /// NOT keep the terminal in raw mode forever. Before the bound, this
+    /// blocked for the full lifetime of the stuck thread.
+    #[test]
+    fn join_with_timeout_gives_up_on_a_wedged_thread() {
+        let release = Arc::new(AtomicBool::new(false));
+        let held = Arc::clone(&release);
+        let h = std::thread::spawn(move || {
+            while !held.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let started = Instant::now();
+        let outcome = join_with_timeout(h, Duration::from_millis(150));
+        let elapsed = started.elapsed();
+        release.store(true, Ordering::Relaxed);
+
+        assert_eq!(outcome, JoinOutcome::TimedOut);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "gave up only after {elapsed:?}; the join is not bounded"
+        );
     }
 }

@@ -1,50 +1,21 @@
 # bazerame-fans TODO
 
-Plan: `docs/plans/2026-07-03-bazerame-fans-plan.md` (design: `docs/plans/2026-07-03-bazerame-fans-design.md`)
+The implemented controller follows [Per-device temperature loops, revision 4](docs/superpowers/runs/2026-09-11-per-device-temperature-loops/2026-09-11-per-device-temperature-loops-design.md). Older milestone plans under `docs/plans/` and historical specifications describe retired implementations and remain as project history.
 
-Rules: one task at a time, in a subagent, TDD, commit per task, tick the box when the
-task's commit lands. Human-gated items are marked 👤.
+## Completed
 
-## Milestone 1 — Monitor (read-only dashboard)
-- [x] 1. Project scaffold (cargo + deps)
-- [x] 2. Core types + ring buffer
-- [x] 3. RAPL power sensor (wraparound-safe)
-- [x] 4. hwmon sensors (fans, Tctl, amdgpu)
-- [x] 5. CPU utilization + frequency sensors
-- [x] 6. NVML sensor wrapper
-- [x] 7. Sampler thread + event enum
-- [x] 7b. Telemetry JSONL logger (samples + decisions, for offline controller review)
-- [x] 8. UI Model + update()
-- [x] 9. Dashboard view + main wiring 👤 (visual check of live dashboard)
+- Read-only monitoring, telemetry, and the terminal dashboard
+- Manual CPU/GPU actuation with startup, shutdown, panic, and signal restoration
+- Sensor and actuator self-test
+- fw-fanctrl read-only socket polling and EC reconciliation
+- Shared T* source with independent CPU-watt and GPU-clock temperature loops
+- Per-device shadow candidates, hot-guard maximum ratchets, and paired verification
+- Native per-device step calibration with keyed gains, paired warm starts, and qualified T* persistence
+- Schema-v3 telemetry and the revision-4 TUI
+- Deterministic offline unit, integration, and plant acceptance suites
 
-## Milestone 2 — Manual actuation + safety
-- [x] 10. Command runner trait + ryzen_smu module handling
-- [x] 11. CPU actuator (ryzenadj) + stock restore
-- [x] 12. GPU actuator (NVML clock locks)
-- [x] 13. Restore guard + startup reset
-- [x] 14. Controller thread + ControlStatus
-- [x] 15. Manual-mode UI
-- [x] 16. Selftest subcommand + M2 hardware verification
+## Hardware validation
 
-## Milestone 3 — Calibration
-- [x] 17. CPU burner (implemented with task 16; selftest uses it)
-- [x] 18. Steady-state detector
-- [x] 19. Clock→watts LUT sweep
-- [x] 20. Thermal model fit + RLS
-- [x] 21. Config + state persistence
-- [x] 22. Calibration runner + UI wizard 👤 (real ~30-min calibration run still pending)
-
-## Milestone 4 — Closed loop
-- [x] 23. Demand estimator + allocator
-- [x] 24. GPU watts→clock inner PI
-- [x] 25. Auto mode wiring + UI 👤 (real gaming session validation still pending — needs a calibration run first)
-
-## Milestone 5 — Adaptive & hardening
-- [x] 26. Bounded trim integrator
-- [x] 27. Online RLS + trust monitor
-- [x] 28. Watchdogs + emergency release
-- [x] 29. Resume hardening + polish + README 👤 (acceptance + abuse tests)
-
-The plan is CODE-COMPLETE. Remaining 👤 items need the real machine: a ~30-min
-calibration run (task 22), a gaming-session Auto validation (task 25), and the design §7
-acceptance + abuse tests (task 29).
+- [ ] Run the guided per-device calibration on the target Framework 16
+- [ ] Run the 30-minute gaming acceptance session
+- [ ] Validate the VR/VRAM label spike on physical hardware

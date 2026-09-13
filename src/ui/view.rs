@@ -427,7 +427,7 @@ fn render_fans(model: &Model, frame: &mut Frame, area: Rect) {
 /// never a measured trend. Neutral only means zero at displayed precision.
 fn error_span(error: Option<f64>) -> Span<'static> {
     match error.filter(|v| v.is_finite()) {
-        Some(v) if v >= 0.05 => Span::styled(format!("↑{v:+.1}°C"), Style::default().fg(Color::Yellow)),
+        Some(v) if v >= 0.05 => Span::styled(format!("↑{v:+.1}°C"), Style::default().fg(Color::Cyan)),
         Some(v) if v <= -0.05 => Span::styled(format!("↓{v:+.1}°C"), Style::default().fg(Color::Yellow)),
         Some(_) => Span::styled("≈0.0°C", Style::default().fg(Color::Green)),
         None => Span::styled("—", Style::default().fg(Color::DarkGray)),
@@ -1316,7 +1316,7 @@ mod tests {
             for expected in ["T* 71.0°C", tstar_state_name(state), "CPU ↑+18.6°C - 31.0W unfitted", "GPU ↓-1.5°C - 2.1GHz"] {
                 assert!(header.contains(expected), "missing {expected}: {header}");
             }
-            for (label, color) in [("↑+18.6°C", Color::Yellow), ("↓-1.5°C", Color::Yellow)] {
+            for (label, color) in [("↑+18.6°C", Color::Cyan), ("↓-1.5°C", Color::Yellow)] {
                 let x = find_col(&header, label).unwrap() as u16;
                 assert_eq!(terminal.backend().buffer().cell((x, 0)).unwrap().fg, color);
             }

@@ -87,12 +87,15 @@ These are fitted values in `/var/lib/fw-fan-quiet/state.json`, not compiled defa
 
 ## Requirements
 
-- Framework 16 (2025), Ryzen AI 9 HX 370 and RTX 5070 Mobile. The shipped limits and sensor grouping are specific to this machine.
-- Bazzite or a compatible Fedora-family system with the proprietary NVIDIA driver.
-- Root access for RAPL, `ryzenadj`, NVML clock locks, and `ryzen_smu` module handling.
+- Linux with fw-fanctrl running and compatible Framework EC temperature/fan readings exposed through hwmon.
+- An AMD CPU supported by `ryzenadj`, with readable CPU package-energy counters.
+- For GPU control: an NVIDIA GPU and driver exposing NVML clock-lock support. Other GPU control backends are not implemented.
+- Root access for package-energy readings, CPU power limits, GPU clock locks, and any required kernel-module handling.
 - A recent `ryzenadj` build in `PATH`.
 
-Bazzite's packaged `ryzen_smu` lacks Strix Point PM-table support. The app unloads it before using `ryzenadj`'s working SMN backend and reloads it on exit. A failed unload leaves monitoring available and reports CPU actuation failure.
+No particular Linux distribution is required by the code. The setup above has been tested on Bazzite with the listed Framework 16 hardware. Other configurations need matching sensor mappings and hardware limits; recalibration fits the thermal response but does not discover those mappings or limits automatically.
+
+The app includes a `ryzen_smu` compatibility workaround: if the loaded module exposes no PM table, it attempts to unload it so `ryzenadj` can use its alternate backend, then reloads it on exit. This condition was observed on the example machine; the check is independent of the distribution name. A failed unload is reported, and CPU actuation may remain unavailable.
 
 ## Setup and usage with fw-fanctrl
 

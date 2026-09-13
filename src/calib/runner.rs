@@ -27,6 +27,7 @@ mod per_device_runner_tests {
     fn context() -> PerDeviceCalibContext {
         PerDeviceCalibContext {
             cpu_cap_w: Some(20.0), cpu_cap_verified: true,
+            cpu_cap_checked_at_s: None, cpu_cap_readback: None, cpu_cap_reset_reason: None,
             cpu_cap_completed_at_s: Some(0.0),
             gpu_cap_mhz: Some(1_000), gpu_cap_verified: true,
             gpu_cap_completed_at_s: Some(0.0), use_current_caps: true,
@@ -88,7 +89,7 @@ mod per_device_runner_tests {
         let mut end = Vec::new();
         for elapsed in 1..=DEVICE_FIT_WINDOW_S {
             let mut tick = gpu_step.clone();
-            tick.gpu_group_c = Some(response(55.0, 0.02, 15.0, 60.0, 500.0, elapsed as f64));
+            tick.gpu_group_c = Some(response(55.0, 0.009_527_65, 32.564, 38.4515, 500.0, elapsed as f64));
             tick.cpu_group_c = Some(response(50.0, 0.001, 15.0, 60.0, 500.0, elapsed as f64));
             end = runner.on_sample(&sample_at(482.0 + elapsed as f64), &tick);
         }
@@ -159,9 +160,11 @@ pub enum RunnerEffect {
     },
     /// A device step was skipped or rejected; existing keyed gains remain.
     Noted(String),
+    /// A disturbed measurement is being retried, not rejected permanently.
+    Retrying(String),
     /// Persist this state (the runner produces it; the controller saves it).
     SaveState(Box<PersistedState>),
-    /// Calibration finished successfully. Terminal.
+    /// Calibration ended; individual fits may have been rejected. Terminal.
     Finished,
 }
 
@@ -182,6 +185,74 @@ pub struct CalibProgress {
     pub note: String,
 }
 
+/// Retained until the next calibration, independently of live progress.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CalibOutcome {
+    pub changes: Vec<CalibGainChange>,
+    pub errors: Vec<String>,
+    pub notes: Vec<String>,
+    pub retained_cpu: Option<crate::control::device_loop::Gains>,
+    pub retained_gpu: Option<crate::control::device_loop::Gains>,
+    /// Fits are staged until the runner supplies SaveState.
+    pub applied: bool,
+    pub saved: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CalibGainChange {
+    pub device: CalibDevice,
+    pub before: crate::control::device_loop::Gains,
+    pub after: crate::control::device_loop::Gains,
+}
+
+impl CalibOutcome {
+    pub fn title(&self) -> &'static str {
+        if !self.applied || self.changes.is_empty() {
+            "failed"
+        } else if !self.saved {
+            "error: gains not saved"
+        } else if self.changes.len() < 2 || !self.errors.is_empty() {
+            "partial success"
+        } else {
+            "success"
+        }
+    }
+
+    pub fn details(&self) -> String {
+        let mut lines = Vec::new();
+        for device in [CalibDevice::Cpu, CalibDevice::Gpu] {
+            let (name, unit) = match device {
+                CalibDevice::Cpu => ("CPU", "W/C"),
+                CalibDevice::Gpu => ("GPU", "MHz/C"),
+            };
+            match self.changes.iter().find(|change| change.device == device).filter(|_| self.applied) {
+                Some(change) => lines.push(format!(
+                    "{name}: Kc {:.4} -> {:.4} {unit}; Ti {:.2} -> {:.2}s",
+                    change.before.kc, change.after.kc, change.before.ti_s, change.after.ti_s
+                )),
+                None => {
+                    let retained = match device {
+                        CalibDevice::Cpu => self.retained_cpu,
+                        CalibDevice::Gpu => self.retained_gpu,
+                    };
+                    lines.push(match retained {
+                        Some(gains) => format!("{name}: unchanged; Kc {:.4} {unit}, Ti {:.2}s retained", gains.kc, gains.ti_s),
+                        None => format!("{name}: unchanged (existing gains retained; calibration context unavailable)"),
+                    });
+                }
+            }
+        }
+        if self.applied && !self.changes.is_empty() {
+            lines.push(if self.saved { "Calibration gains updated and saved." } else { "Calibration gains updated in memory, but NOT saved." }.into());
+        } else {
+            lines.push("No gain changes applied.".into());
+        }
+        if self.applied { lines.extend(self.notes.iter().cloned()); }
+        lines.extend(self.errors.iter().cloned());
+        lines.join("\n")
+    }
+}
+
 /// Revision-4 calibration runner: one shared settle followed by native CPU
 /// watts and GPU clock steps.
 pub struct PerDeviceCalibRunner {
@@ -191,6 +262,7 @@ pub struct PerDeviceCalibRunner {
     started: bool,
     finished: bool,
     note: String,
+    retry_note: Option<String>,
 }
 
 impl PerDeviceCalibRunner {
@@ -205,6 +277,7 @@ impl PerDeviceCalibRunner {
             started: false,
             finished: false,
             note: String::new(),
+            retry_note: None,
         }
     }
 
@@ -230,8 +303,13 @@ impl PerDeviceCalibRunner {
                 RunnerEffect::FittedDevice { device: CalibDevice::Gpu, gains } => {
                     if let Some(key) = &key { self.gpu_gains.insert(key.clone(), *gains); }
                 }
+                RunnerEffect::Retrying(reason) => self.retry_note = Some(reason.clone()),
+                RunnerEffect::Noted(_) => self.retry_note = None,
                 _ => {}
             }
+        }
+        if effects.iter().any(|effect| matches!(effect, RunnerEffect::FittedDevice { .. })) {
+            self.retry_note = None;
         }
         self.note = if self.step.in_settle() {
             "holding both caps; waiting for groups and fans to settle".into()
@@ -241,6 +319,9 @@ impl PerDeviceCalibRunner {
                 CalibDevice::Gpu => "GPU clock step".into(),
             }
         };
+        if let Some(retry) = &self.retry_note {
+            self.note = format!("{retry}\n{}", self.note);
+        }
         if self.step.done() {
             self.finished = true;
             self.note = "calibration complete".into();
@@ -267,6 +348,12 @@ impl PerDeviceCalibRunner {
         self.finished = true;
         self.note = "aborted".into();
         self.step.abort(reason)
+    }
+
+    pub fn finishing_response(&self, now_s: f64) -> bool { self.step.finishing_response(now_s) }
+
+    pub fn diagnostics(&self) -> Option<&crate::calib::step::CalibrationDiagnostics> {
+        self.step.diagnostics()
     }
 
     pub fn progress(&self) -> CalibProgress {

@@ -13,7 +13,9 @@ use crate::types::{Sample, TelemetryDevice, TelemetryFlag, TelemetryTStarState};
 /// 3 (per-device loops): sample lines add independently nullable
 /// `cpu_group_c`/`gpu_group_c`; decision lines add typed T* state,
 /// per-device candidates/holds/gain sources, and labelled/polarity flags.
-const SCHEMA_VERSION: u32 = 3;
+// 4 adds per-sample calibration diagnostics; existing record shapes are unchanged.
+// 5 adds fresh CPU cap read-back timestamps and reset evidence to calibration context.
+const SCHEMA_VERSION: u32 = 5;
 /// Flush at least once every this many records...
 const FLUSH_EVERY_RECORDS: u32 = 10;
 /// ...and no less often than this, so a quiet log still hits disk.
@@ -30,6 +32,17 @@ const MAX_NAME_ATTEMPTS: u32 = 10;
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Record<'a> {
+    /// One evaluated calibration tick, including the tick ending the run.
+    Calibration {
+        t_mono: f64,
+        #[serde(flatten)]
+        diagnostics: &'a crate::calib::step::CalibrationDiagnostics,
+        gpu_util_pct: f64,
+        view_fresh: bool,
+        view_changed: bool,
+        reconciliation_ma_c: Option<f64>,
+        socket_ma_c: Option<f64>,
+    },
     /// One 1 Hz sensor snapshot. `sample`'s own fields flatten straight
     /// onto this line (its `ec`/`fanctrl`/`fanctrl_freshness` fields stay
     /// `#[serde(skip)]`ped on `Sample` itself — `Instant` isn't
@@ -370,7 +383,7 @@ mod tests {
             start["t_wall"].as_f64().unwrap() > 1.5e9,
             "t_wall must be real unix seconds"
         );
-        assert_eq!(start["schema_version"], 3);
+        assert_eq!(start["schema_version"], 5);
 
         let first: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(first["kind"], "sample");

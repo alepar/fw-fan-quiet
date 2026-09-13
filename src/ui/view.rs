@@ -6,14 +6,14 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Axis, Block, Chart, Dataset, Gauge, GraphType, Paragraph, Wrap};
+use ratatui::widgets::{Axis, Block, Chart, Dataset, Gauge, GraphType, Paragraph};
 
 use crate::control::controller::{CalibProgressLite, Mode, StatusFlag};
 use crate::model::{Model, RING_CAP};
 use crate::ring::Ring;
 use crate::types::{
-    GainsSource, TelemetryBound, TelemetryDevice, TelemetryDeviceName, TelemetryFlag,
-    TelemetryHold, TelemetrySelected, TelemetryTStarState,
+    GainsSource, TelemetryBound, TelemetryDeviceName, TelemetryFlag,
+    TelemetryTStarState,
 };
 
 /// Fixed Y bounds per chart: auto-scaling makes live charts jumpy, and these
@@ -29,23 +29,30 @@ const CPU_MAX_CLOCK_MHZ: f64 = 5100.0;
 const GPU_MAX_CLOCK_MHZ: f64 = 3090.0;
 const PCT_BOUNDS: [f64; 2] = [0.0, 100.0];
 
-pub fn view(model: &Model, frame: &mut Frame) {
-    let [header, control, charts, footer] = Layout::vertical([
+fn main_areas(area: Rect) -> [Rect; 3] {
+    Layout::vertical([
         Constraint::Length(1),
-        // Full-width control text keeps every decision field readable on an
-        // ordinary 80-column terminal; the charts use the remaining height.
-        Constraint::Length(8),
         Constraint::Fill(1),
         Constraint::Length(1),
     ])
-    .areas(frame.area());
+    .areas(area)
+}
+
+pub fn calib_result_scroll_max(model: &Model, area: Rect) -> u16 {
+    if model.status.calib.is_some() { return 0; }
+    let Some(outcome) = &model.status.calib_outcome else { return 0; };
+    let [_, charts, _] = main_areas(area);
+    let [_, bottom] = Layout::vertical([Constraint::Fill(1); 2]).areas(charts);
+    outcome_scroll_max(outcome, bottom)
+}
+
+pub fn view(model: &Model, frame: &mut Frame) {
+    let [header, charts, footer] = main_areas(frame.area());
 
     frame.render_widget(
         Paragraph::new(header_line(model)).style(Style::default().fg(Color::White)),
         header,
     );
-
-    render_control(model, frame, control);
 
     let [top, bottom] = Layout::vertical([Constraint::Fill(1); 2]).areas(charts);
     let [fans_area, watts_area] = Layout::horizontal([Constraint::Fill(1); 2]).areas(top);
@@ -53,16 +60,22 @@ pub fn view(model: &Model, frame: &mut Frame) {
 
     render_fans(model, frame, fans_area);
     render_watts(model, frame, watts_area);
-    render_temps(model, frame, temps_area);
-    // The calibration wizard borrows the bottom-right slot (the GPU clock is
-    // the least interesting chart mid-calibration); other charts stay live.
-    match &model.status.calib {
-        Some(progress) => render_calib_wizard(progress, frame, clock_area),
-        None => render_clock(model, frame, clock_area),
+    if model.status.calib.is_none() && let Some(outcome) = &model.status.calib_outcome {
+        render_calib_outcome(outcome, model.calib_result_scroll, frame, bottom);
+    } else {
+        render_temps(model, frame, temps_area);
+        // The calibration wizard borrows the bottom-right slot (the GPU clock is
+        // the least interesting chart mid-calibration); other charts stay live.
+        match &model.status.calib {
+            Some(progress) => render_calib_wizard(progress, frame, clock_area),
+            None => render_clock(model, frame, clock_area),
+        }
     }
 
     let keybar = if model.status.calib.is_some() {
         " q quit  Esc abort calibration"
+    } else if model.status.calib_outcome.is_some() {
+        " q quit  Esc dismiss result  Up/Down scroll  Home top  a auto  k calibrate"
     } else {
         " q quit  a auto  c/C cpu\u{2213}2W  g/G gpu\u{2213}105MHz  t/T fan\u{2213}250  \
          f/F d/D floors  p release  k calibrate"
@@ -77,11 +90,11 @@ pub fn view(model: &Model, frame: &mut Frame) {
 /// warnings for the latest sample. Flags carry their own (loud) styling.
 fn header_line(model: &Model) -> Line<'static> {
     let cpu = match model.status.cpu_limit_w {
-        Some(w) => format!("cpu\u{2264}{w:.0}W"),
+        Some(w) => format!("cpu\u{2264}{w:.1}W"),
         None => "cpu \u{2013}".into(),
     };
     let gpu = match model.status.gpu_max_mhz {
-        Some(mhz) => format!("gpu\u{2264}{mhz}MHz"),
+        Some(mhz) => format!("gpu\u{2264}{:.1}GHz", f64::from(mhz) / 1000.0),
         None => "gpu \u{2013}".into(),
     };
     // Auto is the mode the whole app exists for: style it loud so a glance
@@ -98,10 +111,6 @@ fn header_line(model: &Model) -> Line<'static> {
     let mut spans = vec![
         Span::raw(" bazerame-fans | "),
         mode_span,
-        Span::raw(format!(
-            " | fan target {:.0} rpm | {cpu} | {gpu}",
-            model.fan_target_rpm
-        )),
     ];
     // Severity-first render order: the single-line header has no wrap
     // (ratatui clips at the right edge), so an emergency tripping AFTER
@@ -136,12 +145,38 @@ fn header_line(model: &Model) -> Line<'static> {
             ));
         }
     }
+    // Diagnostic flags stay ahead of optional control details on narrow screens.
+    for flag in &model.status.telemetry_flags {
+        spans.push(Span::raw(format!(" | {}", flag_text(flag))));
+    }
+    spans.push(Span::raw(format!(" | {cpu} | {gpu}")));
+    if model.status.t_star_c.is_some() || model.status.tstar_state.is_some() {
+        spans.push(Span::raw(format!(
+            " | T* {} {}",
+            opt_temp(model.status.t_star_c),
+            model.status.tstar_state.map(tstar_state_name).unwrap_or("—"),
+        )));
+    }
+    for (name, device) in [("CPU", model.status.cpu.as_ref()), ("GPU", model.status.gpu.as_ref())] {
+        if let Some(device) = device {
+            spans.push(Span::raw(format!(" | {name} ")));
+            spans.push(error_span(device.err_c));
+            spans.push(Span::raw(format!(" {}", gains_name(device.gains_source))));
+        }
+    }
+    spans.push(Span::raw(format!(" | fan {:.0}rpm", model.fan_target_rpm)));
+    let ambient = model.latest.as_ref().filter(|s| s.ec_valid)
+        .and_then(|s| s.ec.as_ref())
+        .and_then(|ec| ec.all.iter().find(|(label, _)| label.as_str() == "ambient_f75303@4d"))
+        .map(|(_, temperature)| *temperature);
+    let nvme = model.latest.as_ref().and_then(|s| s.nvme_temp_c);
+    spans.push(Span::raw(format!(" | ambient {} | NVMe {}", opt_temp(ambient), opt_temp(nvme))));
     // Floors: safety config, informational — dim like the trim, and LAST so
     // it can never push a loud flag past a narrow terminal's right edge.
     spans.push(Span::styled(
         format!(
-            " | floors {:.0}W/{}MHz",
-            model.status.cpu_floor_w, model.status.gpu_floor_mhz
+            " | floors {:.0}W/{:.1}GHz",
+            model.status.cpu_floor_w, f64::from(model.status.gpu_floor_mhz) / 1000.0
         ),
         Style::default().fg(Color::DarkGray),
     ));
@@ -326,12 +361,6 @@ fn render_chart(
     frame.render_widget(chart, area);
 }
 
-/// Two-point horizontal guide line at `y` spanning the full X range (fan
-/// target and commanded-limit overlays).
-fn hline(y: f64) -> [(f64, f64); 2] {
-    [(0.0, y), (RING_CAP as f64, y)]
-}
-
 /// Base bounds, auto-extended (never shrunk) so every observed value fits:
 /// data outside the base range widens the axis instead of clipping.
 fn bounds_fit<'a>(
@@ -356,57 +385,25 @@ fn bounds_fit<'a>(
 
 fn render_fans(model: &Model, frame: &mut Frame, area: Rect) {
     let fan_segs = segments(&model.max_fan);
-    let target_pts = hline(model.fan_target_rpm);
-    let bounds = bounds_fit(FAN_BOUNDS, &fan_segs, [model.fan_target_rpm]);
+    let target_segs = segments(&model.fan_target);
+    let bounds = bounds_fit(FAN_BOUNDS, fan_segs.iter().chain(target_segs.iter()), []);
     let title = match &model.latest {
         Some(s) => format!("fans {:.0}/{:.0} rpm", s.fan1_rpm, s.fan2_rpm),
         None => "fans (rpm)".into(),
     };
-    let mut datasets = vec![line_dataset(Color::DarkGray, &target_pts).name("target")];
+    let mut datasets = series("target", Color::DarkGray, &target_segs);
     datasets.extend(series("max fan", Color::Cyan, &fan_segs));
     render_chart(frame, area, title, datasets, bounds);
 }
 
-/// Renders v3 decisions verbatim; the view never reimplements cap selection.
-fn render_control(model: &Model, frame: &mut Frame, area: Rect) {
-    let status = &model.status;
-    let state = status.tstar_state.map(tstar_state_name).unwrap_or("—");
-    let mut lines = vec![Line::from(format!("T* {} | state {state}", opt_temp(status.t_star_c)))];
-    lines.push(Line::from(device_line(
-        "CPU",
-        status.cpu.as_ref(),
-        status.cpu_limit_w.map(|v| format!("{v:.1}W")),
-    )));
-    lines.push(Line::from(device_line(
-        "GPU",
-        status.gpu.as_ref(),
-        status.gpu_max_mhz.map(|v| format!("{v}MHz")),
-    )));
-    if !status.telemetry_flags.is_empty() {
-        lines.push(Line::from(format!(
-            "flags: {}",
-            status.telemetry_flags.iter().map(flag_text).collect::<Vec<_>>().join(" | ")
-        )));
-    }
-    let block = Block::bordered().title("two-loop control");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
-}
-
-fn device_line(
-    name: &str,
-    device: Option<&TelemetryDevice>,
-    applied: Option<String>,
-) -> String {
-    let applied = applied.unwrap_or_else(|| "—".into());
-    match device {
-        Some(d) => format!(
-            "{name} g:{} e:{} th:{} sh:{} cap:{}[{}] app:{applied} h:{} gain:{}",
-            opt_temp(d.group_c), opt_error(d.err_c), d.thermal, d.shadow,
-            d.cap, selected_name(d.selected), hold_name(d.hold), gains_name(d.gains_source),
-        ),
-        None => format!("{name} g:— e:— th:— sh:— cap:—[—] app:{applied} h:— gain:—"),
+/// Error is target minus group temperature: arrows show desired direction,
+/// never a measured trend. Neutral only means zero at displayed precision.
+fn error_span(error: Option<f64>) -> Span<'static> {
+    match error.filter(|v| v.is_finite()) {
+        Some(v) if v >= 0.05 => Span::styled(format!("↑{v:+.1}°C"), Style::default().fg(Color::Cyan)),
+        Some(v) if v <= -0.05 => Span::styled(format!("↓{v:+.1}°C"), Style::default().fg(Color::Yellow)),
+        Some(_) => Span::styled("≈0.0°C", Style::default().fg(Color::Green)),
+        None => Span::styled("—", Style::default().fg(Color::DarkGray)),
     }
 }
 
@@ -414,17 +411,10 @@ fn opt_temp(value: Option<f64>) -> String {
     value.map(|v| format!("{v:.1}\u{b0}C")).unwrap_or_else(|| "—".into())
 }
 
-fn opt_error(value: Option<f64>) -> String {
-    value.map(|v| format!("{v:+.1}\u{b0}C")).unwrap_or_else(|| "—".into())
-}
-
 // Exhaustive names make a new wire variant a compile error until it gains a
 // readable rendering.
 fn tstar_state_name(value: TelemetryTStarState) -> &'static str {
     match value { TelemetryTStarState::Curve => "Curve", TelemetryTStarState::Held => "Held", TelemetryTStarState::Uncontrollable => "Uncontrollable", TelemetryTStarState::Released => "Released" }
-}
-fn selected_name(value: TelemetrySelected) -> &'static str {
-    match value { TelemetrySelected::Thermal => "T", TelemetrySelected::Shadow => "S", TelemetrySelected::Floor => "F", TelemetrySelected::Max => "M" }
 }
 fn bound_name(value: TelemetryBound) -> &'static str {
     match value { TelemetryBound::Floor => "floor", TelemetryBound::Max => "max" }
@@ -436,9 +426,6 @@ fn device_name(value: TelemetryDeviceName) -> &'static str {
     match value { TelemetryDeviceName::Cpu => "CPU", TelemetryDeviceName::Gpu => "GPU" }
 }
 fn polarity(value: bool) -> &'static str { if value { "active" } else { "clear" } }
-fn hold_name(value: TelemetryHold) -> String {
-    match value { TelemetryHold::None => "tracking".into(), TelemetryHold::Shadow => "shadow".into(), TelemetryHold::Clamp { bound } => format!("clamp {}", bound_name(bound)), TelemetryHold::ActuatorMismatch => "actuator mismatch".into(), TelemetryHold::GroupUnavailable => "group unavailable".into(), TelemetryHold::DrawUnavailable => "draw unavailable".into(), TelemetryHold::Bypass => "bypass".into() }
-}
 fn flag_text(value: &TelemetryFlag) -> String { match value {
     TelemetryFlag::ArgmaxUncontrollable { label, active } => format!("argmax uncontrollable {label} ({})", polarity(*active)),
     TelemetryFlag::ArgmaxStuck { label, active } => format!("argmax stuck {label} ({})", polarity(*active)),
@@ -459,7 +446,7 @@ fn render_watts(model: &Model, frame: &mut Frame, area: Rect) {
     let gpu_scale_w = crate::config::GPU_POWER_SCALE_W;
     let cpu_segs = to_percent(&segments(&model.cpu_w), cpu_max_w);
     let gpu_segs = to_percent(&segments(&model.gpu_w), gpu_scale_w);
-    let limit_pts = model.status.cpu_limit_w.map(|w| hline(w / cpu_max_w * 100.0));
+    let cap_segs = to_percent(&segments(&model.cpu_cap), cpu_max_w);
     let title = match &model.latest {
         Some(s) => format!(
             "watts cpu {:.1} gpu {:.1} W (% of display scale)",
@@ -467,10 +454,7 @@ fn render_watts(model: &Model, frame: &mut Frame, area: Rect) {
         ),
         None => "watts (% of display scale)".into(),
     };
-    let mut datasets = Vec::new();
-    if let Some(pts) = &limit_pts {
-        datasets.push(line_dataset(Color::DarkGray, pts).name("cpu cap"));
-    }
+    let mut datasets = series("cpu cap", Color::DarkGray, &cap_segs);
     datasets.extend(series("cpu", Color::Yellow, &cpu_segs));
     datasets.extend(series("gpu", Color::Green, &gpu_segs));
     render_chart(frame, area, title, datasets, PCT_BOUNDS);
@@ -486,8 +470,10 @@ fn render_temps(model: &Model, frame: &mut Frame, area: Rect) {
         ),
         None => "temps".into(),
     };
-    let bounds = bounds_fit(TEMP_BOUNDS, cpu_segs.iter().chain(gpu_segs.iter()), []);
-    let mut datasets = series("cpu", Color::Yellow, &cpu_segs);
+    let target_segs = segments(&model.temp_target);
+    let bounds = bounds_fit(TEMP_BOUNDS, cpu_segs.iter().chain(gpu_segs.iter()).chain(target_segs.iter()), []);
+    let mut datasets = series("T*", Color::DarkGray, &target_segs);
+    datasets.extend(series("cpu", Color::Yellow, &cpu_segs));
     datasets.extend(series("gpu", Color::Green, &gpu_segs));
     render_chart(frame, area, title, datasets, bounds);
 }
@@ -500,8 +486,8 @@ fn render_calib_wizard(progress: &CalibProgressLite, frame: &mut Frame, area: Re
     frame.render_widget(block, area);
     let [gauge_area, load_area, note_area, hint_area] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Min(1),
         Constraint::Length(1),
     ])
     .areas(inner);
@@ -518,21 +504,40 @@ fn render_calib_wizard(progress: &CalibProgressLite, frame: &mut Frame, area: Re
             .label(format!("step {}/{}", progress.step, progress.total)),
         gauge_area,
     );
-    if progress.needs_load {
-        frame.render_widget(
-            Paragraph::new("\u{25b6} START A GPU-HEAVY LOAD (game/benchmark)").style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            load_area,
-        );
-    }
-    frame.render_widget(Paragraph::new(progress.note.clone()), note_area);
+    frame.render_widget(
+        Paragraph::new("Keep GPU load >90% during calibration\nSuggested GPU load: gpu_burn").wrap(ratatui::widgets::Wrap { trim: false }).style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        load_area,
+    );
+    frame.render_widget(Paragraph::new(progress.note.clone()).wrap(ratatui::widgets::Wrap { trim: false }), note_area);
     frame.render_widget(
         Paragraph::new("Esc abort").style(Style::default().fg(Color::DarkGray)),
         hint_area,
     );
+}
+
+fn outcome_scroll_max(outcome: &crate::calib::runner::CalibOutcome, area: Rect) -> u16 {
+    let inner = Block::bordered().inner(area);
+    let lines = Paragraph::new(outcome.details()).wrap(ratatui::widgets::Wrap { trim: false })
+        .line_count(inner.width);
+    lines.saturating_sub(usize::from(inner.height)).min(usize::from(u16::MAX)) as u16
+}
+
+fn render_calib_outcome(outcome: &crate::calib::runner::CalibOutcome, scroll: u16, frame: &mut Frame, area: Rect) {
+    let color = match outcome.title() {
+        "success" => Color::Green,
+        "partial success" => Color::Yellow,
+        _ => Color::Red,
+    };
+    let block = Block::bordered().title(format!("calibration — {}", outcome.title()))
+        .border_style(Style::default().fg(color));
+    let paragraph = Paragraph::new(outcome.details())
+        .wrap(ratatui::widgets::Wrap { trim: false });
+    let scroll = scroll.min(outcome_scroll_max(outcome, area));
+    frame.render_widget(paragraph.scroll((scroll, 0)).block(block), area);
 }
 
 /// Scale every point of pre-split segments to percent of `max` (NaN gaps are
@@ -547,10 +552,7 @@ fn render_clock(model: &Model, frame: &mut Frame, area: Rect) {
     let gpu_segs = to_percent(&segments(&model.gpu_mhz), GPU_MAX_CLOCK_MHZ);
     let cpu_segs = to_percent(&segments(&model.cpu_mhz), CPU_MAX_CLOCK_MHZ);
     // Commanded GPU max-clock overlay, on the GPU's percent scale.
-    let limit_pts = model
-        .status
-        .gpu_max_mhz
-        .map(|mhz| hline(f64::from(mhz) / GPU_MAX_CLOCK_MHZ * 100.0));
+    let cap_segs = to_percent(&segments(&model.gpu_cap), GPU_MAX_CLOCK_MHZ);
     let title = match &model.latest {
         Some(s) => format!(
             "clocks cpu {:.0} gpu {:.0} MHz (% of max)",
@@ -558,10 +560,7 @@ fn render_clock(model: &Model, frame: &mut Frame, area: Rect) {
         ),
         None => "clocks (% of max)".into(),
     };
-    let mut datasets = Vec::new();
-    if let Some(pts) = &limit_pts {
-        datasets.push(line_dataset(Color::DarkGray, pts).name("gpu max"));
-    }
+    let mut datasets = series("gpu max", Color::DarkGray, &cap_segs);
     datasets.extend(series("cpu", Color::Yellow, &cpu_segs));
     datasets.extend(series("gpu", Color::Green, &gpu_segs));
     render_chart(frame, area, title, datasets, PCT_BOUNDS);
@@ -571,7 +570,7 @@ fn render_clock(model: &Model, frame: &mut Frame, area: Rect) {
 mod tests {
     use super::*;
     use crate::event::Event;
-    use crate::types::Sample;
+    use crate::types::{Sample, TelemetryDevice, TelemetryHold, TelemetrySelected};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -731,9 +730,9 @@ mod tests {
         let terminal = draw(&m);
         let header = row_text(&terminal, 0);
         assert!(header.contains("manual"), "header was: {header:?}");
-        assert!(header.contains("cpu\u{2264}20W"), "header was: {header:?}");
+        assert!(header.contains("cpu\u{2264}20.0W"), "header was: {header:?}");
         assert!(
-            header.contains("gpu\u{2264}1500MHz"),
+            header.contains("gpu\u{2264}1.5GHz"),
             "header was: {header:?}"
         );
         assert!(header.contains("LIMIT-SLIP!"), "header was: {header:?}");
@@ -902,10 +901,10 @@ mod tests {
         let terminal = draw(&Model::new());
         let header = row_text(&terminal, 0);
         assert!(
-            header.contains("floors 15W/1000MHz"),
+            header.contains("floors 15W/1.0GHz"),
             "header was: {header:?}"
         );
-        let x = find_col(&header, "floors 15W/1000MHz").unwrap() as u16;
+        let x = find_col(&header, "floors 15W/1.0GHz").unwrap() as u16;
         let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
         assert_eq!(cell.fg, Color::DarkGray, "floors must render dim");
 
@@ -918,7 +917,7 @@ mod tests {
         }));
         let header = row_text(&draw(&m), 0);
         assert!(
-            header.contains("floors 20W/1210MHz"),
+            header.contains("floors 20W/1.2GHz"),
             "header was: {header:?}"
         );
     }
@@ -946,9 +945,9 @@ mod tests {
         assert_eq!(cell.fg, Color::Green);
         assert!(cell.modifier.contains(Modifier::BOLD));
         // Allocation shows through the existing limit fields.
-        assert!(header.contains("cpu\u{2264}17W"), "header was: {header:?}");
+        assert!(header.contains("cpu\u{2264}17.0W"), "header was: {header:?}");
         assert!(
-            header.contains("gpu\u{2264}1653MHz"),
+            header.contains("gpu\u{2264}1.7GHz"),
             "header was: {header:?}"
         );
     }
@@ -1046,13 +1045,69 @@ mod tests {
     }
 
     #[test]
+    fn completed_calibration_panel_shows_changes_and_rejections() {
+        use crate::calib::runner::{CalibGainChange, CalibOutcome};
+        use crate::calib::step::CalibDevice;
+        use crate::control::device_loop::Gains;
+        let mut model = Model::new();
+        model.status.calib_outcome = Some(CalibOutcome {
+            changes: vec![CalibGainChange {
+                device: CalibDevice::Gpu,
+                before: Gains { kc: 22.22, ti_s: 32.56 },
+                after: Gains { kc: 24.0, ti_s: 35.0 },
+            }],
+            errors: vec!["CPU fit rejected: fitted response 2.00C is below 3C".into()],
+            applied: true,
+            saved: true,
+            notes: Vec::new(),
+            ..Default::default()
+        });
+        let text = all_text(&draw(&model));
+        for expected in ["partial success", "GPU: Kc 22.2200 -> 24.0000", "CPU: unchanged", "fitted response 2.00C", "Calibration gains updated and saved"] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        assert!(!text.contains("Esc abort"));
+        assert!(text.contains("Esc dismiss result"));
+        for title in ["success", "failed"] {
+            let outcome = model.status.calib_outcome.as_mut().unwrap();
+            if title == "success" {
+                let mut cpu = outcome.changes[0].clone();
+                cpu.device = CalibDevice::Cpu;
+                outcome.changes.push(cpu);
+                outcome.errors.clear();
+            } else {
+                outcome.applied = false;
+                outcome.errors.push("calibration aborted".into());
+            }
+            assert!(all_text(&draw_size(&model, 80, 24)).contains(title));
+            draw_size(&model, 10, 5);
+        }
+        let text = all_text(&draw(&calibrating_model(false)));
+        assert!(text.contains("gpu_burn"), "{text}");
+        let small = all_text(&draw_size(&calibrating_model(false), 80, 24));
+        assert!(small.contains("gpu_burn"), "{small}");
+    }
+
+    #[test]
+    fn long_calibration_rejection_can_be_read_to_the_end() {
+        let mut model = Model::new();
+        model.status.calib_outcome = Some(crate::calib::runner::CalibOutcome {
+            errors: vec![format!("{} FINAL_REJECTION_DETAIL", "timeout gate failed; ".repeat(80))],
+            ..Default::default()
+        });
+        assert!(!all_text(&draw_size(&model, 80, 24)).contains("FINAL_REJECTION_DETAIL"));
+        model.calib_result_scroll = u16::MAX;
+        assert!(all_text(&draw_size(&model, 80, 24)).contains("FINAL_REJECTION_DETAIL"));
+    }
+
+    #[test]
     fn wizard_panel_renders_with_needs_load_prompt() {
         let terminal = draw(&calibrating_model(true));
         let text = all_text(&terminal);
         assert!(text.contains("calibration \u{2014} matrix"), "text: {text}");
         assert!(text.contains("step 4/11"), "text: {text}");
         assert!(
-            text.contains("START A GPU-HEAVY LOAD"),
+            text.contains("Keep GPU load >90% during calibration"),
             "needs_load prompt missing: {text}"
         );
         assert!(text.contains("matrix point 5/11"), "text: {text}");
@@ -1064,13 +1119,13 @@ mod tests {
     }
 
     #[test]
-    fn wizard_panel_without_needs_load_hides_prompt() {
+    fn wizard_panel_keeps_gpu_requirement_visible_without_load_request() {
         let terminal = draw(&calibrating_model(false));
         let text = all_text(&terminal);
         assert!(text.contains("calibration \u{2014} matrix"), "text: {text}");
         assert!(
-            !text.contains("START A GPU-HEAVY LOAD"),
-            "prompt must be hidden: {text}"
+            text.contains("Keep GPU load >90% during calibration"),
+            "GPU requirement must remain visible: {text}"
         );
     }
 
@@ -1152,38 +1207,32 @@ mod tests {
     }
 
     #[test]
-    fn two_loop_panel_is_legible_at_80x24_and_complete_at_120x40() {
+    fn loop_status_fits_header_and_reclaims_panel_space() {
         for state in [TelemetryTStarState::Curve, TelemetryTStarState::Held, TelemetryTStarState::Uncontrollable, TelemetryTStarState::Released] {
-            let mut model = Model::new(); model.update(Event::Status(two_loop_status(state)));
-            let text = all_text(&draw_size(&model, 80, 24));
-            for expected in ["T* 71.0\u{b0}C", tstar_state_name(state), "CPU g:72.5\u{b0}C e:-1.5\u{b0}C th:31 sh:36 cap:31[T] app:31.0W h:tracking gain:config", "GPU g:72.5\u{b0}C e:-1.5\u{b0}C th:31 sh:36 cap:31[S] app:2100MHz h:shadow gain:fitted"] { assert!(text.contains(expected), "80x24 missing {expected:?}: {text}"); }
-            let wide = all_text(&draw_size(&model, 120, 40));
-            for expected in ["cap:31[T] app:31.0W h:tracking gain:config", "cap:31[S] app:2100MHz h:shadow gain:fitted", "watts"] { assert!(wide.contains(expected), "120x40 clipped {expected:?}: {wide}"); }
+            let mut status = two_loop_status(state);
+            status.cpu.as_mut().unwrap().err_c = Some(18.6);
+            let mut model = Model::new(); model.update(Event::Status(status));
+            let terminal = draw_size(&model, 200, 40);
+            let header = row_text(&terminal, 0);
+            for expected in ["T* 71.0°C", tstar_state_name(state), "cpu≤31.0W", "gpu≤2.1GHz", "CPU ↑+18.6°C config", "GPU ↓-1.5°C fitted"] {
+                assert!(header.contains(expected), "missing {expected}: {header}");
+            }
+            for (label, color) in [("↑+18.6°C", Color::Cyan), ("↓-1.5°C", Color::Yellow)] {
+                let x = find_col(&header, label).unwrap() as u16;
+                assert_eq!(terminal.backend().buffer().cell((x, 0)).unwrap().fg, color);
+            }
+            assert!(row_text(&terminal, 1).contains("fans"));
+            assert!(!all_text(&terminal).contains("two-loop control"));
         }
-        let text = all_text(&draw(&Model::new()));
-        for expected in ["T* — | state —", "CPU g:— e:— th:— sh:— cap:—[—] app:— h:— gain:—", "GPU g:— e:— th:— sh:— cap:—[—] app:— h:— gain:—"] { assert!(text.contains(expected), "missing {expected:?}: {text}"); }
-        for obsolete in ["budget", "split", "lut"] { assert!(!text.to_lowercase().contains(obsolete), "obsolete {obsolete:?}: {text}"); }
     }
 
     #[test]
-    fn view_fixtures_cover_each_selected_hold_gains_and_structured_flag() {
-        for (selected, binding) in [(TelemetrySelected::Thermal, "T"), (TelemetrySelected::Shadow, "S"), (TelemetrySelected::Floor, "F"), (TelemetrySelected::Max, "M")] {
-            let mut status = two_loop_status(TelemetryTStarState::Curve);
-            status.cpu = Some(decision(selected, TelemetryHold::None, GainsSource::Default));
-            let mut model = Model::new(); model.update(Event::Status(status));
-            assert!(all_text(&draw_size(&model, 120, 40)).contains(&format!("cap:31[{binding}]")));
-        }
-        for (hold, text) in [(TelemetryHold::None, "tracking"), (TelemetryHold::Shadow, "shadow"), (TelemetryHold::Clamp { bound: TelemetryBound::Floor }, "clamp floor"), (TelemetryHold::Clamp { bound: TelemetryBound::Max }, "clamp max"), (TelemetryHold::ActuatorMismatch, "actuator mismatch"), (TelemetryHold::GroupUnavailable, "group unavailable"), (TelemetryHold::DrawUnavailable, "draw unavailable"), (TelemetryHold::Bypass, "bypass")] {
-            let mut status = two_loop_status(TelemetryTStarState::Held);
-            status.cpu = Some(decision(TelemetrySelected::Thermal, hold, GainsSource::Config));
-            let mut model = Model::new(); model.update(Event::Status(status));
-            assert!(all_text(&draw_size(&model, 120, 40)).contains(&format!("h:{text}")));
-        }
+    fn view_fixtures_cover_each_gains_source_and_structured_flag() {
         for (source, text) in [(GainsSource::Config, "config"), (GainsSource::Fitted, "fitted"), (GainsSource::Default, "default")] {
             let mut status = two_loop_status(TelemetryTStarState::Uncontrollable);
             status.cpu = Some(decision(TelemetrySelected::Thermal, TelemetryHold::None, source));
             let mut model = Model::new(); model.update(Event::Status(status));
-            assert!(all_text(&draw_size(&model, 120, 40)).contains(&format!("gain:{text}")));
+            assert!(row_text(&draw_size(&model, 200, 40), 0).contains(&format!("CPU ↓-1.5°C {text}")));
         }
         for flag in [
             TelemetryFlag::ArgmaxUncontrollable { label: "ambient".into(), active: true }, TelemetryFlag::ArgmaxStuck { label: "gpu_vr".into(), active: true }, TelemetryFlag::EcUnknownLabel { label: "mystery".into(), active: true }, TelemetryFlag::EcImplausible { label: "gpu_mem".into(), active: true }, TelemetryFlag::EcUncontrollableUnavailable { active: true }, TelemetryFlag::GroupLost { device: TelemetryDeviceName::Gpu, active: true }, TelemetryFlag::DeviceUnreachable { device: TelemetryDeviceName::Cpu, bound: TelemetryBound::Floor, active: true }, TelemetryFlag::TargetUnreachable { bound: TelemetryBound::Max, active: true }, TelemetryFlag::SteepCurve { active: true }, TelemetryFlag::Legacy { flag: "EC MISMATCH".into(), active: false },

@@ -52,6 +52,7 @@ use crate::types::{Sample, TelemetryFlag};
 /// UI-facing calibration progress, re-exported so the view/model layers name
 /// it without reaching into `calib::`.
 pub use crate::calib::runner::CalibProgress as CalibProgressLite;
+use crate::calib::runner::{CalibGainChange, CalibOutcome};
 
 /// Reapply active limits at least this often (defends against PPD/tuned
 /// clobbering the ryzenadj limits behind our back; design §3).
@@ -138,6 +139,8 @@ pub enum Command {
     StartCalibration,
     /// Abort calibration, restore its held pair, and return to its origin mode.
     AbortCalibration,
+    /// Dismiss the retained result without touching actuation.
+    DismissCalibrationOutcome,
     /// Restore hardware and exit the controller thread.
     Quit,
 }
@@ -292,6 +295,8 @@ pub struct ControlStatus {
     pub flags: Vec<StatusFlag>,
     /// Calibration wizard progress; Some exactly while Calibrating.
     pub calib: Option<CalibProgressLite>,
+    /// Last calibration outcome, retained after the live wizard closes.
+    pub calib_outcome: Option<CalibOutcome>,
     /// Shared source target temperature (°C), present while one is usable.
     pub t_star_c: Option<f64>,
     /// The controller's raw reconciliation moving mean (design §2.6),
@@ -336,6 +341,7 @@ impl Default for ControlStatus {
             cpu_max_w: config.cpu_max_w,
             flags: Vec::new(),
             calib: None,
+            calib_outcome: None,
             t_star_c: None,
             ec_ma_c: None,
             ec_argmax: None,
@@ -354,6 +360,15 @@ impl Default for ControlStatus {
 /// (channel sends + telemetry) and asserted on directly in tests.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Effect {
+    /// Sample-local diagnostic snapshot, captured before terminal effects drop the runner.
+    Calibration {
+        diagnostics: Box<crate::calib::step::CalibrationDiagnostics>,
+        gpu_util_pct: f64,
+        view_fresh: bool,
+        view_changed: bool,
+        reconciliation_ma_c: Option<f64>,
+        socket_ma_c: Option<f64>,
+    },
     /// CPU sustained limit commanded (clamped watts).
     CpuSet(f64),
     /// GPU max clock commanded (clamped MHz).
@@ -727,11 +742,10 @@ pub struct Controller<R: Runner> {
     /// (including Calibrating, where the rest of the sample machinery is
     /// suspended); a trip ACTS only when something is commanded.
     watchdog: ThermalWatchdog,
-    /// `Effect::Flagged` transitions recorded by `add_flag`/`remove_flag`
-    /// since the last drain; `on_command`/`on_sample` drain them into their
+    /// Flag transitions and CPU maintenance verdict notes since the last drain; `on_command`/`on_sample` drain them into their
     /// returned batch so every flag transition lands in telemetry exactly
     /// once.
-    pending_flags: Vec<Effect>,
+    pending_effects: Vec<Effect>,
     /// Debounce for the idle-Monitor watchdog warn: the immediate re-arm
     /// means a persistently hot idle machine re-trips every TRIP_STREAK
     /// samples, so warn once per continuous idle-trip episode (reset when
@@ -747,6 +761,8 @@ pub struct Controller<R: Runner> {
     calib_frozen_interval: Option<u32>,
     /// Latest synchronously verified CPU calibration write and completion.
     calib_cpu_verified: bool,
+    calib_cpu_checked_at_s: Option<f64>,
+    calib_cpu_readback: Option<WriteVerdict>,
     calib_cpu_completed_at_s: Option<f64>,
     /// GPU verification stays paired to acquisition time across every
     /// calibration command, including held and stepped locks.
@@ -831,13 +847,15 @@ impl<R: Runner> Controller<R> {
             calib_started_from_auto: false,
             calib_reentry_hold: false,
             watchdog: ThermalWatchdog::new(),
-            pending_flags: Vec::new(),
+            pending_effects: Vec::new(),
             idle_trip_warned: false,
             calib_replica: None,
             calib_ec_slope_window: std::collections::VecDeque::new(),
             calib_frozen_strategy: None,
             calib_frozen_interval: None,
             calib_cpu_verified: false,
+            calib_cpu_checked_at_s: None,
+            calib_cpu_readback: None,
             calib_cpu_completed_at_s: None,
             calib_gpu_verified: false,
             calib_gpu_completed_at_s: None,
@@ -1111,6 +1129,7 @@ impl<R: Runner> Controller<R> {
                         self.status.mode.as_str()
                     );
                 } else {
+                    self.status.calib_outcome = Some(CalibOutcome::default());
                     self.calib_started_from_auto = self.status.mode == Mode::Auto;
                     self.calib_reentry_hold = false;
                     let mut runner = CalibRunner::new(
@@ -1125,6 +1144,8 @@ impl<R: Runner> Controller<R> {
                     self.calib_frozen_strategy = None;
                     self.calib_frozen_interval = None;
                     self.calib_cpu_verified = false;
+                    self.calib_cpu_checked_at_s = None;
+                    self.calib_cpu_readback = None;
                     self.calib_cpu_completed_at_s = None;
                     self.calib_gpu_verified = false;
                     self.calib_gpu_completed_at_s = None;
@@ -1135,6 +1156,12 @@ impl<R: Runner> Controller<R> {
                     self.sync_calib_status();
                 }
                 "calib:start"
+            }
+            Command::DismissCalibrationOutcome => {
+                if self.calib.is_none() {
+                    self.status.calib_outcome = None;
+                }
+                "calib:dismissed"
             }
             Command::AbortCalibration => {
                 match self.calib.take() {
@@ -1348,7 +1375,7 @@ impl<R: Runner> Controller<R> {
                         self.stick_violations = 0;
                         tracing::warn!(
                             "CPU limit not sticking: {} W measured vs {limit} W commanded \
-                             ({needed} consecutive samples); reasserting",
+                             ({needed} consecutive samples); checking cap read-back",
                             s.cpu_pkg_w
                         );
                         if let Some(all_ok) = self.reassert_actuators(s) {
@@ -1383,12 +1410,14 @@ impl<R: Runner> Controller<R> {
             }
         }
 
-        // Periodic reassert (defends against PPD/tuned clobbers). The first
+        // Periodic maintenance: CPU read-first repair, GPU lock reassert.
+        // Defends against PPD/tuned clobbers. The first
         // sample after a command only pins the baseline.
         if self.status.cpu_limit_w.is_some() || self.status.gpu_max_mhz.is_some() {
             match self.last_reassert {
                 None => self.last_reassert = Some(s.t_mono),
                 Some(last) if s.t_mono - last >= REASSERT_PERIOD_S => {
+                    self.last_reassert = Some(s.t_mono);
                     if let Some(all_ok) = self.reassert_actuators(s) {
                         // Advance the baseline even on failure: the retry
                         // cadence stays 10 s. Telemetry honesty: a failed
@@ -2382,9 +2411,18 @@ impl<R: Runner> Controller<R> {
                 Vec::new()
             }
         };
+        let diagnostic = self.calib.as_ref().and_then(|runner| runner.diagnostics()).map(|snapshot| Effect::Calibration {
+            diagnostics: Box::new(snapshot.clone()),
+            gpu_util_pct: s.gpu_util_pct,
+            view_fresh: s.fanctrl_freshness == Freshness::Fresh,
+            view_changed: s.fanctrl_view_changed,
+            reconciliation_ma_c: self.calib_replica.as_ref().and_then(EcReplica::reconciliation_ma),
+            socket_ma_c: s.fanctrl.as_ref().map(|view| view.ma_temperature),
+        });
         let cause = self.apply_calib_effects(runner_effects, Some(s));
         self.sync_calib_status();
         let mut effects = Vec::new();
+        effects.extend(diagnostic);
         self.drain_flag_effects(&mut effects);
         if self.status != before {
             effects.push(Effect::StatusChanged { cause: cause.unwrap_or("calib:progress") });
@@ -2395,6 +2433,29 @@ impl<R: Runner> Controller<R> {
     }
 
     fn build_calib_context(&mut self, s: &Sample) -> PerDeviceCalibContext {
+        let mut cpu_cap_reset_reason = None;
+        if self.calib.is_some() && !self.shutting_down()
+            && (self.calib_cpu_checked_at_s.is_none_or(|at| s.t_mono - at >= REASSERT_PERIOD_S)
+                || self.calib.as_ref().is_some_and(|runner| runner.finishing_response(s.t_mono)))
+            && let (Some(w), Some(cpu)) = (self.status.cpu_limit_w, self.guard.cpu.as_ref())
+        {
+            // Read-only checks are harmless under a hot guard, but a repair
+            // must not precede the runner's thermal abort/restore path.
+            let hot = (s.cpu_temp_valid && s.cpu_temp_c >= self.config.cpu_hot_c)
+                || (s.gpu_temp_valid && s.gpu_temp_c >= self.config.gpu_hot_c)
+                || (s.ec_valid && s.ec.as_ref().is_some_and(|ec| ec.max_c >= 95));
+            let check = cpu.maintain_sustained_mw((w * 1000.0).round() as u32, || !hot && !self.shutting_down());
+            self.calib_cpu_checked_at_s = Some(self.command_completed_at(s));
+            self.calib_cpu_readback = Some(check.observed);
+            self.calib_cpu_verified = matches!(check.verdict(), WriteVerdict::Verified(_));
+            if let WriteVerdict::Mismatch { field, commanded, read } = check.observed {
+                let reason = format!("CPU cap reset: {field} read {read:.2}W, expected {commanded:.2}W; repair {:?}", check.repair);
+                tracing::warn!("calib: {reason}");
+                cpu_cap_reset_reason = Some(reason);
+            } else if !self.calib_cpu_verified {
+                tracing::warn!("calib: CPU cap read-back failed: {:?}", check.observed);
+            }
+        }
         if self.calib_frozen_strategy.is_none()
             && let Some(view) = s.fanctrl.as_ref().filter(|view| !view.strategy.is_empty() && view.ma_interval > 0)
         {
@@ -2481,6 +2542,9 @@ impl<R: Runner> Controller<R> {
         PerDeviceCalibContext {
             cpu_cap_w: self.status.cpu_limit_w,
             cpu_cap_verified: self.calib_cpu_verified,
+            cpu_cap_checked_at_s: self.calib_cpu_checked_at_s,
+            cpu_cap_readback: self.calib_cpu_readback,
+            cpu_cap_reset_reason,
             cpu_cap_completed_at_s: self.calib_cpu_completed_at_s,
             gpu_cap_mhz: self.status.gpu_max_mhz,
             gpu_cap_verified: self.calib_gpu_verified,
@@ -2522,6 +2586,17 @@ impl<R: Runner> Controller<R> {
                 *cur = Some(c);
             }
         }
+        if let (Some(outcome), Some(view)) = (
+            self.status.calib_outcome.as_mut(), s.and_then(|sample| sample.fanctrl.as_ref()),
+        ) {
+            let key = format!("{}:{}", view.strategy, view.ma_interval);
+            outcome.retained_cpu.get_or_insert_with(|| self.config.cpu_gains
+                .or_else(|| self.persisted_cpu_gains.get(&key).copied())
+                .unwrap_or_else(|| default_gains::<W>(view.ma_interval)));
+            outcome.retained_gpu.get_or_insert_with(|| self.config.gpu_gains
+                .or_else(|| self.persisted_gpu_gains.get(&key).copied())
+                .unwrap_or_else(|| default_gains::<Mhz>(view.ma_interval)));
+        }
         let mut cause: Option<&'static str> = None;
         let mut ended = false;
         for effect in effects {
@@ -2541,8 +2616,12 @@ impl<R: Runner> Controller<R> {
                                 self.calib_cpu_verified = true;
                                 self.calib_cpu_completed_at_s =
                                     s.map(|sample| self.command_completed_at(sample));
+                                self.calib_cpu_checked_at_s = self.calib_cpu_completed_at_s;
+                                self.calib_cpu_readback = Some(WriteVerdict::Verified(applied));
                             }
                             verdict => {
+                                self.calib_cpu_checked_at_s = s.map(|sample| self.command_completed_at(sample));
+                                self.calib_cpu_readback = Some(verdict);
                                 tracing::warn!(
                                     "calib: SetCpuMaxWatts({w}) not verified: {verdict:?}"
                                 )
@@ -2603,10 +2682,37 @@ impl<R: Runner> Controller<R> {
                 }
                 RunnerEffect::FittedDevice { device, gains } => {
                     tracing::info!("calib: {device:?} step-test fitted {gains:?}");
+                    let view = s.and_then(|sample| sample.fanctrl.as_ref());
+                    let interval = view.map_or(DEFAULT_MA_INTERVAL as u32, |view| view.ma_interval);
+                    let key = view.map(|view| format!("{}:{}", view.strategy, view.ma_interval));
+                    let before = match device {
+                        crate::calib::step::CalibDevice::Cpu => key.as_ref()
+                            .and_then(|key| self.persisted_cpu_gains.get(key)).copied()
+                            .unwrap_or_else(|| default_gains::<W>(interval)),
+                        crate::calib::step::CalibDevice::Gpu => key.as_ref()
+                            .and_then(|key| self.persisted_gpu_gains.get(key)).copied()
+                            .unwrap_or_else(|| default_gains::<Mhz>(interval)),
+                    };
+                    let overridden = match device {
+                        crate::calib::step::CalibDevice::Cpu => self.config.cpu_gains.is_some(),
+                        crate::calib::step::CalibDevice::Gpu => self.config.gpu_gains.is_some(),
+                    };
+                    let outcome = self.status.calib_outcome.get_or_insert_with(CalibOutcome::default);
+                    outcome.changes.push(CalibGainChange { device, before, after: gains });
+                    if overridden {
+                        outcome.notes.push(format!("{device:?}: config override remains active; remove it to use the new calibration gains."));
+                    }
                     raise(&mut cause, "calib:fitted");
                 }
+                RunnerEffect::Retrying(reason) => {
+                    tracing::warn!("calib: {reason}");
+                    self.status.calib_outcome.get_or_insert_with(CalibOutcome::default).notes.push(reason);
+                    raise(&mut cause, "calib:retry");
+                }
                 RunnerEffect::Noted(reason) => {
-                    tracing::info!("calib: step test skipped: {reason}");
+                    tracing::info!("calib: {reason}");
+                    self.status.calib_outcome.get_or_insert_with(CalibOutcome::default)
+                        .errors.push(reason);
                     raise(&mut cause, "calib:skipped");
                 }
                 RunnerEffect::SaveState(state) => {
@@ -2623,7 +2729,13 @@ impl<R: Runner> Controller<R> {
                     } else {
                         self.add_flag(StatusFlag::NotCalibrated);
                     }
-                    self.save_persisted_state();
+                    let saved = self.try_save_persisted_state();
+                    let outcome = self.status.calib_outcome.get_or_insert_with(CalibOutcome::default);
+                    outcome.applied = true;
+                    outcome.saved = saved.is_ok();
+                    if let Err(error) = saved {
+                        outcome.errors.push(format!("Could not save calibration: {error}"));
+                    }
                 }
                 RunnerEffect::Finished => {
                     raise(&mut cause, "calib:finished");
@@ -2686,6 +2798,12 @@ impl<R: Runner> Controller<R> {
     /// churn). Save failure is warned, not fatal: the in-memory state still
     /// carries the session.
     fn save_persisted_state(&self) {
+        if let Err(error) = self.try_save_persisted_state() {
+            tracing::warn!("auto: state save to {} failed: {error}", self.state_path.display());
+        }
+    }
+
+    fn try_save_persisted_state(&self) -> std::io::Result<()> {
         let state = PersistedState {
             calibrated_at: self.calibrated_at.clone(),
             cpu_gains: self.persisted_cpu_gains.clone(),
@@ -2694,12 +2812,7 @@ impl<R: Runner> Controller<R> {
             warm_start: self.persisted_warm_start.clone(),
             t_star_last_good: self.persisted_t_star_last_good.clone(),
         };
-        if let Err(e) = state.save(&self.state_path) {
-            tracing::warn!(
-                "auto: state save to {} failed: {e}",
-                self.state_path.display()
-            );
-        }
+        state.save(&self.state_path)
     }
 
     /// Drop the Auto loop state and write the state file (a quit from Auto
@@ -2784,6 +2897,8 @@ impl<R: Runner> Controller<R> {
         self.calib_frozen_strategy = None;
         self.calib_frozen_interval = None;
         self.calib_cpu_verified = false;
+        self.calib_cpu_checked_at_s = None;
+        self.calib_cpu_readback = None;
         self.calib_cpu_completed_at_s = None;
         self.calib_gpu_verified = false;
         self.calib_gpu_completed_at_s = None;
@@ -2883,22 +2998,44 @@ impl<R: Runner> Controller<R> {
         }
         let mut any = false;
         let mut all_ok = true;
+        let mut cpu_outcome = None;
         if let (Some(w), Some(cpu)) = (self.status.cpu_limit_w, self.guard.cpu.as_ref()) {
-            any = true;
-            // fw-fanctrl-loop-j6s: see the SetCpuW comment in on_command --
-            // same non-Verified-as-failure mapping; `all_ok` still only
-            // tracks whether the reassert attempt landed, same as before.
-            if !matches!(
-                cpu.set_sustained_mw((w * 1000.0).round() as u32),
-                WriteVerdict::Verified(_)
-            ) {
+            let check = cpu.maintain_sustained_mw((w * 1000.0).round() as u32, || !self.shutting_down());
+            tracing::debug!("CPU cap maintenance: requested {w} W, {check:?}");
+            // A read-only match is not a reassert. Failed reads are still
+            // surfaced as failed maintenance, without an unverified write.
+            any |= check.repair.is_some() || !matches!(check.observed, WriteVerdict::Verified(_));
+            if !matches!(check.verdict(), WriteVerdict::Verified(_)) {
                 all_ok = false;
-                tracing::warn!("reassert: CPU limit ({w} W) not verified");
+                tracing::warn!("CPU cap maintenance failed ({w} W): {check:?}");
             }
             let completed_at = self.command_completed_at(s);
-            if let Some(auto) = self.auto.as_mut() {
-                auto.last_cpu_write_t_mono = Some(completed_at);
+            if check.repair.is_some() {
+                tracing::info!("CPU cap repaired ({w} W): {check:?}");
             }
+            if let Some(auto) = self.auto.as_mut() {
+                let suppress = auto.on_ac_suppress_until.is_some_and(|until| s.t_mono < until);
+                auto.cpu_actuator_state = match check.verdict() {
+                    WriteVerdict::Verified(_) => ActuatorState::Verified,
+                    WriteVerdict::Mismatch { .. } if !suppress => ActuatorState::Mismatch,
+                    _ => ActuatorState::Unverifiable,
+                };
+                // Blocking reads also bound subsequent write attempts.
+                auto.last_cpu_write_t_mono = Some(completed_at);
+                let outcome = auto.cpu_verdict.observe(check.verdict(), suppress);
+                cpu_outcome = Some(outcome);
+                if outcome == VerdictOutcome::Released {
+                    if let Err(error) = cpu.restore_stock() {
+                        tracing::warn!("CPU maintenance release failed: {error}");
+                    }
+                    self.status.cpu_limit_w = None;
+                }
+            }
+        }
+        if let Some(outcome) = cpu_outcome {
+            let mut events = Vec::new();
+            self.apply_verdict_outcome(true, outcome, None, &mut events, &mut None);
+            self.pending_effects.extend(events);
         }
         if let Some(mhz) = self.status.gpu_max_mhz {
             if let Some(gpu) = self.guard.gpu.as_mut() {
@@ -2920,12 +3057,12 @@ impl<R: Runner> Controller<R> {
     }
 
     /// Set a flag. A GENUINE insertion (not already set) also records an
-    /// `Effect::Flagged { active: true }` into `pending_flags` — plan Task
+    /// `Effect::Flagged { active: true }` into `pending_effects` — plan Task
     /// 14 promises a telemetry Flag line on every status-flag transition.
     fn add_flag(&mut self, flag: StatusFlag) {
         if !self.status.flags.contains(&flag) {
             self.status.flags.push(flag);
-            self.pending_flags.push(Effect::Flagged {
+            self.pending_effects.push(Effect::Flagged {
                 flag: flag.as_str(),
                 active: true,
             });
@@ -2938,7 +3075,7 @@ impl<R: Runner> Controller<R> {
         let before = self.status.flags.len();
         self.status.flags.retain(|&f| f != flag);
         if self.status.flags.len() != before {
-            self.pending_flags.push(Effect::Flagged {
+            self.pending_effects.push(Effect::Flagged {
                 flag: flag.as_str(),
                 active: false,
             });
@@ -2949,7 +3086,7 @@ impl<R: Runner> Controller<R> {
     /// `effects`. Every `on_command`/`on_sample` return path that could have
     /// touched a flag drains, so each transition is emitted exactly once.
     fn drain_flag_effects(&mut self, effects: &mut Vec<Effect>) {
-        effects.append(&mut self.pending_flags);
+        effects.append(&mut self.pending_effects);
     }
 }
 
@@ -3078,6 +3215,15 @@ fn apply_effects<R: Runner>(
     let mut flagged: Vec<(&'static str, bool)> = Vec::new();
     for effect in effects {
         match effect {
+            Effect::Calibration { diagnostics, gpu_util_pct, view_fresh, view_changed, reconciliation_ma_c, socket_ma_c } => {
+                if let Some(t) = telemetry::lock(telemetry).as_mut() {
+                    t.log(&Record::Calibration {
+                        t_mono, diagnostics, gpu_util_pct: *gpu_util_pct,
+                        view_fresh: *view_fresh, view_changed: *view_changed,
+                        reconciliation_ma_c: *reconciliation_ma_c, socket_ma_c: *socket_ma_c,
+                    });
+                }
+            }
             Effect::Reasserted { cause: c } => {
                 cause.get_or_insert(c);
             }
@@ -3258,6 +3404,11 @@ mod tests {
             .count()
     }
 
+    fn queue_cpu_reset(runner: &FakeRunner, slow_w: f64) {
+        use crate::actuators::cmd::test_support::{output_with_stdout, ryzenadj_info_table};
+        runner.push_result(Ok(output_with_stdout(&ryzenadj_info_table(slow_w, 53.0, slow_w))));
+    }
+
     fn expected_args(mw: u32) -> Vec<String> {
         vec![
             format!("--stapm-limit={mw}"),
@@ -3403,27 +3554,22 @@ mod tests {
     }
 
     #[test]
-    fn reasserts_cpu_limit_every_10s() {
+    fn checks_cpu_limit_every_10s_without_rewriting_a_match() {
         let runner = FakeRunner::new();
         let mut ctl = controller_no_profile(&runner);
         ctl.on_command(Command::SetCpuW(20.0));
-        assert_eq!(ryzenadj_calls(&runner).len(), 1);
-
-        // First sample only sets the baseline; nothing before 10 s elapse.
-        assert!(ctl.on_sample(&sample_at(0.0)).is_empty());
-        assert!(ctl.on_sample(&sample_at(5.0)).is_empty());
-        assert!(ctl.on_sample(&sample_at(9.9)).is_empty());
-        assert_eq!(ryzenadj_calls(&runner).len(), 1);
-
-        // 10 s past the baseline: reassert with the SAME args.
-        let effects = ctl.on_sample(&sample_at(10.1));
-        assert!(has_reassert(&effects, "reassert"), "got {effects:?}");
-        assert_eq!(
-            ryzenadj_calls(&runner),
-            vec![expected_args(20_000), expected_args(20_000)]
-        );
-        // Reassert alone changes nothing user-visible: no status spam.
-        assert_eq!(status_changes(&effects), 0);
+        let baseline = runner.calls().len();
+        for t in [0.0, 5.0, 9.9] { assert!(ctl.on_sample(&sample_at(t)).is_empty()); }
+        assert_eq!(runner.calls().len(), baseline);
+        assert!(ctl.on_sample(&sample_at(10.1)).is_empty());
+        assert_eq!(runner.calls().len(), baseline + 1);
+        assert_eq!(ryzenadj_calls(&runner), vec![expected_args(20_000)]);
+        assert!(ctl.on_sample(&sample_at(11.0)).is_empty());
+        assert_eq!(runner.calls().len(), baseline + 1, "successful read advances cadence");
+        queue_cpu_reset(&runner, 40.0);
+        let effects = ctl.on_sample(&sample_at(20.2));
+        assert!(has_reassert(&effects, "reassert"));
+        assert_eq!(ryzenadj_calls(&runner), vec![expected_args(20_000), expected_args(20_000)]);
     }
 
     // --- roast-pr-2 finding 2: the abandoned-thread stop fence ------------
@@ -3589,13 +3735,13 @@ mod tests {
             "a failed attempt must not count as a phantom reassert, got {effects:?}"
         );
         assert_eq!(status_changes(&effects), 0, "status is unchanged");
-        assert_eq!(ryzenadj_calls(&runner).len(), 2, "initial set + attempt");
+        assert_eq!(ryzenadj_calls(&runner).len(), 1, "failed read must not cause a blind write");
 
         // The baseline still advanced: retry follows the normal 10 s cadence.
         assert!(ctl.on_sample(&sample_at(10.2)).is_empty());
         let effects = ctl.on_sample(&sample_at(20.2));
-        assert!(has_reassert(&effects, "reassert"), "got {effects:?}");
-        assert_eq!(ryzenadj_calls(&runner).len(), 3);
+        assert!(effects.is_empty(), "matching read needs no rewrite: {effects:?}");
+        assert_eq!(ryzenadj_calls(&runner).len(), 1);
     }
 
     #[test]
@@ -3620,6 +3766,7 @@ mod tests {
 
         // Third consecutive violation: immediate reassert + flag (with its
         // Flagged effect — every genuine transition reaches telemetry).
+        queue_cpu_reset(&runner, 40.0);
         let effects = ctl.on_sample(&sample_with_power(3.0, 26.0));
         assert!(has_reassert(&effects, "stickiness"), "got {effects:?}");
         assert!(ctl.status().flags.contains(&StatusFlag::LimitNotSticking));
@@ -3628,12 +3775,14 @@ mod tests {
         assert_eq!(ryzenadj_calls(&runner).len(), 2, "initial set + reassert");
 
         // A compliant sample clears the flag (Flagged again, active=false).
+        queue_cpu_reset(&runner, 40.0);
         let effects = ctl.on_sample(&sample_with_power(4.0, 19.0));
         assert!(!ctl.status().flags.contains(&StatusFlag::LimitNotSticking));
         assert!(has_flagged(&effects, "limit_not_sticking", false));
         assert_eq!(status_changes(&effects), 1);
 
         // Staying compliant is NOT a transition: no Flagged spam.
+        queue_cpu_reset(&runner, 40.0);
         let effects = ctl.on_sample(&sample_with_power(5.0, 19.0));
         assert!(
             !effects.iter().any(|e| matches!(e, Effect::Flagged { .. })),
@@ -3686,6 +3835,47 @@ mod tests {
         assert_eq!(flags[1]["t_mono"], 4.0);
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn calibration_telemetry_emits_blocked_samples_and_terminal_gate_snapshot() {
+        let runner = FakeRunner::new();
+        let (mut ctl, _gpu) = auto_controller_no_profile(&runner);
+        let dir = std::env::temp_dir().join(format!("calibration-gates-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let telemetry = Mutex::new(Some(Telemetry::open(&dir).unwrap()));
+        let (ui_tx, _ui_rx) = crossbeam_channel::unbounded();
+        ctl.on_command(Command::StartCalibration);
+        for now in [0.0, 1.0, 2.0, 601.0, 602.0] {
+            let mut sample = busy_at(now);
+            sample.gpu_util_pct = 0.0;
+            let effects = ctl.on_sample(&sample);
+            apply_effects(&effects, &ctl, now, &ui_tx, &telemetry);
+        }
+        let path = {
+            let mut guard = telemetry::lock(&telemetry);
+            let sink = guard.as_mut().unwrap();
+            sink.flush();
+            sink.path().to_path_buf()
+        };
+        let records: Vec<serde_json::Value> = fs::read_to_string(path).unwrap().lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|line| line["kind"] == "calibration").collect();
+        assert_eq!(records.len(), 4, "one record per calibration sample, including timeout");
+        let blocked = &records[2];
+        assert_eq!(blocked["t_mono"], 2.0);
+        assert_eq!(blocked["phase"], "settle");
+        assert_eq!(blocked["context"]["gpu_cap_verified"], false);
+        assert_eq!(blocked["gpu_util_pct"], 0.0);
+        assert_eq!(blocked["gates"][0]["name"], "caps_held");
+        assert_eq!(blocked["gates"][0]["satisfied"], false);
+        assert_eq!(blocked["gates"][0]["duration_s"], 2.0);
+        assert_eq!(blocked["windows"][0]["samples"], 0);
+        assert!(blocked["windows"][0]["span"].is_null());
+        assert_eq!(records[3]["phase"], "settle");
+        assert_eq!(records[3]["next_phase"], "done");
+        assert_eq!(records[3]["gates"][0]["satisfied"], false);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -3746,6 +3936,7 @@ mod tests {
         assert!(ctl.on_sample(&sample_with_power(2.0, 26.0)).is_empty());
         assert!(ctl.on_sample(&sample_with_power(3.0, 0.0)).is_empty());
         assert!(!ctl.status().flags.contains(&StatusFlag::LimitNotSticking));
+        queue_cpu_reset(&runner, 40.0);
         let effects = ctl.on_sample(&sample_with_power(4.0, 26.0));
         assert!(has_reassert(&effects, "stickiness"), "got {effects:?}");
     }
@@ -3762,6 +3953,7 @@ mod tests {
             resumed: true,
             ..Sample::default()
         };
+        queue_cpu_reset(&runner, 40.0);
         let effects = ctl.on_sample(&resumed);
         assert!(has_reassert(&effects, "resume"), "got {effects:?}");
         assert!(ctl.status().flags.contains(&StatusFlag::Resumed));
@@ -4092,6 +4284,9 @@ mod tests {
         let PerDeviceCalibContext {
             cpu_cap_w,
             cpu_cap_verified,
+            cpu_cap_checked_at_s,
+            cpu_cap_readback,
+            cpu_cap_reset_reason,
             cpu_cap_completed_at_s,
             gpu_cap_mhz,
             gpu_cap_verified,
@@ -4111,6 +4306,9 @@ mod tests {
             strategy,
             ma_interval,
         } = context;
+        assert_eq!(cpu_cap_checked_at_s, None);
+        assert_eq!(cpu_cap_readback, None);
+        assert_eq!(cpu_cap_reset_reason, None);
         assert_eq!((cpu_cap_w, gpu_cap_mhz), (None, None));
         assert!(!cpu_cap_verified && !gpu_cap_verified);
         assert_eq!((cpu_cap_completed_at_s, gpu_cap_completed_at_s), (None, None));
@@ -4301,6 +4499,152 @@ mod tests {
         }
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn auto_maintenance_releases_after_repeated_failed_repairs_and_stops_owning_cap() {
+        use crate::actuators::cmd::test_support::{output_with_stdout, ryzenadj_info_table};
+        let runner = FakeRunner::new();
+        let (dir, path) = profile_fixture("auto-maintenance-release");
+        let mut ctl = controller(&runner, path);
+        ctl.on_command(Command::SetCpuW(15.0));
+        ctl.on_command(Command::SetAuto(true));
+        for attempt in 1..=3 {
+            queue_cpu_reset(&runner, 40.0); // read before repair
+            runner.push_result(Ok(output_with_code(0))); // repair write
+            queue_cpu_reset(&runner, 40.0); // repair did not stick
+            if attempt == 3 {
+                runner.push_result(Ok(output_with_stdout(&ryzenadj_info_table(54.0, 53.0, 54.0))));
+            }
+            assert_eq!(ctl.reassert_actuators(&sample_at(f64::from(attempt * 10))), Some(false));
+            assert!(ctl.status().flags.contains(&StatusFlag::LimitNotSticking));
+        }
+        assert!(ctl.status().cpu_limit_w.is_none());
+        assert!(ctl.auto.as_ref().unwrap().cpu_verdict.released);
+        let calls = runner.calls().len();
+        assert_eq!(ctl.reassert_actuators(&sample_at(40.0)), None);
+        assert_eq!(runner.calls().len(), calls, "maintenance must not reacquire a released cap");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn calibration_refreshes_cpu_readback_and_preserves_a_reset_after_repair() {
+        use crate::actuators::cmd::test_support::{output_with_stdout, ryzenadj_info_table};
+        let runner = FakeRunner::new();
+        let (dir, path) = profile_fixture("calib-cap-reset");
+        let mut ctl = controller(&runner, path);
+        ctl.on_command(Command::StartCalibration);
+        ctl.apply_calib_effects(vec![RunnerEffect::SetCpuMaxWatts(15.0)], Some(&sample_at(0.0)));
+        let before = runner.calls().len();
+        ctl.build_calib_context(&sample_at(9.0));
+        assert_eq!(runner.calls().len(), before);
+        runner.push_result(Ok(output_with_stdout(&ryzenadj_info_table(40.0, 53.0, 40.0))));
+        let ctx = ctl.build_calib_context(&sample_at(10.0));
+        assert!(ctx.cpu_cap_reset_reason.as_ref().is_some_and(|s| s.contains("40")), "{ctx:?}");
+        assert!(ctx.cpu_cap_verified, "repair verified");
+        assert!(matches!(ctx.cpu_cap_readback, Some(WriteVerdict::Mismatch { read: 40.0, .. })));
+        assert_eq!(ctx.cpu_cap_checked_at_s, Some(10.0));
+        let next = ctl.build_calib_context(&sample_at(11.0));
+        assert!(next.cpu_cap_reset_reason.is_none(), "disturbance is a one-tick event");
+        ctl.on_command(Command::AbortCalibration);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cap_maintenance_reads_before_writing_and_skips_a_matching_cpu_cap() {
+        use crate::actuators::cmd::test_support::{output_with_stdout, ryzenadj_info_table};
+        let runner = FakeRunner::new();
+        let (dir, path) = profile_fixture("cpu-maintenance");
+        let mut ctl = controller(&runner, path);
+        ctl.on_command(Command::SetCpuW(15.0));
+        let before = runner.calls().len();
+        ctl.reassert_actuators(&sample_at(10.0));
+        assert_eq!(&runner.calls()[before..], &[("ryzenadj".into(), vec!["--info".into()])]);
+        runner.push_result(Ok(output_with_stdout(&ryzenadj_info_table(40.0, 53.0, 40.0))));
+        let before = runner.calls().len();
+        assert_eq!(ctl.reassert_actuators(&sample_at(20.0)), Some(true));
+        let calls = runner.calls();
+        assert_eq!(calls[before].1, vec!["--info"]);
+        assert!(calls[before + 1].1.contains(&"--slow-limit=15000".into()));
+        assert_eq!(calls[before + 2].1, vec!["--info"]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn calibration_outcome_reports_saved_partial_success_and_save_errors() {
+        use crate::calib::step::CalibDevice;
+        use crate::control::device_loop::Gains;
+        for (both, fail_save) in [(false, false), (true, false), (true, true)] {
+            let runner = FakeRunner::new();
+            let (dir, path) = profile_fixture("calib-outcome-save");
+            let mut ctl = controller(&runner, path);
+            ctl.state_path = if fail_save { dir.clone() } else { dir.join("state.json") };
+            ctl.on_command(Command::StartCalibration);
+            let mut sample = curve_sample(60.0, 60.0, 60.0, &[(40.0, 20), (80.0, 40)]);
+            let view = sample.fanctrl.as_mut().unwrap();
+            view.strategy = "quiet16".into();
+            view.ma_interval = 60;
+            let key = "quiet16:60".to_string();
+            let old = Gains { kc: 0.3, ti_s: 40.0 };
+            ctl.persisted_cpu_gains.insert(key.clone(), old);
+            let cpu = Gains { kc: 0.4, ti_s: 35.0 };
+            let gpu = Gains { kc: 24.0, ti_s: 35.0 };
+            let mut state = PersistedState::default();
+            state.cpu_gains.insert(key.clone(), cpu);
+            let mut effects = vec![RunnerEffect::FittedDevice { device: CalibDevice::Cpu, gains: cpu }];
+            if both {
+                state.gpu_gains.insert(key.clone(), gpu);
+                effects.push(RunnerEffect::FittedDevice { device: CalibDevice::Gpu, gains: gpu });
+            } else {
+                effects.push(RunnerEffect::Noted("GPU fit rejected: fitted response 2.00C is below 3C".into()));
+            }
+            effects.extend([RunnerEffect::SaveState(Box::new(state)), RunnerEffect::Finished]);
+            ctl.apply_calib_effects(effects, Some(&sample));
+            let outcome = ctl.status().calib_outcome.as_ref().unwrap();
+            assert_eq!(outcome.changes[0].before, old);
+            assert_eq!(outcome.changes[0].after, cpu);
+            assert!(outcome.applied);
+            assert_eq!(outcome.saved, !fail_save);
+            assert_eq!(outcome.title(), if fail_save { "error: gains not saved" } else if both { "success" } else { "partial success" });
+            assert_eq!(ctl.persisted_cpu_gains[&key], cpu);
+            if !both {
+                assert!(outcome.details().contains("GPU: unchanged; Kc 22.2218"), "{}", outcome.details());
+            }
+            if fail_save {
+                assert!(outcome.details().contains("NOT saved"));
+                assert!(outcome.errors.iter().any(|error| error.contains("Could not save calibration")));
+            } else {
+                assert_eq!(PersistedState::load(&ctl.state_path).cpu_gains[&key], cpu);
+            }
+            let calls = runner.calls().len();
+            ctl.on_command(Command::DismissCalibrationOutcome);
+            assert!(ctl.status().calib_outcome.is_none());
+            assert_eq!(runner.calls().len(), calls);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn calibration_outcome_remains_visible_after_completion_and_abort() {
+        let runner = FakeRunner::new();
+        let (dir, path) = profile_fixture("calib-outcome");
+        let mut ctl = controller(&runner, path);
+        ctl.on_command(Command::StartCalibration);
+        ctl.on_command(Command::AbortCalibration);
+        assert!(format!("{:?}", ctl.status()).contains("calibration aborted"));
+        ctl.on_sample(&Sample::default());
+        assert!(format!("{:?}", ctl.status()).contains("calibration aborted"));
+        ctl.on_command(Command::StartCalibration);
+        assert!(!format!("{:?}", ctl.status()).contains("calibration aborted"));
+        ctl.apply_calib_effects(vec![
+            RunnerEffect::Noted("CPU fit rejected: fitted response 2.00C is below 3C".into()),
+            RunnerEffect::Noted("GPU fit rejected: gain exceeds 4x default".into()),
+            RunnerEffect::Finished,
+        ], None);
+        let status = format!("{:?}", ctl.status());
+        assert!(status.contains("fitted response 2.00C"), "{status}");
+        assert!(status.contains("gain exceeds 4x default"), "{status}");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -5211,6 +5555,7 @@ mod tests {
         let runner = FakeRunner::new();
         let mut ctl = controller_no_profile(&runner);
         ctl.on_command(Command::SetCpuW(20.0));
+        queue_cpu_reset(&runner, 40.0);
         let effects = ctl.on_sample(&Sample {
             t_mono: 100.0,
             resumed: true,
@@ -5239,6 +5584,7 @@ mod tests {
         );
         ctl.on_sample(&sample_with_power(101.0, 26.0));
         assert!(!ctl.status().flags.contains(&StatusFlag::LimitNotSticking));
+        queue_cpu_reset(&runner, 40.0);
         let effects = ctl.on_sample(&sample_with_power(102.0, 26.0));
         assert!(has_reassert(&effects, "stickiness"), "got {effects:?}");
         assert!(ctl.status().flags.contains(&StatusFlag::LimitNotSticking));
@@ -5249,12 +5595,14 @@ mod tests {
 
         // Past the 60 s window (t >= 160): back to the normal 3-sample rule.
         ctl.on_sample(&sample_with_power(161.0, 26.0));
+        queue_cpu_reset(&runner, 40.0);
         let effects = ctl.on_sample(&sample_with_power(162.0, 26.0));
         assert!(
             !has_reassert(&effects, "stickiness"),
             "two violations after the strict window must not fire, got {effects:?}"
         );
         assert!(!ctl.status().flags.contains(&StatusFlag::LimitNotSticking));
+        queue_cpu_reset(&runner, 40.0);
         let effects = ctl.on_sample(&sample_with_power(163.0, 26.0));
         assert!(has_reassert(&effects, "stickiness"), "got {effects:?}");
         assert!(ctl.status().flags.contains(&StatusFlag::LimitNotSticking));
@@ -6800,6 +7148,10 @@ mod tests {
             if program == "ryzenadj" && args.iter().any(|arg| arg.starts_with("--stapm-limit=")) {
                 self.fail();
                 return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "blocking write failure"));
+            }
+            if program == "ryzenadj" && args == ["--info"] {
+                use crate::actuators::cmd::test_support::{output_with_stdout, ryzenadj_info_table};
+                return Ok(output_with_stdout(&ryzenadj_info_table(54.0, 53.0, 54.0)));
             }
             Ok(crate::actuators::cmd::test_support::output_with_code(0))
         }

@@ -302,9 +302,17 @@ mod main_flow {
         let mut calib_plant =
             ChainedPlant::new("quiet16", QUIET16_POINTS.to_vec(), MA_INTERVAL, AMBIENT_C, 2)
                 .expect("valid curve");
+        // Use a GPU response representative of the measured default, so
+        // this success/persistence flow stays within the new acceptance band.
+        // The separate robustness matrix retains its original plant grid.
+        calib_plant.set_gpu_plant_params(crate::test_support::plant::GpuPlantParams {
+            tau_s: 32.564,
+            k_c_per_mhz: 0.009_527_65,
+            theta_eff_s: 8.4515, // raw delay; the real replica adds its MA
+            ..crate::test_support::plant::GpuPlantParams::nominal()
+        });
         // The pair is restored and physically re-settled between the CPU
-        // and GPU responses so CPU cool-down cannot masquerade as GPU-step
-        // cross coupling. Leave enough deterministic plant time for that
+        // and GPU responses so each fit starts from a settled state. Leave enough deterministic plant time for that
         // recovery in addition to both 360 s response windows.
         drive_step_test_to_conclusion(&mut calib_plant, &mut ctl, cpu_floor_w, 1_600);
         assert_eq!(ctl.status().mode, Mode::Monitor, "calibration must conclude back to Monitor");
@@ -822,7 +830,7 @@ mod wiring_sweep {
                 assert_eq!(fanctrl_active, None);
                 assert_eq!(strategy, None);
             }
-            Record::Flag { .. } | Record::Decision { .. } => {
+            Record::Calibration { .. } | Record::Flag { .. } | Record::Decision { .. } => {
                 panic!("Record::sample must build a Record::Sample line")
             }
         }
@@ -884,7 +892,7 @@ mod wiring_sweep {
                     t_star, tstar_state, cpu, gpu,
                 );
             }
-            Record::Flag { .. } | Record::Sample { .. } => {
+            Record::Calibration { .. } | Record::Flag { .. } | Record::Sample { .. } => {
                 panic!("must stay a Record::Decision line")
             }
         }
@@ -923,6 +931,7 @@ mod wiring_sweep {
                 Effect::StatusChanged { .. } => {} // apply_effects: Event::Status to the UI + Decision cause
                 Effect::Noted { .. } => {}  // apply_effects: Decision cause (telemetry-only, status unchanged)
                 Effect::Flagged { .. } => {} // apply_effects: a standalone Record::Flag line, in addition to Decision
+                Effect::Calibration { .. } => {} // apply_effects: per-sample calibration JSON
                 Effect::Quit => {}          // controller::spawn's shell loop breaks on this
             }
         }

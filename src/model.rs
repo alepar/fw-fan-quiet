@@ -35,6 +35,10 @@ const CPU_FLOOR_STEP_W: f64 = 1.0;
 
 pub struct Model {
     pub max_fan: Ring,
+    pub fan_target: Ring,
+    pub temp_target: Ring,
+    pub cpu_cap: Ring,
+    pub gpu_cap: Ring,
     pub cpu_w: Ring,
     pub gpu_w: Ring,
     pub cpu_temp: Ring,
@@ -47,6 +51,9 @@ pub struct Model {
     pub latest: Option<Sample>,
     /// Latest status from the controller.
     pub status: ControlStatus,
+    /// Wrapped-line offset for the retained calibration result.
+    pub calib_result_scroll: u16,
+    calib_result_scroll_max: u16,
     /// false => main loop exits.
     pub running: bool,
     /// Fan target shown in the header/fan chart; kept in sync with the
@@ -69,6 +76,10 @@ impl Model {
         let status = ControlStatus::default();
         Self {
             max_fan: Ring::new(RING_CAP),
+            fan_target: Ring::new(RING_CAP),
+            temp_target: Ring::new(RING_CAP),
+            cpu_cap: Ring::new(RING_CAP),
+            gpu_cap: Ring::new(RING_CAP),
             cpu_w: Ring::new(RING_CAP),
             gpu_w: Ring::new(RING_CAP),
             cpu_temp: Ring::new(RING_CAP),
@@ -76,6 +87,8 @@ impl Model {
             gpu_mhz: Ring::new(RING_CAP),
             cpu_mhz: Ring::new(RING_CAP),
             latest: None,
+            calib_result_scroll: 0,
+            calib_result_scroll_max: 0,
             running: true,
             fan_target_rpm: DEFAULT_FAN_TARGET_RPM,
             cpu_setpoint_w: None,
@@ -86,7 +99,13 @@ impl Model {
         }
     }
 
-    /// The ONLY place UI state changes (TEA update). Returned commands are
+    /// The shell supplies rendered bounds before drawing, including resize.
+    pub fn set_calib_result_scroll_max(&mut self, max: u16) {
+        self.calib_result_scroll_max = max;
+        self.calib_result_scroll = self.calib_result_scroll.min(max);
+    }
+
+    /// Fold application events (TEA update). Returned commands are
     /// forwarded to the controller by the main loop.
     pub fn update(&mut self, ev: Event) -> Vec<Command> {
         match ev {
@@ -104,6 +123,12 @@ impl Model {
                     .push(nan_unless(s.gpu_temp_valid, s.gpu_temp_c));
                 self.gpu_mhz.push(nan_unless(s.gpu_mhz_valid, s.gpu_sm_mhz));
                 self.cpu_mhz.push(s.cpu_avg_mhz);
+                // Snapshot the last controller-reported targets on the same
+                // sample clock as measurements. Status changes never rewrite history.
+                self.fan_target.push(self.status.fan_target_rpm);
+                self.temp_target.push(self.status.t_star_c.unwrap_or(f64::NAN));
+                self.cpu_cap.push(self.status.cpu_limit_w.unwrap_or(f64::NAN));
+                self.gpu_cap.push(self.status.gpu_max_mhz.map(f64::from).unwrap_or(f64::NAN));
                 self.latest = Some(s);
             }
             Event::Input(key) => {
@@ -117,11 +142,22 @@ impl Model {
                     (KeyCode::Char('q'), KeyModifiers::NONE) => self.running = false,
                     // Belt and suspenders next to the signal handler.
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.running = false,
-                    // Esc only means something while a calibration runs.
+                    // Esc aborts a running calibration or dismisses its result.
                     (KeyCode::Esc, KeyModifiers::NONE) => {
                         if self.status.mode == Mode::Calibrating {
                             return vec![Command::AbortCalibration];
+                        } else if self.status.calib_outcome.is_some() {
+                            return vec![Command::DismissCalibrationOutcome];
                         }
+                    }
+                    (KeyCode::Up | KeyCode::Down | KeyCode::Home, KeyModifiers::NONE)
+                        if self.status.calib.is_none() && self.status.calib_outcome.is_some() =>
+                    {
+                        self.calib_result_scroll = match key.code {
+                            KeyCode::Down => self.calib_result_scroll.saturating_add(1).min(self.calib_result_scroll_max),
+                            KeyCode::Up => self.calib_result_scroll.saturating_sub(1),
+                            _ => 0,
+                        };
                     }
                     // Shifted letters arrive as uppercase Char + SHIFT.
                     (KeyCode::Char(ch), m)
@@ -133,6 +169,9 @@ impl Model {
                 }
             }
             Event::Status(cs) => {
+                if cs.calib_outcome != self.status.calib_outcome {
+                    self.calib_result_scroll = 0;
+                }
                 // The controller's clamped truth wins over local tracking
                 // (it echoes what we sent, so this cannot fight local edits).
                 self.cpu_setpoint_w = cs.cpu_limit_w;
@@ -261,6 +300,34 @@ mod tests {
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn target_history_follows_samples_not_status_changes_and_keeps_release_gaps() {
+        let mut model = Model::new();
+        let mut status = ControlStatus { fan_target_rpm: 3000.0, t_star_c: Some(79.0),
+            cpu_limit_w: Some(30.0), gpu_max_mhz: Some(2100), ..ControlStatus::default() };
+        model.update(Event::Status(status.clone()));
+        model.update(Event::Sample(Sample::default()));
+        status.fan_target_rpm = 3500.0; status.t_star_c = Some(81.0);
+        status.cpu_limit_w = Some(40.0); status.gpu_max_mhz = Some(2500);
+        model.update(Event::Status(status));
+        assert_eq!(model.temp_target.iter().copied().collect::<Vec<_>>(), vec![79.0]);
+        model.update(Event::Sample(Sample::default()));
+        assert_eq!(model.fan_target.iter().copied().collect::<Vec<_>>(), vec![3000.0, 3500.0]);
+        assert_eq!(model.temp_target.iter().copied().collect::<Vec<_>>(), vec![79.0, 81.0]);
+        assert_eq!(model.cpu_cap.iter().copied().collect::<Vec<_>>(), vec![30.0, 40.0]);
+        assert_eq!(model.gpu_cap.iter().copied().collect::<Vec<_>>(), vec![2100.0, 2500.0]);
+        model.update(Event::Status(ControlStatus::default()));
+        model.update(Event::Sample(Sample::default()));
+        assert!(model.temp_target.last().unwrap().is_nan());
+        assert!(model.cpu_cap.last().unwrap().is_nan());
+        assert!(model.gpu_cap.last().unwrap().is_nan());
+        for _ in 0..RING_CAP { model.update(Event::Sample(Sample::default())); }
+        for history in [&model.fan_target, &model.temp_target, &model.cpu_cap, &model.gpu_cap] {
+            assert_eq!(history.len(), model.cpu_temp.len());
+            assert_eq!(history.len(), RING_CAP);
+        }
     }
 
     #[test]
@@ -636,6 +703,23 @@ mod tests {
             vec![Command::SetCpuW(38.0)]
         );
         assert_eq!(m.update(Event::Input(key('f'))), set_floors(14.0, 1000));
+    }
+
+    #[test]
+    fn completed_calibration_result_can_scroll_and_dismiss() {
+        let mut model = Model::new();
+        model.status.calib_outcome = Some(crate::calib::runner::CalibOutcome::default());
+        model.calib_result_scroll_max = 2;
+        let down = || Event::Input(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        for _ in 0..20 { assert!(model.update(down()).is_empty()); }
+        assert_eq!(model.calib_result_scroll, 2);
+        model.update(Event::Input(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        assert_eq!(model.calib_result_scroll, 1);
+        assert_eq!(model.update(Event::Input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))), vec![Command::DismissCalibrationOutcome]);
+        let mut status = model.status.clone();
+        status.calib_outcome = None;
+        model.update(Event::Status(status));
+        assert_eq!(model.calib_result_scroll, 0);
     }
 
     #[test]

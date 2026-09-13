@@ -1,6 +1,7 @@
 //! Pure per-device temperature-loop control (§2.3, revision 4).
 
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 
 /// CPU sustained-power units (watts).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +23,7 @@ pub trait DeviceUnit: sealed::Sealed + Copy {
     const GRID: f64;
     const RISE_RATE: f64;
     const FALL_RATE: f64;
+    const HOT_HEADROOM: f64;
 }
 
 impl sealed::Sealed for W {}
@@ -32,17 +34,21 @@ impl DeviceUnit for W {
     const GRID: f64 = 0.5;
     const RISE_RATE: f64 = 10.0;
     const FALL_RATE: f64 = f64::INFINITY;
+    const HOT_HEADROOM: f64 = 2.0;
 }
 
 impl sealed::Sealed for Mhz {}
 impl DeviceUnit for Mhz {
-    const TAU_S: f64 = 15.0;
-    const PLANT_GAIN: f64 = 0.02;
-    // EC lag (20 s) plus the measured gpu_vr tail (40 s).
-    const BASE_DELAY_S: f64 = 60.0;
+    // GPU fit from run-1789252085 (2026-09-12, quiet16, 60 s MA).
+    const TAU_S: f64 = 32.564_086_253_945_035;
+    const PLANT_GAIN: f64 = 0.009_527_650_224_779_704;
+    // The fitted 38.4515 s delay already contains the 60 s MA lag.
+    // Remove its 30 s contribution here; default_gains adds the live MA.
+    const BASE_DELAY_S: f64 = 38.451_542_929_544_05 - 30.0;
     const GRID: f64 = 1.0;
     const RISE_RATE: f64 = 105.0;
     const FALL_RATE: f64 = 105.0;
+    const HOT_HEADROOM: f64 = 100.0;
 }
 
 /// Velocity-form PI gains in actuator units per degree Celsius.
@@ -183,6 +189,8 @@ pub struct DeviceLoop<U: DeviceUnit> {
     group_missing_s: f64,
     draw_missing_s: f64,
     draw_missing: bool,
+    draw_clock_s: f64,
+    recent_draw: VecDeque<(f64, f64)>,
     mismatch_latched: bool,
     pending_immediate: bool,
     prev_group: Option<f64>,
@@ -217,6 +225,8 @@ impl<U: DeviceUnit> DeviceLoop<U> {
             group_missing_s: 0.0,
             draw_missing_s: 0.0,
             draw_missing: false,
+            draw_clock_s: 0.0,
+            recent_draw: VecDeque::new(),
             mismatch_latched: false,
             pending_immediate: false,
             prev_group: None,
@@ -330,6 +340,21 @@ impl<U: DeviceUnit> DeviceLoop<U> {
 
     pub fn tick(&mut self, input: TickInput) -> DeviceDecision {
         let dt = control_dt(input.dt_s);
+        self.draw_clock_s += dt;
+        if input.resumed || input.dt_s > 2.0 || dt == 0.0
+            || input.group_c.is_none() || input.actuator == ActuatorState::Mismatch
+        {
+            self.recent_draw.clear();
+        } else if let Some(draw) = input.draw.filter(|d| d.is_finite() && *d > 0.0) {
+            self.recent_draw.push_back((self.draw_clock_s, draw));
+            while self.recent_draw.len() > 1
+                && self.recent_draw[1].0 <= self.draw_clock_s - 5.0
+            {
+                self.recent_draw.pop_front();
+            }
+        } else {
+            self.recent_draw.clear();
+        }
         let (floor, max) = ordered_bounds(input.floor, input.max);
         let floor_changed = self.bounds_initialised && floor != self.floor;
         let max_lowered = self.bounds_initialised && max < self.max;
@@ -508,17 +533,15 @@ impl<U: DeviceUnit> DeviceLoop<U> {
             return decision;
         }
 
-        let measured_crossing =
-            self.prev_group
-                .zip(self.prev_t_star)
-                .is_some_and(|(prev_group, prev_t_star)| {
-                    prev_group <= prev_t_star && group > prev_t_star && group > input.t_star
-                });
+        // A moving target can make us hot without crossing the old target.
+        // Transfer once from the applied cap; never follow hot draw dips.
         let handover = input.mode == ThermalMode::Regulate
             && !resynced_error
             && self.hot_episode_armed
             && self.previous_selected == Some(Selected::Shadow)
-            && measured_crossing;
+            // Let draw recovery reseed the shadow before a hot transfer.
+            && !(self.draw_missing && input.draw.is_some())
+            && error < 0.0;
         let initial_hot_entry =
             self.control_entry_pending && input.mode == ThermalMode::Regulate && error < 0.0;
         if handover || initial_hot_entry {
@@ -543,7 +566,22 @@ impl<U: DeviceUnit> DeviceLoop<U> {
                     .unwrap_or(self.shadow)
                     .clamp(self.floor, self.max)
             };
-            self.thermal = cap;
+            // Trim only at a hot handoff with a full recent history, never
+            // repeatedly as draw falls. Use its peak to reject brief dips.
+            let thermal_cap = if handover && self.recent_draw.front()
+                .is_some_and(|(time, _)| self.draw_clock_s - time >= 5.0)
+            {
+                let peak = self.recent_draw.iter().map(|(_, draw)| *draw).fold(0.0, f64::max);
+                cap.min((peak + U::HOT_HEADROOM.min(input.shadow_headroom))
+                    .clamp(self.floor, self.max))
+            } else { cap };
+            self.thermal = thermal_cap;
+            let cap = if thermal_cap < cap {
+                // Pending requests may not have reached the rate-limited
+                // writer. A hot reduction must slew from hardware, not them.
+                self.requested = Some(cap);
+                self.slew_and_quantize(thermal_cap, Selected::Thermal, dt, false)
+            } else { cap };
             if initial_hot_entry {
                 self.shadow = cap;
             }
@@ -823,8 +861,8 @@ mod tests {
         close(cpu_60.kc, 0.21875);
 
         let gpu_60 = default_gains::<Mhz>(60);
-        close(gpu_60.ti_s, 15.0);
-        close(gpu_60.kc, 2.083_333_333_333_333_5);
+        close(gpu_60.ti_s, 32.564_086_253_945_035);
+        close(gpu_60.kc, 22.221_804_817_775_82);
 
         assert_ne!(default_gains::<W>(20).kc, cpu_60.kc);
         assert_ne!(default_gains::<Mhz>(20).kc, gpu_60.kc);
@@ -1071,6 +1109,53 @@ mod tests {
     }
 
     #[test]
+    fn hot_headroom_slews_from_applied_not_an_unwritten_request() {
+        let mut gpu = DeviceLoop::<Mhz>::new(Gains { kc: 1.0, ti_s: 10.0 });
+        gpu.seed_candidates(3090.0, 2600.0, Some(2450.0), 10.0);
+        let mut tick = input(Some(60.0), 1.0);
+        tick.floor = 1000.0; tick.max = 3090.0;
+        tick.shadow_enabled = true; tick.shadow_headroom = 300.0;
+        tick.draw = Some(2300.0);
+        for _ in 0..6 { gpu.tick(tick); }
+        tick.group_c = Some(71.0);
+        let hot = gpu.tick(tick);
+        close(hot.thermal, 2400.0);
+        close(hot.cap, 2400.0);
+    }
+
+    #[test]
+    fn hot_handoff_trims_headroom_using_recent_peak_and_preserves_gpu_slew() {
+        let gains = Gains { kc: 1.0, ti_s: 10.0 };
+        let mut cpu = DeviceLoop::<W>::new(gains);
+        cpu.seed_candidates(100.0, 50.0, Some(50.0), 10.0);
+        let mut tick = input(Some(60.0), 1.0);
+        tick.shadow_enabled = true;
+        tick.draw = Some(40.0);
+        for _ in 0..6 { cpu.tick(tick); }
+        tick.group_c = Some(71.0);
+        tick.draw = Some(10.0); // a brief dip must not seed a 12 W cap
+        let hot = cpu.tick(tick);
+        close(hot.thermal, 42.0);
+        close(hot.cap, 42.0);
+        for _ in 0..3 { close(cpu.tick(tick).thermal, 42.0); }
+
+        let mut gpu = DeviceLoop::<Mhz>::new(gains);
+        gpu.seed_candidates(3090.0, 2800.0, Some(2800.0), 10.0);
+        tick = input(Some(60.0), 1.0);
+        tick.floor = 1000.0;
+        tick.max = 3090.0;
+        tick.shadow_enabled = true;
+        tick.shadow_headroom = 300.0;
+        tick.draw = Some(2500.0);
+        for _ in 0..6 { gpu.tick(tick); }
+        tick.group_c = Some(71.0);
+        tick.draw = Some(1000.0);
+        let hot = gpu.tick(tick);
+        close(hot.thermal, 2600.0);
+        close(hot.cap, 2695.0); // existing 105 MHz/s downward slew
+    }
+
+    #[test]
     fn measured_crossing_hands_thermal_over_once_and_rearms_after_five_cool_seconds() {
         let gains = Gains {
             kc: 1.0,
@@ -1107,11 +1192,11 @@ mod tests {
         assert_eq!(loop_.tick(cool).selected, Selected::Shadow);
         hot.dt_s = 1.0;
         hot.draw = Some(40.0);
-        close(loop_.tick(hot).thermal, 50.0);
+        close(loop_.tick(hot).thermal, 42.0);
     }
 
     #[test]
-    fn target_only_hot_sign_change_and_hot_draw_dip_do_not_handover_or_track_thermal() {
+    fn target_only_hot_sign_change_hands_over_but_hot_draw_dip_does_not_track_thermal() {
         let gains = Gains {
             kc: 1.0,
             ti_s: 10.0,
@@ -1125,7 +1210,7 @@ mod tests {
         changed_target.t_star = 50.0;
         changed_target.delta_tstar = -20.0;
         let unchanged = target_only.tick(changed_target);
-        close(unchanged.thermal, 100.0);
+        close(unchanged.thermal, 50.0);
 
         let mut replay = DeviceLoop::<W>::new(gains);
         let mut dipped = DeviceLoop::<W>::new(gains);
@@ -1798,13 +1883,13 @@ mod tests {
         close(loop_.tick(recovered).thermal, 56.0);
     }
 
-    fn first_order_cpu_response() -> (f64, f64) {
+    fn first_order_cpu_response(ma_interval: u32) -> (f64, f64) {
         let ambient = 40.0;
         let target = 80.0;
         let initial_cap = 10.0;
         let mut group = ambient + 0.8 * initial_cap;
-        let mut delayed = std::collections::VecDeque::from(vec![initial_cap; 50]);
-        let mut loop_ = DeviceLoop::<W>::new(default_gains::<W>(60));
+        let mut delayed = std::collections::VecDeque::from(vec![initial_cap; (W::BASE_DELAY_S + f64::from(ma_interval) / 2.0).ceil() as usize]);
+        let mut loop_ = DeviceLoop::<W>::new(default_gains::<W>(ma_interval));
         loop_.seed(initial_cap, target - group);
         let mut peak = group;
         for _ in 0..3_000 {
@@ -1832,13 +1917,18 @@ mod tests {
         (group, peak)
     }
 
-    fn first_order_gpu_response() -> (f64, f64) {
-        let ambient = 40.0;
+    fn first_order_gpu_response(ma_interval: u32) -> (f64, f64) {
+        // Recorded GPU model from the 2026-09-12 calibration (60 s MA).
+        // This replaces the provisional K=.02, tau=15, delay=90 s nominal
+        // model; that older model overshoots 11.12 C with these new gains.
+        let ambient = 60.0;
+        let plant_k = 0.009_527_650_224_779_704;
+        let plant_tau = 32.564_086_253_945_035;
         let target = 80.0;
         let initial_cap = 1_000.0;
-        let mut group = ambient + 0.02 * initial_cap;
-        let mut delayed = std::collections::VecDeque::from(vec![initial_cap; 90]);
-        let mut loop_ = DeviceLoop::<Mhz>::new(default_gains::<Mhz>(60));
+        let mut group = ambient + plant_k * initial_cap;
+        let mut delayed = std::collections::VecDeque::from(vec![initial_cap; (Mhz::BASE_DELAY_S + f64::from(ma_interval) / 2.0).ceil() as usize]);
+        let mut loop_ = DeviceLoop::<Mhz>::new(default_gains::<Mhz>(ma_interval));
         loop_.seed(initial_cap, target - group);
         let mut peak = group;
         for _ in 0..3_000 {
@@ -1860,7 +1950,7 @@ mod tests {
             loop_.note_applied(decision.cap);
             delayed.push_back(decision.cap);
             let applied = delayed.pop_front().unwrap();
-            group += (ambient + 0.02 * applied - group) / 15.0;
+            group += (ambient + plant_k * applied - group) / plant_tau;
             peak = peak.max(group);
         }
         (group, peak)
@@ -1868,9 +1958,10 @@ mod tests {
 
     #[test]
     fn live_imc_defaults_settle_first_order_cpu_and_gpu_within_overshoot_bar() {
+        for ma_interval in [30, 60] {
         for (name, target, initial, response) in [
-            ("cpu", 80.0, 48.0, first_order_cpu_response()),
-            ("gpu", 80.0, 60.0, first_order_gpu_response()),
+            ("cpu", 80.0, 48.0, first_order_cpu_response(ma_interval)),
+            ("gpu", 80.0, 69.527_650_224_779_7, first_order_gpu_response(ma_interval)),
         ] {
             let (settled, peak) = response;
             let step = target - initial;
@@ -1882,6 +1973,7 @@ mod tests {
                 peak <= target + step * 0.05,
                 "{name} peaked at {peak}, target {target}"
             );
+        }
         }
     }
 }

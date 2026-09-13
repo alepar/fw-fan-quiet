@@ -7,7 +7,8 @@ edition = "2024"
 rust-version = "1.87"
 
 [dependencies]
-ratatui = "0.30"
+# Wrapped result height is used to keep calibration scrolling in bounds.
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29"
 crossbeam-channel = "0.5"
 nvml-wrapper = "0.12"

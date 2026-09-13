@@ -12,7 +12,7 @@ pub mod smu_module;
 /// stuck, because RyzenAdj's own documentation names the platform silently
 /// reasserting vendor defaults (AC unplug, power-profile change, periodic
 /// resets) as a real and recurring failure mode.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub enum WriteVerdict {
     /// Read-back confirmed the commanded value (within the actuator's
     /// tolerance). Carries the verified value.

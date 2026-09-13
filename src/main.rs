@@ -456,7 +456,10 @@ fn run(
             model.running = false;
             continue;
         }
-        terminal.draw(|f| view(&model, f))?;
+        terminal.draw(|f| {
+            model.set_calib_result_scroll_max(ui::view::calib_result_scroll_max(&model, f.area()));
+            view(&model, f);
+        })?;
         match rx.recv_timeout(RECV_TIMEOUT) {
             Ok(first) => {
                 // Coalesce bursts: fold everything already queued into the

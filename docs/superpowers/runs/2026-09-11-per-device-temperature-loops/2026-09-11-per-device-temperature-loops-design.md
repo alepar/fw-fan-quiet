@@ -835,3 +835,39 @@ budget, split, LUT, Mode A/Mode B.
 - Elapsed-time, setpoint-delta and resynchronisation paths are covered at `TStarSource`, `DeviceLoop` and Controller boundaries, including the new unmarked-gap regression and the resumed plant flow. `requested_slew_accumulates_each_sample_without_an_applied_note` separates per-sample requested slew from applied feedback; the controller cadence tests cover successful and failed CPU/GPU writes and the two-second completion-time boundary.
 - The complete offline acceptance suite was reused rather than copied: nominal CPU/GPU/both runs, the CPU and full 108-cell GPU tau/K/theta robustness matrices, Sim 4 knee timing, Sim 9 guard eligibility/recovery, and Sim 11 raw reconciliation/quarantine/recovery all ran in the full gate. The final elevated `cargo test --no-fail-fast -- --format=terse` result was **695 passed, 0 failed, 2 ignored** in 162.77 s. Focused results were integration tests **9 passed**, controller tests **119 passed**, T* source tests **41 passed**, retained controller simulations **3 passed**, and the telemetry-field filter **1 passed**. `cargo clippy --all-targets -- -D warnings` passed, as did `git diff --check`.
 - The deletion audit found no retired module basename. Current-source hits for retired decision keys occur only in negative serialization assertions; `gpu_max_w` occurs only in its explicit config migration warning/test. No open offline item or blocker remains. No hardware was accessed: the 30-minute gaming check and VR/VRAM label-spike check remain parked for the user, and the two corresponding tests remain ignored.
+
+
+### 2026-09-12: measured GPU defaults and calibration outcomes
+
+User-approved field revision: remove cross-device temperature rejection entirely. With the fan curve live, increasing CPU power can cool the GPU without a workload change. Settling still checks both groups; response fitting requires only the primary group trace. Verified caps, response coverage, thermal guards, minimum response/time constant, and the 0.25×–4× gain band remain.
+
+Use run-1789252085’s GPU model as the runtime default: K=0.009527650224779704 C/MHz, tau=32.564086253945035 s, fitted theta=38.45154292954405 s at MA=60 s. Subtract the 30 s MA contribution before adding the live interval’s contribution, yielding Kc=22.22180481777582 at MA=60. CPU defaults remain unchanged. The user explicitly selected this despite an 11.12 C overshoot on the previous provisional K=.02/tau=15/delay=90 model; actual control validation on the machine remains pending. Nominal response tests now use the measured model. The historical robustness matrix retains its explicit GPU gains (2.1, 15) and must not be cited as validation of this default.
+
+The TUI suggests gpu_burn while maintaining >90% GPU load, then retains success/partial-success/failure details until dismissal or the next calibration. Results include old/new calibration gains, specific rejection values and limits, abort reasons, persistence errors, and any config override preventing fitted gains from controlling the device. Recorded primary response traces are preserved as a regression fixture under src/calib/fixtures/2026-09-12-responses.csv.
+
+
+### 2026-09-12: shared read-first CPU cap maintenance
+
+Field run-1789256681 showed CPU draw jumping15W to52W and settling40W while calibration reused a verification flag from268s earlier. User approved shared read-first maintenance for normal Auto and calibration. CpuActuator now reads slow/fast limits first, repairs only a confirmed mismatch with a post-read shutdown/thermal fence, and preserves both the original verdict and repair result. Normal operation uses the existing10s schedule and feeds maintenance verdicts through Auto’s mismatch/blind/release handling. GPU verification/reassertion remains as before.
+
+Calibration refreshes CPU evidence every10s and before concluding a response; schema5 records the read-back timestamp/result and reset reason separately from command completion. A detected reset discards the affected response, restores the baseline pair, restarts its settling window, and retries at most twice per device. Retry notes remain visible without mislabelling eventual success as rejection. An unreadable CPU check during a response fails explicitly. The cause of the platform’s reset remains unknown; maintenance recovers from it without claiming an external culprit.
+
+### 2026-09-12: compact control header
+
+User-approved display simplification moves the target/state and per-device signed errors/gain sources into the existing cap header and removes the separate eight-row control panel. Watts use one decimal and GPU caps/floors use one-decimal GHz. Cyan up / amber down indicate desired temperature direction (target minus group), not measured trend; displayed zero is green. Raw thermal/shadow candidates and hold details remain in telemetry. Warnings precede optional details on narrow terminals.
+
+### 2026-09-12: board heat and current-target hot handoff
+
+The recorded Auto run showed a sustained ~4,000 RPM plateau for a 3,500 RPM request because ambient + 5°C forced T* above the curve-derived target. Remove that lower bound, retaining a numeric 0°C bound and the guard-derived upper ceiling. Missing board readings no longer collapse the temperature range to the ceiling. Ambient/charger dominance now selects Held RPM feedback with Regulate, never label-triggered bypass. The existing sensor diagnostics and quarantine remain.
+
+Declare a settled fan limitation only with both device floors and 60 seconds of CPU/GPU temperature spans within 1°C/2°C and fan span within 150 RPM, with fans above target + 150 RPM. Reset evidence across missing data, resume/gaps, cap release, or fan-target changes. Hot handoff uses current negative error and prior Shadow selection, once per armed episode with five cool seconds to rearm; draw-recovery reseeding retains precedence. Calibrated gains and thermal guards are unchanged.
+
+The UI bundles the compact header with ambient/NVMe readings. Simulation curve-loss fixtures now warm up for 7,200 seconds before the disturbance (previously 3,600), retaining all per-sample convergence tolerances and post-disturbance deadlines.
+
+### 2026-09-12: hot headroom trim and 30-second averaging
+
+User requested both changes after the improved controller took roughly ten minutes to converge. At an armed hot handoff with five seconds of continuous valid draw history, trim thermal output to at most the recent peak plus 2 W / 100 MHz (bounded by the configured shadow margin), never above the applied cap. A short draw dip cannot seed an excessively low limit. Preserve hardware floors and slew from the applied cap rather than a pending request; retain ordinary PI operation thereafter. Missing data, resume, timing gaps, and actuator mismatch clear the history. Initial Auto entry and ordinary shadow margins are unchanged. The local quiet16 movingAverageInterval was changed from 60 to 30 via fw-fanctrl set_config and verified in memory and on disk. Calibration keys remain interval-specific; no 60-second fit is copied to 30 seconds.
+
+### 2026-09-12: target history on every chart
+
+User requested time-varying target overlays instead of horizontal lines representing only the latest target. The model snapshots the latest controller-reported fan target, T*, CPU cap, and GPU cap on each measurement event into matching rolling rings. Status updates do not mutate existing history. All four charts render those series, splitting unavailable or released temperature/cap targets into gaps and including target history in temperature/fan axis bounds.

@@ -95,9 +95,8 @@ pub struct Feasibility {
     pub floor_c: f64,
     pub ceiling_c: f64,
     pub uncontrollable_available: bool,
-    /// The unconstrained `max(uncontrollable) + 5 C`, when known.  This is
-    /// retained after clamping so callers can distinguish a collapsed high
-    /// interval from an unavailable one.
+    /// Legacy field retained for diagnostic compatibility; board temperature
+    /// no longer establishes a target floor, so this is always None.
     pub raw_floor_c: Option<f64>,
 }
 
@@ -115,19 +114,13 @@ pub fn feasibility(
                 .then_some(value)
         })
         .reduce(f64::max);
-    match hottest {
-        Some(value) => Feasibility {
-            floor_c: (value + 5.0).min(ceiling_c),
-            ceiling_c,
-            uncontrollable_available: true,
-            raw_floor_c: Some(value + 5.0),
-        },
-        None => Feasibility {
-            floor_c: ceiling_c,
-            ceiling_c,
-            uncontrollable_available: false,
-            raw_floor_c: None,
-        },
+    Feasibility {
+        // Board sensors may cool when CPU/GPU power falls. Their readings
+        // describe the plant, not a lower bound on our requested temperature.
+        floor_c: 0.0,
+        ceiling_c,
+        uncontrollable_available: hottest.is_some(),
+        raw_floor_c: None,
     }
 }
 
@@ -265,6 +258,8 @@ pub struct TStarSource {
     held_elapsed_s: f64,
     held_error_prev: Option<f64>,
     device_bound_dwell_s: BTreeMap<Device, (Bound, f64)>,
+    floor_settle_window: VecDeque<(f64, [f64; 3])>,
+    floor_settle_target_rpm: Option<u32>,
 }
 
 impl TStarSource {
@@ -297,6 +292,8 @@ impl TStarSource {
             held_elapsed_s: 0.0,
             held_error_prev: None,
             device_bound_dwell_s: BTreeMap::new(),
+            floor_settle_window: VecDeque::new(),
+            floor_settle_target_rpm: None,
         }
     }
 
@@ -486,7 +483,7 @@ impl TStarSource {
             } else {
                 match self.state {
                     TStarState::Held if uncontrollable_argmax => {
-                        self.state = TStarState::Uncontrollable;
+                        self.state = TStarState::Held;
                     }
                     TStarState::Held if held_to_curve => {
                         self.enter_curve(
@@ -508,12 +505,11 @@ impl TStarSource {
                     }
                     TStarState::Curve if uncontrollable_view => {
                         if uncontrollable_argmax {
-                            self.state = TStarState::Uncontrollable;
+                            self.state = TStarState::Held;
                         }
                     }
                     TStarState::Uncontrollable if uncontrollable_view => {
-                        // A qualified Bypass input is stable indefinitely.  It
-                        // never reuses the Held -> Curve entry timer.
+                        self.state = TStarState::Held;
                     }
                     TStarState::Uncontrollable if controllable_view => {
                         // Leaving Bypass is a mode transfer to Held.  The next
@@ -563,6 +559,9 @@ impl TStarSource {
 
             if let Some(target) = self.target {
                 flags.extend(self.device_unreachable_flags(input, target, held_dt));
+                if self.fan_target_unreachable(input, held_dt) {
+                    flags.push(TStarFlag::TargetUnreachable(Bound::Floor));
+                }
             }
         }
         let mut feasibility_flags = self.feasibility_flags(input, bounds);
@@ -623,6 +622,47 @@ impl TStarSource {
         self.held_elapsed_s = 0.0;
         self.held_error_prev = None;
         self.device_bound_dwell_s.clear();
+        self.floor_settle_window.clear();
+    }
+
+    fn fan_target_unreachable(&mut self, input: &TStarInput, dt: f64) -> bool {
+        if self.floor_settle_target_rpm != Some(input.requested_fan_target_rpm) {
+            self.floor_settle_window.clear();
+            self.floor_settle_target_rpm = Some(input.requested_fan_target_rpm);
+        }
+        let both_at_floor = [Device::Cpu, Device::Gpu].iter().all(|name| {
+            input.previous_holds.iter().any(|d| {
+                d.device == *name && d.previous_hold == Hold::Clamp(Bound::Floor)
+            })
+        });
+        let readings = input.cpu_group_c.zip(input.gpu_group_c).zip(input.fan_rpm);
+        let valid = readings.filter(|((cpu, gpu), fan)| {
+            cpu.is_finite() && gpu.is_finite() && fan.is_finite()
+                && *fan > f64::from(input.requested_fan_target_rpm) + 150.0
+        });
+        if !both_at_floor || input.resumed || dt == 0.0 || valid.is_none() {
+            self.floor_settle_window.clear();
+            return false;
+        }
+        let ((cpu, gpu), fan) = valid.expect("validated readings");
+        self.floor_settle_window.push_back((self.control_s, [cpu, gpu, fan]));
+        while self.floor_settle_window.len() > 1
+            && self.floor_settle_window[1].0 <= self.control_s - 60.0
+        {
+            self.floor_settle_window.pop_front();
+        }
+        if self.control_s - self.floor_settle_window[0].0 < 60.0 {
+            return false;
+        }
+        // Match the established calibration settling spans. This is a
+        // measured operating limit, not a sensor ownership assumption.
+        [1.0, 2.0, 150.0].iter().enumerate().all(|(index, span)| {
+            let (lo, hi) = self.floor_settle_window.iter().fold(
+                (f64::INFINITY, f64::NEG_INFINITY),
+                |(lo, hi), (_, values)| (lo.min(values[index]), hi.max(values[index])),
+            );
+            hi - lo <= *span
+        })
     }
 
     fn feasibility_flags(&self, input: &TStarInput, bounds: Feasibility) -> Vec<TStarFlag> {
@@ -1125,6 +1165,51 @@ mod tests {
     }
 
     #[test]
+    fn fan_target_unreachable_needs_both_floors_and_a_settled_minute() {
+        let mut i = input();
+        i.fresh_view = false;
+        i.fan_rpm = Some(4000.0);
+        i.previous_holds = vec![
+            HeldDeviceInput::new(Device::Cpu, Hold::Clamp(Bound::Floor), Some(75.0)),
+            HeldDeviceInput::new(Device::Gpu, Hold::Clamp(Bound::Floor), Some(70.0)),
+        ];
+        let flag = TStarFlag::TargetUnreachable(Bound::Floor);
+        let mut source = TStarSource::new(EntrySeed::Fallback(70.0));
+        for _ in 0..60 { assert!(!source.tick(&i).flags.contains(&flag)); }
+        assert!(source.tick(&i).flags.contains(&flag));
+        i.requested_fan_target_rpm += 100;
+        assert!(!source.tick(&i).flags.contains(&flag));
+        i.previous_holds[1].previous_hold = Hold::Shadow;
+        assert!(!source.tick(&i).flags.contains(&flag));
+        i.previous_holds[1].previous_hold = Hold::Clamp(Bound::Floor);
+        for n in 0..70 {
+            i.cpu_group_c = Some(60.0 + f64::from(n) * 0.1);
+            assert!(!source.tick(&i).flags.contains(&flag));
+        }
+        i.resumed = true;
+        assert!(!source.tick(&i).flags.contains(&flag));
+    }
+
+    #[test]
+    fn board_heat_does_not_raise_curve_target_or_bypass_regulation() {
+        let mut i = input();
+        i.sensors = vec![ambient(78.85), cpu(84.85)];
+        let mut source = TStarSource::new(EntrySeed::Fallback(79.0));
+        let curve = to_curve(&mut source, &i);
+        assert!(curve.t_star.unwrap() < 76.0);
+        i.argmax_label = Some("ambient_f75303@4d".into());
+        i.argmax_lead_c = 2.0;
+        i.fan_rpm = Some(4000.0);
+        let held = source.tick(&i);
+        assert_eq!(held.state, TStarState::Held);
+        assert_eq!(held.thermal_mode, ThermalMode::Regulate);
+        for _ in 0..10 { source.tick(&i); }
+        let correcting = source.tick(&i);
+        assert!(correcting.t_star.unwrap() < held.t_star.unwrap());
+        assert!(!correcting.flags.iter().any(|f| matches!(f, TStarFlag::ArgmaxUncontrollable(_))));
+    }
+
+    #[test]
     fn held_rpm_pi_uses_five_sample_tail_mean_and_raw_fallback_at_elapsed_cadence() {
         let mut i = input();
         i.fresh_view = false;
@@ -1162,8 +1247,8 @@ mod tests {
         i.curve_points = None;
         i.sensors = vec![ambient(90.0), cpu(70.0)];
         let out = TStarSource::new(EntrySeed::Fallback(70.0)).tick(&i);
-        assert_eq!(out.t_star, Some(80.0));
-        assert!(out
+        assert!((70.0..71.0).contains(&out.t_star.unwrap()));
+        assert!(!out
             .flags
             .contains(&TStarFlag::TargetUnreachable(Bound::Max)));
         assert_eq!(out.held_schedule, 0.25);
@@ -1173,7 +1258,7 @@ mod tests {
         empty.sensors = vec![cpu(70.0)];
         let out = TStarSource::new(EntrySeed::Fallback(70.0)).tick(&empty);
         assert!(out.flags.contains(&TStarFlag::EcUncontrollableUnavailable));
-        assert_eq!(out.t_star, Some(80.0));
+        assert!((70.0..71.0).contains(&out.t_star.unwrap()));
     }
 
     #[test]
@@ -1223,8 +1308,8 @@ mod tests {
         raw_high.curve_points = None;
         raw_high.sensors = vec![ambient(90.0), cpu(70.0)];
         let raw_high = TStarSource::new(EntrySeed::Fallback(70.0)).tick(&raw_high);
-        assert_eq!(raw_high.t_star, Some(80.0));
-        assert!(raw_high
+        assert_eq!(raw_high.t_star, Some(70.0));
+        assert!(!raw_high
             .flags
             .contains(&TStarFlag::TargetUnreachable(Bound::Max)));
 
@@ -1542,14 +1627,14 @@ mod tests {
         assert_eq!(to_curve(&mut s, &i).state, TStarState::Curve);
     }
     #[test]
-    fn entry_seed_uses_groups_or_ceiling_and_clamps_to_known_ambient_floor() {
+    fn entry_seed_uses_groups_or_ceiling_without_an_ambient_floor() {
         let mut i = input();
         i.sensors = vec![ambient(83.0), cpu(70.0)];
         let mut s = TStarSource::new(EntrySeed::Groups {
             cpu_c: Some(70.0),
             gpu_c: Some(65.0),
         });
-        assert_eq!(s.tick(&i).t_star, Some(86.0));
+        assert_eq!(s.tick(&i).t_star, Some(70.0));
         i.cpu_group_c = None;
         i.gpu_group_c = None;
         let mut f = TStarSource::new(EntrySeed::Groups {
@@ -1572,11 +1657,11 @@ mod tests {
         assert!(!c.reseed);
     }
     #[test]
-    fn exact_uncontrollable_bypasses_but_unknown_is_held() {
+    fn board_and_unknown_argmax_keep_regulation_in_held() {
         let mut i = input();
         i.argmax_label = Some("ambient_f75303@4d".into());
         let mut s = TStarSource::new(EntrySeed::Fallback(70.0));
-        assert_eq!(to_curve(&mut s, &i).state, TStarState::Uncontrollable);
+        assert_eq!(to_curve(&mut s, &i).state, TStarState::Held);
         let mut u = input();
         u.sensors.push(SensorReading {
             label: "mystery".into(),
@@ -1678,7 +1763,7 @@ mod tests {
         for _ in 0..17 {
             b.tick(&u);
         }
-        assert_eq!(b.state(), TStarState::Uncontrollable);
+        assert_eq!(b.state(), TStarState::Held);
         assert!(b.tick(&u).persistence.is_none());
     }
 
@@ -1725,16 +1810,16 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_or_mismatched_view_exits_bypass_to_held_with_transfer() {
+    fn a_stale_or_mismatched_board_view_stays_held_without_transfer() {
         let mut i = input();
         i.argmax_label = Some("ambient_f75303@4d".into());
         i.argmax_lead_c = 2.0;
         let mut source = TStarSource::new(EntrySeed::Fallback(70.0));
-        assert_eq!(to_curve(&mut source, &i).state, TStarState::Uncontrollable);
+        assert_eq!(to_curve(&mut source, &i).state, TStarState::Held);
         i.replica_reconciled = false;
         let out = source.tick(&i);
         assert_eq!(out.state, TStarState::Held);
-        assert!(out.mode_transfer);
+        assert!(!out.mode_transfer);
     }
 
     #[test]
@@ -1788,7 +1873,7 @@ mod tests {
             source.tick(&i);
         }
         assert!(!source.quarantined("ambient_f75303@4d"));
-        assert_eq!(source.state(), TStarState::Uncontrollable);
+        assert_eq!(source.state(), TStarState::Held);
     }
 
     #[test]
@@ -1813,7 +1898,7 @@ mod tests {
         for _ in 0..2 {
             assert_eq!(source.tick(&i).state, TStarState::Held);
         }
-        assert_eq!(source.tick(&i).state, TStarState::Uncontrollable);
+        assert_eq!(source.tick(&i).state, TStarState::Held);
     }
 
     #[test]
@@ -1901,7 +1986,7 @@ mod tests {
     }
 
     #[test]
-    fn established_curve_uses_argmax_debounce_before_bypass_and_decisive_leads_bypass_now() {
+    fn established_curve_debounces_board_argmax_before_held() {
         let mut i = input();
         i.argmax_lead_c = 2.0;
         let mut source = TStarSource::new(EntrySeed::Fallback(70.0));
@@ -1910,28 +1995,28 @@ mod tests {
         i.argmax_lead_c = 0.5;
         assert_eq!(source.tick(&i).state, TStarState::Curve);
         assert_eq!(source.tick(&i).state, TStarState::Curve);
-        assert_eq!(source.tick(&i).state, TStarState::Uncontrollable);
+        assert_eq!(source.tick(&i).state, TStarState::Held);
 
         let mut source = TStarSource::new(EntrySeed::Fallback(70.0));
         let mut decisive = input();
         decisive.argmax_lead_c = 2.0;
         to_curve(&mut source, &decisive);
         decisive.argmax_label = Some("ambient_f75303@4d".into());
-        assert_eq!(source.tick(&decisive).state, TStarState::Uncontrollable);
+        assert_eq!(source.tick(&decisive).state, TStarState::Held);
     }
 
     #[test]
-    fn uncontrollable_exit_debounces_to_held_then_requires_a_new_curve_window() {
+    fn board_to_cpu_argmax_requires_a_new_curve_window() {
         let mut i = input();
         i.argmax_label = Some("ambient_f75303@4d".into());
         i.argmax_lead_c = 2.0;
         let mut source = TStarSource::new(EntrySeed::Fallback(70.0));
         let entered = source.tick(&i);
-        assert_eq!(source.state(), TStarState::Uncontrollable);
-        assert!(entered.mode_transfer);
+        assert_eq!(source.state(), TStarState::Held);
+        assert!(!entered.mode_transfer);
         for _ in 0..4 {
             let out = source.tick(&i);
-            assert_eq!(out.state, TStarState::Uncontrollable);
+            assert_eq!(out.state, TStarState::Held);
             assert!(!out.mode_transfer);
         }
         let frozen = source.tick(&i).t_star;
@@ -1939,15 +2024,15 @@ mod tests {
         i.argmax_lead_c = 0.5;
         for _ in 0..2 {
             let out = source.tick(&i);
-            assert_eq!(out.state, TStarState::Uncontrollable);
+            assert_eq!(out.state, TStarState::Held);
             assert_eq!(out.t_star, frozen);
             assert!(!out.mode_transfer);
         }
         let exited = source.tick(&i);
         assert_eq!(exited.state, TStarState::Held);
         assert_eq!(exited.t_star, frozen);
-        assert!(exited.mode_transfer);
-        for _ in 0..14 {
+        assert!(!exited.mode_transfer);
+        for _ in 0..13 {
             let out = source.tick(&i);
             assert_eq!(out.state, TStarState::Held);
             assert!(!out.mode_transfer);
@@ -1988,11 +2073,11 @@ mod tests {
         }
         assert!(source.quarantined("ambient_f75303@4d"));
         assert!(out.flags.contains(&TStarFlag::EcUncontrollableUnavailable));
-        assert_eq!(out.t_star, Some(86.0));
+        assert_eq!(out.t_star, Some(70.0));
     }
 
     #[test]
-    fn curve_to_uncontrollable_debounces_then_stays_bypassed_without_a_gate() {
+    fn curve_to_board_argmax_debounces_then_stays_held() {
         let mut i = input();
         i.argmax_lead_c = 2.0;
         let mut source = TStarSource::new(EntrySeed::Fallback(70.0));
@@ -2009,27 +2094,27 @@ mod tests {
             assert!(!out.mode_transfer);
         }
         let bypass = source.tick(&i);
-        assert_eq!(bypass.state, TStarState::Uncontrollable);
+        assert_eq!(bypass.state, TStarState::Held);
         assert_eq!(bypass.t_star, curve_target);
-        assert!(bypass.mode_transfer);
+        assert!(!bypass.mode_transfer);
         for _ in 0..20 {
             let out = source.tick(&i);
-            assert_eq!(out.state, TStarState::Uncontrollable);
+            assert_eq!(out.state, TStarState::Held);
             assert_eq!(out.t_star, curve_target);
             assert!(!out.mode_transfer);
         }
     }
 
     #[test]
-    fn decisive_uncontrollable_argmax_bypasses_immediately_from_held() {
+    fn decisive_board_argmax_keeps_held_regulation() {
         let mut i = input();
         i.argmax_label = Some("ambient_f75303@4d".into());
         i.argmax_lead_c = 1.1;
         let mut source = TStarSource::new(EntrySeed::Fallback(70.0));
         let out = source.tick(&i);
-        assert_eq!(out.state, TStarState::Uncontrollable);
-        assert!(out.mode_transfer);
-        assert!(out
+        assert_eq!(out.state, TStarState::Held);
+        assert!(!out.mode_transfer);
+        assert!(!out
             .flags
             .contains(&TStarFlag::ArgmaxUncontrollable("ambient_f75303@4d".into())));
     }

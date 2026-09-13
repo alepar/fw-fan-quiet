@@ -69,6 +69,18 @@ fn parse_info_table(text: &str) -> InfoTable {
     table
 }
 
+/// Read-first maintenance evidence; preserve the pre-repair verdict so a
+/// successful repair cannot conceal an interrupted calibration response.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CpuCapMaintenance {
+    pub observed: WriteVerdict,
+    pub repair: Option<WriteVerdict>,
+}
+
+impl CpuCapMaintenance {
+    pub fn verdict(self) -> WriteVerdict { self.repair.unwrap_or(self.observed) }
+}
+
 pub struct CpuActuator<R: Runner> {
     runner: R,
     /// Stock burst ceiling left untouched so short spikes stay fast
@@ -140,6 +152,17 @@ impl<R: Runner> CpuActuator<R> {
         }
         self.last_commanded_mw.store(mw, Ordering::Relaxed);
         self.verify_write(mw)
+    }
+
+    /// Read the held limit, repair a confirmed mismatch, then verify the
+    /// repair. Unreadable evidence never triggers a blind write. The caller
+    /// supplies its shutdown/thermal fence, checked after the blocking read.
+    pub fn maintain_sustained_mw(&self, mw: u32, may_repair: impl Fn() -> bool) -> CpuCapMaintenance {
+        let observed = self.verify_write(mw);
+        let repair = if matches!(observed, WriteVerdict::Mismatch { .. }) && may_repair() {
+            Some(self.set_sustained_mw(mw))
+        } else { None };
+        CpuCapMaintenance { observed, repair }
     }
 
     /// Run `ryzenadj --info` and parse its table; `None` when the call fails
@@ -279,6 +302,21 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::process::Output;
+
+    #[test]
+    fn maintenance_never_writes_without_readable_mismatch_and_permission() {
+        use crate::actuators::cmd::test_support::{output_with_stdout, ryzenadj_info_table};
+        for (readable, allowed) in [(false, true), (true, false)] {
+            let runner = FakeRunner::new();
+            runner.push_result(Ok(if readable {
+                output_with_stdout(&ryzenadj_info_table(40.0, 53.0, 40.0))
+            } else { output_with_code(1) }));
+            let cpu = CpuActuator::new(&runner, PathBuf::from("/nonexistent/platform_profile"));
+            let check = cpu.maintain_sustained_mw(15_000, || allowed);
+            assert!(check.repair.is_none());
+            assert_eq!(runner.calls(), vec![("ryzenadj".into(), vec!["--info".into()])]);
+        }
+    }
 
     fn actuator(runner: FakeRunner) -> CpuActuator<FakeRunner> {
         CpuActuator::new(runner, PathBuf::from("/nonexistent/platform_profile"))

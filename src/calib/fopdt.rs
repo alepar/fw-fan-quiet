@@ -42,29 +42,33 @@ pub struct Fopdt {
 /// `data` need not be sorted; `t` is measured from the same origin the step
 /// was applied at (a point with `t <= theta` is treated as pre-step).
 ///
-/// Returns `None` if there are fewer than 4 points, `step_w` is zero or
+/// Returns an explanatory error if there are fewer than 4 points, `step_w` is zero or
 /// non-finite, the search fails to find a usable `(tau, theta)` (degenerate
 /// data — no variation to fit), or any of the rejection rules fire: the
 /// fitted `k <= 0`, `tau < 5 s`, or the identified response magnitude
 /// (`|k * step_w|`) is under `min_response`.
-pub fn fit_fopdt(data: &[(f64, f64)], step_w: f64, min_response: f64) -> Option<Fopdt> {
-    if data.len() < 4 || step_w == 0.0 || !step_w.is_finite() {
-        return None;
+pub fn fit_fopdt(data: &[(f64, f64)], step_w: f64, min_response: f64) -> Result<Fopdt, String> {
+    if data.len() < 4 {
+        return Err(format!("only {} response samples; need at least 4", data.len()));
     }
-    let (tau, theta) = search_tau_theta(data)?;
-    let (_a, b, _sse) = linear_fit_at(data, tau, theta)?;
+    if step_w == 0.0 || !step_w.is_finite() {
+        return Err(format!("invalid applied step {step_w}; need a finite nonzero step"));
+    }
+    let (tau, theta) = search_tau_theta(data)
+        .ok_or_else(|| "response cannot identify a thermal model".to_owned())?;
+    let (_a, b, _sse) = linear_fit_at(data, tau, theta)
+        .ok_or_else(|| "response has insufficient variation to fit a model".to_owned())?;
     let k = b / step_w;
-    // NaN-aware: `k <= 0.0` alone would silently accept a NaN result.
-    if k.is_nan() || k <= 0.0 {
-        return None;
+    if !k.is_finite() || k <= 0.0 {
+        return Err(format!("fitted thermal gain {k:.4} must be finite and positive"));
     }
     if tau < MIN_TAU_S {
-        return None;
+        return Err(format!("fitted time constant {tau:.2}s is below {MIN_TAU_S:.0}s"));
     }
     if b.abs() < min_response {
-        return None;
+        return Err(format!("fitted response {:.2}C is below {min_response:.0}C", b.abs()));
     }
-    Some(Fopdt { k, tau, theta })
+    Ok(Fopdt { k, tau, theta })
 }
 
 /// For fixed `(tau, theta)`, the FOPDT step model is linear in `y0` (`a`)
@@ -176,30 +180,30 @@ fn search_tau_theta(data: &[(f64, f64)]) -> Option<(f64, f64)> {
 /// Derives `Kc = tau/(K*(lambda + theta))`, `Ti = tau`, `lambda =
 /// max(90, 3*theta)`, independently for `ec` and `rpm`, using each `theta`
 /// **exactly as fitted** (see the theta-trap module note). Rejects (returns
-/// `None`) if either signal has `k <= 0`, `tau < 5 s` (both re-checked here
+/// an explanatory error) if either signal has `k <= 0`, `tau < 5 s` (both re-checked here
 /// defensively — a caller can construct a [`Fopdt`] by hand, not only via
-/// [`fit_fopdt`]), or the resulting `Kc` falls outside `[0.25, 4]x` the
-pub fn derive_device_gains(fopdt: &Fopdt, defaults: Gains) -> Option<Gains> {
-    let (kc, ti_s) = derive_one(fopdt, defaults.kc)?;
-    Some(Gains { kc, ti_s })
-}
-
-/// One signal's `(Kc, Ti)` derivation plus its rejection rules. `Ti = tau`
-/// unconditionally; `Kc` is checked against `[0.25, 4]x default_kc`.
-fn derive_one(fopdt: &Fopdt, default_kc: f64) -> Option<(f64, f64)> {
-    if fopdt.k.is_nan() || fopdt.k <= 0.0 || fopdt.tau.is_nan() || fopdt.tau < MIN_TAU_S {
-        return None;
+/// [`fit_fopdt`]), or the resulting `Kc` falls outside `[0.25, 4]x`
+/// the corresponding default. Errors name the measured value and limit.
+pub fn derive_device_gains(fopdt: &Fopdt, defaults: Gains) -> Result<Gains, String> {
+    if !fopdt.k.is_finite() || fopdt.k <= 0.0 {
+        return Err(format!("fitted thermal gain {} must be finite and positive", fopdt.k));
+    }
+    if !fopdt.tau.is_finite() || fopdt.tau < MIN_TAU_S {
+        return Err(format!("fitted time constant {:.2}s must be finite and at least {MIN_TAU_S:.0}s", fopdt.tau));
     }
     let lambda = (LAMBDA_THETA_MULT * fopdt.theta).max(LAMBDA_FLOOR_S);
     let kc = fopdt.tau / (fopdt.k * (lambda + fopdt.theta));
     if !kc.is_finite() {
-        return None;
+        return Err("derived control gain Kc is not finite".into());
     }
-    let ratio = kc / default_kc;
+    let ratio = kc / defaults.kc;
     if !(KC_RATIO_LO..=KC_RATIO_HI).contains(&ratio) {
-        return None;
+        return Err(format!(
+            "derived Kc {kc:.4} is {ratio:.2}x default {:.4}; outside allowed {KC_RATIO_LO:.2}x-{KC_RATIO_HI:.0}x ({:.4}-{:.4})",
+            defaults.kc, defaults.kc * KC_RATIO_LO, defaults.kc * KC_RATIO_HI
+        ));
     }
-    Some((kc, fopdt.tau))
+    Ok(Gains { kc, ti_s: fopdt.tau })
 }
 
 #[cfg(test)]
@@ -339,7 +343,7 @@ mod tests {
             },
             &mut rng,
         );
-        assert_eq!(fit_fopdt(&data, 30.0, MIN_EC_RESPONSE_C), None);
+        assert!(fit_fopdt(&data, 30.0, MIN_EC_RESPONSE_C).is_err());
     }
 
     #[test]
@@ -359,7 +363,7 @@ mod tests {
             },
             &mut rng,
         );
-        assert_eq!(fit_fopdt(&data, 30.0, MIN_EC_RESPONSE_C), None);
+        assert!(fit_fopdt(&data, 30.0, MIN_EC_RESPONSE_C).is_err());
     }
 
     #[test]
@@ -380,25 +384,25 @@ mod tests {
             },
             &mut rng,
         );
-        assert_eq!(fit_fopdt(&data, 30.0, MIN_EC_RESPONSE_C), None);
+        assert!(fit_fopdt(&data, 30.0, MIN_EC_RESPONSE_C).is_err());
     }
 
     #[test]
     fn derive_gains_rejects_kc_outside_ratio_band_directly() {
         let fit = Fopdt { k: 0.01, tau: 35.0, theta: 20.0 };
         let defaults = Gains { kc: 0.4, ti_s: 35.0 };
-        assert_eq!(derive_device_gains(&fit, defaults), None);
+        assert!(derive_device_gains(&fit, defaults).is_err());
     }
 
     #[test]
     fn derive_gains_rejects_non_positive_k_directly() {
         let fit = Fopdt { k: -0.1, tau: 35.0, theta: 20.0 };
-        assert_eq!(derive_device_gains(&fit, Gains { kc: 0.4, ti_s: 35.0 }), None);
+        assert!(derive_device_gains(&fit, Gains { kc: 0.4, ti_s: 35.0 }).is_err());
     }
 
     #[test]
     fn derive_gains_rejects_tau_under_5s_directly() {
         let fit = Fopdt { k: 0.8, tau: 4.0, theta: 1.0 };
-        assert_eq!(derive_device_gains(&fit, Gains { kc: 0.4, ti_s: 35.0 }), None);
+        assert!(derive_device_gains(&fit, Gains { kc: 0.4, ti_s: 35.0 }).is_err());
     }
 }

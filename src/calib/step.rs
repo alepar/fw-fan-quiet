@@ -26,7 +26,8 @@ pub const DEVICE_STEP_W: f64 = 15.0;
 pub const DEVICE_STEP_MHZ: u32 = 500;
 const DEVICE_GROUP_WINDOW_S: usize = 60;
 const DEVICE_FAN_WINDOW_S: usize = 20;
-const DEVICE_GROUP_SPAN_C: f64 = 0.5;
+const DEVICE_CPU_GROUP_SPAN_C: f64 = 1.0;
+const DEVICE_GPU_GROUP_SPAN_C: f64 = 2.0;
 const DEVICE_FAN_SPAN_RPM: f64 = 150.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,10 +36,13 @@ pub enum CalibDevice {
     Gpu,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct PerDeviceCalibContext {
     pub cpu_cap_w: Option<f64>,
     pub cpu_cap_verified: bool,
+    pub cpu_cap_checked_at_s: Option<f64>,
+    pub cpu_cap_readback: Option<crate::actuators::WriteVerdict>,
+    pub cpu_cap_reset_reason: Option<String>,
     pub cpu_cap_completed_at_s: Option<f64>,
     pub gpu_cap_mhz: Option<u32>,
     pub gpu_cap_verified: bool,
@@ -66,6 +70,9 @@ impl Default for PerDeviceCalibContext {
         Self {
             cpu_cap_w: None,
             cpu_cap_verified: false,
+            cpu_cap_checked_at_s: None,
+            cpu_cap_readback: None,
+            cpu_cap_reset_reason: None,
             cpu_cap_completed_at_s: None,
             gpu_cap_mhz: None,
             gpu_cap_verified: false,
@@ -122,17 +129,69 @@ impl GateDuration {
     }
 }
 
+/// Snapshot of the exact inputs and windows used by one calibration tick.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct CalibrationDiagnostics {
+    pub phase: &'static str,
+    pub next_phase: &'static str,
+    pub run_elapsed_s: f64,
+    pub phase_elapsed_s: f64,
+    pub timeout_s: f64,
+    pub baseline_cpu_w: f64,
+    pub baseline_gpu_mhz: u32,
+    pub phase_commanded_at_s: Option<f64>,
+    pub context: PerDeviceCalibContext,
+    /// None outside settling/recovery; old gate state is never reported as current.
+    pub gates: Option<Vec<CalibrationGate>>,
+    pub windows: Option<Vec<CalibrationWindow>>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct CalibrationGate {
+    pub name: &'static str,
+    pub satisfied: bool,
+    pub observed: bool,
+    pub last_observed_at_s: Option<f64>,
+    /// Continuous duration of the current satisfied/failed state.
+    pub duration_s: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct CalibrationWindow {
+    pub name: &'static str,
+    pub samples: usize,
+    pub coverage_s: f64,
+    pub required_s: f64,
+    pub span: Option<f64>,
+    pub limit: f64,
+    pub unit: &'static str,
+}
+
+impl CalibrationWindow {
+    fn snapshot(name: &'static str, values: &VecDeque<(f64, f64)>, required_s: f64, limit: f64, unit: &'static str) -> Self {
+        let coverage_s = values.front().zip(values.back()).map_or(0.0, |(first, last)| (last.0 - first.0).max(0.0));
+        let span = (!values.is_empty()).then(|| {
+            let low = values.iter().map(|(_, v)| *v).fold(f64::INFINITY, f64::min);
+            let high = values.iter().map(|(_, v)| *v).fold(f64::NEG_INFINITY, f64::max);
+            high - low
+        });
+        Self { name, samples: values.len(), coverage_s, required_s, span, limit, unit }
+    }
+}
+
 pub struct PerDeviceStepTest {
     sub: DeviceSub,
+    diagnostics: Option<CalibrationDiagnostics>,
     initialized: bool,
     run_started_at_s: Option<f64>,
+    settle_started_at_s: Option<f64>,
+    cpu_retries: u8,
+    gpu_retries: u8,
     phase_commanded_at_s: Option<f64>,
     last_sample_at_s: Option<f64>,
     cpu_hot_streak: u8,
     baseline_cpu_w: f64,
     baseline_gpu_mhz: u32,
-    baseline_cpu_group_c: f64,
-    baseline_gpu_group_c: f64,
     step_cpu_w: f64,
     step_gpu_mhz: u32,
     applied_step_cpu_w: Option<f64>,
@@ -146,22 +205,23 @@ pub struct PerDeviceStepTest {
     fan: VecDeque<(f64, f64)>,
     settle_gates: [GateDuration; 7],
     primary: Vec<(f64, f64)>,
-    secondary: Vec<(f64, f64)>,
 }
 
 impl PerDeviceStepTest {
     pub fn new() -> Self {
         Self {
             sub: DeviceSub::Settle,
+            diagnostics: None,
             initialized: false,
             run_started_at_s: None,
+            settle_started_at_s: None,
+            cpu_retries: 0,
+            gpu_retries: 0,
             phase_commanded_at_s: None,
             last_sample_at_s: None,
             cpu_hot_streak: 0,
             baseline_cpu_w: 0.0,
             baseline_gpu_mhz: 0,
-            baseline_cpu_group_c: 0.0,
-            baseline_gpu_group_c: 0.0,
             step_cpu_w: 0.0,
             step_gpu_mhz: 0,
             applied_step_cpu_w: None,
@@ -175,7 +235,6 @@ impl PerDeviceStepTest {
             fan: VecDeque::new(),
             settle_gates: std::array::from_fn(|_| GateDuration::default()),
             primary: Vec::new(),
-            secondary: Vec::new(),
         }
     }
 
@@ -199,7 +258,60 @@ impl PerDeviceStepTest {
         self.sub == DeviceSub::Settle
     }
 
-    pub fn on_sample(
+    pub fn finishing_response(&self, now_s: f64) -> bool {
+        matches!(self.sub, DeviceSub::Cpu | DeviceSub::Gpu)
+            && self.phase_commanded_at_s.is_some_and(|at| now_s - at >= DEVICE_FIT_WINDOW_S as f64)
+    }
+
+    pub fn diagnostics(&self) -> Option<&CalibrationDiagnostics> {
+        self.diagnostics.as_ref()
+    }
+
+    fn phase_name(&self) -> &'static str {
+        match self.sub {
+            DeviceSub::Settle => "settle",
+            DeviceSub::Cpu => "cpu_step",
+            DeviceSub::RecoverGpu => "gpu_recovery",
+            DeviceSub::Gpu => "gpu_step",
+            DeviceSub::Done => "done",
+        }
+    }
+
+    pub fn on_sample(&mut self, s: &Sample, ctx: &PerDeviceCalibContext) -> Vec<RunnerEffect> {
+        let phase = self.phase_name();
+        let settling = matches!(self.sub, DeviceSub::Settle | DeviceSub::RecoverGpu);
+        let start = match self.sub {
+            DeviceSub::Settle => self.settle_started_at_s,
+            DeviceSub::RecoverGpu => self.recovery_started_at_s,
+            _ => self.phase_commanded_at_s,
+        }.unwrap_or(s.t_mono);
+        let effects = self.on_sample_inner(s, ctx);
+        let gates = settling.then(|| {
+            ["caps_held", "fanctrl_active", "ec_match", "argmax_controllable", "cpu_group_flat", "gpu_group_flat", "fans_flat"]
+                .into_iter().zip(self.settle_gates.iter()).map(|(name, gate)| CalibrationGate {
+                    name, satisfied: gate.satisfied, observed: gate.observed,
+                    last_observed_at_s: gate.observed.then_some(gate.last_s),
+                    duration_s: if gate.observed { (gate.last_s - gate.since_s).max(0.0) } else { 0.0 },
+                }).collect()
+        });
+        let windows = settling.then(|| vec![
+            CalibrationWindow::snapshot("cpu_group", &self.cpu_group, DEVICE_GROUP_WINDOW_S as f64, DEVICE_CPU_GROUP_SPAN_C, "celsius"),
+            CalibrationWindow::snapshot("gpu_group", &self.gpu_group, DEVICE_GROUP_WINDOW_S as f64, DEVICE_GPU_GROUP_SPAN_C, "celsius"),
+            CalibrationWindow::snapshot("fans", &self.fan, DEVICE_FAN_WINDOW_S as f64, DEVICE_FAN_SPAN_RPM, "rpm"),
+        ]);
+        self.diagnostics = Some(CalibrationDiagnostics {
+            phase, next_phase: self.phase_name(),
+            run_elapsed_s: (s.t_mono - self.run_started_at_s.unwrap_or(s.t_mono)).max(0.0),
+            phase_elapsed_s: (s.t_mono - start).max(0.0),
+            timeout_s: if settling { DEVICE_SETTLE_S as f64 } else { DEVICE_FIT_WINDOW_S as f64 },
+            baseline_cpu_w: self.baseline_cpu_w, baseline_gpu_mhz: self.baseline_gpu_mhz,
+            phase_commanded_at_s: self.phase_commanded_at_s,
+            context: ctx.clone(), gates, windows,
+        });
+        effects
+    }
+
+    fn on_sample_inner(
         &mut self,
         s: &Sample,
         ctx: &PerDeviceCalibContext,
@@ -213,6 +325,7 @@ impl PerDeviceStepTest {
         if first_sample {
             self.initialized = true;
             self.run_started_at_s = Some(now_s);
+            self.settle_started_at_s = Some(now_s);
             self.baseline_cpu_w = if ctx.use_current_caps {
                 ctx.cpu_cap_w.unwrap_or(ctx.cpu_floor_w)
             } else {
@@ -233,6 +346,9 @@ impl PerDeviceStepTest {
         }
         if let Some(reason) = self.key_change_reason(ctx) {
             return self.abort(reason);
+        }
+        if !first_sample && let Some(reason) = &ctx.cpu_cap_reset_reason {
+            return self.retry_after_cpu_cap_reset(now_s, reason);
         }
         if first_sample {
             for (gate, satisfied) in self.settle_gates.iter_mut().zip([
@@ -259,6 +375,40 @@ impl PerDeviceStepTest {
             DeviceSub::Gpu => self.on_response(now_s, ctx, CalibDevice::Gpu),
             DeviceSub::Done => Vec::new(),
         }
+    }
+
+    fn retry_after_cpu_cap_reset(&mut self, now_s: f64, reason: &str) -> Vec<RunnerEffect> {
+        let device = self.phase();
+        let retries = match device { CalibDevice::Cpu => &mut self.cpu_retries, CalibDevice::Gpu => &mut self.gpu_retries };
+        if *retries >= 2 {
+            return self.abort(format!("{} calibration failed after 2 retries: {reason}", device_name(device)));
+        }
+        *retries += 1;
+        let note = format!("{} retry {}/2: {reason}; discarded response, settling again", device_name(device), *retries);
+        self.primary.clear();
+        self.response_last_at_s = None;
+        self.phase_commanded_at_s = None;
+        self.applied_step_cpu_w = None;
+        self.applied_step_gpu_mhz = None;
+        self.cpu_group.clear();
+        self.gpu_group.clear();
+        self.fan.clear();
+        self.settle_gates = std::array::from_fn(|_| GateDuration::default());
+        match device {
+            CalibDevice::Cpu => {
+                self.sub = DeviceSub::Settle;
+                self.settle_started_at_s = Some(now_s);
+            }
+            CalibDevice::Gpu => {
+                self.sub = DeviceSub::RecoverGpu;
+                self.recovery_started_at_s = Some(now_s);
+            }
+        }
+        vec![
+            RunnerEffect::SetCpuMaxWatts(self.baseline_cpu_w),
+            RunnerEffect::SetGpuMaxClock(self.baseline_gpu_mhz),
+            RunnerEffect::Retrying(note),
+        ]
     }
 
     fn key_change_reason(&mut self, ctx: &PerDeviceCalibContext) -> Option<String> {
@@ -342,8 +492,8 @@ impl PerDeviceStepTest {
             self.fan.clear();
         }
 
-        let cpu_flat = timed_span_within(&self.cpu_group, DEVICE_GROUP_WINDOW_S as f64, DEVICE_GROUP_SPAN_C);
-        let gpu_flat = timed_span_within(&self.gpu_group, DEVICE_GROUP_WINDOW_S as f64, DEVICE_GROUP_SPAN_C);
+        let cpu_flat = timed_span_within(&self.cpu_group, DEVICE_GROUP_WINDOW_S as f64, DEVICE_CPU_GROUP_SPAN_C);
+        let gpu_flat = timed_span_within(&self.gpu_group, DEVICE_GROUP_WINDOW_S as f64, DEVICE_GPU_GROUP_SPAN_C);
         let fans_flat = timed_span_within(&self.fan, DEVICE_FAN_WINDOW_S as f64, DEVICE_FAN_SPAN_RPM);
         for (gate, satisfied) in self.settle_gates.iter_mut().zip([
             caps_held,
@@ -364,17 +514,14 @@ impl PerDeviceStepTest {
             let Some(_interval) = self.interval else {
                 return self.abort("settle completed without a moving-average interval".into());
             };
-            self.baseline_cpu_group_c = timed_mean(&self.cpu_group).expect("full CPU settle window");
-            self.baseline_gpu_group_c = timed_mean(&self.gpu_group).expect("full GPU settle window");
             self.sub = DeviceSub::Cpu;
             self.phase_commanded_at_s = Some(now_s);
             self.applied_step_cpu_w = None;
             self.response_last_at_s = None;
             self.primary.clear();
-            self.secondary.clear();
             return vec![RunnerEffect::SetCpuMaxWatts(self.step_cpu_w)];
         }
-        if now_s - self.run_started_at_s.unwrap_or(now_s) >= DEVICE_SETTLE_S as f64 {
+        if now_s - self.settle_started_at_s.unwrap_or(now_s) >= DEVICE_SETTLE_S as f64 {
             return self.abort(self.settle_timeout_reason());
         }
         Vec::new()
@@ -452,26 +599,23 @@ impl PerDeviceStepTest {
             } else {
                 self.baseline_gpu_mhz
             });
+        if !ctx.cpu_cap_verified && ctx.cpu_cap_readback.is_some() {
+            return self.abort(format!("{} step rejected: CPU cap read-back unverified ({:?})", device_name(device), ctx.cpu_cap_readback));
+        }
         if !pair_held {
             return self.abort(format!(
                 "{} step rejected: verified applied pair changed during response",
                 device_name(device)
             ));
         }
-        let (primary, secondary) = match device {
-            CalibDevice::Cpu => (ctx.cpu_group_c, ctx.gpu_group_c),
-            CalibDevice::Gpu => (ctx.gpu_group_c, ctx.cpu_group_c),
+        let primary = match device {
+            CalibDevice::Cpu => ctx.cpu_group_c,
+            CalibDevice::Gpu => ctx.gpu_group_c,
         };
         let t = now_s - self.phase_commanded_at_s.unwrap_or(now_s);
         let Some(primary) = primary.filter(|value| value.is_finite()) else {
             return self.finish_device_response(now_s, device, vec![RunnerEffect::Noted(format!(
                 "{} fit rejected: primary group coverage missing or interrupted",
-                device_name(device)
-            ))]);
-        };
-        let Some(secondary) = secondary.filter(|value| value.is_finite()) else {
-            return self.finish_device_response(now_s, device, vec![RunnerEffect::Noted(format!(
-                "{} fit rejected: secondary group coverage missing or interrupted",
                 device_name(device)
             ))]);
         };
@@ -484,7 +628,6 @@ impl PerDeviceStepTest {
         }
         self.response_last_at_s = Some(now_s);
         self.primary.push((t, primary));
-        self.secondary.push((t, secondary));
         if t < DEVICE_FIT_WINDOW_S as f64 { return Vec::new(); }
 
         let effects = self.conclude_device(device, self.interval.unwrap_or(60));
@@ -498,15 +641,13 @@ impl PerDeviceStepTest {
         mut effects: Vec<RunnerEffect>,
     ) -> Vec<RunnerEffect> {
         self.primary.clear();
-        self.secondary.clear();
         self.response_last_at_s = None;
         match device {
             CalibDevice::Cpu => {
                 // Restore the complete held pair after the CPU step. The
                 // CPU group is still carrying the step response, so wait
                 // for the same physical flatness conditions before the GPU
-                // step; otherwise CPU cooling would be misclassified as a
-                // GPU-step cross term on every real run.
+                // step starts from a settled thermal state.
                 self.sub = DeviceSub::RecoverGpu;
                 self.recovery_started_at_s = Some(now_s);
                 self.phase_commanded_at_s = None;
@@ -550,8 +691,8 @@ impl PerDeviceStepTest {
             self.gpu_group.clear();
             self.fan.clear();
         }
-        let cpu_flat = timed_span_within(&self.cpu_group, DEVICE_GROUP_WINDOW_S as f64, DEVICE_GROUP_SPAN_C);
-        let gpu_flat = timed_span_within(&self.gpu_group, DEVICE_GROUP_WINDOW_S as f64, DEVICE_GROUP_SPAN_C);
+        let cpu_flat = timed_span_within(&self.cpu_group, DEVICE_GROUP_WINDOW_S as f64, DEVICE_CPU_GROUP_SPAN_C);
+        let gpu_flat = timed_span_within(&self.gpu_group, DEVICE_GROUP_WINDOW_S as f64, DEVICE_GPU_GROUP_SPAN_C);
         let fans_flat = timed_span_within(&self.fan, DEVICE_FAN_WINDOW_S as f64, DEVICE_FAN_SPAN_RPM);
         for (gate, satisfied) in self.settle_gates.iter_mut().zip([
             caps_held,
@@ -565,13 +706,10 @@ impl PerDeviceStepTest {
             gate.observe(now_s, satisfied);
         }
         if self.settle_gates.iter().all(|gate| gate.satisfied) {
-            self.baseline_cpu_group_c = timed_mean(&self.cpu_group).expect("full CPU recovery window");
-            self.baseline_gpu_group_c = timed_mean(&self.gpu_group).expect("full GPU recovery window");
             self.sub = DeviceSub::Gpu;
             self.phase_commanded_at_s = Some(now_s);
             self.response_last_at_s = None;
             self.primary.clear();
-            self.secondary.clear();
             return vec![RunnerEffect::SetGpuMaxClock(self.step_gpu_mhz)];
         }
         if now_s - recovery_started >= DEVICE_SETTLE_S as f64 {
@@ -581,27 +719,6 @@ impl PerDeviceStepTest {
     }
 
     fn conclude_device(&self, device: CalibDevice, interval: u32) -> Vec<RunnerEffect> {
-        let primary_baseline = match device {
-            CalibDevice::Cpu => self.baseline_cpu_group_c,
-            CalibDevice::Gpu => self.baseline_gpu_group_c,
-        };
-        let secondary_baseline = match device {
-            CalibDevice::Cpu => self.baseline_gpu_group_c,
-            CalibDevice::Gpu => self.baseline_cpu_group_c,
-        };
-        let primary_delta = tail_series_mean(&self.primary).map_or(0.0, |v| v - primary_baseline);
-        let secondary_delta = self
-            .secondary
-            .iter()
-            .map(|(_, value)| (value - secondary_baseline).abs())
-            .fold(0.0, f64::max);
-        let cross_limit = 1.0_f64.max(0.2 * primary_delta.abs());
-        if secondary_delta > cross_limit {
-            return vec![RunnerEffect::Noted(format!(
-                "{} fit rejected: other group moved {:.2}C > {:.2}C (load changed)",
-                device_name(device), secondary_delta, cross_limit
-            ))];
-        }
         let step = match device {
             CalibDevice::Cpu => self.applied_step_cpu_w.unwrap_or(self.baseline_cpu_w) - self.baseline_cpu_w,
             CalibDevice::Gpu => {
@@ -616,10 +733,9 @@ impl PerDeviceStepTest {
         let fit = fit_fopdt(&self.primary, step, MIN_EC_RESPONSE_C);
         let gains = fit.and_then(|fit| derive_device_gains(&fit, defaults));
         match gains {
-            Some(gains) => vec![RunnerEffect::FittedDevice { device, gains }],
-            None => vec![RunnerEffect::Noted(format!(
-                "{} fit rejected: primary response below 3C or model invalid",
-                device_name(device)
+            Ok(gains) => vec![RunnerEffect::FittedDevice { device, gains }],
+            Err(reason) => vec![RunnerEffect::Noted(format!(
+                "{} fit rejected: {reason}", device_name(device)
             ))],
         }
     }
@@ -662,9 +778,13 @@ fn push_timed_optional(
     match value.filter(|v| v.is_finite()) {
         Some(value) => {
             window.push_back((now_s, value));
+            // Keep the most recent sample at or before the window boundary.
+            // Dropping it on a jittered 1 Hz stream leaves only ~59/~19 s
+            // of coverage, so even perfectly flat windows can never settle.
+            // The retained boundary value participates in the span check.
             while window
-                .front()
-                .is_some_and(|(at, _)| now_s - at > horizon_s)
+                .get(1)
+                .is_some_and(|(at, _)| now_s - at >= horizon_s)
             {
                 window.pop_front();
             }
@@ -682,16 +802,7 @@ fn timed_span_within(window: &VecDeque<(f64, f64)>, horizon_s: f64, tolerance: f
     hi - lo <= tolerance
 }
 
-fn tail_series_mean(series: &[(f64, f64)]) -> Option<f64> {
-    if series.is_empty() { return None; }
-    let n = series.len().min(60);
-    Some(series.iter().rev().take(n).map(|(_, v)| v).sum::<f64>() / n as f64)
-}
 
-fn timed_mean(series: &VecDeque<(f64, f64)>) -> Option<f64> {
-    (!series.is_empty())
-        .then(|| series.iter().map(|(_, value)| *value).sum::<f64>() / series.len() as f64)
-}
 
 #[cfg(test)]
 mod per_device_behavior_tests {
@@ -715,6 +826,9 @@ mod per_device_behavior_tests {
         PerDeviceCalibContext {
             cpu_cap_w: Some(70.0),
             cpu_cap_verified: true,
+            cpu_cap_checked_at_s: None,
+            cpu_cap_readback: None,
+            cpu_cap_reset_reason: None,
             cpu_cap_completed_at_s: Some(0.0),
             gpu_cap_mhz: Some(2_800),
             gpu_cap_verified: true,
@@ -742,6 +856,98 @@ mod per_device_behavior_tests {
             fan_valid: true,
             fan1_rpm: 2_400.0,
             ..Sample::default()
+        }
+    }
+
+    #[test]
+    fn calibration_settles_with_jitter_in_entry_and_recovery() {
+        for recovery in [false, true] {
+            for interval in [1.0, 1.001] {
+                let mut step = PerDeviceStepTest::new();
+                let ctx = context();
+                step.on_sample(&sample_at(0.0), &ctx);
+                if recovery {
+                    step.sub = DeviceSub::RecoverGpu;
+                    step.recovery_started_at_s = Some(0.0);
+                    step.baseline_cpu_w = ctx.cpu_cap_w.unwrap();
+                    step.baseline_gpu_mhz = ctx.gpu_cap_mhz.unwrap();
+                }
+                for second in 0..=60 {
+                    step.on_sample(&sample_at(f64::from(second) * interval), &ctx);
+                }
+                let d = step.diagnostics().unwrap();
+                assert_eq!(d.context, ctx);
+                assert_eq!(d.phase, if recovery { "gpu_recovery" } else { "settle" });
+                let gates = d.gates.as_ref().unwrap();
+                assert_eq!(gates.len(), 7);
+                assert!(gates[..4].iter().all(|gate| gate.observed && gate.satisfied));
+                let windows = d.windows.as_ref().unwrap();
+                assert_eq!(windows.iter().map(|w| w.limit).collect::<Vec<_>>(), vec![1.0, 2.0, 150.0]);
+                assert!(windows.iter().all(|w| w.span == Some(0.0) && w.samples > 1));
+                assert!(gates.iter().all(|gate| gate.satisfied));
+                assert_eq!(d.next_phase, if recovery { "gpu_step" } else { "cpu_step" });
+                assert!(windows.iter().all(|w| w.coverage_s >= w.required_s));
+                assert!((windows[0].coverage_s - 60.0 * interval).abs() < 1e-9);
+                assert!((windows[2].coverage_s - 20.0 * interval).abs() < 1e-9);
+                step.on_sample(&sample_at(62.0), &ctx);
+                let response = step.diagnostics().unwrap();
+                assert!(response.gates.is_none() && response.windows.is_none(),
+                    "response phase must not publish stale settling measurements");
+            }
+        }
+    }
+
+    #[test]
+    fn settling_window_retains_only_one_boundary_sample_and_expires_old_outlier() {
+        let mut window = VecDeque::new();
+        for (at, value) in [(0.0, 10.0), (1.001, 0.0), (19.019, 0.0)] {
+            push_timed_optional(&mut window, Some(value), at, 20.0);
+        }
+        assert!(!timed_span_within(&window, 20.0, 1.0));
+        push_timed_optional(&mut window, Some(0.0), 20.020, 20.0);
+        assert_eq!(window.front().unwrap().0, 0.0);
+        assert!(!timed_span_within(&window, 20.0, 1.0), "boundary outlier still counts");
+        push_timed_optional(&mut window, Some(0.0), 21.021, 20.0);
+        assert_eq!(window.front().unwrap().0, 1.001);
+        assert!(timed_span_within(&window, 20.0, 1.0));
+        push_timed_optional(&mut window, None, 22.022, 20.0);
+        assert!(window.is_empty(), "missing readings still discard coverage");
+        push_timed_optional(&mut window, Some(0.0), 23.023, 20.0);
+        assert!(!timed_span_within(&window, 20.0, 1.0));
+    }
+
+    #[test]
+    fn per_device_settle_spans_apply_to_entry_and_recovery() {
+        for recovery in [false, true] {
+            for (cpu_span, gpu_span, fan_span, accepted) in [
+                (1.0, 2.0, 150.0, true),
+                (1.01, 2.0, 150.0, false),
+                (1.0, 2.01, 150.0, false),
+                (1.0, 2.0, 151.0, false),
+            ] {
+                let mut step = PerDeviceStepTest::new();
+                let mut ctx = context();
+                step.on_sample(&sample_at(0.0), &ctx);
+                if recovery {
+                    step.sub = DeviceSub::RecoverGpu;
+                    step.recovery_started_at_s = Some(0.0);
+                    step.baseline_cpu_w = ctx.cpu_cap_w.unwrap();
+                    step.baseline_gpu_mhz = ctx.gpu_cap_mhz.unwrap();
+                }
+                let mut effects = Vec::new();
+                for second in 0..=60 {
+                    let high = second % 2 == 1;
+                    ctx.cpu_group_c = Some(50.0 + if high { cpu_span } else { 0.0 });
+                    ctx.gpu_group_c = Some(55.0 + if high { gpu_span } else { 0.0 });
+                    let mut sample = sample_at(f64::from(second));
+                    sample.fan1_rpm += if high { fan_span } else { 0.0 };
+                    effects = step.on_sample(&sample, &ctx);
+                }
+                let advanced = effects.iter().any(|effect| matches!(effect,
+                    RunnerEffect::SetCpuMaxWatts(_) | RunnerEffect::SetGpuMaxClock(_)));
+                assert_eq!(advanced, accepted,
+                    "recovery={recovery} CPU={cpu_span} GPU={gpu_span} fan={fan_span}");
+            }
         }
     }
 
@@ -820,7 +1026,7 @@ mod per_device_behavior_tests {
         };
         for elapsed in 1..=360 {
             let mut tick = gpu_ctx.clone();
-            tick.gpu_group_c = Some(response(55.0, 0.02, 15.0, 60.0, 290.0, elapsed as f64));
+            tick.gpu_group_c = Some(response(55.0, 0.012, 32.564, 38.4515, 290.0, elapsed as f64));
             tick.cpu_group_c = Some(response(50.0, 0.001, 15.0, 60.0, 290.0, elapsed as f64));
             gpu_end = step.on_sample(&sample_at(481.0 + elapsed as f64), &tick);
         }
@@ -943,23 +1149,117 @@ mod per_device_behavior_tests {
     }
 
     #[test]
-    fn cross_term_above_max_one_or_twenty_percent_rejects_as_load_changed() {
+    fn cross_device_temperature_changes_do_not_reject_a_valid_cpu_fit() {
+        for excursion in [-20.0, 20.0] {
+            let mut step = PerDeviceStepTest::new();
+            let mut ctx = context();
+            ctx.cpu_cap_w = Some(20.0);
+            enter_cpu_step(&mut step, &ctx);
+            let response_ctx = cpu_step_context(&ctx, 35.0);
+            let mut end = Vec::new();
+            for elapsed in 1..=DEVICE_FIT_WINDOW_S {
+                let mut tick = response_ctx.clone();
+                tick.cpu_group_c = Some(50.0 + 12.0 * (1.0 - (-(elapsed as f64 - 20.0).max(0.0) / 35.0).exp()));
+                tick.gpu_group_c = Some(55.0 + excursion);
+                end = step.on_sample(&sample_at(60.0 + elapsed as f64), &tick);
+            }
+            assert!(end.iter().any(|effect| matches!(effect,
+                RunnerEffect::FittedDevice { device: CalibDevice::Cpu, .. })), "{end:?}");
+        }
+    }
+
+    #[test]
+    fn cpu_retry_resettles_and_fits_only_a_fresh_full_response() {
         let mut step = PerDeviceStepTest::new();
         let mut ctx = context();
         ctx.cpu_cap_w = Some(20.0);
         enter_cpu_step(&mut step, &ctx);
-        let response_ctx = cpu_step_context(&ctx, 35.0);
-        let mut end = Vec::new();
-        for elapsed in 1..=DEVICE_FIT_WINDOW_S {
-            let mut tick = response_ctx.clone();
-            tick.cpu_group_c = Some(if elapsed < 20 { 50.0 } else { 62.0 });
-            tick.gpu_group_c = Some(if elapsed < 20 { 55.0 } else { 58.1 });
-            end = step.on_sample(&sample_at(60.0 + elapsed as f64), &tick);
+        let mut disturbed = cpu_step_context(&ctx, 35.0);
+        disturbed.cpu_cap_reset_reason = Some("CPU limit changed to 40W".into());
+        step.primary.push((1.0, 99.0));
+        step.on_sample(&sample_at(100.0), &disturbed);
+        let mut restored = ctx.clone();
+        restored.cpu_cap_completed_at_s = Some(100.0);
+        restored.gpu_cap_completed_at_s = Some(100.0);
+        for second in 101..=161 {
+            let effects = step.on_sample(&sample_at(f64::from(second)), &restored);
+            if second < 161 { assert!(effects.is_empty(), "{effects:?}"); }
+            else { assert_eq!(effects, vec![RunnerEffect::SetCpuMaxWatts(35.0)]); }
         }
-        assert!(end.iter().any(|effect| matches!(effect,
-            RunnerEffect::Noted(reason) if reason.contains("load changed"))));
-        assert!(!end.iter().any(|effect| matches!(effect,
-            RunnerEffect::FittedDevice { device: CalibDevice::Cpu, .. })));
+        assert!(step.primary.is_empty());
+        let mut response = cpu_step_context(&restored, 35.0);
+        response.cpu_cap_completed_at_s = Some(161.0);
+        for elapsed in 1..=360 {
+            response.cpu_group_c = Some(50.0 + 12.0 * (1.0 - (-(f64::from(elapsed) - 20.0).max(0.0) / 35.0).exp()));
+            let effects = step.on_sample(&sample_at(161.0 + f64::from(elapsed)), &response);
+            let fitted = effects.iter().any(|effect| matches!(effect, RunnerEffect::FittedDevice { device: CalibDevice::Cpu, .. }));
+            assert_eq!(fitted, elapsed == 360, "{effects:?}");
+        }
+    }
+
+    #[test]
+    fn cap_reset_discards_response_and_bounds_retries_for_each_device() {
+        for device in [CalibDevice::Cpu, CalibDevice::Gpu] {
+            let mut step = PerDeviceStepTest::new();
+            let ctx = context();
+            enter_cpu_step(&mut step, &ctx);
+            for attempt in 0..3 {
+                step.sub = if device == CalibDevice::Cpu { DeviceSub::Cpu } else { DeviceSub::Gpu };
+                step.primary.push((1.0, 65.0));
+                let mut disturbed = ctx.clone();
+                disturbed.cpu_cap_w = Some(if device == CalibDevice::Cpu { 80.0 } else { 70.0 });
+                disturbed.cpu_cap_reset_reason = Some("CPU cap reset: read 40W instead of 15W".into());
+                let effects = step.on_sample(&sample_at(100.0 + f64::from(attempt)), &disturbed);
+                assert!(!effects.iter().any(|effect| matches!(effect, RunnerEffect::FittedDevice { .. })));
+                assert!(effects.contains(&RunnerEffect::SetCpuMaxWatts(70.0)), "{effects:?}");
+                if attempt < 2 {
+                    assert!(!step.done(), "{effects:?}");
+                    assert!(step.primary.is_empty());
+                    assert_eq!(step.sub, if device == CalibDevice::Cpu { DeviceSub::Settle } else { DeviceSub::RecoverGpu });
+                    assert!(format!("{effects:?}").contains(&format!("retry {}/2", attempt + 1)));
+                } else {
+                    assert!(step.done());
+                    assert!(effects.iter().any(|effect| matches!(effect, RunnerEffect::Noted(reason) if reason.contains("2 retries"))));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recorded_september_run_accepts_both_fits_with_measured_gpu_default() {
+        let data = include_str!("fixtures/2026-09-12-responses.csv");
+        for (name, device, expected_kc) in [("cpu", CalibDevice::Cpu, 0.332_081_5), ("gpu", CalibDevice::Gpu, 22.221_804_8)] {
+            let mut step = PerDeviceStepTest::new();
+            step.baseline_cpu_w = 15.0;
+            step.applied_step_cpu_w = Some(30.0);
+            step.baseline_gpu_mhz = 1_000;
+            step.applied_step_gpu_mhz = Some(1_500);
+            step.primary = data.lines().filter_map(|line| {
+                let mut fields = line.split(',');
+                if fields.next()? != name { return None; }
+                Some((fields.next()?.parse().unwrap(), fields.next()?.parse().unwrap()))
+            }).collect();
+            assert_eq!(step.primary.len(), 360);
+            let effects = step.conclude_device(device, 60);
+            assert!(effects.iter().any(|effect| matches!(effect,
+                RunnerEffect::FittedDevice { device: fitted, gains }
+                if *fitted == device && (gains.kc - expected_kc).abs() < 0.0001)), "{effects:?}");
+        }
+    }
+
+    #[test]
+    fn fit_rejections_explain_response_and_gain_limits_separately() {
+        let mut step = PerDeviceStepTest::new();
+        step.applied_step_cpu_w = Some(30.0);
+        step.baseline_cpu_w = 15.0;
+        for (amplitude, tau, expected) in [(2.0, 35.0, "fitted response"), (4.0, 300.0, "outside allowed")] {
+            step.primary = (1..=360).map(|t| {
+                (t as f64, 50.0 + amplitude * (1.0 - (-(t as f64 - 20.0).max(0.0) / tau).exp()))
+            }).collect();
+            let effects = step.conclude_device(CalibDevice::Cpu, 60);
+            assert!(effects.iter().any(|effect| matches!(effect,
+                RunnerEffect::Noted(reason) if reason.contains(expected))), "{effects:?}");
+        }
     }
 
     #[test]
@@ -972,7 +1272,7 @@ mod per_device_behavior_tests {
         let mut end = Vec::new();
         for elapsed in 1..=DEVICE_FIT_WINDOW_S {
             let mut tick = response_ctx.clone();
-            tick.cpu_group_c = Some(if elapsed < 20 { 50.0 } else { 52.9 });
+            tick.cpu_group_c = Some(50.0 + 2.9 * (1.0 - (-(elapsed as f64 - 20.0).max(0.0) / 35.0).exp()));
             tick.gpu_group_c = Some(55.0);
             end = step.on_sample(&sample_at(60.0 + elapsed as f64), &tick);
         }
@@ -1061,24 +1361,6 @@ mod per_device_behavior_tests {
     }
 
     #[test]
-    fn a_secondary_excursion_that_returns_to_baseline_still_rejects_the_fit() {
-        let mut step = PerDeviceStepTest::new();
-        let mut ctx = context();
-        ctx.cpu_cap_w = Some(20.0);
-        enter_cpu_step(&mut step, &ctx);
-        let response_ctx = cpu_step_context(&ctx, 35.0);
-        let mut end = Vec::new();
-        for elapsed in 1..=DEVICE_FIT_WINDOW_S {
-            let mut tick = response_ctx.clone();
-            tick.cpu_group_c = Some(if elapsed < 20 { 50.0 } else { 62.0 });
-            tick.gpu_group_c = Some(if (100..180).contains(&elapsed) { 59.0 } else { 55.0 });
-            end = step.on_sample(&sample_at(60.0 + elapsed as f64), &tick);
-        }
-        assert!(end.iter().any(|effect| matches!(effect,
-            RunnerEffect::Noted(reason) if reason.contains("load changed"))));
-    }
-
-    #[test]
     fn response_rejects_a_failed_or_externally_changed_applied_pair() {
         let mut step = PerDeviceStepTest::new();
         let mut ctx = context();
@@ -1093,35 +1375,19 @@ mod per_device_behavior_tests {
     }
 
     #[test]
-    fn response_rejects_a_wholly_missing_secondary_group_instead_of_treating_it_as_zero() {
+    fn response_does_not_require_the_other_groups_trace() {
         let mut step = PerDeviceStepTest::new();
-        let mut settled = context();
-        settled.cpu_cap_w = Some(20.0);
-        enter_cpu_step(&mut step, &settled);
-        let mut response = cpu_step_context(&settled, 35.0);
-        response.gpu_group_c = None;
-        let effects = step.on_sample(&sample_at(61.0), &response);
-        assert!(effects.iter().any(|effect| matches!(effect,
-            RunnerEffect::Noted(reason) if reason.contains("secondary group coverage"))), "{effects:?}");
-        assert!(!effects.iter().any(|effect| matches!(effect, RunnerEffect::FittedDevice { .. })));
-    }
-
-    #[test]
-    fn response_rejects_an_interrupted_secondary_group_trace() {
-        let mut step = PerDeviceStepTest::new();
-        let mut settled = context();
-        settled.cpu_cap_w = Some(20.0);
-        enter_cpu_step(&mut step, &settled);
-        let response = cpu_step_context(&settled, 35.0);
-        for elapsed in 1..=40 {
-            assert!(step.on_sample(&sample_at(60.0 + f64::from(elapsed)), &response).is_empty());
+        let mut ctx = context();
+        ctx.cpu_cap_w = Some(20.0);
+        enter_cpu_step(&mut step, &ctx);
+        let mut response = cpu_step_context(&ctx, 35.0);
+        let mut end = Vec::new();
+        for elapsed in 1..=DEVICE_FIT_WINDOW_S {
+            response.cpu_group_c = Some(50.0 + 12.0 * (1.0 - (-(elapsed as f64 - 20.0).max(0.0) / 35.0).exp()));
+            response.gpu_group_c = None;
+            end = step.on_sample(&sample_at(60.0 + elapsed as f64), &response);
         }
-        let mut interrupted = response;
-        interrupted.gpu_group_c = None;
-        let effects = step.on_sample(&sample_at(101.0), &interrupted);
-        assert!(effects.iter().any(|effect| matches!(effect,
-            RunnerEffect::Noted(reason) if reason.contains("secondary group coverage"))), "{effects:?}");
-        assert!(!effects.iter().any(|effect| matches!(effect, RunnerEffect::FittedDevice { .. })));
+        assert!(end.iter().any(|effect| matches!(effect, RunnerEffect::FittedDevice { device: CalibDevice::Cpu, .. })), "{end:?}");
     }
 
     #[test]

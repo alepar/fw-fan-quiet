@@ -226,13 +226,13 @@ variant.
 
 ## Test results
 
-- `cargo test --bin bazerame-fans` (full suite): **605 passed, 0 failed,
+- `cargo test --bin fw-fan-quiet` (full suite): **605 passed, 0 failed,
   2 ignored** (same 2 pre-existing ignores as baseline, unrelated to this
   task).
-- `cargo test --bin bazerame-fans calib::`: 60/60 passing (step.rs: 14
+- `cargo test --bin fw-fan-quiet calib::`: 60/60 passing (step.rs: 14
   tests; runner.rs: 9 tests; unchanged fopdt/lut_sweep/steady/burner
   suites: 37 tests).
-- `cargo test --bin bazerame-fans control::controller::`: 61/61 passing.
+- `cargo test --bin fw-fan-quiet control::controller::`: 61/61 passing.
 - `cargo clippy --all-targets -- -D warnings`: **not clean crate-wide**,
   but this is a pre-existing baseline condition, not something this task
   introduced or is positioned to fix. I verified this precisely: I

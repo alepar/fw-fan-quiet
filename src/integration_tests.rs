@@ -46,7 +46,7 @@ use crate::types::Sample;
 /// module doc: those are unreachable from here).
 fn fixture_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "bazerame-integration-test-{}-{name}",
+        "fw-fan-quiet-integration-test-{}-{name}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1024,7 +1024,7 @@ mod real_types {
     #[test]
     fn config_fanctrl_socket_flows_into_real_poller_construction() {
         let config = Config {
-            fanctrl_socket: PathBuf::from("/tmp/bazerame-fanctrl-loop-eb9-17-test.sock"),
+            fanctrl_socket: PathBuf::from("/tmp/fw-fan-quiet-fanctrl-loop-eb9-17-test.sock"),
             ..Config::default()
         };
         let client = Box::new(UnixFanctrlClient::new(config.fanctrl_socket.clone()))

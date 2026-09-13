@@ -3,7 +3,7 @@
 > **Historical / superseded (2026-09-11).** Retained as research evidence. The implemented controller is specified by [Per-device temperature loops, revision 4](../superpowers/runs/2026-09-11-per-device-temperature-loops/2026-09-11-per-device-temperature-loops-design.md).
 
 Research notes, 2026-09-07. Input for a `super-design` run on the refactor. Everything below was
-verified on this machine (bazerame) unless marked *reported*. Motivation for the refactor is
+verified on this machine (fw-fan-quiet) unless marked *reported*. Motivation for the refactor is
 **robustness**, not loop tightness — the analysis concludes the loop should be *slow*.
 
 ## 1. What fw-fanctrl actually is (v1.1.0, `fw-fanctrl-0.0.0-11.20260606.gitb040da6`)
@@ -14,7 +14,7 @@ Source: `/usr/lib/python3.14/site-packages/fw_fanctrl/`. Only backend is `framew
 - **Sensor = MAX over every line of `framework_tool --thermal`** matching `:\s*(\d+)\sC`, zeros
   dropped. Battery is included. `Charger IC` is silently excluded (label has no colon).
   On any `framework_tool` failure it returns a **hardcoded 50 °C**.
-- **NOT k10temp/Tctl.** bazerame-fans reads `k10temp/temp1_input` — a different signal.
+- **NOT k10temp/Tctl.** fw-fan-quiet reads `k10temp/temp1_input` — a different signal.
   Measured 2026-09-07 at idle: `ambient_f75303@4d`=48 °C was the argmax while `cpu@4c`=39 °C;
   fw-fanctrl reported `temperature: 48.0`. Under CPU load earlier the same day `cpu@4c`=78.8 °C
   was the argmax while ambient=61.9 °C. **The argmax sensor switches by regime.**
@@ -104,7 +104,7 @@ What this establishes:
   5 °C band, which is why the guard/trip pair became 88 / 91 with a 2 °C hysteresis
   (fw-fanctrl-loop-a78).
 
-## 3. bazerame-fans code map (2026-09-07, 19,452 lines incl. tests)
+## 3. fw-fan-quiet code map (2026-09-07, 19,452 lines incl. tests)
 
 Control loop: `control/controller.rs` (`on_auto_sample` ~:985-1329); allocator 5 s
 (`ALLOC_PERIOD_S`); GPU PI 1 Hz (`control/gpu_pid.rs`); Kalman 20 s. Fan RPM is the controlled

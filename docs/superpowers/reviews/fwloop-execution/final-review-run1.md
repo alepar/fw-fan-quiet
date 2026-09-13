@@ -18,7 +18,7 @@ parked: []  |  pendingRetry: []  |  stalled: False
 
 ## VERDICT: **DO NOT LAND.** This is a mid-demolition branch, not a finishable one.
 
-Branch: `epic-fw-fanctrl-loop-6ma-integration` @ `9f112ed` (worktree `/var/home/alepar/AleCode/bazerame-fans/.claude/worktrees/fw-fanctrl-loop/.worktrees/epic-fw-fanctrl-loop-6ma-integration`)
+Branch: `epic-fw-fanctrl-loop-6ma-integration` @ `9f112ed` (worktree `/var/home/alepar/AleCode/fw-fan-quiet/.claude/worktrees/fw-fanctrl-loop/.worktrees/epic-fw-fanctrl-loop-6ma-integration`)
 
 **Measurements I re-ran at the tip (the sweep is valid, not stale):**
 - `cargo test` — 599 passed, 0 failed, 2 ignored. **Green.**

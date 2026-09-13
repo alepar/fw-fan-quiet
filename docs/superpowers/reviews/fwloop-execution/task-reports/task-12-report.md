@@ -154,16 +154,16 @@ blocked on this task for it.
 ## Test results
 
 ```
-$ cargo test --bin bazerame-fans
+$ cargo test --bin fw-fan-quiet
 test result: ok. 514 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 2.00s
 ```
 
-The controller module alone (`cargo test --bin bazerame-fans
+The controller module alone (`cargo test --bin fw-fan-quiet
 control::controller::`): 52 passed, 0 failed. The 2 ignored tests are
 pre-existing and unrelated to this change (not touched).
 
 ```
-$ cargo clippy --bin bazerame-fans --tests
+$ cargo clippy --bin fw-fan-quiet --tests
 ```
 No errors; no warnings anywhere in `controller.rs` (checked with `grep -c
 controller.rs` against clippy's output: 0 hits). Remaining warnings across
@@ -211,7 +211,7 @@ only `controller.rs` is in the diff).
 
 - Commits: `91fcc7c` — "refactor(control): remove the adaptation tier
   (fw-fanctrl-loop-24s)"
-- `cargo test --bin bazerame-fans`: 514/514 passing, output pristine.
+- `cargo test --bin fw-fan-quiet`: 514/514 passing, output pristine.
 - `git status --short` after commit: empty.
 - `head` (this branch's tip after commit):
   `91fcc7ce55cfb04c8fec0a9c6cee7f1010c78d00`
@@ -269,12 +269,12 @@ except for one assertion:
 
 **Verification:**
 ```
-$ cargo build --bin bazerame-fans        # clean (only pre-existing dead_code warnings)
-$ cargo test --bin bazerame-fans control::controller::
+$ cargo build --bin fw-fan-quiet        # clean (only pre-existing dead_code warnings)
+$ cargo test --bin fw-fan-quiet control::controller::
    test result: ok. 61 passed; 0 failed
-$ cargo test --bin bazerame-fans
+$ cargo test --bin fw-fan-quiet
    test result: ok. 523 passed; 0 failed; 2 ignored
-$ cargo clippy --bin bazerame-fans --tests   # clean, only pre-existing warnings
+$ cargo clippy --bin fw-fan-quiet --tests   # clean, only pre-existing warnings
 $ cargo fmt --check -- src/control/controller.rs   # no diff
 ```
 

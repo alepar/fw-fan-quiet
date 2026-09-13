@@ -1,4 +1,4 @@
-//! User configuration (TOML, `/etc/bazerame-fans/config.toml` in production,
+//! User configuration (TOML, `/etc/fw-fan-quiet/config.toml` in production,
 //! `--config` overridable). Loading NEVER crashes: a missing file means
 //! defaults, a corrupt file means defaults plus a warning — the daemon must
 //! come up and manage fans regardless of config state. `#[serde(default)]`
@@ -438,7 +438,7 @@ mod tests {
     /// Unique-per-test fixture root; caller removes it when done.
     fn fixture_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "bazerame-config-test-{}-{name}",
+            "fw-fan-quiet-config-test-{}-{name}",
             std::process::id()
         ));
         fs::create_dir_all(&dir).unwrap();

@@ -813,7 +813,7 @@ mod per_device_behavior_tests {
 
     fn ec_at(temp_c: f64) -> crate::sensors::ec::EcReading {
         let n = EC_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("bazerame-device-step-{}-{n}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("fw-fan-quiet-device-step-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("temp1_label"), "apu@4c\n").unwrap();
         std::fs::write(dir.join("temp1_input"), format!("{}\n", (temp_c * 1000.0) as i64)).unwrap();

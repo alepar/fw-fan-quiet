@@ -5,7 +5,7 @@ import json, re, sys, pathlib, os
 
 IT = int(sys.argv[1]); PRIOR = sys.argv[2] if len(sys.argv) > 2 else ''
 SK = pathlib.Path('/var/home/alepar/.codex/plugins/cache/superpowers-alepar/superpowers/6.3.0-alepar3.8/skills/super-roast')
-WT = '/var/home/alepar/AleCode/bazerame-fans/.claude/worktrees/fw-fanctrl-loop/.worktrees/super-auto-per-device-temperature-loops'
+WT = '/var/home/alepar/AleCode/fw-fan-quiet/.claude/worktrees/fw-fanctrl-loop/.worktrees/super-auto-per-device-temperature-loops'
 RUN = f'{WT}/docs/superpowers/runs/2026-09-11-per-device-temperature-loops'
 SPEC = f'{RUN}/2026-09-11-per-device-temperature-loops-design.md'
 TREE = f'{RUN}/task-tree-settled.md'
@@ -29,7 +29,7 @@ context = (
     'and may be read for context); the seed that settled the user decisions is '
     f'`{WT}/docs/superpowers/specs/2026-09-11-per-device-temperature-loops-seed.md`; the code the tree will change is '
     f'the Rust crate at `{WT}` (branch super-auto/per-device-temperature-loops, base epic-fw-fanctrl-loop-6ma-integration). '
-    'Field evidence the spec rests on: telemetry runs `/var/lib/bazerame-fans/telemetry/run-1789067819.jsonl` and '
+    'Field evidence the spec rests on: telemetry runs `/var/lib/fw-fan-quiet/telemetry/run-1789067819.jsonl` and '
     '`run-1789139478.jsonl` (readable). Decided by the user and NOT up for re-litigation unless you show them '
     'unworkable: budget/split deleted; per-device EC groups; GPU driven by clock lock (LUT deleted); shadow cap with '
     'override control; halt = hold; no trim with a live curve; per-device step test; the 30-min hardware acceptance '

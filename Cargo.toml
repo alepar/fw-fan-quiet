@@ -1,5 +1,5 @@
 [package]
-name = "bazerame-fans"
+name = "fw-fan-quiet"
 version = "0.1.0"
 edition = "2024"
 # >= 1.87: Linux Instant is CLOCK_BOOTTIME-backed (advances during suspend),

@@ -379,7 +379,7 @@ mod tests {
     /// Unique-per-test fixture root; caller removes it when done.
     fn fixture_dir(name: &str) -> PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("bazerame-state-test-{}-{name}", std::process::id()));
+            std::env::temp_dir().join(format!("fw-fan-quiet-state-test-{}-{name}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
     }

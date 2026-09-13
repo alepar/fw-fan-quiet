@@ -3345,7 +3345,7 @@ mod tests {
 
     fn profile_fixture(name: &str) -> (PathBuf, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
-            "bazerame-controller-test-{}-{name}",
+            "fw-fan-quiet-controller-test-{}-{name}",
             std::process::id()
         ));
         fs::create_dir_all(&dir).unwrap();
@@ -3796,7 +3796,7 @@ mod tests {
         // standalone Record::Flag JSONL line, not just the watchdog's.
         let runner = FakeRunner::new();
         let dir = std::env::temp_dir().join(format!(
-            "bazerame-controller-test-{}-flag-telemetry",
+            "fw-fan-quiet-controller-test-{}-flag-telemetry",
             std::process::id()
         ));
         fs::create_dir_all(&dir).unwrap();
@@ -3882,7 +3882,7 @@ mod tests {
     fn production_apply_effects_emits_v3_fields_and_omits_retired_fields() {
         let runner = FakeRunner::new();
         let dir = std::env::temp_dir().join(format!(
-            "bazerame-controller-test-{}-v3-decision",
+            "fw-fan-quiet-controller-test-{}-v3-decision",
             std::process::id()
         ));
         fs::create_dir_all(&dir).unwrap();
@@ -5612,7 +5612,7 @@ mod tests {
     fn set_floors_sanitizes_echoes_and_persists_on_change_only() {
         let runner = FakeRunner::new();
         let dir = std::env::temp_dir().join(format!(
-            "bazerame-controller-test-{}-floors-persist",
+            "fw-fan-quiet-controller-test-{}-floors-persist",
             std::process::id()
         ));
         fs::create_dir_all(&dir).unwrap();
@@ -5828,7 +5828,7 @@ mod tests {
     fn set_fan_target_persists_config_on_change_only() {
         let runner = FakeRunner::new();
         let dir = std::env::temp_dir().join(format!(
-            "bazerame-controller-test-{}-fan-persist",
+            "fw-fan-quiet-controller-test-{}-fan-persist",
             std::process::id()
         ));
         fs::create_dir_all(&dir).unwrap();
@@ -6017,7 +6017,7 @@ mod tests {
     fn ec_reading_c(sensors: &[(&str, f64)]) -> EcReading {
         let n = EC_FIXTURE_COUNTER_C.fetch_add(1, AtomicOrdering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "bazerame-controller-test-{}-{n}",
+            "fw-fan-quiet-controller-test-{}-{n}",
             std::process::id()
         ));
         fs::create_dir_all(&dir).unwrap();

@@ -1,4 +1,4 @@
-# bazerame-fans — Design
+# fw-fan-quiet — Design
 
 Noise-targeted power shaping for the Framework 16 (2025, Ryzen AI 9 HX 370 + RTX 5070
 Mobile) on Bazzite Linux. A single Rust TUI binary, run under sudo, that holds fan noise
@@ -134,8 +134,8 @@ acoustics). Actuator-stickiness check via RAPL/NVML. Suspend/resume → full rea
 | Sensors | direct sysfs reads (hwmon, RAPL) |
 | PID | `pid` crate (anti-windup, derivative-on-measurement) |
 | RLS | hand-rolled (~30 lines, `nalgebra` for 4×4 covariance) |
-| Config | `serde` + `toml`, `/etc/bazerame-fans/config.toml` (CLI-overridable) |
-| State (model, LUT, stock snapshot) | `serde_json`, `/var/lib/bazerame-fans/state.json`, atomic write (tmp+rename) |
+| Config | `serde` + `toml`, `/etc/fw-fan-quiet/config.toml` (CLI-overridable) |
+| State (model, LUT, stock snapshot) | `serde_json`, `/var/lib/fw-fan-quiet/state.json`, atomic write (tmp+rename) |
 | Logging | `tracing` + `tracing-appender` → file, `with_ansi(false)` |
 | Signals/panics | `signal-hook`, panic hook chained with `ratatui`'s |
 | CLI | `clap`; errors: `color-eyre` |

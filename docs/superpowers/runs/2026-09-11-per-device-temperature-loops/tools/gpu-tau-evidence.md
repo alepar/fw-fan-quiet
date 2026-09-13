@@ -45,8 +45,8 @@ Both purpose-built captures are tracked in this repository (introduced by commit
 The longer September telemetry files were also inspected:
 
 ```text
-/var/lib/bazerame-fans/telemetry/run-1789067819.jsonl
-/var/lib/bazerame-fans/telemetry/run-1789139478.jsonl
+/var/lib/fw-fan-quiet/telemetry/run-1789067819.jsonl
+/var/lib/fw-fan-quiet/telemetry/run-1789139478.jsonl
 ```
 
 They record only the global `ec_max` and `ec_argmax`, not the four raw GPU-group members.  At
@@ -219,6 +219,6 @@ PY
 
 sha256sum docs/research/2026-09-09-gpu-burn-*.csv
 wc -l docs/research/2026-09-09-gpu-burn-*.csv
-head -2 /var/lib/bazerame-fans/telemetry/run-1789067819.jsonl
-head -2 /var/lib/bazerame-fans/telemetry/run-1789139478.jsonl
+head -2 /var/lib/fw-fan-quiet/telemetry/run-1789067819.jsonl
+head -2 /var/lib/fw-fan-quiet/telemetry/run-1789139478.jsonl
 ```

@@ -96,7 +96,7 @@ At the *original* 0..=255 domain and 5000 iterations the same numerical-precisio
 reappears (all 256 possible key slots end up needing distinct floats within a ~4700 RPM span);
 I judged that out of scope rather than fixing further, see "Domain of `duty`" below.
 
-## What I tested (framed as RED before GREEN per step, `cargo test --bin bazerame-fans fanctrl`)
+## What I tested (framed as RED before GREEN per step, `cargo test --bin fw-fan-quiet fanctrl`)
 
 I wrote the full test file per module (not literally one test-then-implement cycle per function
 in separate commits — the curve inversion math needed to be worked out as a whole to get
@@ -124,13 +124,13 @@ in either file that's decoration once I re-read the file looking for that specif
 
 Final run, both modules:
 ```
-cargo test --bin bazerame-fans fanctrl
+cargo test --bin fw-fan-quiet fanctrl
 running 30 tests (17 curve + 13 table)
 test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 428 filtered out
 ```
 Full suite (confirms nothing outside `fanctrl/` regressed):
 ```
-cargo test --bin bazerame-fans
+cargo test --bin fw-fan-quiet
 test result: ok. 456 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out
 ```
 (426 pre-existing + 30 new = 456; the 2 ignored are pre-existing and untouched by this task.)

@@ -917,7 +917,7 @@ mod tests {
     #[test]
     fn header_omits_name_and_floors() {
         let header = row_text(&draw(&Model::new()), 0);
-        assert!(!header.contains("bazerame-fans"));
+        assert!(!header.contains("fw-fan-quiet"));
         assert!(!header.contains("floors"));
     }
 

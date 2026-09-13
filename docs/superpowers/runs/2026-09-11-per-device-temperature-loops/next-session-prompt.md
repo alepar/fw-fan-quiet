@@ -1,7 +1,7 @@
 # Next-session prompt — design roast extension round for per-device temperature loops
 
 Paste everything below the line into a fresh Claude Code session started from
-`/var/home/alepar/AleCode/bazerame-fans/.claude/worktrees/fw-fanctrl-loop`.
+`/var/home/alepar/AleCode/fw-fan-quiet/.claude/worktrees/fw-fanctrl-loop`.
 
 ---
 
@@ -15,7 +15,7 @@ autonomous within that scope.
 ## Where everything is
 
 - Run worktree (all writes go here, on branch `super-auto/per-device-temperature-loops`):
-  `/var/home/alepar/AleCode/bazerame-fans/.claude/worktrees/fw-fanctrl-loop/.worktrees/super-auto-per-device-temperature-loops`
+  `/var/home/alepar/AleCode/fw-fan-quiet/.claude/worktrees/fw-fanctrl-loop/.worktrees/super-auto-per-device-temperature-loops`
 - Run dir: `docs/superpowers/runs/2026-09-11-per-device-temperature-loops/` inside that worktree, containing
   `run.md` (state; `roastDesignRound: 3`, `roastDesignCapped:` line), the spec
   `2026-09-11-per-device-temperature-loops-design.md` (revision 3), `task-tree-settled.md`
@@ -28,7 +28,7 @@ autonomous within that scope.
   replaces the whole field; preserve the `blocked-by …` lines and the `Files:` line). Never append
   "amendment" paragraphs; roast round 2 flagged that as Blocking.
 - Scratchpad from the previous session (may be gone; recreate if missing):
-  `/tmp/claude-1000/-var-home-alepar-AleCode-bazerame-fans--claude-worktrees-fw-fanctrl-loop/6e6f1052-b05b-421f-abbd-edfbee8e089d/scratchpad/`
+  `/tmp/claude-1000/-var-home-alepar-AleCode-fw-fan-quiet--claude-worktrees-fw-fanctrl-loop/6e6f1052-b05b-421f-abbd-edfbee8e089d/scratchpad/`
   with `super-roast-engine.mjs` (the Workflow script), `assemble-design-roast.py <iteration> <prior_report_path>`
   (renders pointer-style prompts into `roast-prompts-design-N/` and `roast-args-design-N.json`),
   `extract-design-report.py <run_id> <iteration>` (pulls `reportMarkdown` out of the workflow journal

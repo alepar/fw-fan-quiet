@@ -8,7 +8,7 @@ use tracing_appender::rolling::{InitError, RollingFileAppender, Rotation};
 use tracing_subscriber::EnvFilter;
 
 /// Initializes the global tracing subscriber writing to
-/// `<log_dir>/bazerame-fans.<date>.log`. Filter defaults to `info`,
+/// `<log_dir>/fw-fan-quiet.<date>.log`. Filter defaults to `info`,
 /// overridable via `RUST_LOG`. Returns the appender's worker guard — keep it
 /// alive in main or buffered log lines are lost. `None` if no log file could
 /// be opened anywhere or a subscriber is already installed.
@@ -45,7 +45,7 @@ fn build_appender(dir: &Path) -> Result<RollingFileAppender, InitError> {
     let _ = std::fs::create_dir_all(dir);
     RollingFileAppender::builder()
         .rotation(Rotation::DAILY)
-        .filename_prefix("bazerame-fans")
+        .filename_prefix("fw-fan-quiet")
         .filename_suffix("log")
         .build(dir)
 }

@@ -1,6 +1,6 @@
-# bazerame-fans
+# fw-fan-quiet
 
-`bazerame-fans` shapes CPU and GPU heat on a Framework 16 so fw-fanctrl can hold a chosen fan-noise target. fw-fanctrl remains the only process that commands the fans. This app adjusts the CPU sustained-power cap and GPU clock ceiling, and restores stock limits whenever control stops or the process exits.
+`fw-fan-quiet` shapes CPU and GPU heat on a Framework 16 so fw-fanctrl can hold a chosen fan-noise target. fw-fanctrl remains the only process that commands the fans. This app adjusts the CPU sustained-power cap and GPU clock ceiling, and restores stock limits whenever control stops or the process exits.
 
 Auto uses one shared target temperature (T*) from fw-fanctrl's active curve and two independent controllers. The CPU controller regulates the CPU EC sensor group in watts; the GPU controller regulates the GPU EC sensor group in MHz. Each controller combines a thermal candidate with a measured shadow cap, applies its own slew limits, and can keep operating when the other device is unavailable.
 
@@ -63,7 +63,7 @@ The `quiet16` entry in fw-fanctrl's `/etc/fw-fanctrl/config.json` → `strategie
 }
 ```
 
-Our app settings in `/etc/bazerame-fans/config.toml` include:
+Our app settings in `/etc/fw-fan-quiet/config.toml` include:
 
 ```toml
 fan_target_rpm = 3500.0
@@ -83,7 +83,7 @@ Latest saved calibration for **`quiet16:30`**:
 | CPU | 0.279475988 W/°C | 29.809252495 s |
 | GPU | 46.435961060 MHz/°C | 48.413195881 s |
 
-These are fitted values in `/var/lib/bazerame-fans/state.json`, not compiled defaults or TOML overrides. Calibration keeps gains separate for each strategy and averaging interval; the older 60-second fits remain separate. Press `k` to fit the active setup, keeping GPU load above 90% with a workload such as `gpu_burn`.
+These are fitted values in `/var/lib/fw-fan-quiet/state.json`, not compiled defaults or TOML overrides. Calibration keeps gains separate for each strategy and averaging interval; the older 60-second fits remain separate. Press `k` to fit the active setup, keeping GPU load above 90% with a workload such as `gpu_burn`.
 
 ## Requirements
 
@@ -96,7 +96,7 @@ Bazzite's packaged `ryzen_smu` lacks Strix Point PM-table support. The app unloa
 
 ## Setup and usage with fw-fanctrl
 
-Run **fw-fanctrl alongside this app**. fw-fanctrl reads the EC temperatures and sets fan duty using its active curve. `bazerame-fans` reads that curve and adjusts CPU power and GPU clock caps to approach the requested fan RPM; it does not set fan duty itself.
+Run **fw-fanctrl alongside this app**. fw-fanctrl reads the EC temperatures and sets fan duty using its active curve. `fw-fan-quiet` reads that curve and adjusts CPU power and GPU clock caps to approach the requested fan RPM; it does not set fan duty itself.
 
 1. Install fw-fanctrl and `framework_tool`, and ensure fw-fanctrl is running. If your installation supplies `fw-fanctrl.service`, start it with `sudo systemctl enable --now fw-fanctrl`. Otherwise, run `sudo fw-fanctrl run` in a separate terminal.
 2. Add the **`quiet16` entry above** to the `strategies` object in `/etc/fw-fanctrl/config.json`, preserving the rest of that file. Set `defaultStrategy` to `quiet16` if it should be the startup strategy. This profile uses a **30-second moving average** and a **1-second update interval**.
@@ -109,11 +109,11 @@ Run **fw-fanctrl alongside this app**. fw-fanctrl reads the EC temperatures and 
    ```
 
    Check that the strategy is `quiet16`, control is active, and the curve and averaging interval match the profile above. The app's default read-only socket is `/run/fw-fanctrl/.fw-fanctrl.commands.sock`.
-4. Build the app and create `/etc/bazerame-fans/config.toml` with the settings above:
+4. Build the app and create `/etc/fw-fan-quiet/config.toml` with the settings above:
 
    ```sh
    cargo build --release
-   sudo ./target/release/bazerame-fans
+   sudo ./target/release/fw-fan-quiet
    ```
 
 5. Press **`k` to calibrate** your machine. Keep GPU utilization above 90% throughout calibration; `gpu_burn` is the suggested workload. Follow the on-screen CPU-load prompts, and wait for the explicit success or partial-success result. The saved gains apply only to that strategy and moving-average interval.
@@ -122,7 +122,7 @@ Run **fw-fanctrl alongside this app**. fw-fanctrl reads the EC temperatures and 
 
 The app can monitor and run Auto with default gains before calibration, but the current profile above uses measured fits. Recalibrate after changing the fw-fanctrl strategy or averaging interval. Select the curve before starting calibration; calibration freezes its context for the run.
 
-Optional paths are selected with `--config`, `--state-file`, `--telemetry-dir`, and `--log-dir`. `sudo ./target/release/bazerame-fans selftest` exercises the sensor and actuator paths before a controlled session.
+Optional paths are selected with `--config`, `--state-file`, `--telemetry-dir`, and `--log-dir`. `sudo ./target/release/fw-fan-quiet selftest` exercises the sensor and actuator paths before a controlled session.
 
 ## Configuration
 
@@ -215,10 +215,10 @@ Schema v5 JSONL contains `run_start`, 1 Hz `sample`, event-driven `decision`, an
 
 ## Files
 
-- `/etc/bazerame-fans/config.toml` — operator configuration
-- `/var/lib/bazerame-fans/state.json` — calibrated gains and qualified entry state
-- `/var/lib/bazerame-fans/telemetry/` — JSONL runs
-- `/var/lib/bazerame-fans/log/` — tracing logs
+- `/etc/fw-fan-quiet/config.toml` — operator configuration
+- `/var/lib/fw-fan-quiet/state.json` — calibrated gains and qualified entry state
+- `/var/lib/fw-fan-quiet/telemetry/` — JSONL runs
+- `/var/lib/fw-fan-quiet/log/` — tracing logs
 
 `cargo test` runs the offline suite. Hardware tests are ignored and must be invoked manually. The current design is [Per-device temperature loops, revision 4](docs/superpowers/runs/2026-09-11-per-device-temperature-loops/2026-09-11-per-device-temperature-loops-design.md).
 

@@ -578,7 +578,7 @@ mod tests {
     /// Unique-per-test profile file fixture; caller removes the dir when done.
     fn profile_fixture(name: &str, content: &str) -> (PathBuf, PathBuf) {
         let dir =
-            std::env::temp_dir().join(format!("bazerame-cpu-test-{}-{name}", std::process::id()));
+            std::env::temp_dir().join(format!("fw-fan-quiet-cpu-test-{}-{name}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("platform_profile");
         fs::write(&path, content).unwrap();

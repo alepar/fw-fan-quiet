@@ -61,21 +61,21 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Parser)]
 #[command(
-    name = "bazerame-fans",
+    name = "fw-fan-quiet",
     about = "Fan-noise-first power manager (M1: monitor)"
 )]
 struct Args {
     /// Directory for JSONL telemetry logs (falls back to `.` if unwritable).
-    #[arg(long, default_value = "/var/lib/bazerame-fans/telemetry")]
+    #[arg(long, default_value = "/var/lib/fw-fan-quiet/telemetry")]
     telemetry_dir: PathBuf,
     /// Directory for tracing logs (falls back to `.` if unwritable).
-    #[arg(long, default_value = "/var/lib/bazerame-fans/log")]
+    #[arg(long, default_value = "/var/lib/fw-fan-quiet/log")]
     log_dir: PathBuf,
     /// Config file (TOML); missing or invalid falls back to defaults.
-    #[arg(long, default_value = "/etc/bazerame-fans/config.toml")]
+    #[arg(long, default_value = "/etc/fw-fan-quiet/config.toml")]
     config: PathBuf,
     /// Persisted calibration state (JSON); missing means "not calibrated".
-    #[arg(long, default_value = "/var/lib/bazerame-fans/state.json")]
+    #[arg(long, default_value = "/var/lib/fw-fan-quiet/state.json")]
     state_file: PathBuf,
     /// Default (no subcommand): the live TUI dashboard.
     #[command(subcommand)]
@@ -104,7 +104,7 @@ fn main() -> Result<()> {
     // Root check before logging::init: a non-root run should print the hint
     // and exit without leaving a stray fallback log file in the cwd.
     if let Err(e) = std::fs::File::open(RAPL_ENERGY_PATH) {
-        eprintln!("bazerame-fans needs root for RAPL/actuators - run: sudo ./bazerame-fans");
+        eprintln!("fw-fan-quiet needs root for RAPL/actuators - run: sudo ./fw-fan-quiet");
         eprintln!("(cannot open {RAPL_ENERGY_PATH} for read: {e})");
         std::process::exit(1);
     }
@@ -549,20 +549,20 @@ mod tests {
 
     #[test]
     fn parses_selftest_subcommand() {
-        let args = Args::try_parse_from(["bazerame-fans", "selftest"]).unwrap();
+        let args = Args::try_parse_from(["fw-fan-quiet", "selftest"]).unwrap();
         assert!(matches!(args.command, Some(Commands::Selftest)));
     }
 
     #[test]
     fn no_subcommand_means_tui() {
-        let args = Args::try_parse_from(["bazerame-fans"]).unwrap();
+        let args = Args::try_parse_from(["fw-fan-quiet"]).unwrap();
         assert!(args.command.is_none());
     }
 
     #[test]
     fn flags_still_parse_alongside_subcommand() {
         let args =
-            Args::try_parse_from(["bazerame-fans", "--log-dir", "/tmp/x", "selftest"]).unwrap();
+            Args::try_parse_from(["fw-fan-quiet", "--log-dir", "/tmp/x", "selftest"]).unwrap();
         assert!(matches!(args.command, Some(Commands::Selftest)));
         assert_eq!(args.log_dir, PathBuf::from("/tmp/x"));
     }

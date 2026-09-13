@@ -2,7 +2,7 @@
 
 **Bead:** `fw-fanctrl-loop-nsc`
 **Branch:** `task-fw-fanctrl-loop-nsc`, off integration branch `epic-fw-fanctrl-loop-6ma-integration`
-**Worktree:** `/var/home/alepar/AleCode/bazerame-fans/.claude/worktrees/fw-fanctrl-loop/.worktrees/epic-fw-fanctrl-loop-6ma-integration/.worktrees/epic-fw-fanctrl-loop-6ma-integration--task-fw-fanctrl-loop-nsc`
+**Worktree:** `/var/home/alepar/AleCode/fw-fan-quiet/.claude/worktrees/fw-fanctrl-loop/.worktrees/epic-fw-fanctrl-loop-6ma-integration/.worktrees/epic-fw-fanctrl-loop-6ma-integration--task-fw-fanctrl-loop-nsc`
 **Head:** `6beab0be3fbc1d8e0684628bfb8a414b02f7c4b3`
 
 ## What I implemented

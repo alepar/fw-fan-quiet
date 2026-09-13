@@ -128,7 +128,7 @@ part of the original bug, it's this task's own addition — didn't mask the
 underlying NaN by firing first):
 
 ```
-$ cargo test --release --bin bazerame-fans control::mode::tests::arbiter_keeps_u_finite_at_floor_and_ceiling_duty -- --nocapture
+$ cargo test --release --bin fw-fan-quiet control::mode::tests::arbiter_keeps_u_finite_at_floor_and_ceiling_duty -- --nocapture
 thread '...arbiter_keeps_u_finite_at_floor_and_ceiling_duty' panicked at src/control/mode.rs:1132:17:
 duty 15 tick 2: u = NaN is not finite (t_star was -inf)
 ```
@@ -147,14 +147,14 @@ first `raw_du = kc*(±inf - 0)` clamps to a finite bound), then NaN on tick
 **GREEN** (after restoring the `curve.rs` fix):
 
 ```
-$ cargo test --bin bazerame-fans control::mode
+$ cargo test --bin fw-fan-quiet control::mode
 running 16 tests
 test control::mode::tests::arbiter_keeps_u_finite_at_floor_and_ceiling_duty ... ok
 test control::mode::tests::ceiling_target_unreachable_high_after_60s_pinned_at_the_upper_bound ... ok
 ... (14 more, all pass)
 test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 590 filtered out; finished in 0.00s
 
-$ cargo test --bin bazerame-fans fanctrl::curve
+$ cargo test --bin fw-fan-quiet fanctrl::curve
 running 20 tests
 ... all pass
 test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 584 filtered out; finished in 0.00s
@@ -171,9 +171,9 @@ test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 584 filtered out; f
   duty jump in the curve — a separate, pre-existing, already-documented
   case that neither `quiet16` nor `cool16` exercises. I left it untouched
   per the brief's instruction.
-- Full suite: `cargo test --bin bazerame-fans` → **604 passed, 0 failed, 2
+- Full suite: `cargo test --bin fw-fan-quiet` → **604 passed, 0 failed, 2
   ignored** (the 2 ignored are pre-existing and unrelated to this task).
-- `cargo clippy --bin bazerame-fans --all-targets`: 84 warnings, all
+- `cargo clippy --bin fw-fan-quiet --all-targets`: 84 warnings, all
   pre-existing `dead_code` (this epic's controller wiring, a later task,
   hasn't connected these modules to `main` yet). Confirmed identical count
   (84) on the pre-change tree via `git stash`/`git stash pop` — no new

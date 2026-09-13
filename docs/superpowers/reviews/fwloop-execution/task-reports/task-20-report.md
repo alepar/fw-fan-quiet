@@ -1,7 +1,7 @@
 # Task 20 Report: Controller hooks — warm-start, refinement, calibration
 
 **Bead:** `fw-fanctrl-loop-438` · **Branch:** `task-fw-fanctrl-loop-438` (off `epic-fw-fanctrl-loop-6ma-integration`)
-**Worktree:** `/var/home/alepar/AleCode/bazerame-fans/.claude/worktrees/fw-fanctrl-loop/.worktrees/epic-fw-fanctrl-loop-6ma-integration/.worktrees/epic-fw-fanctrl-loop-6ma-integration--task-fw-fanctrl-loop-438`
+**Worktree:** `/var/home/alepar/AleCode/fw-fan-quiet/.claude/worktrees/fw-fanctrl-loop/.worktrees/epic-fw-fanctrl-loop-6ma-integration/.worktrees/epic-fw-fanctrl-loop-6ma-integration--task-fw-fanctrl-loop-438`
 **File touched:** `src/control/controller.rs` (only file — matches the brief's scope)
 
 ## What I implemented
@@ -140,14 +140,14 @@ that same tick, matching the strategy/on_ac tests' single-tick change shape.
 ### Validation run
 
 ```
-cd /var/home/alepar/AleCode/bazerame-fans/.claude/worktrees/fw-fanctrl-loop/.worktrees/epic-fw-fanctrl-loop-6ma-integration/.worktrees/epic-fw-fanctrl-loop-6ma-integration--task-fw-fanctrl-loop-438
-cargo test --bin bazerame-fans re_keys_without_reseeding
+cd /var/home/alepar/AleCode/fw-fan-quiet/.claude/worktrees/fw-fanctrl-loop/.worktrees/epic-fw-fanctrl-loop-6ma-integration/.worktrees/epic-fw-fanctrl-loop-6ma-integration--task-fw-fanctrl-loop-438
+cargo test --bin fw-fan-quiet re_keys_without_reseeding
 # 3 passed; 0 failed (a_strategy_change_..., an_on_ac_change_..., a_snapped_duty_change_...)
 
-cargo test --bin bazerame-fans
+cargo test --bin fw-fan-quiet
 # test result: ok. 575 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out
 
-cargo clippy --bin bazerame-fans --tests
+cargo clippy --bin fw-fan-quiet --tests
 # same pre-existing dead-code warnings as base (Budget::set_gains,
 # fanctrl::client::resolve_curve, Curve::continuous_duty_at/duty_at,
 # EcAverage::is_seeded/sample_count) — none new, none in the added tests

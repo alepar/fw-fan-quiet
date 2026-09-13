@@ -1,4 +1,4 @@
-# Research prompts for bazerame-fans
+# Research prompts for fw-fan-quiet
 
 Run each in a separate researcher session. Paste results into `docs/research/` as
 `01-hardware.md`, `02-rust.md`, `03-control.md`.

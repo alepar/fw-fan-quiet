@@ -1,4 +1,4 @@
-//! Hardware selftest (`bazerame-fans selftest`): exercises the Milestone 2
+//! Hardware selftest (`fw-fan-quiet selftest`): exercises the Milestone 2
 //! actuator + sensor stack end to end and prints one plain
 //! `[ OK ]/[FAIL]/[SKIP] step: detail` line per step. No TUI, no file
 //! logging — this runs from a terminal as root and its stdout IS the report.

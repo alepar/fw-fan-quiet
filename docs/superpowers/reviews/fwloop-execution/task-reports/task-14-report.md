@@ -106,7 +106,7 @@ synthetic 1-second ticks (no real sleeping) against a command-recording fake sou
 `Speed` count == 12, `All` count == 2, and that both fire in the right order (`All` before
 `Speed`) on the ticks where both are due. The fixed `next_due += PERIOD` schedule never drifts
 when driven at 1-tick granularity, so the "±1 tick" tolerance is trivially satisfied — no jitter
-to tolerate in this design. `cargo test --bin bazerame-fans sensors::poller`: **5/5 passing**.
+to tolerate in this design. `cargo test --bin fw-fan-quiet sensors::poller`: **5/5 passing**.
 
 > `Stale` after 90 s of `All` failures and after 15 s of `Speed` failures
 
@@ -167,7 +167,7 @@ src/sensors/mod.rs src/main.rs` — zero matches across all five touched files.
 
 ## Full test run
 
-`cargo test --bin bazerame-fans`: **562 passed, 0 failed, 2 ignored** (the 2 ignored predate this
+`cargo test --bin fw-fan-quiet`: **562 passed, 0 failed, 2 ignored** (the 2 ignored predate this
 task, unrelated to this path). Focused runs before the full one: `sensors::poller` (5/5),
 `sensors::sampler` (8/8, all passing including the two pre-existing tests I strengthened with new
 field assertions), `types::` (1/1).

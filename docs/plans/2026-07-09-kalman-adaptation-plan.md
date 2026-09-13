@@ -33,7 +33,7 @@ compares against the WHOLE trailing 30 s window, not the last step (staircases m
   Claude-Session: https://claude.ai/code/session_01K4RP1ADiwFXdudQWSTMk1z
   ```
 - Match the codebase's dense WHY-doc-comment style (state constraints/invariants, not narration).
-- Do NOT touch `/var/lib/bazerame-fans` and do NOT run the TUI (the app is live). Unit/controller
+- Do NOT touch `/var/lib/fw-fan-quiet` and do NOT run the TUI (the app is live). Unit/controller
   tests only.
 
 ---

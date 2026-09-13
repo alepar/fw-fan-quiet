@@ -99,7 +99,7 @@ by hand — FIFO gives explicit scripts priority over the synthesized default. I
 narrow `controller.rs`'s own `ryzenadj_calls` test helper to exclude the new `--info` calls (it
 asserts "what did we command," which read-back is not) — the exact args list it checks would
 otherwise have gained a spurious trailing `["--info"]` entry on every CPU-actuating test.
-After both changes, the full suite (`cargo test --bin bazerame-fans`) is 499/499, unchanged from
+After both changes, the full suite (`cargo test --bin fw-fan-quiet`) is 499/499, unchanged from
 before this task's file count (91 pre-existing controller tests + 40 actuator tests, all still
 green, plus my new tests).
 
@@ -110,14 +110,14 @@ green, plus my new tests).
 increments — the read-back format (the fixture table shape) and the tolerance rule were already
 fully specified by §2.9 and the existing fixture, so I judged incremental red-steps would add
 noise, not information, here. I did run the new+existing suite together immediately afterward
-and it was green on the first try (`cargo test --bin bazerame-fans actuators::cpu::` → 16/16,
+and it was green on the first try (`cargo test --bin fw-fan-quiet actuators::cpu::` → 16/16,
 `control::controller::` → 91/91) — I do **not** have a captured RED transcript for these, and am
 saying so rather than reporting a fabricated one.
 
 **Step 5 (`verify_lock`) — genuine RED → GREEN**, since I wrote all six `gpu.rs` tests before
 re-running:
 
-RED — `cargo test --bin bazerame-fans actuators::gpu::`:
+RED — `cargo test --bin fw-fan-quiet actuators::gpu::`:
 ```
 ---- actuators::gpu::tests::a_below_floor_sample_resets_the_overshoot_streak stdout ----
 thread '...' panicked at src/actuators/gpu.rs:361:9:
@@ -138,10 +138,10 @@ test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 492 filtered out
 ## Full-suite verification
 
 ```
-$ cargo test --bin bazerame-fans
+$ cargo test --bin fw-fan-quiet
 test result: ok. 499 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out
 ```
-(verified against the base commit directly — `git stash` + `cargo test --bin bazerame-fans` on
+(verified against the base commit directly — `git stash` + `cargo test --bin fw-fan-quiet` on
 the unmodified tree gives `485 passed; 0 failed; 2 ignored`; this task adds a net +14: cpu.rs
 went from 7 tests to 16 [+9], gpu.rs from 4 to 9 [+5, one `#[ignore]`d in both]. No existing test
 was deleted — the pre-existing CPU-actuator tests were rewritten in place to match the new
@@ -153,7 +153,7 @@ The RAPL stickiness watchdog tests specifically (`control::controller::`, includ
 `strict_stickiness_window_fires_on_two_violations_after_resume`,
 `failed_stickiness_reassert_reports_stickiness_failed`, `alloc_change_resets_stickiness_streak`,
 plus all 91 controller tests): **91/91 passing**, confirmed both standalone
-(`cargo test --bin bazerame-fans control::controller::`) and inside the full-suite run above.
+(`cargo test --bin fw-fan-quiet control::controller::`) and inside the full-suite run above.
 
 ```
 $ cargo clippy --all-targets -- -D warnings

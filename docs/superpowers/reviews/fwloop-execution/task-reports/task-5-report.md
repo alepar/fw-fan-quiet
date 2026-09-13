@@ -104,7 +104,7 @@ implementation and reverting it — not just asserting it in prose:
 
 **RED** — replaced the body of `hysteresis` with a stub that always returns `false` regardless of
 input (`fn hysteresis(_was_hot: bool, _temp_c: Option<f64>, _enter_c: f64) -> bool { false }`),
-then ran `cargo test --bin bazerame-fans guards::`:
+then ran `cargo test --bin fw-fan-quiet guards::`:
 
 ```
 failures:
@@ -143,7 +143,7 @@ exact, not an accidental rewrite.
 ## Test results
 
 ```
-$ cargo test --bin bazerame-fans guards::
+$ cargo test --bin fw-fan-quiet guards::
 running 8 tests
 test control::guards::tests::none_reading_deactivates_and_clears_an_already_hot_gpu_guard ... ok
 test control::guards::tests::guards_are_independent_axes ... ok
@@ -155,7 +155,7 @@ test control::guards::tests::gpu_hysteresis_enters_at_threshold_and_exits_five_b
 test control::guards::tests::none_reading_deactivates_and_clears_an_already_hot_nvme_guard ... ok
 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 429 filtered out
 
-$ cargo test --bin bazerame-fans config::
+$ cargo test --bin fw-fan-quiet config::
 running 10 tests
 test config::tests::corrupt_file_gives_defaults_no_panic ... ok
 test config::tests::missing_file_gives_defaults ... ok

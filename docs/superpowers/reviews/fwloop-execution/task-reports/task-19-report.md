@@ -443,7 +443,7 @@ implementation, not just hand-derivation):**
 **Verification run:**
 
 ```
-cargo test --bin bazerame-fans        # 564 passed, 0 failed, 2 ignored (pre-existing, hardware-gated, unrelated)
+cargo test --bin fw-fan-quiet        # 564 passed, 0 failed, 2 ignored (pre-existing, hardware-gated, unrelated)
 cargo clippy --all-targets            # no new warnings (same pre-existing dead-code set as the original report)
 cargo fmt --check                     # clean for all three touched files (cmd.rs, cpu.rs, controller.rs);
                                        # fopdt.rs/plant.rs's pre-existing unrelated drift (noted in the

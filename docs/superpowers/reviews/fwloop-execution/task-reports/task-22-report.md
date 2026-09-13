@@ -15,8 +15,8 @@ regression tests, not because anything I claim as passing is shaky.
 
 ## Files changed
 
-- `/var/home/alepar/AleCode/bazerame-fans/.claude/worktrees/fw-fanctrl-loop/.worktrees/epic-fw-fanctrl-loop-6ma-integration/.worktrees/epic-fw-fanctrl-loop-6ma-integration--task-fw-fanctrl-loop-cm7/src/control/sim_tests.rs` (new, 2290 lines)
-- `/var/home/alepar/AleCode/bazerame-fans/.claude/worktrees/fw-fanctrl-loop/.worktrees/epic-fw-fanctrl-loop-6ma-integration/.worktrees/epic-fw-fanctrl-loop-6ma-integration--task-fw-fanctrl-loop-cm7/src/control/mod.rs` (added `#[cfg(test)] mod sim_tests;`)
+- `/var/home/alepar/AleCode/fw-fan-quiet/.claude/worktrees/fw-fanctrl-loop/.worktrees/epic-fw-fanctrl-loop-6ma-integration/.worktrees/epic-fw-fanctrl-loop-6ma-integration--task-fw-fanctrl-loop-cm7/src/control/sim_tests.rs` (new, 2290 lines)
+- `/var/home/alepar/AleCode/fw-fan-quiet/.claude/worktrees/fw-fanctrl-loop/.worktrees/epic-fw-fanctrl-loop-6ma-integration/.worktrees/epic-fw-fanctrl-loop-6ma-integration--task-fw-fanctrl-loop-cm7/src/control/mod.rs` (added `#[cfg(test)] mod sim_tests;`)
 
 Commit: `1b09b09378a25d9e1921b6789adb5c72cd072cbe` on branch
 `task-fw-fanctrl-loop-cm7` (base `91b32e5`), `git status --short` empty.
@@ -24,18 +24,18 @@ Commit: `1b09b09378a25d9e1921b6789adb5c72cd072cbe` on branch
 ## Test evidence
 
 ```
-cargo test --bin bazerame-fans sim_tests::
+cargo test --bin fw-fan-quiet sim_tests::
 ```
 → `test result: ok. 35 passed; 0 failed; 2 ignored; 0 measured; 577 filtered out`
 
 ```
-cargo test --bin bazerame-fans
+cargo test --bin fw-fan-quiet
 ```
 (whole workspace) → `test result: ok. 610 passed; 0 failed; 4 ignored`
 (the other 2 ignored are pre-existing, not mine).
 
 ```
-cargo clippy --bin bazerame-fans --tests
+cargo clippy --bin fw-fan-quiet --tests
 ```
 → no errors. Remaining warnings in `sim_tests.rs` are pedantic style only
 (4× `needless_range_loop`, 1× `type_complexity`, 1× `ptr_arg` on a
@@ -296,9 +296,9 @@ itself.
 ## Suggested next commands
 
 ```bash
-cd /var/home/alepar/AleCode/bazerame-fans/.claude/worktrees/fw-fanctrl-loop/.worktrees/epic-fw-fanctrl-loop-6ma-integration/.worktrees/epic-fw-fanctrl-loop-6ma-integration--task-fw-fanctrl-loop-cm7
-cargo test --bin bazerame-fans sim_tests:: -- --nocapture   # see every run's residency/relay report
-cargo test --bin bazerame-fans -- --ignored sim_tests::     # reproduce the two filed defects directly
+cd /var/home/alepar/AleCode/fw-fan-quiet/.claude/worktrees/fw-fanctrl-loop/.worktrees/epic-fw-fanctrl-loop-6ma-integration/.worktrees/epic-fw-fanctrl-loop-6ma-integration--task-fw-fanctrl-loop-cm7
+cargo test --bin fw-fan-quiet sim_tests:: -- --nocapture   # see every run's residency/relay report
+cargo test --bin fw-fan-quiet -- --ignored sim_tests::     # reproduce the two filed defects directly
 bd show fw-fanctrl-loop-a5j
 bd show fw-fanctrl-loop-a78
 ```
@@ -439,7 +439,7 @@ to flip green the moment it lands.
 ### Test evidence
 
 ```
-cargo test --bin bazerame-fans sim_tests::
+cargo test --bin fw-fan-quiet sim_tests::
 ```
 → `test result: ok. 40 passed; 0 failed; 6 ignored` (was 35 passed, 2
 ignored; net +10 tests: +6 new-scenario, +1 GPU-HOT-90 ignored, +1
@@ -449,20 +449,20 @@ feasibility tests and the reconciliation/skipped-view tests account for
 the rest).
 
 ```
-cargo test --bin bazerame-fans sim_tests:: -- --ignored
+cargo test --bin fw-fan-quiet sim_tests:: -- --ignored
 ```
 → all 6 ignored tests FAIL when forced to run (the expected shape for a
 regression test pinned on a real, cited defect) — verified individually
 for every one of them while writing this round, not just at the end.
 
 ```
-cargo test --bin bazerame-fans
+cargo test --bin fw-fan-quiet
 ```
 (whole workspace) → `test result: ok. 615 passed; 0 failed; 8 ignored`
 (2 pre-existing + this module's 6).
 
 ```
-cargo clippy --bin bazerame-fans --tests
+cargo clippy --bin fw-fan-quiet --tests
 ```
 → no errors; the same pre-existing pedantic warnings as before (4×
 `needless_range_loop`, 1× `type_complexity`, 1× `ptr_arg`, 1×

@@ -36,7 +36,7 @@ controller's adaptation tier no longer exist.
 | EC temperature source | **cros_ec hwmon replica** of fw-fanctrl's max rule, reconciled against the socket periodically |
 | Persisted state | **Integrator warm-start keyed by (strategy, target duty, AC)** plus LUT, gains, duty table |
 
-## Facts verified on bazerame while designing
+## Facts verified on fw-fan-quiet while designing
 
 - The fw-fanctrl socket answers without root; `print all` returns `strategy`, `speed`,
   `temperature`, `movingAverageTemperature`, `effectiveTemperature`, `active` and the full config.

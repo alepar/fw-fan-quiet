@@ -103,10 +103,10 @@ machine's margin/floor coincidence. Both are documented in §2.4.
 
 ## Test results
 
-`cargo test --bin bazerame-fans`: **543 passed, 0 failed, 2 ignored** (full suite, confirms
+`cargo test --bin fw-fan-quiet`: **543 passed, 0 failed, 2 ignored** (full suite, confirms
 nothing else broke).
 
-`cargo test --bin bazerame-fans control::spike_antiwindup`: **9 passed, 0 failed** —
+`cargo test --bin fw-fan-quiet control::spike_antiwindup`: **9 passed, 0 failed** —
 `no_candidate_ever_tracks_the_draw`, `no_halt_baseline_overshoots_the_windup_scenario`,
 `per_axis_rules_overshoot_much_less_than_no_halt_on_the_windup_scenario`,
 `per_axis_predicate_excludes_an_axis_pinned_at_its_floor`,
@@ -251,7 +251,7 @@ coordinator (or `j6s`'s implementer) doesn't discover it late.
 
 ### Verification
 
-- `cargo check --bin bazerame-fans`: clean (only the same pre-existing 46 dead-code
+- `cargo check --bin fw-fan-quiet`: clean (only the same pre-existing 46 dead-code
   warnings noted in the original report, confirmed unrelated via `git stash` in that run).
 - `git diff -- src/control/budget.rs` reviewed: doc-comment-only change, no code touched.
 

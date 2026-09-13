@@ -1,4 +1,4 @@
-# bazerame-fans TODO
+# fw-fan-quiet TODO
 
 The implemented controller follows [Per-device temperature loops, revision 4](docs/superpowers/runs/2026-09-11-per-device-temperature-loops/2026-09-11-per-device-temperature-loops-design.md). Older milestone plans under `docs/plans/` and historical specifications describe retired implementations and remain as project history.
 

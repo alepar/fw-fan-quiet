@@ -114,10 +114,10 @@ against a synthetic temp hwmon-shaped fixture dir, mirroring `ec.rs`'s own test 
 (cannot import theirs directly: they're private to that module's `#[cfg(test)]`).
 
 ```
-cargo test --bin bazerame-fans control::mode::
+cargo test --bin fw-fan-quiet control::mode::
 -> test result: ok. 14 passed; 0 failed; 0 ignored
 
-cargo test --bin bazerame-fans
+cargo test --bin fw-fan-quiet
 -> test result: ok. 567 passed; 0 failed; 2 ignored
 ```
 
@@ -141,7 +141,7 @@ covering any acceptance bullet.
 
 ## Quality gate
 
-- `cargo test --bin bazerame-fans`: **567 passed, 0 failed, 2 ignored** (the 2 ignored are
+- `cargo test --bin fw-fan-quiet`: **567 passed, 0 failed, 2 ignored** (the 2 ignored are
   pre-existing NVML hardware smoke tests, unrelated to this task).
 - `cargo clippy --all-targets -- -D warnings`: **not clean — dead_code only, precedented.**
   Confirmed via `git stash` on the base commit: baseline is 63 dead_code errors (structural to

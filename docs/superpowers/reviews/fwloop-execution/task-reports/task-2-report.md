@@ -22,7 +22,7 @@ full fixture corpus the bead lists.
 
 ### Fixture corpus — what was captured live vs. reconstructed
 
-This machine (bazerame) is live and reachable, so most fixtures are fresh
+This machine (fw-fan-quiet) is live and reachable, so most fixtures are fresh
 captures, not reconstructions:
 
 **Captured live (2026-09-09):**
@@ -47,7 +47,7 @@ captures, not reconstructions:
   Verified the module was back (`lsmod | grep ryzen_smu` and
   `/sys/kernel/ryzen_smu_drv` both present after).
 - `state_v1.json` — copied verbatim from the real
-  `/var/lib/bazerame-fans/state.json` on this machine (world-readable,
+  `/var/lib/fw-fan-quiet/state.json` on this machine (world-readable,
   no sudo needed). Genuinely today's `PersistedState` shape: `model`
   (a/b/e/c), `lut.points`, `calibrated_at`, `adapt_bias`, `adapt_gain` —
   exactly what Task 13's migration test needs to prove against.
@@ -142,7 +142,7 @@ controller/reviewer.
 TDD evidence for `fixtures::path` (the one production symbol this task
 owns):
 
-**RED** — `cargo test --bin bazerame-fans test_support::fixtures`, with
+**RED** — `cargo test --bin fw-fan-quiet test_support::fixtures`, with
 `fixtures.rs` containing only the test module (no `path` fn):
 ```
 error[E0423]: expected function, found built-in attribute `path`
@@ -237,7 +237,7 @@ cargo fmt --check
 - `tests/fixtures/ryzenadj_info.txt` — new, live capture (ryzen_smu
   unloaded/reloaded via sudo.txt).
 - `tests/fixtures/state_v1.json` — new, copied from the real
-  `/var/lib/bazerame-fans/state.json` on this machine.
+  `/var/lib/fw-fan-quiet/state.json` on this machine.
 
 ## Self-review findings
 

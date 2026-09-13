@@ -1,11 +1,11 @@
-# bazerame-fans Implementation Plan
+# fw-fan-quiet Implementation Plan
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this
 > plan task-by-task. Progress is tracked in `TODO.md` at the repo root — mark each task's
 > checkbox when its final commit lands.
 
 **Goal:** A sudo-run Rust TUI that holds Framework 16 fan noise at/below a user-set RPM
-target by shaping sustained CPU/GPU power (design: `docs/plans/2026-07-03-bazerame-fans-design.md`).
+target by shaping sustained CPU/GPU power (design: `docs/plans/2026-07-03-fw-fan-quiet-design.md`).
 
 **Architecture:** Four OS threads (sampler 1 Hz, controller, input, main/render) joined by
 crossbeam channels; TEA-style UI (single Model, `update()`, pure `view()`); controller owns
@@ -21,7 +21,7 @@ signal-hook, clap, color-eyre.
 - Pure logic (control math, parsing, update()) must be unit-testable without hardware.
   Hardware access goes behind small traits so logic tests use fakes.
 - Build as the user (`cargo build`, `cargo test` — never sudo). Manual hardware
-  verification runs the built binary: `sudo -S ./target/debug/bazerame-fans < sudo.txt`.
+  verification runs the built binary: `sudo -S ./target/debug/fw-fan-quiet < sudo.txt`.
   Password: pipe `sudo.txt` (repo root, gitignored, never commit). Each sudo call stalls
   ~30 s on a fingerprint timeout before reading stdin — this is normal; use generous
   command timeouts (≥120 s).
@@ -43,11 +43,11 @@ signal-hook, clap, color-eyre.
 **Files:** Create `Cargo.toml`, `src/main.rs`, `rustfmt.toml` (empty = defaults).
 
 **Steps:**
-1. `cargo init --name bazerame-fans` in repo root.
+1. `cargo init --name fw-fan-quiet` in repo root.
 2. Set `Cargo.toml`:
    ```toml
    [package]
-   name = "bazerame-fans"
+   name = "fw-fan-quiet"
    version = "0.1.0"
    edition = "2024"
 
@@ -69,7 +69,7 @@ signal-hook, clap, color-eyre.
    color-eyre = "0.6"
    ```
    (If a version fails to resolve, use the nearest available and note it in the commit.)
-3. `src/main.rs`: `fn main() { println!("bazerame-fans"); }`
+3. `src/main.rs`: `fn main() { println!("fw-fan-quiet"); }`
 4. Run: `cargo build` → compiles. `cargo run` → prints name.
 5. Append `/target` check to `.gitignore` (already has `target/`), commit:
    `feat: scaffold cargo project with dependency stack`
@@ -253,7 +253,7 @@ pub enum Record<'a> {
 }
 pub struct Telemetry { /* BufWriter<File> */ }
 impl Telemetry {
-    /// path e.g. /var/lib/bazerame-fans/telemetry/run-<unix_ts>.jsonl (dir created);
+    /// path e.g. /var/lib/fw-fan-quiet/telemetry/run-<unix_ts>.jsonl (dir created);
     /// CLI-overridable; falls back to ./telemetry-<ts>.jsonl if dir unwritable
     pub fn open(dir: &Path) -> std::io::Result<Self>;
     pub fn log(&mut self, r: &Record) ;   // serialize + \n; flush every 10 records or 5 s
@@ -317,13 +317,13 @@ fn view_renders_without_panic_on_empty_and_full_model() {
 }
 ```
 **main.rs:** color_eyre install → logging init (tracing-appender →
-`/var/lib/bazerame-fans/log/` if writable else `./bazerame-fans.log`) → require root
+`/var/lib/fw-fan-quiet/log/` if writable else `./fw-fan-quiet.log`) → require root
 (`nix`-free check: `std::fs::metadata("/proc/self").uid() == 0` or read euid via
 `unsafe { libc::geteuid() }` — simplest: attempt opening RAPL energy_uj, friendly error) →
 channels, spawn sampler + input threads → `ratatui::init()` → loop
 `{ draw; select! on rx with 100ms tick }` → on quit: flip shutdown flag,
 `ratatui::restore()`.
-**Manual verification:** `cargo build && sudo -S ./target/debug/bazerame-fans < sudo.txt`
+**Manual verification:** `cargo build && sudo -S ./target/debug/fw-fan-quiet < sudo.txt`
 in a real terminal — confirm live fan RPM/watts/temps update each second; `q` exits and
 terminal is intact. (Agent: run it with a 15 s timeout piping `q` after; human does the
 visual check.)
@@ -449,10 +449,10 @@ Commit: `feat: manual actuation controls in TUI`.
 ### Task 16: Milestone 2 end-to-end verification
 
 No new files. Build; run
-`sudo -S ./target/debug/bazerame-fans < sudo.txt` alongside a CPU load
+`sudo -S ./target/debug/fw-fan-quiet < sudo.txt` alongside a CPU load
 (the agent may run 24 shell spinners for 60 s). Script the TUI? No — verify at the
 actuator level with a disposable `--selftest` hidden subcommand instead:
-`bazerame-fans selftest` runs: startup_reset → set CPU 20 W → spawn built-in 10 s burn →
+`fw-fan-quiet selftest` runs: startup_reset → set CPU 20 W → spawn built-in 10 s burn →
 read RAPL (expect ≤ 22 W) → set GPU max 1200 MHz → read NVML lock state → release all →
 print PASS/FAIL lines and exit. Implement `selftest.rs` (this doubles as the future
 calibration burner seed). Run it, capture output, fix until PASS.
@@ -525,9 +525,9 @@ Commit: `feat: affine+cross thermal model with batch fit and gated RLS`.
 
 `config.rs`: `Config { fan_target_rpm: f64 (default 3000), cpu_floor_w: f64 (15),
 gpu_floor_mhz: u32 (1000), fast_limit_mw: u32 (53000) }` — load
-`/etc/bazerame-fans/config.toml` if present else defaults; `--config` CLI override.
+`/etc/fw-fan-quiet/config.toml` if present else defaults; `--config` CLI override.
 `state.rs`: `PersistedState { model: Option<ThermalModel>, lut: Option<ClockWattsLut>,
-calibrated_at: Option<String> }` — load/save `/var/lib/bazerame-fans/state.json`
+calibrated_at: Option<String> }` — load/save `/var/lib/fw-fan-quiet/state.json`
 (CLI-overridable path), atomic save (write `.tmp`, rename). Tests: roundtrip in tempdir;
 missing file → default; corrupt JSON → default + logged (never crash).
 Commit: `feat: config loading and atomic state persistence`.

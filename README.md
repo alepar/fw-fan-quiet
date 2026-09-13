@@ -2,7 +2,7 @@
 
 `fw-fan-quiet` shapes CPU and GPU heat on a Framework 16 so fw-fanctrl can hold a chosen fan-noise target. fw-fanctrl remains the only process that commands the fans. This app adjusts the CPU sustained-power cap and GPU clock ceiling, and restores stock limits whenever control stops or the process exits.
 
-Auto uses one shared target temperature (T*) from fw-fanctrl's active curve and two independent controllers. The CPU controller regulates the CPU EC sensor group in watts; the GPU controller regulates the GPU EC sensor group in MHz. Each controller combines a thermal candidate with a measured shadow cap, applies its own slew limits, and can keep operating when the other device is unavailable.
+In Auto mode, you choose how fast you want the fans to spin. The app uses fw-fanctrl’s fan curve to work out the temperature to aim for, then adjusts the CPU and GPU separately: if either gets too hot, it lowers that device’s limit; if it has room to warm up, it lets the device do more work. It makes these changes gradually and accounts for how much work each device is actually doing. If one device’s readings disappear, it can still manage the other.
 
 ## Current machine and tuning
 

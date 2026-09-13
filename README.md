@@ -231,3 +231,5 @@ Hot handoff can now skip unused headroom: with five seconds of valid recent draw
 Chart target overlays are historical series sampled alongside measurements: fan RPM target, temperature T*, CPU watts cap, and GPU clock cap. Status updates change future points without rewriting earlier history; absent or released temperature/cap targets leave gaps. The histories cover the same rolling five-minute window and begin when the app starts.
 
 Each graph marks its current target with a bright `<` on the right border: fan RPM, CPU watt cap, T*, or GPU clock cap. Markers match their device traces: cyan for fans, yellow for the CPU cap, green for the GPU cap, and white for the shared temperature target. The marker stays visible over overlapping traces; the gray target time series preserves previous targets. Released or unavailable targets have no marker.
+
+A shared `fan cpu gpu` legend sits at the top-right, colored cyan/yellow/green. Graph panels have no internal legends. Very narrow terminals prioritize the status line.

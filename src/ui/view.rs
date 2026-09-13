@@ -49,10 +49,26 @@ pub fn calib_result_scroll_max(model: &Model, area: Rect) -> u16 {
 pub fn view(model: &Model, frame: &mut Frame) {
     let [header, charts, footer] = main_areas(frame.area());
 
+    // Keep one shared legend outside the plots. Reserve its columns so a
+    // long status line cannot overwrite it; tiny terminals prioritize status.
+    let legend_width = if header.width >= 24 { 11 } else { 0 };
+    let status_area = Rect::new(header.x, header.y,
+        header.width.saturating_sub(legend_width + u16::from(legend_width > 0)), header.height);
     frame.render_widget(
         Paragraph::new(header_line(model)).style(Style::default().fg(Color::White)),
-        header,
+        status_area,
     );
+    if legend_width > 0 {
+        let legend = Line::from(vec![
+            Span::styled("fan", Style::default().fg(Color::Cyan)),
+            Span::raw(" "),
+            Span::styled("cpu", Style::default().fg(Color::Yellow)),
+            Span::raw(" "),
+            Span::styled("gpu", Style::default().fg(Color::Green)),
+        ]);
+        frame.render_widget(Paragraph::new(legend),
+            Rect::new(header.right() - legend_width, header.y, legend_width, header.height));
+    }
 
     let [top, bottom] = Layout::vertical([Constraint::Fill(1); 2]).areas(charts);
     let [fans_area, watts_area] = Layout::horizontal([Constraint::Fill(1); 2]).areas(top);
@@ -347,6 +363,7 @@ fn render_chart(
 ) {
     let y_mid = ((y_bounds[0] + y_bounds[1]) / 2.0).round();
     let chart = Chart::new(datasets)
+        .legend_position(None)
         .block(Block::bordered().title(title))
         .x_axis(
             Axis::default()
@@ -764,6 +781,23 @@ mod tests {
         m.status.gpu_max_mhz = None;
         let terminal = draw_size(&m, 200, 40);
         assert_eq!(all_text(&terminal).matches('<').count(), 1);
+    }
+
+    #[test]
+    fn shared_legend_is_colored_top_right_and_panel_legends_are_hidden() {
+        let mut m = Model::new();
+        m.update(Event::Status(two_loop_status(TelemetryTStarState::Curve)));
+        for _ in 0..10 { m.update(Event::Sample(valid_sample(1500.0))); }
+        let terminal = draw_size(&m, 200, 80);
+        let header = row_text(&terminal, 0);
+        assert!(header.ends_with("fan cpu gpu"), "{header}");
+        for (x, color) in [(189, Color::Cyan), (193, Color::Yellow), (197, Color::Green)] {
+            assert_eq!(terminal.backend().buffer().cell((x, 0)).unwrap().fg, color);
+        }
+        let text = all_text(&terminal);
+        for label in ["max fan", "cpu cap", "gpu max"] {
+            assert!(!text.contains(label), "panel legend {label} remains");
+        }
     }
 
     #[test]

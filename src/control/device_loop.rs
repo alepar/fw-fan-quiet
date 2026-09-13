@@ -197,6 +197,8 @@ pub struct DeviceLoop<U: DeviceUnit> {
     prev_t_star: Option<f64>,
     previous_selected: Option<Selected>,
     hot_episode_armed: bool,
+    /// A hot engagement may precede usable draw history; trim once it arrives.
+    hot_entry_trim_pending: bool,
     hot_rearm_s: f64,
     control_entry_pending: bool,
     entry_candidates_seeded: bool,
@@ -233,6 +235,7 @@ impl<U: DeviceUnit> DeviceLoop<U> {
             prev_t_star: None,
             previous_selected: None,
             hot_episode_armed: true,
+            hot_entry_trim_pending: false,
             hot_rearm_s: 0.0,
             control_entry_pending: true,
             entry_candidates_seeded: false,
@@ -343,6 +346,7 @@ impl<U: DeviceUnit> DeviceLoop<U> {
         self.draw_clock_s += dt;
         if input.resumed || input.dt_s > 2.0 || dt == 0.0
             || input.group_c.is_none() || input.actuator == ActuatorState::Mismatch
+            || (self.mismatch_latched && input.actuator != ActuatorState::Verified)
         {
             self.recent_draw.clear();
         } else if let Some(draw) = input.draw.filter(|d| d.is_finite() && *d > 0.0) {
@@ -376,6 +380,11 @@ impl<U: DeviceUnit> DeviceLoop<U> {
         }
 
         let err = input.group_c.map(|group| input.t_star - group);
+        if input.mode != ThermalMode::Regulate || !input.shadow_enabled
+            || err.is_some_and(|error| error >= 0.0)
+        {
+            self.hot_entry_trim_pending = false;
+        }
         if input.resumed {
             self.mismatch_latched = false;
         }
@@ -533,6 +542,33 @@ impl<U: DeviceUnit> DeviceLoop<U> {
             return decision;
         }
 
+        // Hot entry has already transferred from the applied cap, but may
+        // have had no power reading yet. Once history is ready, skip unused
+        // headroom exactly once; never increase a PI candidate already lower.
+        if self.hot_entry_trim_pending && !resynced_error
+            && self.recent_draw.front()
+                .is_some_and(|(time, _)| self.draw_clock_s - time >= 5.0)
+        {
+            self.hot_entry_trim_pending = false;
+            let applied = self.last_applied.or(self.requested).unwrap_or(self.max)
+                .clamp(self.floor, self.max);
+            let peak = self.recent_draw.iter().map(|(_, draw)| *draw).fold(0.0, f64::max);
+            let thermal = self.thermal.min(applied)
+                .min((peak + U::HOT_HEADROOM.min(input.shadow_headroom))
+                    .clamp(self.floor, self.max));
+            if thermal < self.thermal {
+                self.transfer_thermal(thermal, error);
+                self.requested = Some(applied);
+                let (target, selected) = select_candidates(thermal, self.shadow, self.floor, self.max);
+                let cap = self.slew_and_quantize(target, selected, dt, false);
+                self.requested = Some(cap);
+                let decision = self.decision(input, cap, thermal, self.shadow, true, false);
+                self.record_valid_tick(group, input.t_star, decision.selected);
+                self.last_mode = Some(input.mode);
+                return decision;
+            }
+        }
+
         // A moving target can make us hot without crossing the old target.
         // Transfer once from the applied cap; never follow hot draw dips.
         let handover = input.mode == ThermalMode::Regulate
@@ -584,6 +620,7 @@ impl<U: DeviceUnit> DeviceLoop<U> {
             } else { cap };
             if initial_hot_entry {
                 self.shadow = cap;
+                self.hot_entry_trim_pending = input.shadow_enabled;
             }
             self.requested = Some(self.quantize(cap));
             self.resync_error(error);
@@ -1106,6 +1143,148 @@ mod tests {
         gpu_tick.draw = Some(1_000.0);
         let fallen = gpu.tick(gpu_tick);
         close(fallen.shadow, 1_290.0);
+    }
+
+    #[test]
+    fn hot_entry_with_late_draw_skips_deadzone_once_after_five_valid_seconds() {
+        let mut cpu = DeviceLoop::<W>::new(Gains { kc: 0.279475988, ti_s: 29.809252495 });
+        let mut tick = input(Some(85.0), 1.0);
+        tick.t_star = 81.0;
+        tick.max = 54.0;
+        tick.floor = 15.0;
+        tick.shadow_enabled = true;
+        tick.draw = None;
+        for _ in 0..4 {
+            let d = cpu.tick(tick);
+            cpu.note_applied(d.cap);
+        }
+        tick.draw = Some(39.0);
+        for _ in 0..5 {
+            let d = cpu.tick(tick);
+            cpu.note_applied(d.cap);
+            assert!(d.thermal > 50.0, "must collect a full five-second history");
+        }
+        let trimmed = cpu.tick(tick);
+        close(trimmed.thermal, 41.0);
+        close(trimmed.cap, 41.0);
+        cpu.note_applied(trimmed.cap);
+        tick.draw = Some(20.0);
+        for _ in 0..10 {
+            let d = cpu.tick(tick);
+            cpu.note_applied(d.cap);
+            assert!(d.thermal > 40.0, "must not chase later draw dips");
+        }
+    }
+
+    fn pending_hot_cpu() -> (DeviceLoop<W>, TickInput) {
+        let mut cpu = DeviceLoop::<W>::new(Gains { kc: 0.28, ti_s: 30.0 });
+        let mut tick = input(Some(74.0), 1.0);
+        tick.max = 54.0;
+        tick.shadow_enabled = true;
+        tick.draw = None;
+        let d = cpu.tick(tick);
+        cpu.note_applied(d.cap);
+        tick.draw = Some(39.0);
+        (cpu, tick)
+    }
+
+    #[test]
+    fn deferred_hot_trim_restarts_evidence_after_every_sampling_interruption() {
+        for interruption in 0..6 {
+            let (mut cpu, tick) = pending_hot_cpu();
+            for _ in 0..4 {
+                let d = cpu.tick(tick);
+                cpu.note_applied(d.cap);
+            }
+            let mut gap = tick;
+            match interruption {
+                0 => gap.resumed = true,
+                1 => gap.group_c = None,
+                2 => gap.draw = None,
+                3 => gap.actuator = ActuatorState::Mismatch,
+                4 => gap.dt_s = 3.0,
+                _ => gap.dt_s = 0.0,
+            }
+            cpu.tick(gap);
+            for _ in 0..5 {
+                let d = cpu.tick(tick);
+                assert!(d.thermal > 50.0, "premature trim after interruption {interruption}");
+                cpu.note_applied(d.cap);
+            }
+            let d = cpu.tick(tick);
+            close(d.thermal, 41.0);
+        }
+    }
+
+    #[test]
+    fn deferred_hot_trim_waits_for_fresh_history_after_mismatch_latch_clears() {
+        let (mut cpu, tick) = pending_hot_cpu();
+        let mut mismatch = tick;
+        mismatch.actuator = ActuatorState::Mismatch;
+        cpu.tick(mismatch);
+        let mut blind = tick;
+        blind.actuator = ActuatorState::Unverifiable;
+        for _ in 0..8 { cpu.tick(blind); }
+        for _ in 0..5 {
+            let d = cpu.tick(tick);
+            assert!(d.thermal > 50.0, "mismatch-latched readings cannot qualify history");
+            cpu.note_applied(d.cap);
+        }
+        close(cpu.tick(tick).thermal, 41.0);
+    }
+
+    #[test]
+    fn deferred_hot_trim_is_cancelled_when_cool_or_shadow_disabled() {
+        for disable_shadow in [false, true] {
+            let (mut cpu, tick) = pending_hot_cpu();
+            let mut cancel = tick;
+            if disable_shadow { cancel.shadow_enabled = false; }
+            else { cancel.group_c = Some(69.0); }
+            cpu.tick(cancel);
+            for _ in 0..8 {
+                let d = cpu.tick(tick);
+                cpu.note_applied(d.cap);
+                assert!(d.thermal > 50.0);
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_hot_trim_keeps_lower_thermal_candidate_and_uses_recent_peak() {
+        let (mut cpu, tick) = pending_hot_cpu();
+        for _ in 0..5 { cpu.tick(tick); }
+        let mut dip = tick;
+        dip.draw = Some(20.0);
+        close(cpu.tick(dip).thermal, 41.0);
+
+        let (mut cpu, tick) = pending_hot_cpu();
+        cpu.transfer_thermal(30.0, -4.0);
+        cpu.note_applied(30.0);
+        for _ in 0..6 {
+            let d = cpu.tick(tick);
+            assert!(d.thermal <= 30.0);
+            assert!(d.cap <= 30.0);
+            cpu.note_applied(d.cap);
+        }
+    }
+
+    #[test]
+    fn deferred_gpu_trim_uses_applied_cap_and_existing_downward_slew() {
+        let mut gpu = DeviceLoop::<Mhz>::new(Gains { kc: 1.0, ti_s: 30.0 });
+        gpu.seed_candidates(3090.0, 2800.0, Some(2800.0), -4.0);
+        let mut tick = input(Some(74.0), 1.0);
+        tick.floor = 1000.0;
+        tick.max = 3090.0;
+        tick.shadow_headroom = 300.0;
+        tick.shadow_enabled = true;
+        tick.draw = None;
+        gpu.tick(tick);
+        tick.draw = Some(2400.0);
+        for _ in 0..5 { gpu.tick(tick); }
+        gpu.requested = Some(3000.0); // a request still ahead of the writer
+        let d = gpu.tick(tick);
+        close(d.thermal, 2500.0);
+        close(d.cap, 2695.0);
     }
 
     #[test]

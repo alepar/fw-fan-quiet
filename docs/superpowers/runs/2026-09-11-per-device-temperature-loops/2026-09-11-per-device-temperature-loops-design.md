@@ -871,3 +871,10 @@ User requested both changes after the improved controller took roughly ten minut
 ### 2026-09-12: target history on every chart
 
 User requested time-varying target overlays instead of horizontal lines representing only the latest target. The model snapshots the latest controller-reported fan target, T*, CPU cap, and GPU cap on each measurement event into matching rolling rings. Status updates do not mutate existing history. All four charts render those series, splitting unavailable or released temperature/cap targets into gaps and including target history in temperature/fan axis bounds.
+
+
+### 2026-09-12: Deferred trim for already-hot entry
+
+The recorded run `run-1789279798.jsonl` entered Auto already above T* with CPU draw initially unavailable. Thermal seeded at 54 W; draw subsequently measured about 38–40 W, while the fitted PI reduced the unused headroom by about 2 W/minute. Initial hot entry had consumed the handoff before the five-second peak history could qualify.
+
+An already-hot entry with shadow control enabled now retains one pending headroom trim. After five uninterrupted seconds of valid draw, it lowers thermal to the minimum of its existing value, the applied cap, and the recent peak plus the existing 2 W CPU / 100 MHz GPU allowance (bounded by configured shadow margin). The selected cap respects bounds and existing slew from the applied cap. It never raises an already-lower thermal candidate, consumes the opportunity once, and cancels it when cooling to target, leaving regulation, or disabling shadow. Resume, sample gaps, missing readings, and actuator mismatch invalidate the evidence window. PI gains are unchanged.

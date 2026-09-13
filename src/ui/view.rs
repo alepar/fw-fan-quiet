@@ -343,7 +343,7 @@ fn render_chart(
     title: String,
     datasets: Vec<Dataset>,
     y_bounds: [f64; 2],
-    target: Option<f64>,
+    target: Option<(f64, Color)>,
 ) {
     let y_mid = ((y_bounds[0] + y_bounds[1]) / 2.0).round();
     let chart = Chart::new(datasets)
@@ -373,7 +373,7 @@ fn render_chart(
     // its Braille canvas's four-dot vertical resolution before mapping to a
     // terminal row, so the tick aligns with the actual plotted target.
     if area.width >= 8 && area.height >= 5
-        && let Some(target) = target.filter(|v| v.is_finite())
+        && let Some((target, color)) = target.filter(|(v, _)| v.is_finite())
         && y_bounds[1] > y_bounds[0]
         && (y_bounds[0]..=y_bounds[1]).contains(&target)
     {
@@ -382,7 +382,7 @@ fn render_chart(
             * (f64::from(plot_height) * 4.0 - 1.0)).round() as u16;
         let y = area.y + 1 + dot / 4;
         frame.render_widget(
-            Paragraph::new("<").style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Paragraph::new("<").style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
             Rect::new(area.right() - 1, y, 1, 1),
         );
     }
@@ -420,7 +420,7 @@ fn render_fans(model: &Model, frame: &mut Frame, area: Rect) {
     };
     let mut datasets = series("target", Color::DarkGray, &target_segs);
     datasets.extend(series("max fan", Color::Cyan, &fan_segs));
-    render_chart(frame, area, title, datasets, bounds, Some(model.fan_target_rpm));
+    render_chart(frame, area, title, datasets, bounds, Some((model.fan_target_rpm, Color::Cyan)));
 }
 
 /// Error is target minus group temperature: arrows show desired direction,
@@ -491,7 +491,7 @@ fn render_watts(model: &Model, frame: &mut Frame, area: Rect) {
     let mut datasets = series("cpu cap", Color::DarkGray, &cap_segs);
     datasets.extend(series("cpu", Color::Yellow, &cpu_segs));
     datasets.extend(series("gpu", Color::Green, &gpu_segs));
-    render_chart(frame, area, title, datasets, PCT_BOUNDS, model.status.cpu_limit_w.map(|w| w / cpu_max_w * 100.0));
+    render_chart(frame, area, title, datasets, PCT_BOUNDS, model.status.cpu_limit_w.map(|w| (w / cpu_max_w * 100.0, Color::Yellow)));
 }
 
 fn render_temps(model: &Model, frame: &mut Frame, area: Rect) {
@@ -509,7 +509,7 @@ fn render_temps(model: &Model, frame: &mut Frame, area: Rect) {
     let mut datasets = series("T*", Color::DarkGray, &target_segs);
     datasets.extend(series("cpu", Color::Yellow, &cpu_segs));
     datasets.extend(series("gpu", Color::Green, &gpu_segs));
-    render_chart(frame, area, title, datasets, bounds, model.status.t_star_c);
+    render_chart(frame, area, title, datasets, bounds, model.status.t_star_c.map(|t| (t, Color::White)));
 }
 
 /// Calibration wizard panel: phase, step gauge, load prompt, note, abort
@@ -597,7 +597,7 @@ fn render_clock(model: &Model, frame: &mut Frame, area: Rect) {
     let mut datasets = series("gpu max", Color::DarkGray, &cap_segs);
     datasets.extend(series("cpu", Color::Yellow, &cpu_segs));
     datasets.extend(series("gpu", Color::Green, &gpu_segs));
-    render_chart(frame, area, title, datasets, PCT_BOUNDS, model.status.gpu_max_mhz.map(|mhz| f64::from(mhz) / GPU_MAX_CLOCK_MHZ * 100.0));
+    render_chart(frame, area, title, datasets, PCT_BOUNDS, model.status.gpu_max_mhz.map(|mhz| (f64::from(mhz) / GPU_MAX_CLOCK_MHZ * 100.0, Color::Green)));
 }
 
 #[cfg(test)]
@@ -727,7 +727,7 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
             let points = [(0.0, target), (RING_CAP as f64, target)];
             terminal.draw(|f| render_chart(f, f.area(), "test".into(),
-                vec![line_dataset(Color::Green, &points)], [0.0, 100.0], Some(target))).unwrap();
+                vec![line_dataset(Color::Green, &points)], [0.0, 100.0], Some((target, Color::White)))).unwrap();
             let buf = terminal.backend().buffer();
             let tick_y = (1..9).find(|&y| buf.cell((39, y)).unwrap().symbol() == "<").unwrap();
             let trace = buf.cell((38, tick_y)).unwrap();
@@ -736,12 +736,12 @@ mod tests {
         }
         for target in [None, Some(f64::NAN), Some(f64::INFINITY), Some(101.0)] {
             let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
-            terminal.draw(|f| render_chart(f, f.area(), "test".into(), vec![], [0.0, 100.0], target)).unwrap();
+            terminal.draw(|f| render_chart(f, f.area(), "test".into(), vec![], [0.0, 100.0], target.map(|t| (t, Color::White)))).unwrap();
             assert!(!all_text(&terminal).contains('<'));
         }
         for (width, height) in [(1, 1), (8, 4), (8, 5), (20, 8)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            terminal.draw(|f| render_chart(f, f.area(), "test".into(), vec![], [0.0, 100.0], Some(50.0))).unwrap();
+            terminal.draw(|f| render_chart(f, f.area(), "test".into(), vec![], [0.0, 100.0], Some((50.0, Color::White)))).unwrap();
         }
     }
 
@@ -754,10 +754,10 @@ mod tests {
         m.status.t_star_c = Some(90.0);
         m.status.gpu_max_mhz = Some(3090);
         let terminal = draw_size(&m, 200, 40);
-        for (x, y) in [(99, 2), (199, 2), (99, 21), (199, 21)] {
+        for (x, y, color) in [(99, 2, Color::Cyan), (199, 2, Color::Yellow), (99, 21, Color::White), (199, 21, Color::Green)] {
             let cell = terminal.backend().buffer().cell((x, y)).unwrap();
             assert_eq!(cell.symbol(), "<", "missing tick at {x},{y}");
-            assert_eq!(cell.fg, Color::White);
+            assert_eq!(cell.fg, color);
         }
         m.status.cpu_limit_w = None;
         m.status.t_star_c = None;

@@ -216,6 +216,7 @@ fn main() -> Result<()> {
     let fanctrl_poller_thread = fanctrl_poller.spawn(Arc::clone(&shutdown));
 
     let nvme_hwmon = Hwmon::discover(Path::new("/sys/class/hwmon"));
+    let nvme_max_c = nvme_hwmon.nvme_max_c(config.nvme_hot_c);
     let nvme_cache: SharedNvme = Arc::new(Mutex::new(None));
     let nvme_poller_thread = spawn_nvme_poller(
         move || nvme_hwmon.nvme_composite_c(),
@@ -275,7 +276,7 @@ fn main() -> Result<()> {
             let mut terminal = std::mem::ManuallyDrop::new(terminal);
             install_tty_safe_panic_hook();
             spawn_input_thread(ui_tx);
-            let result = run(&mut terminal, &ui_rx, &cmd_tx, &telemetry, &term_flag);
+            let result = run(&mut terminal, &ui_rx, &cmd_tx, &telemetry, &term_flag, nvme_max_c);
             // Hardware restore BEFORE any terminal I/O (see ORDER above).
             shutdown.store(true, Ordering::Relaxed);
             controller_joined = quit_and_join_controller(cmd_tx, ctl);
@@ -448,8 +449,10 @@ fn run(
     cmd_tx: &Sender<Command>,
     telemetry: &Mutex<Option<Telemetry>>,
     term_flag: &AtomicBool,
+    nvme_max_c: f64,
 ) -> Result<()> {
     let mut model = Model::new();
+    model.nvme_max_c = nvme_max_c;
     while model.running {
         if term_flag.load(Ordering::Relaxed) {
             tracing::info!("caught termination signal (SIGINT/SIGTERM/SIGHUP), shutting down");

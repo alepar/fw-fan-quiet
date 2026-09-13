@@ -86,6 +86,15 @@ impl Hwmon {
         Some(self.read_chip_value("nvme", "temp1_input")? / 1000.0)
     }
 
+    /// Drive-reported composite maximum threshold, read once at startup for
+    /// display. Missing or invalid thresholds use the configured hot threshold.
+    pub fn nvme_max_c(&self, fallback: f64) -> f64 {
+        self.read_chip_value("nvme", "temp1_max")
+            .map(|v| v / 1000.0)
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(fallback)
+    }
+
     fn read_chip_value(&self, chip: &str, file: &str) -> Option<f64> {
         let Some(dir) = self.chips.get(chip) else {
             tracing::debug!("hwmon: chip {chip} not present");
@@ -268,6 +277,19 @@ mod tests {
             .nvme_composite_c()
             .expect("nvme composite should read from the fixture");
         assert!((temp - 59.85).abs() < 1e-9, "expected 59.85 C, got {temp}");
+    }
+
+    #[test]
+    fn nvme_max_threshold_validates_drive_value_and_falls_back() {
+        let root = fixture_dir("nvme-max");
+        add_chip(&root, "hwmon0", "nvme", &[("temp1_input", "60000")]);
+        let hwmon = Hwmon::discover(&root);
+        assert_eq!(hwmon.nvme_max_c(80.0), 80.0);
+        for (value, expected) in [("90000", 90.0), ("0", 80.0), ("-273150", 80.0), ("NaN", 80.0), ("inf", 80.0), ("bad", 80.0)] {
+            fs::write(root.join("hwmon0/temp1_max"), value).unwrap();
+            assert_eq!(hwmon.nvme_max_c(80.0), expected);
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

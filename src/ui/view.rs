@@ -86,16 +86,16 @@ pub fn view(model: &Model, frame: &mut Frame) {
     );
 }
 
-/// App name, mode, fan target, commanded limits, active flags and validity
+/// Mode, fan target, commanded limits, active flags and validity
 /// warnings for the latest sample. Flags carry their own (loud) styling.
 fn header_line(model: &Model) -> Line<'static> {
     let cpu = match model.status.cpu_limit_w {
-        Some(w) => format!("cpu\u{2264}{w:.1}W"),
-        None => "cpu \u{2013}".into(),
+        Some(w) => format!("{w:.1}W"),
+        None => "—".into(),
     };
     let gpu = match model.status.gpu_max_mhz {
-        Some(mhz) => format!("gpu\u{2264}{:.1}GHz", f64::from(mhz) / 1000.0),
-        None => "gpu \u{2013}".into(),
+        Some(mhz) => format!("{:.1}GHz", f64::from(mhz) / 1000.0),
+        None => "—".into(),
     };
     // Auto is the mode the whole app exists for: style it loud so a glance
     // tells whether the closed loop is driving.
@@ -109,7 +109,7 @@ fn header_line(model: &Model) -> Line<'static> {
         mode => Span::raw(mode.as_str()),
     };
     let mut spans = vec![
-        Span::raw(" bazerame-fans | "),
+        Span::raw(" "),
         mode_span,
     ];
     // Severity-first render order: the single-line header has no wrap
@@ -149,7 +149,6 @@ fn header_line(model: &Model) -> Line<'static> {
     for flag in &model.status.telemetry_flags {
         spans.push(Span::raw(format!(" | {}", flag_text(flag))));
     }
-    spans.push(Span::raw(format!(" | {cpu} | {gpu}")));
     if model.status.t_star_c.is_some() || model.status.tstar_state.is_some() {
         spans.push(Span::raw(format!(
             " | T* {} {}",
@@ -157,11 +156,15 @@ fn header_line(model: &Model) -> Line<'static> {
             model.status.tstar_state.map(tstar_state_name).unwrap_or("—"),
         )));
     }
-    for (name, device) in [("CPU", model.status.cpu.as_ref()), ("GPU", model.status.gpu.as_ref())] {
-        if let Some(device) = device {
-            spans.push(Span::raw(format!(" | {name} ")));
-            spans.push(error_span(device.err_c));
-            spans.push(Span::raw(format!(" {}", gains_name(device.gains_source))));
+    for (name, device, cap) in [
+        ("CPU", model.status.cpu.as_ref(), cpu),
+        ("GPU", model.status.gpu.as_ref(), gpu),
+    ] {
+        spans.push(Span::raw(format!(" | {name} ")));
+        spans.push(error_span(device.and_then(|d| d.err_c)));
+        spans.push(Span::raw(format!(" - {cap}")));
+        if device.is_some_and(|d| d.gains_source != GainsSource::Fitted) {
+            spans.push(Span::styled(" unfitted", Style::default().fg(Color::Red)));
         }
     }
     spans.push(Span::raw(format!(" | fan {:.0}rpm", model.fan_target_rpm)));
@@ -170,16 +173,10 @@ fn header_line(model: &Model) -> Line<'static> {
         .and_then(|ec| ec.all.iter().find(|(label, _)| label.as_str() == "ambient_f75303@4d"))
         .map(|(_, temperature)| *temperature);
     let nvme = model.latest.as_ref().and_then(|s| s.nvme_temp_c);
-    spans.push(Span::raw(format!(" | ambient {} | NVMe {}", opt_temp(ambient), opt_temp(nvme))));
-    // Floors: safety config, informational — dim like the trim, and LAST so
-    // it can never push a loud flag past a narrow terminal's right edge.
-    spans.push(Span::styled(
-        format!(
-            " | floors {:.0}W/{:.1}GHz",
-            model.status.cpu_floor_w, f64::from(model.status.gpu_floor_mhz) / 1000.0
-        ),
-        Style::default().fg(Color::DarkGray),
-    ));
+    spans.push(Span::raw(" | ambient "));
+    spans.push(temperature_span(ambient, model.status.t_star_c));
+    spans.push(Span::raw(" | NVMe "));
+    spans.push(temperature_span(nvme, Some(model.nvme_max_c)));
     Line::from(spans)
 }
 
@@ -400,11 +397,21 @@ fn render_fans(model: &Model, frame: &mut Frame, area: Rect) {
 /// never a measured trend. Neutral only means zero at displayed precision.
 fn error_span(error: Option<f64>) -> Span<'static> {
     match error.filter(|v| v.is_finite()) {
-        Some(v) if v >= 0.05 => Span::styled(format!("↑{v:+.1}°C"), Style::default().fg(Color::Cyan)),
+        Some(v) if v >= 0.05 => Span::styled(format!("↑{v:+.1}°C"), Style::default().fg(Color::Yellow)),
         Some(v) if v <= -0.05 => Span::styled(format!("↓{v:+.1}°C"), Style::default().fg(Color::Yellow)),
         Some(_) => Span::styled("≈0.0°C", Style::default().fg(Color::Green)),
         None => Span::styled("—", Style::default().fg(Color::DarkGray)),
     }
+}
+
+fn temperature_span(value: Option<f64>, threshold: Option<f64>) -> Span<'static> {
+    let value = value.filter(|v| v.is_finite());
+    let color = match (value, threshold.filter(|t| t.is_finite())) {
+        (Some(v), Some(t)) if v < t => Color::Green,
+        (Some(_), Some(_)) => Color::Yellow,
+        _ => Color::DarkGray,
+    };
+    Span::styled(opt_temp(value), Style::default().fg(color))
 }
 
 fn opt_temp(value: Option<f64>) -> String {
@@ -418,9 +425,6 @@ fn tstar_state_name(value: TelemetryTStarState) -> &'static str {
 }
 fn bound_name(value: TelemetryBound) -> &'static str {
     match value { TelemetryBound::Floor => "floor", TelemetryBound::Max => "max" }
-}
-fn gains_name(value: GainsSource) -> &'static str {
-    match value { GainsSource::Config => "config", GainsSource::Fitted => "fitted", GainsSource::Default => "default" }
 }
 fn device_name(value: TelemetryDeviceName) -> &'static str {
     match value { TelemetryDeviceName::Cpu => "CPU", TelemetryDeviceName::Gpu => "GPU" }
@@ -730,9 +734,9 @@ mod tests {
         let terminal = draw(&m);
         let header = row_text(&terminal, 0);
         assert!(header.contains("manual"), "header was: {header:?}");
-        assert!(header.contains("cpu\u{2264}20.0W"), "header was: {header:?}");
+        assert!(header.contains("CPU — - 20.0W"), "header was: {header:?}");
         assert!(
-            header.contains("gpu\u{2264}1.5GHz"),
+            header.contains("GPU — - 1.5GHz"),
             "header was: {header:?}"
         );
         assert!(header.contains("LIMIT-SLIP!"), "header was: {header:?}");
@@ -745,8 +749,8 @@ mod tests {
         let terminal = draw(&Model::new());
         let header = row_text(&terminal, 0);
         assert!(header.contains("monitor"), "header was: {header:?}");
-        assert!(header.contains("cpu \u{2013}"), "header was: {header:?}");
-        assert!(header.contains("gpu \u{2013}"), "header was: {header:?}");
+        assert!(header.contains("CPU — - —"), "header was: {header:?}");
+        assert!(header.contains("GPU — - —"), "header was: {header:?}");
         assert!(!header.contains("LIMIT-SLIP!"), "header was: {header:?}");
     }
 
@@ -895,31 +899,26 @@ mod tests {
     // --- Task 29: floors in the header ---
 
     #[test]
-    fn header_shows_floors_dim() {
-        use crate::control::ControlStatus;
-        // Defaults render right away (floors are always shown).
-        let terminal = draw(&Model::new());
-        let header = row_text(&terminal, 0);
-        assert!(
-            header.contains("floors 15W/1.0GHz"),
-            "header was: {header:?}"
-        );
-        let x = find_col(&header, "floors 15W/1.0GHz").unwrap() as u16;
-        let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
-        assert_eq!(cell.fg, Color::DarkGray, "floors must render dim");
+    fn temperature_color_respects_threshold_and_unknown_values() {
+        for (value, threshold, color) in [
+            (Some(76.8), Some(79.0), Color::Green),
+            (Some(79.0), Some(79.0), Color::Yellow),
+            (Some(81.0), Some(79.0), Color::Yellow),
+            (Some(85.0), Some(90.0), Color::Green),
+            (Some(90.0), Some(90.0), Color::Yellow),
+            (None, Some(90.0), Color::DarkGray),
+            (Some(70.0), None, Color::DarkGray),
+            (Some(f64::NAN), Some(90.0), Color::DarkGray),
+        ] {
+            assert_eq!(temperature_span(value, threshold).style.fg, Some(color));
+        }
+    }
 
-        // Edited floors show through the echoed status.
-        let mut m = Model::new();
-        m.update(Event::Status(ControlStatus {
-            cpu_floor_w: 20.0,
-            gpu_floor_mhz: 1210,
-            ..ControlStatus::default()
-        }));
-        let header = row_text(&draw(&m), 0);
-        assert!(
-            header.contains("floors 20W/1.2GHz"),
-            "header was: {header:?}"
-        );
+    #[test]
+    fn header_omits_name_and_floors() {
+        let header = row_text(&draw(&Model::new()), 0);
+        assert!(!header.contains("bazerame-fans"));
+        assert!(!header.contains("floors"));
     }
 
     // --- Task 25: auto mode in the header ---
@@ -945,9 +944,9 @@ mod tests {
         assert_eq!(cell.fg, Color::Green);
         assert!(cell.modifier.contains(Modifier::BOLD));
         // Allocation shows through the existing limit fields.
-        assert!(header.contains("cpu\u{2264}17.0W"), "header was: {header:?}");
+        assert!(header.contains("CPU — - 17.0W"), "header was: {header:?}");
         assert!(
-            header.contains("gpu\u{2264}1.7GHz"),
+            header.contains("GPU — - 1.7GHz"),
             "header was: {header:?}"
         );
     }
@@ -1214,10 +1213,10 @@ mod tests {
             let mut model = Model::new(); model.update(Event::Status(status));
             let terminal = draw_size(&model, 200, 40);
             let header = row_text(&terminal, 0);
-            for expected in ["T* 71.0°C", tstar_state_name(state), "cpu≤31.0W", "gpu≤2.1GHz", "CPU ↑+18.6°C config", "GPU ↓-1.5°C fitted"] {
+            for expected in ["T* 71.0°C", tstar_state_name(state), "CPU ↑+18.6°C - 31.0W unfitted", "GPU ↓-1.5°C - 2.1GHz"] {
                 assert!(header.contains(expected), "missing {expected}: {header}");
             }
-            for (label, color) in [("↑+18.6°C", Color::Cyan), ("↓-1.5°C", Color::Yellow)] {
+            for (label, color) in [("↑+18.6°C", Color::Yellow), ("↓-1.5°C", Color::Yellow)] {
                 let x = find_col(&header, label).unwrap() as u16;
                 assert_eq!(terminal.backend().buffer().cell((x, 0)).unwrap().fg, color);
             }
@@ -1228,11 +1227,20 @@ mod tests {
 
     #[test]
     fn view_fixtures_cover_each_gains_source_and_structured_flag() {
-        for (source, text) in [(GainsSource::Config, "config"), (GainsSource::Fitted, "fitted"), (GainsSource::Default, "default")] {
+        for (source, text) in [(GainsSource::Config, " unfitted"), (GainsSource::Fitted, ""), (GainsSource::Default, " unfitted")] {
             let mut status = two_loop_status(TelemetryTStarState::Uncontrollable);
             status.cpu = Some(decision(TelemetrySelected::Thermal, TelemetryHold::None, source));
             let mut model = Model::new(); model.update(Event::Status(status));
-            assert!(row_text(&draw_size(&model, 200, 40), 0).contains(&format!("CPU ↓-1.5°C {text}")));
+            let terminal = draw_size(&model, 200, 40);
+            let header = row_text(&terminal, 0);
+            assert!(header.contains(&format!("CPU ↓-1.5°C - 31.0W{text}")));
+            assert!(!header.contains(" fitted"));
+            if source != GainsSource::Fitted {
+                let x = find_col(&header, "unfitted").unwrap() as u16;
+                assert_eq!(terminal.backend().buffer().cell((x, 0)).unwrap().fg, Color::Red);
+            } else {
+                assert!(!header.contains("unfitted"));
+            }
         }
         for flag in [
             TelemetryFlag::ArgmaxUncontrollable { label: "ambient".into(), active: true }, TelemetryFlag::ArgmaxStuck { label: "gpu_vr".into(), active: true }, TelemetryFlag::EcUnknownLabel { label: "mystery".into(), active: true }, TelemetryFlag::EcImplausible { label: "gpu_mem".into(), active: true }, TelemetryFlag::EcUncontrollableUnavailable { active: true }, TelemetryFlag::GroupLost { device: TelemetryDeviceName::Gpu, active: true }, TelemetryFlag::DeviceUnreachable { device: TelemetryDeviceName::Cpu, bound: TelemetryBound::Floor, active: true }, TelemetryFlag::TargetUnreachable { bound: TelemetryBound::Max, active: true }, TelemetryFlag::SteepCurve { active: true }, TelemetryFlag::Legacy { flag: "EC MISMATCH".into(), active: false },

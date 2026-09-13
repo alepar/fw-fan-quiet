@@ -34,6 +34,8 @@ const FAN_MAX_RPM: f64 = 7000.0;
 const CPU_FLOOR_STEP_W: f64 = 1.0;
 
 pub struct Model {
+    /// Display threshold from NVMe hwmon, or the configured hot fallback.
+    pub nvme_max_c: f64,
     pub max_fan: Ring,
     pub fan_target: Ring,
     pub temp_target: Ring,
@@ -75,6 +77,7 @@ impl Model {
     pub fn new() -> Self {
         let status = ControlStatus::default();
         Self {
+            nvme_max_c: crate::config::Config::default().nvme_hot_c,
             max_fan: Ring::new(RING_CAP),
             fan_target: Ring::new(RING_CAP),
             temp_target: Ring::new(RING_CAP),
